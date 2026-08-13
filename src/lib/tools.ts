@@ -2,6 +2,7 @@ import "server-only";
 import { convexMutation, convexQuery } from "./context";
 import { getSecret, getServiceSecrets } from "./vault";
 import { r2Put, r2StoreFromUrl } from "./r2";
+import { privateR2Get } from "./private-r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
@@ -12,6 +13,14 @@ import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import { createICloudEvent, deleteICloudEvent, findICloudEvents, listICloudEvents } from "./icloud-calendar";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
+import {
+  gmailSearch,
+  gmailReadMessage,
+  gmailCreateDraft,
+  gmailListLikelySubscriptions,
+  gmailUnsubscribe,
+  gmailMarkSpam,
+} from "./gmail";
 import { resolveProjectSourceAdmission } from "./source-admission-server";
 import { isSafeSourceBranch, type ProjectSourceAdmission } from "./source-admission";
 import { canonicalizeRepository } from "./workflow-contract";
@@ -904,12 +913,13 @@ export const TOOL_DEFS = [
   {
     name: "draft",
     description:
-      "LIVE WRITING DESK: put a text draft (email, message, post, script, caption...) on screen as a clean document. Use for ANY 'help me write / draft / reword X'. Call again with the FULL revised text after each change Daniel asks for — the document updates live so you two can discuss it. Never paste the draft into chat; it lives on the panel. Same title = same document.",
+      "LIVE WRITING DESK: put a text draft (email, message, post, script, caption...) on screen as a clean document. Use for ANY 'help me write / draft / reword X'. Call again with the FULL revised text after each change Daniel asks for — the document updates live so you two can discuss it. Never paste the draft into chat; it lives on the panel. Same title = same document. Pass creation_id to target an exact already-open document precisely (e.g. one just opened via open_file_as_doc) instead of relying on title matching.",
     parameters: {
       type: "object",
       properties: {
         title: { type: "string", description: "short stable name, e.g. 'Email to Hygglo support'" },
         content: { type: "string", description: "the complete current draft text (markdown ok) — full replacement each call" },
+        creation_id: { type: "string", description: "optional: exact id of an already-open document to update directly, bypassing title matching" },
         document_type: { type: "string", enum: ["email", "note", "document", "message", "script"], description: "used to file the draft in the right library category" },
         project: { type: "string" },
         inquiry: { type: "string", description: "short stable topic when not tied to a project" },
@@ -1123,6 +1133,107 @@ export const TOOL_DEFS = [
         request: { type: "string", description: "The capability or improvement, specific and self-contained" },
       },
       required: ["request"],
+    },
+  },
+  {
+    name: "open_file_as_doc",
+    description:
+      "Turn an already-uploaded file (PDF, DOCX, CSV, plain text) into an editable working document on screen, using its already-extracted text. Use when Daniel wants to edit, rewrite or work on the contents of a file he's shared — not just discuss it. Returns a creation_id; pass that same id to draft afterwards to keep revising the SAME document.",
+    parameters: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "the file's id from a recent upload/attachment" },
+        title: { type: "string", description: "optional title for the doc; defaults to the file's original name" },
+      },
+      required: ["file_id"],
+    },
+  },
+  // Feature 4b — Gmail capability (read/draft/unsubscribe/spam), built on the
+  // Feature 4a OAuth connection. gmail_unsubscribe and gmail_mark_spam both
+  // touch Daniel's real inbox, so their tool defs require a "confirmed"
+  // boolean and their dispatch cases in executeTool() hard-refuse to run
+  // without confirmed === true — see the matching cases below.
+  {
+    name: "gmail_search",
+    description:
+      "Search Daniel's Gmail. Pass a Gmail search query (same syntax as the Gmail search box, e.g. 'from:amazon.co.uk newer_than:7d') or leave query empty to use a sensible default that surfaces calendar-relevant mail (appointments, invites, reservations, deadlines, RSVPs) plus messages carrying a genuine .ics/calendar-invite attachment. Read-only — never modifies anything.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "optional Gmail search query; omit for the calendar-relevant default" },
+        max_results: { type: "number", description: "optional, default 20, max 50" },
+      },
+    },
+  },
+  {
+    name: "gmail_read",
+    description:
+      "Open one Gmail message by id (from gmail_search) and return its headers, full body text, attachment list, and any parsed calendar-invite events found in a real .ics attachment. Read-only.",
+    parameters: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "Gmail message id, from gmail_search results" },
+      },
+      required: ["message_id"],
+    },
+  },
+  {
+    name: "gmail_draft_reply",
+    description:
+      "Creates a draft only, never sends, Daniel must send it himself from Gmail. Writes a Gmail draft — a reply inside an existing thread when thread_id/in_reply_to_message_id is given, or a new email otherwise. The draft sits in Daniel's Gmail Drafts folder for him to review and send manually; this tool cannot and does not send email.",
+    parameters: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "recipient email address" },
+        subject: { type: "string", description: "email subject" },
+        body: { type: "string", description: "full plain-text draft body" },
+        thread_id: { type: "string", description: "optional Gmail thread id to file the draft into" },
+        in_reply_to_message_id: { type: "string", description: "optional Gmail message id being replied to, for proper In-Reply-To threading" },
+      },
+      required: ["to", "subject", "body"],
+    },
+  },
+  {
+    name: "gmail_list_subscriptions",
+    description:
+      "Scans recent Gmail for mailing-list/newsletter/marketing mail — anything carrying a List-Unsubscribe header — grouped by sender with frequency and whether one-click unsubscribe is supported. Read-only: surfaces candidates for Daniel to review. Only call gmail_unsubscribe afterward for senders he explicitly confirms.",
+    parameters: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "optional lookback window in days, default 60" },
+      },
+    },
+  },
+  {
+    name: "gmail_unsubscribe",
+    description:
+      "Unsubscribes Daniel from one sender's mailing list using that message's List-Unsubscribe header (RFC 8058 one-click POST when supported, otherwise a Gmail DRAFT to the list's unsubscribe address — never auto-sent). This changes Daniel's real inbox subscriptions. You MUST first tell him in chat exactly which sender/list this will unsubscribe from and get an explicit yes. Call with confirmed left false/omitted first to describe what would happen and stop — only call again with confirmed:true after Daniel has explicitly agreed in this conversation.",
+    parameters: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "Gmail message id carrying the List-Unsubscribe header (from gmail_list_subscriptions)" },
+        confirmed: {
+          type: "boolean",
+          description: "Must be true, and must only be set true after Daniel explicitly said yes in chat to unsubscribing from this specific sender. Omit or leave false to preview only.",
+        },
+      },
+      required: ["message_id", "confirmed"],
+    },
+  },
+  {
+    name: "gmail_mark_spam",
+    description:
+      "Marks one Gmail message as spam (adds the SPAM label, removes it from the inbox) in Daniel's real inbox. You MUST first tell him in chat which message/sender this will mark as spam and get an explicit yes. Call with confirmed left false/omitted first to describe what would happen and stop — only call again with confirmed:true after Daniel has explicitly agreed in this conversation.",
+    parameters: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "Gmail message id to mark as spam (from gmail_search or gmail_read)" },
+        confirmed: {
+          type: "boolean",
+          description: "Must be true, and must only be set true after Daniel explicitly said yes in chat to marking this specific message as spam. Omit or leave false to preview only.",
+        },
+      },
+      required: ["message_id", "confirmed"],
     },
   },
 ];
@@ -3026,7 +3137,6 @@ async function draftDoc(args: any): Promise<string> {
   const title = String(args.title ?? "Draft").slice(0, 80);
   const content = String(args.content ?? "");
   if (!content.trim()) return "TOOL DID NOTHING: no content passed.";
-  const existing: any = await convexQuery("creations:latest", { kind: "doc", titleMatch: title.toLowerCase() }).catch(() => null);
   const categoryByType: Record<string, string> = {
     email: "emails",
     note: "notes",
@@ -3035,14 +3145,22 @@ async function draftDoc(args: any): Promise<string> {
     script: "scripts",
   };
   const filing = await creationFiling(args, categoryByType[String(args.document_type ?? "")] ?? undefined);
-  let id = existing?._id ?? null;
-  if (id && filing.project && existing.project && existing.project !== filing.project) id = null;
-  if (id && filing.inquiry && existing.inquiry && existing.inquiry !== filing.inquiry) id = null;
-  if (id) await convexMutation("creations:update", { id, title, data: content, ...filing });
-  else id = await convexMutation("creations:create", { kind: "doc", title, data: content, ...filing });
+  const creationId = String(args.creation_id ?? "").trim();
+  let id: string | null = null;
+  if (creationId) {
+    await convexMutation("creations:update", { id: creationId, title, data: content, ...filing });
+    id = creationId;
+  } else {
+    const existing: any = await convexQuery("creations:latest", { kind: "doc", titleMatch: title.toLowerCase() }).catch(() => null);
+    id = existing?._id ?? null;
+    if (id && filing.project && existing.project && existing.project !== filing.project) id = null;
+    if (id && filing.inquiry && existing.inquiry && existing.inquiry !== filing.inquiry) id = null;
+    if (id) await convexMutation("creations:update", { id, title, data: content, ...filing });
+    else id = await convexMutation("creations:create", { kind: "doc", title, data: content, ...filing });
+  }
   await convexMutation("ui:setPanel", { type: "doc", value: JSON.stringify({ creationId: id }), title: `draft · ${title}` });
   const words = content.trim().split(/\s+/).length;
-  return `Draft "${title}" is on screen (${words} words) and updates LIVE. Discuss it in one or two short sentences — don't read it out. To revise, call draft again with the same title and the full new text.`;
+  return `Draft "${title}" is on screen (${words} words) and updates LIVE. Discuss it in one or two short sentences — don't read it out. To revise, call draft again with the same ${creationId ? "creation_id" : "title"} and the full new text.`;
 }
 
 // Day planner (mined from ethanplusai/jarvis planner.py, web-adapted): real
@@ -3415,6 +3533,35 @@ async function creationFiling(args: any, category?: string): Promise<{
   const project = String(args?.project ?? "").trim().slice(0, 80) || undefined;
   const inquiry = String(args?.inquiry ?? "").trim().slice(0, 80) || undefined;
   return { category, project, inquiry, threadId: await activeThread() };
+}
+
+async function openFileAsDoc(args: any): Promise<string> {
+  const fileId = String(args.file_id ?? "").trim();
+  if (!fileId) return "TOOL DID NOTHING: no file_id passed.";
+  const file: any = await convexQuery("files:getForOwner", { fileId }).catch(() => null);
+  if (!file || file.status === "deleted") return "TOOL DID NOTHING: file not found.";
+  if (!file.extractedTextR2Key) {
+    return `TOOL DID NOTHING: "${file.originalName}" has no extracted text available (status: ${file.status}). Only text-bearing files (pdf, docx, csv, plain text) can open as a doc.`;
+  }
+  const upstream = await privateR2Get(file.extractedTextR2Key).catch(() => null);
+  if (!upstream || !upstream.ok) return "TOOL DID NOTHING: couldn't read the extracted text for that file.";
+  const MAX_DOC_BYTES = 1_500_000;
+  const raw = new Uint8Array(await upstream.arrayBuffer());
+  const bounded = raw.byteLength > MAX_DOC_BYTES ? raw.slice(0, MAX_DOC_BYTES) : raw;
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bounded);
+  if (!text.trim()) return "TOOL DID NOTHING: extracted text is empty.";
+  const title = String(args.title ?? file.originalName ?? "Document").slice(0, 80);
+  const filing = await creationFiling(args, "documents");
+  const id = await convexMutation("creations:create", {
+    kind: "doc",
+    title,
+    data: text,
+    sourceFiles: [{ fileId: String(file._id ?? fileId), name: String(file.originalName ?? title) }],
+    ...filing,
+  });
+  await convexMutation("ui:setPanel", { type: "doc", value: JSON.stringify({ creationId: id }), title: `doc · ${title}` });
+  const words = text.trim().split(/\s+/).length;
+  return `Opened "${title}" as an editable doc (${words} words, creation_id ${id}) from ${file.originalName}. It updates LIVE on screen — discuss it briefly, don't read it out. To revise it, call draft with creation_id "${id}" and the full new text.`;
 }
 
 export async function executeTool(
@@ -4258,6 +4405,70 @@ export async function executeTool(
         hour12: true,
       }).format(now);
       return formatted;
+    }
+    case "open_file_as_doc":
+      return await openFileAsDoc(args);
+    case "gmail_search": {
+      const query = typeof args.query === "string" ? args.query : undefined;
+      const maxResults = Number(args.max_results) || 20;
+      const messages = await gmailSearch(query, maxResults);
+      if (!messages.length) return "No matching Gmail messages found.";
+      const lines = messages.map((m) => {
+        const invite = m.hasIcsAttachment
+          ? ` [calendar invite${m.icsEvents?.[0]?.title ? `: ${m.icsEvents[0].title}` : ""}]`
+          : "";
+        return `- id:${m.id} · ${m.subject} · from ${m.from}${m.date ? ` · ${m.date}` : ""}${invite}\n  ${m.snippet}`;
+      });
+      return `Found ${messages.length} Gmail message${messages.length === 1 ? "" : "s"}:\n${lines.join("\n")}`;
+    }
+    case "gmail_read": {
+      const messageId = String(args.message_id ?? "").trim();
+      if (!messageId) return "TOOL DID NOTHING: no message_id given.";
+      const message = await gmailReadMessage(messageId);
+      const invite = message.icsEvents?.length
+        ? `\nCalendar invite: ${message.icsEvents.map((e) => `${e.title} (${new Date(e.start).toISOString()}${e.location ? ` @ ${e.location}` : ""})`).join("; ")}`
+        : "";
+      const attachments = message.attachments.length ? `\nAttachments: ${message.attachments.map((a) => a.filename).join(", ")}` : "";
+      return `From: ${message.from}\nTo: ${message.to ?? ""}\nSubject: ${message.subject}\nDate: ${message.date ?? ""}${invite}${attachments}\n\n${message.bodyText.slice(0, 6000)}`;
+    }
+    case "gmail_draft_reply": {
+      const to = String(args.to ?? "").trim();
+      const subject = String(args.subject ?? "").trim();
+      const body = String(args.body ?? "");
+      if (!to || !body.trim()) return "TOOL DID NOTHING: need at least 'to' and 'body' to draft an email.";
+      const draft = await gmailCreateDraft({
+        to,
+        subject,
+        body,
+        threadId: args.thread_id ? String(args.thread_id) : undefined,
+        inReplyToMessageId: args.in_reply_to_message_id ? String(args.in_reply_to_message_id) : undefined,
+      });
+      return `Draft created in Daniel's Gmail Drafts folder (id ${draft.draftId}) — not sent. He needs to open Gmail and send it himself.`;
+    }
+    case "gmail_list_subscriptions": {
+      const days = Number(args.days) || 60;
+      const candidates = await gmailListLikelySubscriptions({ days });
+      if (!candidates.length) return "No mailing-list/newsletter mail with a List-Unsubscribe header found in that window.";
+      const lines = candidates
+        .slice(0, 30)
+        .map((c) => `- ${c.senderName ?? c.senderEmail} <${c.senderEmail}> · ${c.count} email${c.count === 1 ? "" : "s"} · latest: "${c.latestSubject}" (id:${c.latestMessageId})${c.oneClick ? " · one-click unsubscribe available" : ""}`);
+      return `Found ${candidates.length} likely subscription sender${candidates.length === 1 ? "" : "s"}:\n${lines.join("\n")}\n\nAsk Daniel which ones to unsubscribe from before calling gmail_unsubscribe.`;
+    }
+    case "gmail_unsubscribe": {
+      if (args.confirmed !== true) return "Not confirmed — ask the user first and only call this again with confirmed: true after they say yes.";
+      const messageId = String(args.message_id ?? "").trim();
+      if (!messageId) return "TOOL DID NOTHING: no message_id given.";
+      const result = await gmailUnsubscribe(messageId);
+      if (result.method === "one-click-post") return `Unsubscribed via the sender's one-click link (${result.target}).`;
+      if (result.method === "draft") return `That sender only supports email-based unsubscribing — created a draft to ${result.to} (id ${result.draftId}), not sent. Daniel needs to send it from Gmail to complete the unsubscribe.`;
+      return `Could not unsubscribe automatically: ${result.reason}`;
+    }
+    case "gmail_mark_spam": {
+      if (args.confirmed !== true) return "Not confirmed — ask the user first and only call this again with confirmed: true after they say yes.";
+      const messageId = String(args.message_id ?? "").trim();
+      if (!messageId) return "TOOL DID NOTHING: no message_id given.";
+      const result = await gmailMarkSpam(messageId);
+      return `Marked message ${result.id} as spam and removed it from the inbox.`;
     }
     default:
       return `Unknown tool ${name}.`;

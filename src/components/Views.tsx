@@ -656,17 +656,19 @@ export function DocView({ value }: { value: string }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
+  const [conflict, setConflict] = useState(false);
   const prev = useRef<string>("");
   useEffect(() => {
     const cur = String(doc?.data ?? "");
     if (prev.current && cur && cur !== prev.current) {
       setFlash(true);
+      if (editing) setConflict(true);
       const t = setTimeout(() => setFlash(false), 1200);
       prev.current = cur;
       return () => clearTimeout(t);
     }
     prev.current = cur;
-  }, [doc?.data]);
+  }, [doc?.data, editing]);
   if (!doc) return <div className="flex flex-1 items-center justify-center text-sm text-slate">opening the draft…</div>;
   const text = String(doc.data ?? "");
   const visibleText = editing ? draft : text;
@@ -676,6 +678,7 @@ export function DocView({ value }: { value: string }) {
     try {
       await clientMutation("creations:update", { id: creationId, data: draft });
       setEditing(false);
+      setConflict(false);
     } finally {
       setSaving(false);
     }
@@ -696,14 +699,19 @@ export function DocView({ value }: { value: string }) {
             </a>
             {editing ? (
               <>
-                <button onClick={() => { setDraft(text); setEditing(false); }} className="rounded border border-black/10 px-2 py-1 text-neutral-600 hover:bg-black/5">cancel</button>
+                <button onClick={() => { setDraft(text); setEditing(false); setConflict(false); }} className="rounded border border-black/10 px-2 py-1 text-neutral-600 hover:bg-black/5">cancel</button>
                 <button disabled={saving} onClick={() => void save()} className="rounded bg-neutral-800 px-2 py-1 text-white disabled:opacity-50">{saving ? "saving…" : "save"}</button>
               </>
             ) : (
-              <button onClick={() => { setDraft(text); setEditing(true); }} className="rounded border border-black/10 px-2 py-1 text-neutral-600 hover:bg-black/5">edit</button>
+              <button onClick={() => { setDraft(text); setEditing(true); setConflict(false); }} className="rounded border border-black/10 px-2 py-1 text-neutral-600 hover:bg-black/5">edit</button>
             )}
           </div>
         </div>
+        {editing && conflict ? (
+          <div className="mb-4 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-[11px] uppercase tracking-[0.12em] text-amber-600">
+            Jarvis updated this while you were editing — saving now will overwrite that change.
+          </div>
+        ) : null}
         {editing ? (
           <textarea
             autoFocus
@@ -1996,7 +2004,7 @@ export function CreationsView({ value }: { value: string }) {
                         </div>
                       </button>
                       <CreationSourceFiles files={r.sourceFiles} maxVisible={2} className="px-2.5 pb-2" />
-                      <div className="flex items-center justify-between gap-1 border-t border-white/5 px-2.5 py-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-1 border-t border-white/5 px-2.5 py-1.5">
                         <button onClick={() => open(r)} className="text-[9px] uppercase tracking-wider text-cyan-dim hover:text-cyan">open / edit</button>
                         <button
                           onClick={() => setEditing({ id: r._id, title: r.title, folder: r.folder })}
@@ -2004,7 +2012,25 @@ export function CreationsView({ value }: { value: string }) {
                         >
                           organize
                         </button>
-                        <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan">download ↓</a>
+                        {r.kind === "doc" ? (
+                          <span className="flex items-center gap-1.5 text-[9px] uppercase tracking-wider">
+                            <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}&format=md`} className="text-slate hover:text-cyan">text ↓</a>
+                            <span className="text-white/15">·</span>
+                            <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}&format=pdf`} className="text-slate hover:text-cyan">pdf ↓</a>
+                          </span>
+                        ) : r.kind === "board" ? (
+                          <span className="flex items-center gap-1.5 text-[9px] uppercase tracking-wider">
+                            <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="text-slate hover:text-cyan" title="Editable .excalidraw source">file ↓</a>
+                            <span className="text-white/15">·</span>
+                            {r.thumb ? (
+                              <a href={r.thumb} download className="text-slate hover:text-cyan">image ↓</a>
+                            ) : (
+                              <span className="text-slate/40" title="Open the board and use “export image” first">image ↓</span>
+                            )}
+                          </span>
+                        ) : (
+                          <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="text-[9px] uppercase tracking-wider text-slate hover:text-cyan">download ↓</a>
+                        )}
                       </div>
                     </div>
                   ))}

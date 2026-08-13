@@ -2,6 +2,7 @@ import "server-only";
 
 import { randomUUID } from "node:crypto";
 import { XMLParser } from "fast-xml-parser";
+import { parseIcsVevents } from "./ics";
 
 const DAV = "DAV:";
 const CALDAV = "urn:ietf:params:xml:ns:caldav";
@@ -36,7 +37,6 @@ export type ICloudEventInput = {
 };
 
 type XmlRecord = Record<string, unknown>;
-type IcalField = { name: string; value: string; params: Record<string, string> };
 
 let calendarHomeCache: { value: string; expiresAt: number } | null = null;
 
@@ -200,99 +200,17 @@ async function resolveCalendar(requested?: string): Promise<ICloudCalendar> {
   throw new ICloudCalendarError(`Calendar '${requested}' was not found.`);
 }
 
-function unfoldIcs(source: string): string[] {
-  const lines: string[] = [];
-  for (const raw of source.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
-    if (/^[ \t]/.test(raw) && lines.length) lines[lines.length - 1] += raw.slice(1);
-    else lines.push(raw);
-  }
-  return lines;
-}
-
-function icalField(line: string): IcalField | null {
-  const colon = line.indexOf(":");
-  if (colon < 1) return null;
-  const fields = line.slice(0, colon).split(";");
-  const params: Record<string, string> = {};
-  for (const parameter of fields.slice(1)) {
-    const [key, ...rest] = parameter.split("=");
-    if (key && rest.length) params[key.toUpperCase()] = rest.join("=").replace(/^"|"$/g, "");
-  }
-  return { name: fields[0].toUpperCase(), value: line.slice(colon + 1), params };
-}
-
-function unescapeIcs(value: string): string {
-  return value.replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\");
-}
-
-function londonTimeMs(year: number, month: number, day: number, hour: number, minute: number, second: number): number {
-  let guess = Date.UTC(year, month - 1, day, hour, minute, second);
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: LONDON,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date(guess));
-  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  const interpreted = Date.UTC(Number(byType.year), Number(byType.month) - 1, Number(byType.day), Number(byType.hour), Number(byType.minute), Number(byType.second));
-  guess -= interpreted - guess;
-  return guess;
-}
-
-function calendarDayMs(value: string): number {
-  const match = value.match(/^(\d{4})(\d{2})(\d{2})$/);
-  if (!match) return Date.now();
-  return londonTimeMs(Number(match[1]), Number(match[2]), Number(match[3]), 0, 0, 0);
-}
-
-function icalTimeMs(value: string, timeZone?: string): number {
-  const match = value.match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?)?(Z)?$/);
-  if (!match) return Date.now();
-  const [, year, month, day, hour = "00", minute = "00", second = "00", utc] = match;
-  if (utc) return Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
-  if (!timeZone || timeZone === LONDON) return londonTimeMs(Number(year), Number(month), Number(day), Number(hour), Number(minute), Number(second));
-  return Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
-}
-
+// VEVENT parsing itself lives in ./ics (shared with src/lib/gmail.ts, Feature
+// 4b, for .ics/text-calendar Gmail attachments) — this just adds the
+// iCloud/CalDAV-specific wrapper fields.
 function parseIcsEvents(source: string, eventUrl: string, calendarName: string, etag?: string): ICloudEvent[] {
-  const events: ICloudEvent[] = [];
-  let fields: Record<string, IcalField> | null = null;
-  for (const line of unfoldIcs(source)) {
-    if (line.toUpperCase() === "BEGIN:VEVENT") {
-      fields = {};
-      continue;
-    }
-    if (line.toUpperCase() === "END:VEVENT") {
-      if (fields) {
-        const starts = fields.DTSTART;
-        const ends = fields.DTEND;
-        const allDay = starts?.params.VALUE === "DATE" || Boolean(starts?.value.match(/^\d{8}$/));
-        events.push({
-          uid: fields.UID?.value ?? "",
-          title: unescapeIcs(fields.SUMMARY?.value ?? "(untitled)"),
-          start: starts ? (allDay ? calendarDayMs(starts.value) : icalTimeMs(starts.value, starts.params.TZID)) : Date.now(),
-          end: ends ? (allDay ? calendarDayMs(ends.value) : icalTimeMs(ends.value, ends.params.TZID)) : undefined,
-          allDay,
-          location: fields.LOCATION ? unescapeIcs(fields.LOCATION.value) : undefined,
-          notes: fields.DESCRIPTION ? unescapeIcs(fields.DESCRIPTION.value) : undefined,
-          eventUrl,
-          etag,
-          calendarName,
-          source: "icloud",
-        });
-      }
-      fields = null;
-      continue;
-    }
-    if (!fields) continue;
-    const field = icalField(line);
-    if (field && ["UID", "SUMMARY", "DTSTART", "DTEND", "LOCATION", "DESCRIPTION"].includes(field.name)) fields[field.name] ??= field;
-  }
-  return events;
+  return parseIcsVevents(source).map((event) => ({
+    ...event,
+    eventUrl,
+    etag,
+    calendarName,
+    source: "icloud" as const,
+  }));
 }
 
 function toIcalUtc(epochMs: number): string {

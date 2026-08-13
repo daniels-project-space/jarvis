@@ -8,7 +8,8 @@ const TOOL_BELT_REGISTRY = {
     "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "show", "net_worth", "memory_map",
     "rental_availability", "rental_stats", "rentals_calendar", "clear_chat", "new_chat", "visual_scene", "project_goal",
     "work_control", "read_url", "remember", "memory_search", "agent_status", "reminder_cancel", "todo_remove",
-    "calendar_remove", "deliberate",
+    "calendar_remove", "deliberate", "open_file_as_doc", "gmail_search", "gmail_read", "gmail_draft_reply",
+    "gmail_list_subscriptions", "gmail_unsubscribe", "gmail_mark_spam",
   ]),
   creative: new Set([
     "creative_sprint", "create_image", "store_image", "create_pdf", "board", "mind_map", "chart", "draft",

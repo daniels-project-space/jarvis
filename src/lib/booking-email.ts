@@ -1,6 +1,7 @@
 import "server-only";
 
 import { createHash } from "node:crypto";
+import { getGoogleAccessToken } from "./google-oauth";
 
 export type BookingKind = "flight" | "stay" | "activity" | "transport" | "dining" | "reservation";
 
@@ -317,27 +318,14 @@ export function parseBookingEmail(input: { id: string; threadId?: string; subjec
   };
 }
 
-let tokenCache: { value: string; expiresAt: number } | null = null;
-
 async function accessToken(): Promise<string> {
-  if (tokenCache && tokenCache.expiresAt > Date.now()) return tokenCache.value;
-  const direct = process.env.GMAIL_BOOKINGS_ACCESS_TOKEN;
-  if (direct) return direct;
-  const clientId = process.env.GMAIL_BOOKINGS_CLIENT_ID;
-  const clientSecret = process.env.GMAIL_BOOKINGS_CLIENT_SECRET;
-  const refreshToken = process.env.GMAIL_BOOKINGS_REFRESH_TOKEN;
-  if (!clientId || !clientSecret || !refreshToken)
-    throw new GmailBookingsError("Gmail booking sync is not connected yet. Add the read-only Gmail OAuth credentials in the cloud secret store.");
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: "refresh_token" }),
-    cache: "no-store",
-  });
-  const payload = await response.json().catch(() => ({})) as { access_token?: unknown; expires_in?: unknown };
-  if (!response.ok || !payload.access_token) throw new GmailBookingsError("Gmail booking sync could not refresh its read-only access.");
-  tokenCache = { value: String(payload.access_token), expiresAt: Date.now() + Math.max(60, Number(payload.expires_in ?? 300) - 45) * 1000 };
-  return tokenCache.value;
+  // Feature 4b: delegates to the shared Feature 4a helper, which reads the
+  // Convex-stored encrypted Google connection first and transparently falls
+  // back to these same legacy GMAIL_BOOKINGS_CLIENT_ID/CLIENT_SECRET/
+  // REFRESH_TOKEN env vars internally if no Convex connection exists yet —
+  // see src/lib/google-oauth.ts. Its own token cache replaces the one that
+  // used to live here.
+  return await getGoogleAccessToken();
 }
 
 async function gmail<T = JsonObject>(path: string): Promise<T> {

@@ -92,6 +92,7 @@ export const create = mutation({
     inquiry: v.optional(v.string()),
     threadId: v.optional(v.string()),
     sourceMessageId: v.optional(v.id("chatMessages")),
+    sourceFiles: v.optional(v.array(v.object({ fileId: v.id("files"), name: v.string() }))),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
@@ -105,6 +106,7 @@ export const create = mutation({
       thumb: a.thumb,
       ...filing,
       threadId: a.threadId?.slice(0, 120),
+      sourceFiles: a.sourceFiles,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });

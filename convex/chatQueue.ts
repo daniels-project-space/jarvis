@@ -1254,6 +1254,7 @@ export const postCard = mutation({
     type: v.string(),
     value: v.string(),
     title: v.optional(v.string()),
+    downloadUrl: v.optional(v.string()),
     authTokenHash: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
@@ -1265,7 +1266,7 @@ export const postCard = mutation({
       text: "",
       status: "done",
       delivery: "foreground",
-      attachment: { type: a.type, value: a.value, title: a.title },
+      attachment: { type: a.type, value: a.value, title: a.title, downloadUrl: a.downloadUrl },
       createdAt: Date.now(),
     });
   },

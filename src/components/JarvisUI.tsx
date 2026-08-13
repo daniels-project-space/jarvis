@@ -134,7 +134,7 @@ const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">assembling visual workspace…</div>,
 });
 
-type Attachment = { type: string; value: string; title?: string };
+type Attachment = { type: string; value: string; title?: string; downloadUrl?: string };
 type JarvisPrefs = { reduceMotion: boolean; liveDefault: boolean };
 type LiveMicrophoneResources = {
   stream: MediaStream;
@@ -428,8 +428,8 @@ function MediaCard({ a, onShow }: { a: Attachment; onShow: (a: Attachment) => vo
   // open the panel first. Docs default to PDF; boards to the editable
   // .excalidraw bundle (PNG/SVG need the live canvas — see BoardView's own
   // "export image" once opened).
-  let downloadHref = "";
-  if (a.type === "doc" || a.type === "board") {
+  let downloadHref = a.downloadUrl ?? "";
+  if (!downloadHref && (a.type === "doc" || a.type === "board")) {
     try {
       const creationId = JSON.parse(a.value)?.creationId;
       if (creationId) downloadHref = `/api/creation-download?id=${encodeURIComponent(creationId)}${a.type === "doc" ? "&format=pdf" : ""}`;
@@ -563,6 +563,12 @@ function OptionsPanel({
   );
   const permissionText = (value: JarvisPermissionState["microphone"]) =>
     value === "granted" ? "ready" : value === "denied" ? "blocked" : value === "unsupported" ? "unavailable" : "not enabled";
+  // Connection state is personal context. It follows the same viewer/session
+  // gate as the rest of the options panel; the encrypted credential itself is
+  // only ever available to trusted server/worker code.
+  const googleStatus = useJarvisQuery(api.googleAuth.getConnectionStatus, {});
+  const googleConnected = googleStatus && googleStatus.connected === true;
+  const googleEmail = googleStatus && googleStatus.connected ? googleStatus.email : undefined;
   return (
     <>
       <div className="fixed inset-0 z-[55]" onClick={onClose} />
@@ -605,6 +611,15 @@ function OptionsPanel({
             <button onClick={onMacSetup} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
               set up
             </button>
+          </Row>
+          <Row label="Google account" hint={googleConnected ? `connected${googleEmail ? ` · ${googleEmail}` : ""}` : "Gmail read/draft/unsubscribe — connect to enable"}>
+            {googleConnected ? (
+              <span className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-[11px] text-emerald-300">connected ✓</span>
+            ) : (
+              <a href="/api/auth/google/start" className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
+                connect
+              </a>
+            )}
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>

@@ -181,7 +181,15 @@ export default defineSchema({
     // Persistent media card: everything JARVIS shows also lands in the stream
     // so Daniel can always get back to it later.
     attachment: v.optional(
-      v.object({ type: v.string(), value: v.string(), title: v.optional(v.string()) }),
+      v.object({
+        type: v.string(),
+        value: v.string(),
+        title: v.optional(v.string()),
+        // Persistent artifacts carry a first-party attachment route so a
+        // visual card and its direct-download action never depend on an R2
+        // browser header or a temporary third-party URL.
+        downloadUrl: v.optional(v.string()),
+      }),
     ),
     createdAt: v.number(),
   })
@@ -2127,4 +2135,17 @@ export default defineSchema({
   })
     .index("by_surfaced", ["surfaced", "createdAt"])
     .index("by_domain", ["domain", "createdAt"]),
+
+  // Google OAuth connection (Feature 4a). One row per provider — today only
+  // "google". Stores the refresh token AES-256-GCM-encrypted at rest; the
+  // plaintext token never touches Convex. See src/lib/google-oauth.ts.
+  googleAccounts: defineTable({
+    provider: v.string(), // "google"
+    encryptedRefreshToken: v.string(), // base64 AES-256-GCM envelope (schema byte + nonce + tag + ciphertext)
+    scope: v.string(),
+    email: v.optional(v.string()), // connected Google account address, for UI display only
+    connectedAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_provider", ["provider"]),
 });

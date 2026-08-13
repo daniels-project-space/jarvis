@@ -44,6 +44,8 @@ export async function r2Put(name: string, body: Uint8Array | ArrayBuffer | strin
       ? "webp"
       : contentType.includes("jpeg")
         ? "jpg"
+        : contentType.includes("svg")
+          ? "svg"
         : contentType.includes("pdf")
           ? "pdf"
           : contentType.includes("json")
@@ -60,6 +62,21 @@ export async function r2Put(name: string, body: Uint8Array | ArrayBuffer | strin
   });
   if (!r.ok) throw new Error(`R2 upload failed: ${r.status} ${(await r.text()).slice(0, 150)}`);
   return `${PUBLIC_BASE}/${key}`;
+}
+
+// Only used to compensate for a failed durable-record write immediately after
+// this process created an object. Keeping the URL → key conversion narrow
+// prevents a caller from turning this into a general bucket-delete primitive.
+export async function r2DeleteFreshCreation(url: string): Promise<void> {
+  const prefix = `${PUBLIC_BASE}/creations/`;
+  if (!url.startsWith(prefix)) throw new Error("refusing to delete a non-Jarvis creation object");
+  const key = url.slice(`${PUBLIC_BASE}/`.length);
+  if (!key || key.includes("..") || /[?#]/.test(key)) throw new Error("invalid Jarvis creation object key");
+  const { aws, endpoint } = await client();
+  const response = await aws.fetch(`${endpoint}/${BUCKET}/${key}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`R2 cleanup failed: ${response.status} ${(await response.text()).slice(0, 150)}`);
+  }
 }
 
 // Fetch a remote image (e.g. a Novita result before its 48h TTL runs out) and

@@ -119,6 +119,7 @@ export default function BoardView({ value }: { value: string }) {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [ready, setReady] = useState(false);
   const [viewMode, setViewMode] = useState<"graph" | "canvas">("graph");
+  const [exporting, setExporting] = useState<"" | "png" | "svg">("");
   const initialLoaded = useRef(false);
   const overviewFitDone = useRef(false);
 
@@ -201,6 +202,48 @@ export default function BoardView({ value }: { value: string }) {
       imageUrls: JSON.stringify(urls),
       appliedUpTo: appliedTs.current,
     }).catch(() => {});
+  };
+
+  // Render the live scene to a PNG/SVG client-side (Excalidraw's export
+  // utilities need a real canvas), then hand the bytes to creation-export so
+  // they get a permanent R2 url and become the library thumbnail (`thumb`).
+  const exportImage = async (format: "png" | "svg") => {
+    const ex = apiRef.current;
+    if (!ex || !creationId || exporting) return;
+    const elements = ex.getSceneElements();
+    if (!elements.length) return;
+    setExporting(format);
+    try {
+      const appState = ex.getAppState();
+      const files = ex.getFiles();
+      const { exportToBlob, exportToSvg } = await import("@excalidraw/excalidraw");
+      const blob =
+        format === "png"
+          ? await exportToBlob({
+              elements,
+              appState,
+              files,
+              mimeType: "image/png",
+              quality: 0.9,
+              // Cap raster size — an unbounded export can blow well past what's
+              // sane to store, and r2Put() itself has no size ceiling.
+              maxWidthOrHeight: 1600,
+              exportPadding: 16,
+            })
+          : new Blob([(await exportToSvg({ elements, appState, files, exportPadding: 16 })).outerHTML], { type: "image/svg+xml" });
+      const res = await fetch(`/api/creation-export?creationId=${encodeURIComponent(creationId)}&format=${format}`, {
+        method: "POST",
+        headers: { "content-type": blob.type },
+        body: blob,
+      });
+      if (!res.ok) throw new Error(`export failed: ${res.status}`);
+      const { url } = (await res.json()) as { url?: string };
+      if (url) window.open(url, "_blank", "noopener");
+    } catch {
+      /* export is a nice-to-have affordance — never break the board over it */
+    } finally {
+      setExporting("");
+    }
   };
 
   const fitOverview = (animate = true) => {
@@ -437,6 +480,28 @@ export default function BoardView({ value }: { value: string }) {
           >
             fit overview
           </button>
+          {viewMode === "canvas" && (
+            <>
+              <button
+                type="button"
+                onClick={() => void exportImage("png")}
+                disabled={exporting !== ""}
+                title="Export this board as a PNG and save a permanent link"
+                className="pointer-events-auto rounded-md border border-amber/25 px-2 py-1 text-[9px] uppercase tracking-[0.14em] text-amber transition hover:border-amber/60 hover:bg-amber/10 disabled:opacity-50"
+              >
+                {exporting === "png" ? "exporting…" : "export png"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void exportImage("svg")}
+                disabled={exporting !== ""}
+                title="Export this board as an SVG and save a permanent link"
+                className="pointer-events-auto rounded-md border border-amber/25 px-2 py-1 text-[9px] uppercase tracking-[0.14em] text-amber transition hover:border-amber/60 hover:bg-amber/10 disabled:opacity-50"
+              >
+                {exporting === "svg" ? "exporting…" : "export svg"}
+              </button>
+            </>
+          )}
         </div>
         <CreationSourceFiles files={row?.sourceFiles} className="pointer-events-auto mt-2" />
         {latestConcepts.length > 0 && (

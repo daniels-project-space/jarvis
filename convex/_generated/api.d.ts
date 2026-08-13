@@ -26,6 +26,7 @@ import type * as findings from "../findings.js";
 import type * as goalHandoffs from "../goalHandoffs.js";
 import type * as goalIntegration from "../goalIntegration.js";
 import type * as goalMode from "../goalMode.js";
+import type * as googleAuth from "../googleAuth.js";
 import type * as guestMigration from "../guestMigration.js";
 import type * as incidents from "../incidents.js";
 import type * as jobs from "../jobs.js";
@@ -81,6 +82,7 @@ declare const fullApi: ApiFromModules<{
   goalHandoffs: typeof goalHandoffs;
   goalIntegration: typeof goalIntegration;
   goalMode: typeof goalMode;
+  googleAuth: typeof googleAuth;
   guestMigration: typeof guestMigration;
   incidents: typeof incidents;
   jobs: typeof jobs;

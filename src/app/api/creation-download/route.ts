@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { adminSessionHash, controlQuery, validateAdminSession } from "@/lib/control-session";
+import { markdownToPdf } from "@/lib/pdf";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -100,12 +101,32 @@ export async function GET(req: NextRequest) {
   const row = (await controlQuery("creations:get", { id, authTokenHash }).catch(() => null)) as Creation | null;
   if (!row) return Response.json({ error: "creation not found" }, { status: 404 });
   const base = safeName(row.title);
+  const format = req.nextUrl.searchParams.get("format")?.trim().toLowerCase();
+
+  // PDF is synthesized on demand from the doc's markdown source — it is never
+  // stored, so this branch runs before the stored-url proxy below (which docs
+  // don't populate anyway) and before the default raw-markdown behavior.
+  if (row.kind === "doc" && format === "pdf") {
+    const bytes = await markdownToPdf(row.title, String(row.data ?? ""));
+    // Same generic-Uint8Array-vs-BodyInit mismatch r2.ts already works around.
+    return attachment(bytes as unknown as BodyInit, `${base}.pdf`, "application/pdf");
+  }
 
   if (row.url && /^https:\/\//i.test(row.url)) {
     const upstream = await fetch(row.url, { cache: "no-store", redirect: "follow" }).catch(() => null);
     if (upstream?.ok && upstream.body) {
       const type = upstream.headers.get("content-type") || (row.kind === "pdf" ? "application/pdf" : "application/octet-stream");
-      const extension = row.kind === "pdf" ? "pdf" : type.includes("png") ? "png" : type.includes("webp") ? "webp" : type.includes("jpeg") ? "jpg" : "bin";
+      const extension = row.kind === "pdf"
+        ? "pdf"
+        : type.includes("png")
+          ? "png"
+          : type.includes("webp")
+            ? "webp"
+            : type.includes("jpeg")
+              ? "jpg"
+              : type.includes("svg")
+                ? "svg"
+                : "bin";
       return attachment(upstream.body, `${base}.${extension}`, type);
     }
   }
