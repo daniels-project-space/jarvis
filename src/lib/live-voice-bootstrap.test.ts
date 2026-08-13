@@ -81,4 +81,14 @@ describe("live voice bootstrap policy", () => {
     expect(toggleLive).not.toContain("withClientDeadline(microphone");
     expect(toggleLive).toContain("const microphoneReady = await microphone");
   });
+
+  it("fails closed when passive narration cannot obtain the shared voice lease", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    const ensureVoice = source.slice(
+      source.indexOf("async function ensureVoice"),
+      source.indexOf("async function narrateText"),
+    );
+    expect(ensureVoice).toContain("return false;");
+    expect(ensureVoice).not.toContain("better one voice too many than silence");
+  });
 });

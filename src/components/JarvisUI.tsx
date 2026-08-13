@@ -2540,7 +2540,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     try {
       return (await electVoice({ client: me.current })) !== false;
     } catch {
-      return true; // convex hiccup: better one voice too many than silence
+      // An unavailable election service cannot prove that this tab is the
+      // sole narrator. Stay silent until the authoritative lease recovers.
+      return false;
     }
   }
 

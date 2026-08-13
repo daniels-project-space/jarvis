@@ -115,6 +115,50 @@ describe("created artifact download cards", () => {
     expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
   });
 
+  it("posts a stored image with its authenticated creation download link", async () => {
+    mock.convexMutation.mockImplementation(async (name: string) => {
+      if (name === "creations:create") return "stored/creation 1";
+      return undefined;
+    });
+
+    await expect(executeTool("store_image", { title: "Reference image", url: "https://source.example/reference.webp" }))
+      .resolves.toContain("secure download card");
+
+    expect(mock.convexMutation).toHaveBeenCalledWith("creations:create", expect.objectContaining({
+      kind: "image", title: "Reference image", url: imageUrl, thumb: imageUrl,
+    }));
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", {
+      threadId: "main",
+      type: "image",
+      value: imageUrl,
+      title: "Reference image",
+      downloadUrl: "/api/creation-download?id=stored%2Fcreation%201",
+    });
+  });
+
+  it("cleans up a stored image and withholds its card when creation persistence fails", async () => {
+    mock.convexMutation.mockImplementation(async (name: string) => {
+      if (name === "creations:create") throw new Error("Convex unavailable");
+      return undefined;
+    });
+
+    await expect(executeTool("store_image", { title: "Reference image", url: "https://source.example/reference.webp" }))
+      .resolves.toContain("could not be saved");
+
+    expect(mock.r2DeleteFreshCreation).toHaveBeenCalledWith(imageUrl);
+    expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
+  });
+
+  it("does not claim a stored image when persistence returns no creation receipt", async () => {
+    mock.convexMutation.mockResolvedValue(undefined);
+
+    await expect(executeTool("store_image", { title: "Reference image", url: "https://source.example/reference.webp" }))
+      .resolves.toContain("could not be saved");
+
+    expect(mock.r2DeleteFreshCreation).toHaveBeenCalledWith(imageUrl);
+    expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
+  });
+
   it("posts a rendered PDF with its authenticated creation download link", async () => {
     mock.convexMutation.mockImplementation(async (name: string) => {
       if (name === "creations:create") return "pdf/creation 1";

@@ -2436,9 +2436,27 @@ async function storeImage(args: any): Promise<string> {
   try {
     const { url: stored } = await r2StoreFromUrl(title, url);
     const filing = await creationFiling(args);
-    await convexMutation("creations:create", { kind: "image", title, url: stored, thumb: stored, ...filing }).catch(() => {});
-    await convexMutation("chatQueue:postCard", { threadId: filing.threadId, type: "image", value: stored, title }).catch(() => {});
-    return `Stored permanently in the creations library: ${stored}`;
+    let creationId: unknown;
+    try {
+      creationId = await convexMutation("creations:create", {
+        kind: "image", title, url: stored, thumb: stored, ...filing,
+      });
+      if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
+    } catch {
+      // The R2 object is fresh and undiscoverable without a library record;
+      // never leave it behind while claiming that this image was saved.
+      await r2DeleteFreshCreation(stored).catch(() => undefined);
+      return "The image was copied, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
+    }
+    const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
+    try {
+      await convexMutation("chatQueue:postCard", {
+        threadId: filing.threadId, type: "image", value: stored, title, downloadUrl,
+      });
+    } catch {
+      return "Image saved to the creations library, but its download card could not be posted.";
+    }
+    return `Stored permanently in the creations library and attached with a secure download card. URL: ${stored}`;
   } catch (e: any) {
     return `Couldn't store that image: ${e?.message ?? e}`;
   }
