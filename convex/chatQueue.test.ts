@@ -337,6 +337,28 @@ describe("durable foreground chat recovery", () => {
     expect(rows.some((row) => row.parentMessageId === userId && row.status === "error" && /recovery/i.test(row.text))).toBe(true);
   });
 
+  it("returns the exact pending thread so scheduled recovery stays owner-scoped", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "travel",
+      text: "recover this exact thread",
+      requestId: "scheduled-thread-scope",
+      workerToken: WORKER,
+    });
+
+    const pending = await t.query(api.chatQueue.pendingSignal, { workerToken: WORKER });
+    expect(pending).toEqual({ messageId: userId, threadId: "travel" });
+    expect(await t.mutation(api.chatQueue.requestRecovery, {
+      messageId: pending!.messageId,
+      threadId: pending!.threadId,
+      workerToken: WORKER,
+    })).toMatchObject({
+      status: "pending",
+      messageId: userId,
+      dispatchEpoch: 1,
+    });
+  });
+
   it("expires outage-era backlog without spending a model call or replying days late", async () => {
     const t = convexTest(schema, modules);
     const staleId = await createTurn(t, "stale-pending");

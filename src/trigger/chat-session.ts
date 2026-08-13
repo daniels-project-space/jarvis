@@ -45,6 +45,7 @@ import {
 import { abortForegroundLeaseWork, waitForForegroundLease } from "./foreground-lease";
 import { successorLane, taskForForegroundLane, type ForegroundLane } from "./foreground-lanes";
 import { buildForegroundTiming, type ForegroundTurnTiming } from "./foreground-timing";
+import { dispatchPendingForegroundRecovery } from "./foreground-recovery";
 import { CodexAppServer, type CodexTurnInput } from "./codex-app-server";
 import { ForegroundSessionOwner } from "./foreground-session";
 import { MEMORY_SUBSCRIPTION_VALIDITY_MS } from "./subscription-validity";
@@ -131,7 +132,7 @@ function waitForPending(
     unsubscribe = client.onUpdate(
       api.chatQueue.pendingSignal,
       { workerToken },
-      (messageId) => { if (messageId) finish(true); },
+      (pending) => { if (pending) finish(true); },
       () => finish(false),
     );
   });
@@ -691,16 +692,29 @@ export const chatDispatcher = schedules.task({
       .catch(() => ({ requeued: 0, failed: 0 })) as { requeued?: number; failed?: number };
     const [lease, pendingMessageId] = await Promise.all([
       convexCall("query", "chatQueue:runnerLeaseForWorker", {}) as Promise<{ updatedAt?: number } | null>,
-      convexCall("query", "chatQueue:pendingSignal", {}) as Promise<string | null>,
+      convexCall("query", "chatQueue:pendingSignal", {}) as Promise<{ messageId?: string; threadId?: string } | null>,
     ]);
     const warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
     if (warm) return { warm: true, pending: Boolean(pendingMessageId), reaped };
-    if (!pendingMessageId) return { warm: false, pending: false, reaped };
-    const handle = await tasks.trigger(
-      "jarvis-chat-turn",
-      { source: "recovery", messageId: pendingMessageId ?? undefined },
-      { idempotencyKey: `jarvis-recovery-${Math.floor(Date.now() / 60_000)}` },
-    );
-    return { warm: false, pending: Boolean(pendingMessageId), reaped, runId: handle.id };
+    if (!pendingMessageId?.messageId || !pendingMessageId.threadId) return { warm: false, pending: false, reaped };
+    const recovery = await dispatchPendingForegroundRecovery({
+      messageId: pendingMessageId.messageId,
+      threadId: pendingMessageId.threadId,
+    }, {
+      requestRecovery: async ({ messageId, threadId }) => await convexCall(
+        "mutation",
+        "chatQueue:requestRecovery",
+        { messageId, threadId },
+      ),
+      trigger: async (messageId, dispatchEpoch) => {
+        const handle = await tasks.trigger(
+          "jarvis-chat-turn",
+          { source: "recovery", messageId },
+          { idempotencyKey: `jarvis-recovery-${messageId}-${dispatchEpoch}` },
+        );
+        return { id: handle.id };
+      },
+    });
+    return { warm: false, pending: true, reaped, ...recovery };
   },
 });

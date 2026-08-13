@@ -1150,7 +1150,7 @@ export const pendingSignal = query({
       .query("chatMessages")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
       .first();
-    return pending?._id ?? null;
+    return pending ? { messageId: pending._id, threadId: pending.threadId } : null;
   },
 });
 
