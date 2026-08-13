@@ -40,15 +40,15 @@ describe("tool belt registry", () => {
     expect(SUBSCRIPTION_TOOL_NAMES.has("work_control")).toBe(false);
   });
 
-  it("keeps Gmail data and mailbox mutations out of background workers", () => {
+  it("keeps Gmail data capabilities out of background workers and does not expose destructive mailbox mutations", () => {
     for (const name of [
       "gmail_search",
       "gmail_read",
       "gmail_draft_reply",
       "gmail_list_subscriptions",
-      "gmail_unsubscribe",
-      "gmail_mark_spam",
     ]) expect(SUBSCRIPTION_TOOL_NAMES.has(name)).toBe(false);
+    expect(definedNames.has("gmail_unsubscribe")).toBe(false);
+    expect(definedNames.has("gmail_mark_spam")).toBe(false);
   });
 
   it("keeps the explicitly named Google Calendar lane out of background workers", () => {

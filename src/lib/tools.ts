@@ -20,8 +20,6 @@ import {
   gmailReadMessage,
   gmailCreateDraft,
   gmailListLikelySubscriptions,
-  gmailUnsubscribe,
-  gmailMarkSpam,
 } from "./gmail";
 import { resolveProjectSourceAdmission } from "./source-admission-server";
 import { isSafeSourceBranch, type ProjectSourceAdmission } from "./source-admission";
@@ -1181,11 +1179,9 @@ export const TOOL_DEFS = [
       required: ["file_id"],
     },
   },
-  // Feature 4b — Gmail capability (read/draft/unsubscribe/spam), built on the
-  // Feature 4a OAuth connection. gmail_unsubscribe and gmail_mark_spam both
-  // touch Daniel's real inbox, so their tool defs require a "confirmed"
-  // boolean and their dispatch cases in executeTool() hard-refuse to run
-  // without confirmed === true — see the matching cases below.
+  // Gmail supports search, reading, subscription discovery, and draft creation.
+  // Destructive inbox actions are intentionally not tool definitions: a model-
+  // supplied `confirmed: true` is not an owner approval receipt.
   {
     name: "gmail_search",
     description:
@@ -1229,44 +1225,12 @@ export const TOOL_DEFS = [
   {
     name: "gmail_list_subscriptions",
     description:
-      "Scans recent Gmail for mailing-list/newsletter/marketing mail — anything carrying a List-Unsubscribe header — grouped by sender with frequency and whether one-click unsubscribe is supported. Read-only: surfaces candidates for Daniel to review. Only call gmail_unsubscribe afterward for senders he explicitly confirms.",
+      "Scans recent Gmail for mailing-list/newsletter/marketing mail — anything carrying a List-Unsubscribe header — grouped by sender with frequency and whether one-click unsubscribe is supported. Read-only: surfaces candidates for Daniel to review and manage directly in Gmail.",
     parameters: {
       type: "object",
       properties: {
         days: { type: "number", description: "optional lookback window in days, default 60" },
       },
-    },
-  },
-  {
-    name: "gmail_unsubscribe",
-    description:
-      "Unsubscribes Daniel from one sender's mailing list using that message's List-Unsubscribe header (RFC 8058 one-click POST when supported, otherwise a Gmail DRAFT to the list's unsubscribe address — never auto-sent). This changes Daniel's real inbox subscriptions. You MUST first tell him in chat exactly which sender/list this will unsubscribe from and get an explicit yes. Call with confirmed left false/omitted first to describe what would happen and stop — only call again with confirmed:true after Daniel has explicitly agreed in this conversation.",
-    parameters: {
-      type: "object",
-      properties: {
-        message_id: { type: "string", description: "Gmail message id carrying the List-Unsubscribe header (from gmail_list_subscriptions)" },
-        confirmed: {
-          type: "boolean",
-          description: "Must be true, and must only be set true after Daniel explicitly said yes in chat to unsubscribing from this specific sender. Omit or leave false to preview only.",
-        },
-      },
-      required: ["message_id", "confirmed"],
-    },
-  },
-  {
-    name: "gmail_mark_spam",
-    description:
-      "Marks one Gmail message as spam (adds the SPAM label, removes it from the inbox) in Daniel's real inbox. You MUST first tell him in chat which message/sender this will mark as spam and get an explicit yes. Call with confirmed left false/omitted first to describe what would happen and stop — only call again with confirmed:true after Daniel has explicitly agreed in this conversation.",
-    parameters: {
-      type: "object",
-      properties: {
-        message_id: { type: "string", description: "Gmail message id to mark as spam (from gmail_search or gmail_read)" },
-        confirmed: {
-          type: "boolean",
-          description: "Must be true, and must only be set true after Daniel explicitly said yes in chat to marking this specific message as spam. Omit or leave false to preview only.",
-        },
-      },
-      required: ["message_id", "confirmed"],
     },
   },
 ];
@@ -4602,23 +4566,13 @@ export async function executeTool(
       const lines = candidates
         .slice(0, 30)
         .map((c) => `- ${c.senderName ?? c.senderEmail} <${c.senderEmail}> · ${c.count} email${c.count === 1 ? "" : "s"} · latest: "${c.latestSubject}" (id:${c.latestMessageId})${c.oneClick ? " · one-click unsubscribe available" : ""}`);
-      return `Found ${candidates.length} likely subscription sender${candidates.length === 1 ? "" : "s"}:\n${lines.join("\n")}\n\nAsk Daniel which ones to unsubscribe from before calling gmail_unsubscribe.`;
+      return `Found ${candidates.length} likely subscription sender${candidates.length === 1 ? "" : "s"}:\n${lines.join("\n")}\n\nReview and manage any unsubscribe directly in Gmail. Jarvis will not change inbox subscriptions from chat.`;
     }
     case "gmail_unsubscribe": {
-      if (args.confirmed !== true) return "Not confirmed — ask the user first and only call this again with confirmed: true after they say yes.";
-      const messageId = String(args.message_id ?? "").trim();
-      if (!messageId) return "TOOL DID NOTHING: no message_id given.";
-      const result = await gmailUnsubscribe(messageId);
-      if (result.method === "one-click-post") return "Unsubscribed via the sender's one-click link.";
-      if (result.method === "draft") return `That sender only supports email-based unsubscribing — created a draft to ${result.to} (id ${result.draftId}), not sent. Daniel needs to send it from Gmail to complete the unsubscribe.`;
-      return `Could not unsubscribe automatically: ${result.reason}`;
+      return "Gmail unsubscribe is unavailable until Jarvis has a host-mediated owner-approval receipt. No subscription or inbox change was made.";
     }
     case "gmail_mark_spam": {
-      if (args.confirmed !== true) return "Not confirmed — ask the user first and only call this again with confirmed: true after they say yes.";
-      const messageId = String(args.message_id ?? "").trim();
-      if (!messageId) return "TOOL DID NOTHING: no message_id given.";
-      const result = await gmailMarkSpam(messageId);
-      return `Marked message ${result.id} as spam and removed it from the inbox.`;
+      return "Gmail spam marking is unavailable until Jarvis has a host-mediated owner-approval receipt. No inbox change was made.";
     }
     default:
       return `Unknown tool ${name}.`;
