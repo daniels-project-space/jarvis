@@ -44,6 +44,7 @@ async function enqueueFixture(t: ReturnType<typeof convexTest>, input: {
   task: string;
   repo?: string;
   readonly?: boolean;
+  model?: string;
   risk?: string;
   approvalRequired?: boolean;
   workerToken: string;
@@ -60,6 +61,33 @@ async function enqueueFixture(t: ReturnType<typeof convexTest>, input: {
 }
 
 describe("bounded exact textual work orders", () => {
+  it("persists the calculated route instead of a static agent default or cheap override", async () => {
+    const t = convexTest(schema, modules);
+    const boundedTask = "Rename one UI label.";
+    const hardTask = "Trace the root cause and redesign this multi-repo Convex architecture.";
+
+    const boundedId = await enqueueFixture(t, {
+      task: boundedTask,
+      repo: REPO,
+      workerToken: WORKER,
+    });
+    const hardId = await enqueueFixture(t, {
+      task: hardTask,
+      repo: REPO,
+      model: "luna",
+      workerToken: WORKER,
+    });
+    const [bounded, hard] = await t.run(async (ctx) => [
+      await ctx.db.get(boundedId),
+      await ctx.db.get(hardId),
+    ]);
+
+    // Paul defaults to Sol, but a short one-line rename is intentionally Luna.
+    expect(bounded).toMatchObject({ agentId: "paul", model: "luna" });
+    // A caller's cheap requested tier may never lower hard engineering work.
+    expect(hard).toMatchObject({ agentId: "paul", model: "sol" });
+  });
+
   it("persists every reproduced policy exploit behind the approval gate", async () => {
     const t = convexTest(schema, modules);
     for (const task of CLAUSE_BOUNDARY_AND_LIFECYCLE_EXPLOITS) {

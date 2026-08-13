@@ -662,7 +662,11 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   });
   const agent = workOrderAgent(persistedValue.agentId) ?? workOrderAgent(routed.agentId);
   if (!agent) throw new Error("Job requires one canonical permanent-agent role");
-  const model = normalizeWorkModelTier(persistedValue.model, agent.defaultModel);
+  // `routeWork` is the durable routing authority, including hard/consequential
+  // quality floors. Do not fall back to a specialist's static default here:
+  // that would make every small Paul task run at Sol and would let an explicit
+  // cheap model bypass the route's safety escalation.
+  const model = normalizeWorkModelTier(routed.model, agent.defaultModel);
   const readonly = Boolean(persistedValue.readonly || !persistedValue.repo);
   const reasoningEffort = normalizeMinimumReasoningEffort(persistedValue.reasoningEffort, model);
   const triggerMachine = admittedTriggerMachine({ readonly, minimumModel: model, minimumReasoningEffort: reasoningEffort });
