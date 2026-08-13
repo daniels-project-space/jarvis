@@ -55,9 +55,14 @@ const slug = (s: unknown) =>
     .slice(0, 50);
 const clean = (s: unknown) => redactSecrets(s).replace(/[*#`_>]/g, "").trim();
 
+// The fast Convex recall index is consolidated into the durable Obsidian
+// mirror on the documented six-hour cadence. Keep this exported so the
+// schedule contract is covered without ever running a vault write in tests.
+export const MEMORY_VAULT_CRON = "17 */6 * * *";
+
 export const memoryVault = schedules.task({
   id: "jarvis-memory-vault",
-  cron: "17 4 * * 1", // weekly, Monday 04:17 UTC
+  cron: MEMORY_VAULT_CRON,
   maxDuration: 180,
   run: async () => {
     const token = process.env.GITHUB_TOKEN;
