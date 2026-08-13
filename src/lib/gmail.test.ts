@@ -2,17 +2,77 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mock = vi.hoisted(() => ({
   accessToken: vi.fn(async () => "test-access-token"),
+  lookup: vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]),
 }));
 
 vi.mock("server-only", () => ({}));
 vi.mock("./google-oauth", () => ({ getGoogleAccessToken: mock.accessToken }));
+vi.mock("node:dns/promises", () => ({ lookup: mock.lookup }));
 
-import { gmailCreateDraft } from "./gmail";
+import { gmailCreateDraft, gmailUnsubscribe } from "./gmail";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   mock.accessToken.mockClear();
+  mock.lookup.mockClear();
+});
+
+function unsubscribeMetadata(endpoint: string) {
+  return new Response(JSON.stringify({
+    id: "message-1",
+    payload: {
+      headers: [
+        { name: "List-Unsubscribe", value: `<${endpoint}>` },
+        { name: "List-Unsubscribe-Post", value: "List-Unsubscribe=One-Click" },
+      ],
+    },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+describe("Gmail one-click unsubscribe boundary", () => {
+  it("posts only to a resolved public HTTPS endpoint and never follows redirects", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("gmail.googleapis.com")) return unsubscribeMetadata("https://unsubscribe.example/one-click");
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(gmailUnsubscribe("message-1")).resolves.toEqual({ method: "one-click-post" });
+    expect(mock.lookup).toHaveBeenCalledWith("unsubscribe.example", { all: true, verbatim: true });
+    const [, request] = fetchMock.mock.calls[1] as unknown as [URL, RequestInit];
+    expect(request).toMatchObject({ method: "POST", redirect: "manual" });
+  });
+
+  it("rejects private or malformed unsubscribe targets before any external fetch", async () => {
+    const fetchMock = vi.fn(async () => unsubscribeMetadata("https://127.0.0.1/admin"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await gmailUnsubscribe("message-1");
+    expect(result).toEqual({
+      method: "unavailable",
+      reason: "The sender's one-click endpoint was not a safe public HTTPS destination.",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(mock.lookup).not.toHaveBeenCalled();
+  });
+
+  it("does not expose or follow a one-click redirect", async () => {
+    const endpoint = "https://unsubscribe.example/one-click?secret=do-not-log";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("gmail.googleapis.com")) return unsubscribeMetadata(endpoint);
+      return new Response(null, { status: 302, headers: { location: "https://127.0.0.1/admin" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await gmailUnsubscribe("message-1");
+    expect(result).toEqual({
+      method: "unavailable",
+      reason: "The sender's one-click unsubscribe endpoint returned HTTP 302.",
+    });
+    expect(JSON.stringify(result)).not.toContain("do-not-log");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("Gmail draft MIME boundary", () => {

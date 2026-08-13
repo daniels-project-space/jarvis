@@ -4459,7 +4459,7 @@ export async function executeTool(
       const messageId = String(args.message_id ?? "").trim();
       if (!messageId) return "TOOL DID NOTHING: no message_id given.";
       const result = await gmailUnsubscribe(messageId);
-      if (result.method === "one-click-post") return `Unsubscribed via the sender's one-click link (${result.target}).`;
+      if (result.method === "one-click-post") return "Unsubscribed via the sender's one-click link.";
       if (result.method === "draft") return `That sender only supports email-based unsubscribing — created a draft to ${result.to} (id ${result.draftId}), not sent. Daniel needs to send it from Gmail to complete the unsubscribe.`;
       return `Could not unsubscribe automatically: ${result.reason}`;
     }

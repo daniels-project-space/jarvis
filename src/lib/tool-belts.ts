@@ -44,7 +44,18 @@ export const SUBSCRIPTION_TOOL_NAMES = new Set(
 
 // A subscription subprocess may propose or dispatch guarded work, but it can
 // never approve its own consequential job or impersonate Daniel's decision.
-SUBSCRIPTION_TOOL_NAMES.delete("work_control");
+for (const name of [
+  "work_control",
+  // Email contents and mailbox mutations remain foreground, owner-session
+  // capabilities. A background subscription worker must not turn a
+  // model-supplied `confirmed: true` into a real inbox action.
+  "gmail_search",
+  "gmail_read",
+  "gmail_draft_reply",
+  "gmail_list_subscriptions",
+  "gmail_unsubscribe",
+  "gmail_mark_spam",
+]) SUBSCRIPTION_TOOL_NAMES.delete(name);
 // The subscription model already supplies the reasoning. These legacy tools
 // invoke metered text models and would duplicate both latency and intelligence.
 SUBSCRIPTION_TOOL_NAMES.delete("deliberate");

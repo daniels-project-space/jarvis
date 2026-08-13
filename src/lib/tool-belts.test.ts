@@ -39,4 +39,15 @@ describe("tool belt registry", () => {
     expect(SUBSCRIPTION_TOOL_NAMES.has("deliberate")).toBe(false);
     expect(SUBSCRIPTION_TOOL_NAMES.has("work_control")).toBe(false);
   });
+
+  it("keeps Gmail data and mailbox mutations out of background workers", () => {
+    for (const name of [
+      "gmail_search",
+      "gmail_read",
+      "gmail_draft_reply",
+      "gmail_list_subscriptions",
+      "gmail_unsubscribe",
+      "gmail_mark_spam",
+    ]) expect(SUBSCRIPTION_TOOL_NAMES.has(name)).toBe(false);
+  });
 });
