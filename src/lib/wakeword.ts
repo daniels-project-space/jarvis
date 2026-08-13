@@ -57,6 +57,13 @@ export function startWake(
     r.lang = "en-GB";
     r.continuous = true;
     r.interimResults = true;
+    // `SpeechRecognition.start()` only queues a browser service request. Do
+    // not paint the standby mic as ready until the service has actually
+    // started; on cold startup that distinction is visible and prevents a
+    // false-ready UI state.
+    r.onstart = () => {
+      if (rec === r && wanted) onState?.(true);
+    };
     let wakeTranscript = "";
     let wakeTimer: ReturnType<typeof setTimeout> | null = null;
     let delivered = false;
@@ -130,7 +137,6 @@ export function startWake(
     };
     try {
       r.start();
-      onState?.(true);
     } catch {
       if (rec === r) rec = null;
       wanted = false;

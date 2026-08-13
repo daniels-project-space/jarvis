@@ -379,6 +379,54 @@ export const getLiveOn = query({
   },
 });
 
+// Passive wake recognition has a separate, short-lived lease from live voice.
+// A single browser microphone listener is enough to hear "Hey Jarvis"; letting
+// every open tab and embedded host run SpeechRecognition creates duplicate
+// commands before the live-mode lock has a chance to engage.
+const STANDBY_LISTENER_KEY = "standbyListener";
+const STANDBY_LISTENER_LEASE_MS = 25_000;
+
+export const setStandbyListener = mutation({
+  args: { client: v.string(), on: v.boolean(), ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const ex = await ctx.db.query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", STANDBY_LISTENER_KEY))
+      .first();
+    if (!a.on) {
+      // Never let one tab release another tab's fenced listener lease.
+      if (ex && ex.value === a.client) await ctx.db.delete(ex._id);
+      return true;
+    }
+    // A caller can renew only its own lease while it is fresh. Another active
+    // listener wins until it hides, unloads, or stops heartbeating.
+    if (ex && ex.value !== a.client && Date.now() - ex.updatedAt < STANDBY_LISTENER_LEASE_MS) {
+      return false;
+    }
+    const doc = {
+      key: STANDBY_LISTENER_KEY,
+      type: "voice-standby",
+      value: a.client,
+      updatedAt: Date.now(),
+    };
+    if (ex) await ctx.db.patch(ex._id, doc);
+    else await ctx.db.insert("ui", doc);
+    return true;
+  },
+});
+
+export const getStandbyListener = query({
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const row = await ctx.db.query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", STANDBY_LISTENER_KEY))
+      .first();
+    if (!row || Date.now() - row.updatedAt >= STANDBY_LISTENER_LEASE_MS) return null;
+    return row;
+  },
+});
+
 // Video remote control: the brain writes a command ("play" | "pause" | "close"),
 // the client relays it into the YouTube iframe via the JS API. updatedAt is the
 // nonce — the client acts once per fresh command.

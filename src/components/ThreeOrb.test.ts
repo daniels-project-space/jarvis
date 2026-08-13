@@ -92,7 +92,9 @@ describe("orb side-mode layout contracts", () => {
     expect(diameter).toBeCloseTo(316.8, 5);
     expect(center - diameter / 2).toBeGreaterThan(rightStripStart);
     expect(center + diameter / 2).toBeLessThan(viewportWidth);
-    expect(jarvisSource).toContain('"top-[70%] hidden md:flex md:left-[62%] md:right-0"');
+    // Keep captions beneath the right-side orb's visual core rather than
+    // competing with it; this is deliberately lower than the prior 70%.
+    expect(jarvisSource).toContain('"top-[72%] hidden md:flex md:left-[62%] md:right-0"');
   });
 
   it("retains the existing mobile hide/non-aside collision policy at 390x844", () => {

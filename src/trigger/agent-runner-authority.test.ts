@@ -70,6 +70,9 @@ vi.mock("./cloud-workspace-providers", async (importOriginal) => ({
 vi.mock("./push-send", () => ({ sendPush: notifications.sendPush }));
 
 import {
+  AGENT_WORKER_CHECKPOINT_MARGIN_MS,
+  AGENT_WORKER_MAX_DURATION_SECONDS,
+  AGENT_WORKER_SOFT_DEADLINE_MS,
   agentWorker,
   createProductionAgentRunnerDependencies,
   handoffCompletedAgentWorker,
@@ -244,11 +247,13 @@ async function invokeHarness(
   reservation: any,
   runId: string,
   dependencies: AgentRunnerDependencies,
+  workerDeadlineAt?: number,
 ) {
   return await runAgentHarness({
     reservation: { ...workerPayload(reservation), workerRunId: runId },
     runtimeAttestation: { triggerDeploymentVersion: "runner-authority-test" },
     dependencies,
+    workerDeadlineAt,
   });
 }
 
@@ -518,6 +523,53 @@ afterEach(() => {
 });
 
 describe("production Trigger worker authority harness", () => {
+  it("uses a finite worker envelope, a checkpoint margin, and a minute recovery sweep", () => {
+    expect(AGENT_WORKER_MAX_DURATION_SECONDS).toBe(30 * 60);
+    expect(AGENT_WORKER_CHECKPOINT_MARGIN_MS).toBe(2 * 60_000);
+    expect(AGENT_WORKER_SOFT_DEADLINE_MS).toBe(28 * 60_000);
+    expect(trigger.definitions.get("jarvis-agent-worker").maxDuration).toBe(AGENT_WORKER_MAX_DURATION_SECONDS);
+    expect(trigger.definitions.get("jarvis-agent-fleet-supervisor").cron).toBe("*/1 * * * *");
+  });
+
+  it("checkpoints an expired worker watchdog instead of leaving its lease running", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-worker-watchdog");
+    bridgeProductionRunnerToConvex(t);
+    const runProcess = vi.fn(async (input: any) => {
+      expect(await input.executionState()).toBe("stalled");
+      await input.turnReceipt.beforeRequest();
+      input.turnReceipt.requestWritten();
+      await input.turnReceipt.accepted();
+      await input.turnReceipt.completed();
+      return {
+        text: "Worker watchdog preserved this bounded repository pass.",
+        timedOut: false,
+        stopped: "stalled",
+        checkpointLog: "watchdog checkpoint",
+        commands: [],
+      };
+    });
+    const dependencies = injectedRunnerDependencies({ runProcess });
+
+    expect(await invokeHarness(
+      reservation,
+      "worker-watchdog-run",
+      dependencies,
+      Date.now() - 1,
+    )).toEqual({ processed: 1 });
+
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempts: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1))
+        .first(),
+    }));
+    expect(state.job).toMatchObject({ status: "pending", attempt: 2 });
+    expect(state.attempts).toMatchObject({ status: "checkpointed", workerRunId: "worker-watchdog-run" });
+    expect(String(state.job?.checkpoint)).toContain("finite Trigger worker watchdog");
+  });
+
   it.each(["dormant", "rollback"] as const)(
     "does not read supervisor authority during %s completion handoff",
     async (mode) => {

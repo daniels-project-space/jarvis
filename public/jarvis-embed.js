@@ -1,8 +1,9 @@
 // JARVIS everywhere — one script tag on any of Daniel's internal apps:
 //   <script src="https://jarvis-orcin-six.vercel.app/jarvis-embed.js" defer></script>
-// The top-level host owns wake recognition. Browsers routinely deny a hidden
-// cross-origin iframe's microphone request even when `allow="microphone"` is
-// present, so transcripts are forwarded into the canonical Jarvis client.
+// The top-level host owns physical wake recognition only after the canonical
+// Jarvis iframe grants its fenced listener lease. Browsers routinely deny a
+// hidden cross-origin iframe's microphone request even when `allow="microphone"`
+// is present, so host transcripts are forwarded into the canonical client.
 (function () {
   if (window.__jarvisEmbed) return;
   window.__jarvisEmbed = 1;
@@ -34,6 +35,11 @@
   var liveBlocked = false;
   var recognition = null;
   var recognitionWanted = true;
+  // The authenticated Jarvis iframe owns the cross-app listener lease. The
+  // host only owns the browser SpeechRecognition instance after that iframe
+  // grants it, which prevents a host overlay and the main Jarvis app from
+  // handling the same wake phrase in parallel.
+  var listenerLeaseGranted = false;
   var recognitionNeedsGesture = false;
   var wakeEnablePending = false;
   var restartTimer = null;
@@ -773,6 +779,7 @@
 
   function recognitionAllowed() {
     return recognitionWanted
+      && listenerLeaseGranted
       && !speechBlocked
       && !liveBlocked
       && document.visibilityState === "visible";
@@ -915,9 +922,19 @@
   function enableWakeFromGesture() {
     recognitionWanted = true;
     if ((recognition && !recognitionNeedsGesture) || wakeEnablePending) return;
+    // Claiming the lease can cross an iframe boundary, so preserve the browser
+    // gesture by requesting mic permission here but do not start a recognizer
+    // until the trusted iframe has granted this host its listener lease.
+    function requestLease() {
+      if (listenerLeaseGranted) {
+        startRecognition(true);
+        return;
+      }
+      post({ jarvis: "host-listener-request" });
+    }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       recognitionNeedsGesture = false;
-      startRecognition(true);
+      requestLease();
       return;
     }
     wakeEnablePending = true;
@@ -925,7 +942,7 @@
       stream.getTracks().forEach(function (track) { track.stop(); });
       wakeEnablePending = false;
       recognitionNeedsGesture = false;
-      startRecognition(true);
+      requestLease();
     }).catch(function () {
       wakeEnablePending = false;
       recognitionNeedsGesture = true;
@@ -989,7 +1006,20 @@
       flushCodingProviderRequests();
       dispatchEmbedEvent("jarvis:ready", { state: "online" });
       paintUniversalControls();
+      if (recognitionWanted && !listenerLeaseGranted) {
+        post({ jarvis: "host-listener-request" });
+      }
+    } else if (data.jarvis === "host-listener-grant") {
+      listenerLeaseGranted = true;
+      // The lease grant is the start barrier itself; avoid an additional
+      // timer tick on cold overlay startup.
+      startRecognition(false);
+    } else if (data.jarvis === "host-listener-revoke") {
+      listenerLeaseGranted = false;
+      pauseRecognition("listener-lease");
     } else if (data.jarvis === "unloading") {
+      listenerLeaseGranted = false;
+      pauseRecognition("frame-reloading");
       rejectCodingProviderWaiters("Jarvis reloaded before confirming the handover target", true);
       ready = false;
       framePhase = "connecting";
@@ -1113,10 +1143,8 @@
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () {
       mount();
-      startRecognition(false);
     });
   } else {
     mount();
-    startRecognition(false);
   }
 })();

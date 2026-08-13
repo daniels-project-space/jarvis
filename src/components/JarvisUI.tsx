@@ -1374,7 +1374,7 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
       ref={boxRef}
       data-jarvis-caption
       data-caption-phase={caption.phase ?? "ready"}
-      className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[26vh] max-w-[min(820px,88%)] overflow-hidden text-center text-xl font-semibold leading-snug tracking-tight md:text-[1.7rem] lg:text-[1.95rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
+      className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[24vh] max-w-[min(780px,86%)] overflow-hidden text-center text-lg font-semibold leading-snug tracking-tight md:text-[1.55rem] lg:text-[1.75rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
     >
       {caption.text}
     </div>
@@ -1544,8 +1544,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const claimVoice = (args: Record<string, unknown>) => privateMutation("ui:claimVoice", args);
   const electVoice = (args: Record<string, unknown>) => privateMutation<boolean>("ui:electVoice", args);
   const setLiveOn = (args: Record<string, unknown>) => privateMutation<boolean>("ui:setLiveOn", args);
+  const setStandbyListener = (args: Record<string, unknown>) => privateMutation<boolean>("ui:setStandbyListener", args);
   const voiceRow = useJarvisQuery(api.ui.getVoice, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useJarvisQuery(api.ui.getLiveOn, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
+  const standbyListenerRow = useJarvisQuery(api.ui.getStandbyListener, guest ? "skip" : {}) as
+    | { value: string; updatedAt: number }
+    | null
+    | undefined;
   const hostActionRow = useJarvisQuery(api.ui.getHostAction, embedded && !guest ? {} : "skip") as
     | { value: string; updatedAt: number }
     | null
@@ -1844,6 +1849,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const lastVoiceInput = useRef<{ text: string; at: number } | null>(null);
   const liveRef = useRef(false);
   const me = useRef("");
+  const standbyLeaseOwnedRef = useRef(false);
+  const standbyClaimingRef = useRef(false);
+  const standbyEpochRef = useRef(0);
+  const standbyHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
   const localVoiceLeaseUntilRef = useRef(0);
   const localVoiceClaimedAtRef = useRef(0);
@@ -1954,10 +1963,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     };
     const start = () => void import("../lib/tts").then((module) => module.warm());
     if (idleWindow.requestIdleCallback) {
-      const id = idleWindow.requestIdleCallback(start, { timeout: embedded ? 2_000 : 900 });
+      const id = idleWindow.requestIdleCallback(start, { timeout: embedded ? 900 : 300 });
       return () => idleWindow.cancelIdleCallback?.(id);
     }
-    const id = window.setTimeout(start, embedded ? 1_200 : 500);
+    const id = window.setTimeout(start, embedded ? 600 : 180);
     return () => window.clearTimeout(id);
   }, [embedded]);
   useEffect(() => {
@@ -2138,6 +2147,45 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const wakeIsEnabled = () => embedded
     ? localStorage.getItem(wakePreferenceKey) !== "0"
     : localStorage.getItem(wakePreferenceKey) === "1";
+  const standbyIsEligible = () => wakeIsEnabled() || chatModeRef.current === "off";
+  const clearStandbyHeartbeat = () => {
+    if (standbyHeartbeatRef.current) clearInterval(standbyHeartbeatRef.current);
+    standbyHeartbeatRef.current = null;
+  };
+  const stopStandbyRecognition = () => {
+    if (wakeOwnedByHost()) {
+      postToParent({ jarvis: "host-listener-revoke" });
+    } else {
+      void import("../lib/wakeword").then((m) => m.stopWake());
+    }
+    setWake(false);
+  };
+  const releaseStandbyListener = () => {
+    standbyEpochRef.current += 1;
+    clearStandbyHeartbeat();
+    const owned = standbyLeaseOwnedRef.current;
+    standbyLeaseOwnedRef.current = false;
+    stopStandbyRecognition();
+    if (!guest && owned && me.current) {
+      void setStandbyListener({ client: me.current, on: false }).catch(() => {});
+    }
+  };
+  const maintainStandbyHeartbeat = () => {
+    if (guest || standbyHeartbeatRef.current) return;
+    standbyHeartbeatRef.current = setInterval(() => {
+      if (!standbyLeaseOwnedRef.current || document.hidden || !standbyIsEligible()) {
+        releaseStandbyListener();
+        return;
+      }
+      void setStandbyListener({ client: me.current, on: true })
+        .then((held) => {
+          // Fail closed. If this browser cannot renew its fence, it must not
+          // keep a native recognizer alive past the server-side lease.
+          if (held !== true) releaseStandbyListener();
+        })
+        .catch(() => releaseStandbyListener());
+    }, 8_000);
+  };
   const onWakeDetected = () => {
     setWake(false);
     setChatMode(embedded ? "off" : "full", false);
@@ -2172,16 +2220,65 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
   };
   const rearmWake = () => {
-    // A cross-origin iframe cannot reliably obtain microphone permission.
-    // Project Hub owns recognition at the top level and sends commands here.
-    if (wakeOwnedByHost()) return;
-    if (!wakeIsEnabled()) return;
-    if (document.hidden) return;
-    import("../lib/wakeword").then((m) => {
-      if (!m.wakeSupported()) return;
-      m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
-    });
+    // The top-level host owns a cross-origin iframe's actual microphone, but
+    // the authenticated Jarvis iframe owns the fenced logical listener lease.
+    // That single lease keeps main Jarvis and every installed overlay from
+    // hearing the same wake phrase at the same time.
+    if (guest || !standbyIsEligible() || document.hidden) {
+      releaseStandbyListener();
+      return;
+    }
+    if (wakeOwnedByHost() && !parentOrigin) return;
+    if (standbyClaimingRef.current) return;
+    const epoch = standbyEpochRef.current;
+    standbyClaimingRef.current = true;
+    void (async () => {
+      let claimed = standbyLeaseOwnedRef.current;
+      if (!claimed) {
+        try {
+          claimed = await withClientDeadline(
+            setStandbyListener({ client: me.current || (me.current = clientId()), on: true }),
+            4_000,
+            "standby listener ownership",
+          );
+        } catch {
+          claimed = false;
+        }
+      }
+      standbyClaimingRef.current = false;
+      if (
+        claimed !== true
+        || epoch !== standbyEpochRef.current
+        || document.hidden
+        || !standbyIsEligible()
+      ) {
+        if (claimed === true && epoch !== standbyEpochRef.current && !guest && me.current) {
+          void setStandbyListener({ client: me.current, on: false }).catch(() => {});
+        }
+        stopStandbyRecognition();
+        return;
+      }
+      standbyLeaseOwnedRef.current = true;
+      if (wakeOwnedByHost()) {
+        postToParent({ jarvis: "host-listener-grant" });
+      } else {
+        const m = await import("../lib/wakeword");
+        if (!m.wakeSupported()) {
+          releaseStandbyListener();
+          return;
+        }
+        m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
+      }
+      maintainStandbyHeartbeat();
+    })();
   };
+  // An embedded frame learns its verified host origin after its first render.
+  // Retry the lease request then; the initial effect intentionally does not
+  // postMessage to an unverified parent origin.
+  useEffect(() => {
+    if (embedded && parentOrigin) rearmWake();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [embedded, parentOrigin]);
   function toggleWake() {
     import("../lib/wakeword").then((m) => {
       if (!m.wakeSupported()) {
@@ -2190,8 +2287,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
       if (wake) {
         localStorage.setItem(wakePreferenceKey, "0");
-        m.stopWake();
-        setWake(false);
+        releaseStandbyListener();
       } else {
         localStorage.setItem(wakePreferenceKey, "1");
         rearmWake();
@@ -2201,17 +2297,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Zen mode = always listening: the wake word is forced on while chat is
   // hidden, regardless of the manual wake toggle.
   useEffect(() => {
-    if (wakeOwnedByHost()) return;
     if (chatMode !== "off") return;
-    import("../lib/wakeword").then((m) => {
-      if (!m.wakeSupported() || liveRef.current) return;
-      m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
-    });
+    if (!liveRef.current) rearmWake();
     return () => {
-      if (!wakeIsEnabled()) {
-        import("../lib/wakeword").then((m) => m.stopWake());
-        setWake(false);
-      }
+      if (!standbyIsEligible()) releaseStandbyListener();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatMode]);
@@ -2220,17 +2309,36 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     rearmWake(); // resume standby across reloads if Daniel left it on
     // release the live lock instantly if the tab closes mid-session
     const bye = () => {
+      clearStandbyHeartbeat();
+      const standbyOwned = standbyLeaseOwnedRef.current;
+      standbyLeaseOwnedRef.current = false;
+      stopStandbyRecognition();
+      if (!guest && standbyOwned && me.current) {
+        const standbyBody = JSON.stringify({
+          path: "ui:setStandbyListener",
+          args: { client: me.current, on: false },
+        });
+        void viewerFetch("/api/client-mutation", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: standbyBody,
+          keepalive: true,
+        }).catch(() => {});
+      }
       if (guest || !liveRef.current) return;
-      const body = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
+      const liveBody = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
       void viewerFetch("/api/client-mutation", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body,
+        body: liveBody,
         keepalive: true,
       }).catch(() => {});
     };
     window.addEventListener("pagehide", bye);
-    return () => window.removeEventListener("pagehide", bye);
+    return () => {
+      window.removeEventListener("pagehide", bye);
+      releaseStandbyListener();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [guest]);
 
@@ -2294,6 +2402,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (message.jarvis === "host-ready-probe" && typeof message.probe === "number") {
         postToParent({ jarvis: "ready", probe: message.probe });
       }
+      if (message.jarvis === "host-listener-request") rearmWake();
       if (message.jarvis === "host-interrupt") stopTalking();
       if (message.jarvis === "host-wake-detected") {
         setWake(true);
@@ -2346,6 +2455,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     liveOnRef.current = liveOnRow ?? null;
   }, [liveOnRow]);
+  useEffect(() => {
+    // Subscription updates are the fast revocation channel. The heartbeat and
+    // short server TTL remain the fallback when a tab has lost connectivity.
+    if (
+      standbyLeaseOwnedRef.current
+      && standbyListenerRow
+      && standbyListenerRow.value !== me.current
+    ) releaseStandbyListener();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [standbyListenerRow]);
   // A fresh live session anywhere = narrated TTS is forbidden everywhere.
   const liveAnywhere = () => {
     const l = liveOnRef.current;
@@ -3625,6 +3744,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (liveRef.current) return true;
     liveManuallyStopped.current = false;
     unlockSpeechPlayback();
+    // Live capture supersedes passive wake listening. Releasing this distinct
+    // lease also tells a host-owned overlay recognizer to stop before its own
+    // microphone stream opens.
+    releaseStandbyListener();
     // Stop the browser wake recognizer and open the persistent stream before a
     // network round-trip. Otherwise the wake mic visibly closes while Convex
     // elects the live owner, then opens again a moment later.
@@ -3734,6 +3857,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
         return;
       }
+      releaseStandbyListener();
       if (!liveRef.current) return;
       resumeLiveWhenVisible.current = !liveManuallyStopped.current;
       endFreeVoiceSession();
@@ -4811,7 +4935,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             </div>
           )}
           {caption && (
-            <div className="pointer-events-none absolute inset-x-2 bottom-2 z-50 flex justify-center px-3">
+            <div className="pointer-events-none absolute inset-x-2 bottom-1 z-50 flex justify-center px-3">
               <SpokenCaption caption={caption} />
             </div>
           )}
@@ -5158,7 +5282,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               finalization and narration. Compact overlays keep it beside their
               visible orb; only a truly full-screen workspace owns the surface. */}
           {caption && !fullBleed && (
-            <div className={`pointer-events-none absolute ${compactAside || (commandExpanded && !overlayUp) ? "top-[70%] hidden md:flex md:left-[62%] md:right-0" : "top-[52%] inset-x-0"} z-30 flex justify-center px-6`}>
+            <div className={`pointer-events-none absolute ${compactAside || (commandExpanded && !overlayUp) ? "top-[72%] hidden md:flex md:left-[62%] md:right-0" : "top-[57%] inset-x-0"} z-30 flex justify-center px-6`}>
               <SpokenCaption caption={caption} />
             </div>
           )}

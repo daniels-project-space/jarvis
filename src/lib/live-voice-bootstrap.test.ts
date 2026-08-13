@@ -45,7 +45,7 @@ describe("live voice bootstrap policy", () => {
       const cancelPromptBootstrap = scheduleAutoLiveBootstrap(() => { starts += 1; }, setAttempted);
       expect(attempted).toBe(true);
 
-      // A prompt -> granted permission refresh tears down the old effect before 450 ms.
+      // A prompt -> granted permission refresh tears down the old effect before 150 ms.
       cancelPromptBootstrap();
       expect(attempted).toBe(false);
       expect(shouldAutoStartLiveVoice({
@@ -58,7 +58,7 @@ describe("live voice bootstrap policy", () => {
       })).toBe(true);
 
       const cancelGrantedBootstrap = scheduleAutoLiveBootstrap(() => { starts += 1; }, setAttempted);
-      await vi.advanceTimersByTimeAsync(450);
+      await vi.advanceTimersByTimeAsync(150);
       expect(starts).toBe(1);
       cancelGrantedBootstrap();
     } finally {

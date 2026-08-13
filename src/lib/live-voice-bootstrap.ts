@@ -24,7 +24,9 @@ export function liveVoiceRetryDelay(attempt: number): number | null {
 export function scheduleAutoLiveBootstrap(
   attempt: () => void | Promise<void>,
   setAttempted: (attempted: boolean) => void,
-  delayMs = 450,
+  // Enough time for hydration to attach the stop/retry handlers, without
+  // making a remembered microphone grant feel like an idle half-second.
+  delayMs = 150,
 ): () => void {
   let cancelled = false;
   setAttempted(true);

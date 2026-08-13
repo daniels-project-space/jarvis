@@ -1,4 +1,4 @@
-import { metadata, schedules, task, timeout } from "@trigger.dev/sdk/v3";
+import { metadata, schedules, task } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
@@ -137,6 +137,14 @@ const CONVEX_URL =
 const kib = 1_024;
 const mib = 1_024 * kib;
 const DEFAULT_GIT_PROCESS_TIMEOUT_MS = 2 * 60_000;
+// A worker performs one bounded Codex segment and then checkpoints. Keep the
+// Trigger envelope finite as a last-resort watchdog, but stop two minutes
+// earlier so the running segment can checkpoint and release its cloud
+// workspace rather than being killed with a live lease.
+export const AGENT_WORKER_MAX_DURATION_SECONDS = 30 * 60;
+export const AGENT_WORKER_CHECKPOINT_MARGIN_MS = 2 * 60_000;
+export const AGENT_WORKER_SOFT_DEADLINE_MS =
+  AGENT_WORKER_MAX_DURATION_SECONDS * 1_000 - AGENT_WORKER_CHECKPOINT_MARGIN_MS;
 const streamLimits = (
   maxBytes: number,
   maxChunks: number,
@@ -733,6 +741,11 @@ export type AgentHarnessOptions = {
   runtimeAttestation: CloudProviderRuntimeAttestation;
   onProgress?: (progress: AgentProgress) => void;
   dependencies?: AgentRunnerDependencies;
+  /**
+   * Soft wall-clock budget supplied by the Trigger task. It expires before
+   * Trigger's hard maxDuration so the specialist can checkpoint safely.
+   */
+  workerDeadlineAt?: number;
 };
 
 export function createProductionAgentRunnerDependencies(): AgentRunnerDependencies {
@@ -1311,8 +1324,21 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         expectedSteerRevision,
         workerToken,
       });
+      const workerDeadlineReached = () =>
+        typeof options.workerDeadlineAt === "number" && Date.now() >= options.workerDeadlineAt;
       const executionStatus = leaseControl.status;
       const stopIfLeaseLost = async (checkpoint: string, result: string, branch?: string | null): Promise<boolean> => {
+        if (workerDeadlineReached()) {
+          await checkpointMutation({
+            jobId: job.jobId,
+            expectedAttempt,
+            checkpoint: `${checkpoint}\n\nThe finite Trigger worker watchdog reached its soft deadline. Continue from this checkpoint in a fresh worker; do not restart completed work.`,
+            result: result.slice(0, 4000),
+            branch: branch ?? undefined,
+            delayMs: 5_000,
+          }).catch(() => null);
+          return true;
+        }
         const state = await executionStatus();
         if (state === "running") return false;
         if (state === "paused" || state === "cancelled") {
@@ -2089,6 +2115,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const model = normalizeWorkModelTier(
           typeof job.model === "string" && job.model ? job.model : pickAgentModel(job.task),
         );
+        // Jobs are persisted as strings and can outlive a policy deploy. Feed
+        // every executor the canonical tier-default effort when a legacy value
+        // is absent or invalid so metadata and the actual Codex turn agree.
+        const reasoningEffort = normalizeReasoningEffort(job.reasoningEffort, codexModelFor(model).effort);
         let lastHeartbeatAt = 0;
         let lastDurableStage = "";
         let lastDurablePercent = 0;
@@ -2257,9 +2287,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             workspace: providerWorkspace!,
             prompt,
             model,
-            reasoningEffort: job.reasoningEffort,
+            reasoningEffort,
             onProgress: reportProgress,
             executionState: async () => {
+              if (workerDeadlineReached()) return "stalled";
               const state = await executionStatus();
               return state === "superseded" ? "cancelled" : state;
             },
@@ -3081,7 +3112,7 @@ export const agentWorker = task({
     outOfMemory: { machine: "medium-2x" },
   },
   queue: { name: BACKGROUND_QUEUE, concurrencyLimit: BACKGROUND_CONCURRENCY_LIMIT },
-  maxDuration: timeout.None,
+  maxDuration: AGENT_WORKER_MAX_DURATION_SECONDS,
   run: async (payload: AgentWorkerPayload, { ctx }) => {
     metadata
       .set("status", "claiming")
@@ -3097,6 +3128,7 @@ export const agentWorker = task({
         triggerPlatformAttempt: ctx.attempt.number,
       },
       runtimeAttestation: { triggerDeploymentVersion: ctx.deployment?.version },
+      workerDeadlineAt: Date.now() + AGENT_WORKER_SOFT_DEADLINE_MS,
       onProgress: (progress) => {
         metadata
           .set("status", "running")
@@ -3126,7 +3158,10 @@ export const agentWorker = task({
 // runnable jobs into independent workers.
 export const agentFleetSupervisor = schedules.task({
   id: "jarvis-agent-fleet-supervisor",
-  cron: "*/15 * * * *",
+  // Stale leases expire after five minutes. A one-minute sweep bounds a lost
+  // worker's recovery delay to roughly one additional minute instead of the
+  // prior 5–20 minute blind spot.
+  cron: "*/1 * * * *",
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,

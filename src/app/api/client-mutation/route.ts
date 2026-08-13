@@ -18,6 +18,7 @@ const ALLOWED = new Set([
   "ui:claimVoice",
   "ui:electVoice",
   "ui:setLiveOn",
+  "ui:setStandbyListener",
   "ui:setMood",
   "ui:setVideoCmd",
   "watchRules:cancel",

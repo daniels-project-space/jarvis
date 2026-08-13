@@ -61,6 +61,7 @@ type FakeElement = {
 function createLoader(options: {
   denyFirstRecognition?: boolean;
   frameOrigin?: string;
+  grantListener?: boolean;
 } = {}) {
   const messages: unknown[] = [];
   const listeners = new Map<string, LoaderListener[]>();
@@ -181,6 +182,13 @@ function createLoader(options: {
     window: windowObject,
   };
   runInNewContext(loaderSource, context);
+  if (options.grantListener !== false) {
+    listeners.get("message")?.[0]?.({
+      origin: JARVIS_ORIGIN,
+      source: frameWindow,
+      data: { jarvis: "host-listener-grant" },
+    });
+  }
   return { createdElements, FakeRecognition, frame, frameWindow, listeners, messages, navigator, window: windowObject };
 }
 
@@ -189,6 +197,34 @@ afterEach(() => {
 });
 
 describe("Project Hub Jarvis loader", () => {
+  it("starts host recognition only after a trusted iframe grants the listener lease", () => {
+    const harness = createLoader({ grantListener: false });
+    const receive = harness.listeners.get("message")?.[0];
+
+    expect(harness.FakeRecognition.instances).toHaveLength(0);
+    receive?.({
+      origin: "https://untrusted.example",
+      source: harness.frameWindow,
+      data: { jarvis: "host-listener-grant" },
+    });
+    expect(harness.FakeRecognition.instances).toHaveLength(0);
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "host-listener-grant" },
+    });
+    expect(harness.FakeRecognition.instances).toHaveLength(1);
+
+    receive?.({
+      origin: JARVIS_ORIGIN,
+      source: harness.frameWindow,
+      data: { jarvis: "host-listener-revoke" },
+    });
+    expect(harness.FakeRecognition.instances[0].abort).toHaveBeenCalledOnce();
+    expect(harness.window.JARVIS.wake.listening).toBe(false);
+  });
+
   it("waits for the iframe to leave inherited about:blank before posting", () => {
     vi.useFakeTimers();
     const harness = createLoader({ frameOrigin: "https://project-hub.test" });

@@ -7,9 +7,10 @@ class FakeSpeechRecognition {
   continuous = false;
   interimResults = false;
   onresult: ((event: unknown) => void) | null = null;
+  onstart: (() => void) | null = null;
   onend: (() => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
-  start = vi.fn();
+  start = vi.fn(() => this.onstart?.());
   stop = vi.fn();
 
   constructor() {
@@ -84,6 +85,19 @@ describe("wake command capture", () => {
 
     vi.stubGlobal("window", { webkitSpeechRecognition: FakeSpeechRecognition });
     startWake(vi.fn(), state);
+    expect(state).toHaveBeenLastCalledWith(true);
+  });
+
+  it("waits for the native recognizer start event before reporting standby ready", () => {
+    class DelayedSpeechRecognition extends FakeSpeechRecognition {
+      start = vi.fn();
+    }
+    vi.stubGlobal("window", { webkitSpeechRecognition: DelayedSpeechRecognition });
+    const state = vi.fn();
+
+    startWake(vi.fn(), state);
+    expect(state).not.toHaveBeenCalledWith(true);
+    FakeSpeechRecognition.instance?.onstart?.();
     expect(state).toHaveBeenLastCalledWith(true);
   });
 });
