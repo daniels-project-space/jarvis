@@ -1,5 +1,70 @@
 import type { BrowserPermission } from "./permissions";
 
+export type LiveVoiceLeaseStart<T> =
+  | { status: "ready"; microphone: T }
+  | { status: "not-owned" }
+  | { status: "cancelled" }
+  | { status: "failed"; stage: "lease" | "microphone"; error: unknown };
+
+/**
+ * Fence microphone startup behind a shared live-voice lease. Browser documents
+ * cannot share their in-memory getUserMedia promise, so this ordering is the
+ * only boundary that prevents a main page and an embedded surface from opening
+ * capture simultaneously.
+ */
+export async function startLiveWithLease<T>(args: {
+  acquireLiveLease: () => Promise<boolean>;
+  openMicrophone: () => Promise<T>;
+  releaseLiveLease: () => Promise<void> | void;
+  isStillWanted?: () => boolean;
+  closeMicrophone?: (microphone: T) => Promise<void> | void;
+}): Promise<LiveVoiceLeaseStart<T>> {
+  const isStillWanted = args.isStillWanted ?? (() => true);
+  const release = async () => {
+    try {
+      await args.releaseLiveLease();
+    } catch {
+      // A best-effort release must not turn a stopped/cancelled start into an
+      // uncaught client error. The lease TTL is the final recovery backstop.
+    }
+  };
+
+  if (!isStillWanted()) return { status: "cancelled" };
+
+  let owned: boolean;
+  try {
+    owned = await args.acquireLiveLease();
+  } catch (error) {
+    return { status: "failed", stage: "lease", error };
+  }
+  if (!owned) return { status: "not-owned" };
+
+  if (!isStillWanted()) {
+    await release();
+    return { status: "cancelled" };
+  }
+
+  let microphone: T;
+  try {
+    microphone = await args.openMicrophone();
+  } catch (error) {
+    await release();
+    return { status: "failed", stage: "microphone", error };
+  }
+
+  if (!isStillWanted()) {
+    try {
+      await args.closeMicrophone?.(microphone);
+    } catch {
+      // The ownership release still matters if a browser refuses a late close.
+    }
+    await release();
+    return { status: "cancelled" };
+  }
+
+  return { status: "ready", microphone };
+}
+
 export function shouldAutoStartLiveVoice(args: {
   embedded: boolean;
   visible: boolean;

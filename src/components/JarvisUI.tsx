@@ -32,6 +32,7 @@ import {
   scheduleAutoLiveBootstrap,
   shouldAutoStartLiveVoice,
   speechServiceRetryDelay,
+  startLiveWithLease,
 } from "@/lib/live-voice-bootstrap";
 import {
   LIVE_SPEAKER_TAIL_MS,
@@ -3844,9 +3845,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // lease also tells a host-owned overlay recognizer to stop before its own
     // microphone stream opens.
     releaseStandbyListener();
-    // Stop the browser wake recognizer and open the persistent stream before a
-    // network round-trip. Otherwise the wake mic visibly closes while Convex
-    // elects the live owner, then opens again a moment later.
+    // Stop the browser wake recognizer before taking the global live lease.
+    // The winner opens persistent capture only after Convex fences every other
+    // document; per-document in-memory mic guards cannot prevent dual capture.
     const { stopWake } = await import("../lib/wakeword");
     if (sessionEpoch !== liveSessionEpoch.current) return false;
     stopWake();
@@ -3854,59 +3855,49 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     freeLoop.current = true;
     liveRef.current = true;
     setLive("connecting");
-    let microphoneError: unknown = null;
-    const microphone = ensurePersistentLiveMic().then(
-      () => true,
-      (error) => {
-        microphoneError = error;
-        const name = String((error as DOMException | undefined)?.name ?? "");
-        if (/NotAllowed|Security/i.test(name)) forgetMicrophoneGrant();
-        return false;
-      },
-    );
     const ownership = guest
       ? Promise.resolve(true)
       : setLiveOn({ client: me.current, on: true });
-    let owned = false;
-    try {
-      owned = await withClientDeadline(ownership, 5_000, "live ownership");
-    } catch {
-      // A late successful claim must not leave a ghost live owner after this
-      // UI has already recovered to standby.
-      void ownership.then((claimed) => {
-        if (!guest && claimed && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
-      }, () => undefined);
-    }
+    const started = await startLiveWithLease({
+      acquireLiveLease: async () => {
+        try {
+          return await withClientDeadline(ownership, 5_000, "live ownership");
+        } catch (error) {
+          // A late successful claim must not leave a ghost live owner after
+          // this UI has already recovered to standby.
+          void ownership.then((claimed) => {
+            if (!guest && claimed && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+          }, () => undefined);
+          throw error;
+        }
+      },
+      openMicrophone: ensurePersistentLiveMic,
+      releaseLiveLease: async () => {
+        if (!guest) await setLiveOn({ client: me.current, on: false }).catch(() => {});
+      },
+      isStillWanted: () => liveRef.current,
+      closeMicrophone: () => closePersistentLiveMic(),
+    });
     if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
-      void microphone.then((opened) => { if (opened && !liveRef.current) closePersistentLiveMic(); });
-      if (!guest && owned && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+      if (started.status === "ready" && !liveRef.current) closePersistentLiveMic();
       return false;
     }
-    if (owned === false) {
+    if (started.status === "not-owned" || (started.status === "failed" && started.stage === "lease")) {
       freeLoop.current = false;
       liveRef.current = false;
       setLive("off");
       closePersistentLiveMic();
-      void microphone.then((opened) => { if (opened && !liveRef.current) closePersistentLiveMic(); });
       showCaption({ who: "jarvis", text: "I could not start live listening. Check the connection, then tap the mic to retry." });
       rearmWake();
       return false;
     }
-    // Do not time out a browser-owned permission prompt. A timeout cannot
-    // cancel getUserMedia and previously caused auto-start to issue overlapping
-    // capture requests. Manual Stop still advances the session epoch and the
-    // late stream is closed by the guard below.
-    const microphoneReady = await microphone;
-    if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
-      if (microphoneReady && !liveRef.current) closePersistentLiveMic();
-      return false;
-    }
-    if (!microphoneReady) {
+    if (started.status === "cancelled") return false;
+    if (started.status === "failed") {
       freeLoop.current = false;
       liveRef.current = false;
       setLive("off");
-      releaseLive();
-      const errorName = String((microphoneError as DOMException | undefined)?.name ?? "");
+      const errorName = String((started.error as DOMException | undefined)?.name ?? "");
+      if (/NotAllowed|Security/i.test(errorName)) forgetMicrophoneGrant();
       showCaption({
         who: "jarvis",
         text: /NotAllowed|Security/i.test(errorName)

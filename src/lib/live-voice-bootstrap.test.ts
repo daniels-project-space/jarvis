@@ -5,7 +5,18 @@ import {
   scheduleAutoLiveBootstrap,
   shouldAutoStartLiveVoice,
   speechServiceRetryDelay,
+  startLiveWithLease,
 } from "./live-voice-bootstrap";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("live voice bootstrap policy", () => {
   it.each(["prompt", "granted"] as const)("starts the main site when microphone permission is %s", (permission) => {
@@ -79,7 +90,75 @@ describe("live voice bootstrap policy", () => {
     expect(ensureMic).toContain("if (liveMicOpeningRef.current) return liveMicOpeningRef.current");
     expect(ensureMic.match(/getUserMedia\(/g)).toHaveLength(1);
     expect(toggleLive).not.toContain("withClientDeadline(microphone");
-    expect(toggleLive).toContain("const microphoneReady = await microphone");
+    expect(toggleLive).toContain("startLiveWithLease({");
+    expect(toggleLive).toContain("openMicrophone: ensurePersistentLiveMic");
+    expect(toggleLive).not.toContain("const microphone = ensurePersistentLiveMic");
+  });
+
+  it("opens capture only after its shared live lease wins across documents", async () => {
+    const firstLease = deferred<boolean>();
+    const secondLease = deferred<boolean>();
+    const firstMicrophone = { id: "main" };
+    const secondMicrophone = { id: "embed" };
+    const openFirst = vi.fn(async () => firstMicrophone);
+    const openSecond = vi.fn(async () => secondMicrophone);
+
+    const first = startLiveWithLease({
+      acquireLiveLease: () => firstLease.promise,
+      openMicrophone: openFirst,
+      releaseLiveLease: vi.fn(),
+    });
+    const second = startLiveWithLease({
+      acquireLiveLease: () => secondLease.promise,
+      openMicrophone: openSecond,
+      releaseLiveLease: vi.fn(),
+    });
+
+    await Promise.resolve();
+    expect(openFirst).not.toHaveBeenCalled();
+    expect(openSecond).not.toHaveBeenCalled();
+
+    firstLease.resolve(true);
+    secondLease.resolve(false);
+
+    await expect(first).resolves.toEqual({ status: "ready", microphone: firstMicrophone });
+    await expect(second).resolves.toEqual({ status: "not-owned" });
+    expect(openFirst).toHaveBeenCalledTimes(1);
+    expect(openSecond).not.toHaveBeenCalled();
+  });
+
+  it("releases its live lease when the winning microphone cannot open", async () => {
+    const releaseLiveLease = vi.fn(async () => {});
+    const error = new DOMException("blocked", "NotAllowedError");
+
+    await expect(startLiveWithLease({
+      acquireLiveLease: async () => true,
+      openMicrophone: async () => { throw error; },
+      releaseLiveLease,
+    })).resolves.toEqual({ status: "failed", stage: "microphone", error });
+    expect(releaseLiveLease).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes a late microphone and releases the lease after cancellation", async () => {
+    const microphone = deferred<{ id: string }>();
+    const closeMicrophone = vi.fn();
+    const releaseLiveLease = vi.fn(async () => {});
+    let wanted = true;
+
+    const start = startLiveWithLease({
+      acquireLiveLease: async () => true,
+      openMicrophone: () => microphone.promise,
+      releaseLiveLease,
+      isStillWanted: () => wanted,
+      closeMicrophone,
+    });
+    await Promise.resolve();
+    wanted = false;
+    microphone.resolve({ id: "late" });
+
+    await expect(start).resolves.toEqual({ status: "cancelled" });
+    expect(closeMicrophone).toHaveBeenCalledWith({ id: "late" });
+    expect(releaseLiveLease).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed when passive narration cannot obtain the shared voice lease", () => {
