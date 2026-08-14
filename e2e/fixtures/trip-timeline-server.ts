@@ -21,6 +21,8 @@ const contentTypes: Record<string, string> = {
   "/artifact.js": "text/javascript; charset=utf-8",
   "/private-video": "text/html; charset=utf-8",
   "/private-video.js": "text/javascript; charset=utf-8",
+  "/private-pdf": "text/html; charset=utf-8",
+  "/private-pdf.js": "text/javascript; charset=utf-8",
   "/voice": "text/html; charset=utf-8",
   "/voice-child": "text/html; charset=utf-8",
   "/voice.js": "text/javascript; charset=utf-8",
@@ -85,7 +87,21 @@ const privateVideoFixtureHtml = `<!doctype html>
   </body>
 </html>`;
 
+const privatePdfFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Private PDF viewer fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/private-pdf.js" defer></script>
+  </body>
+</html>`;
+
 const fixtureArtifactBytes = Buffer.from("jarvis artifact fixture\n", "utf8");
+const fixturePdfBytes = Buffer.from("%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n", "utf8");
 // A deterministic 160×90 one-second H.264 MP4 is generated in the fixture
 // temp directory so the browser test exercises a real metadata load.
 let fixtureVideoBytes: Buffer;
@@ -182,6 +198,7 @@ async function main() {
     fixture: join(projectRoot, "e2e/fixtures/trip-timeline.browser.tsx"),
     artifact: join(projectRoot, "e2e/fixtures/artifact-card.browser.tsx"),
     "private-video": join(projectRoot, "e2e/fixtures/private-video-player.browser.tsx"),
+    "private-pdf": join(projectRoot, "e2e/fixtures/private-pdf-viewer.browser.tsx"),
     voice: join(projectRoot, "e2e/fixtures/browser-voice-lease.browser.ts"),
     caption: join(projectRoot, "e2e/fixtures/spoken-caption-layout.browser.tsx"),
     location: join(projectRoot, "e2e/fixtures/trip-location-follow.browser.tsx"),
@@ -203,6 +220,7 @@ async function main() {
   const fixtureCssPath = join(outputDir, "fixture.css");
   const artifactJsPath = join(outputDir, "artifact.js");
   const privateVideoJsPath = join(outputDir, "private-video.js");
+  const privatePdfJsPath = join(outputDir, "private-pdf.js");
   const voiceJsPath = join(outputDir, "voice.js");
   const captionJsPath = join(outputDir, "caption.js");
   const captionCssPath = join(outputDir, "caption.css");
@@ -213,6 +231,7 @@ async function main() {
     access(fixtureCssPath),
     access(artifactJsPath),
     access(privateVideoJsPath),
+    access(privatePdfJsPath),
     access(voiceJsPath),
     access(captionJsPath),
     access(captionCssPath),
@@ -265,6 +284,21 @@ async function main() {
     return;
   }
 
+  if (pathname === "/api/files/fixture-pdf") {
+    const download = url.searchParams.get("download") === "1";
+    response.writeHead(200, {
+      "Cache-Control": "private, no-store",
+      "Content-Disposition": `${download ? "attachment" : "inline"}; filename="fixture-itinerary.pdf"`,
+      "Content-Length": String(fixturePdfBytes.byteLength),
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+      "Content-Type": "application/pdf",
+      "Cross-Origin-Resource-Policy": "same-origin",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response.end(method === "HEAD" ? undefined : fixturePdfBytes);
+    return;
+  }
+
   if (!(pathname in contentTypes)) {
     response.writeHead(404, { "Content-Security-Policy": csp });
     response.end();
@@ -293,6 +327,11 @@ async function main() {
   if (pathname === "/private-video") {
     response.writeHead(200);
     response.end(privateVideoFixtureHtml);
+    return;
+  }
+  if (pathname === "/private-pdf") {
+    response.writeHead(200);
+    response.end(privatePdfFixtureHtml);
     return;
   }
   if (pathname === "/voice") {
@@ -329,6 +368,8 @@ async function main() {
         ? artifactJsPath
         : pathname === "/private-video.js"
           ? privateVideoJsPath
+          : pathname === "/private-pdf.js"
+            ? privatePdfJsPath
         : pathname === "/fixture.css"
         ? fixtureCssPath
         : pathname === "/caption.js"

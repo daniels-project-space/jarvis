@@ -1915,7 +1915,9 @@ export function LaunchView({ value }: { value: string }) {
 /* ---------------------------------- pdf ---------------------------------- */
 
 export function PdfView({ url, title }: { url: string; title?: string }) {
-  const downloadUrl = url.startsWith("/api/creation-media?") ? `${url}&download=1` : url;
+  const downloadUrl = url.startsWith("/api/creation-media?") || /^\/api\/files\/[A-Za-z0-9%_-]+$/.test(url)
+    ? `${url}${url.includes("?") ? "&" : "?"}download=1`
+    : url;
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center justify-between border-b border-white/5 px-3 py-1.5">

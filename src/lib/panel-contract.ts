@@ -67,6 +67,7 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
             : panel.type === "doc" ? "doc"
               : panel.type === "launch" ? "launch"
                 : panel.type === "pdf" ? "pdf"
+                  : panel.type === "private_pdf" && isPrivateFilePanelUrl(panel.value) ? "pdf"
                   : panel.type === "creations" ? "creations"
                     : panel.type === "travel" ? "travel"
                       : panel.type === "fleet" ? "fleet"
@@ -115,7 +116,8 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
     case "travel": presentation = "workspace"; size = "h-full w-full"; break;
     case "trip": presentation = "workspace"; size = "h-full w-full"; break;
     case "fleet": presentation = "workspace"; size = "h-full w-full"; break;
-    case "pdf": presentation = "workspace"; size = "h-full w-full"; break;
+    case "pdf":
+    case "private_pdf": presentation = "workspace"; size = "h-full w-full"; break;
     case "site":
     case "url": presentation = "workspace"; size = "h-full w-full"; break;
     case "video": presentation = "workspace"; size = "h-full w-full"; break;

@@ -68,6 +68,32 @@ describe("private file controls", () => {
     expect(mock.privateR2Get).toHaveBeenCalledWith("owners/daniel/files/file-1/v1/original", undefined);
   });
 
+  it("previews ready private PDFs inline while preserving an explicit owner download", async () => {
+    mock.controlQuery.mockResolvedValue({
+      _id: "file-pdf",
+      originalName: "itinerary.pdf",
+      mimeType: "application/pdf",
+      detectedMimeType: "application/pdf",
+      status: "ready",
+      r2Key: "owners/daniel/files/file-pdf/v1/original",
+    });
+
+    const preview = await GET(
+      new NextRequest("https://jarvis.example/api/files/file-pdf"),
+      { params: Promise.resolve({ id: "file-pdf" }) },
+    );
+    const download = await GET(
+      new NextRequest("https://jarvis.example/api/files/file-pdf?download=1"),
+      { params: Promise.resolve({ id: "file-pdf" }) },
+    );
+
+    expect(preview.status).toBe(200);
+    expect(preview.headers.get("content-type")).toBe("application/pdf");
+    expect(preview.headers.get("content-disposition")).toContain("inline");
+    expect(download.headers.get("content-disposition")).toContain("attachment");
+    expect(download.headers.get("cache-control")).toBe("private, no-store");
+  });
+
   it("queues cleanup without deleting underneath an active PUT", async () => {
     const request = new NextRequest("https://jarvis.example/api/files/file-1", {
       method: "DELETE",

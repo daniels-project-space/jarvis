@@ -21,10 +21,11 @@ function disposition(name: string, download: boolean): string {
   return `${download ? "attachment" : "inline"}; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(safe)}`;
 }
 
-// These are decoder-only media formats served from an owner-authorized,
+// These native rendering formats are served only from an owner-authorized,
 // same-origin route with a sandboxed no-script policy. Every other private
 // type remains an attachment, never inline browser content.
 const SAFE_INLINE_MIME = new Set([
+  "application/pdf",
   "image/jpeg",
   "image/png",
   "image/webp",

@@ -10,13 +10,18 @@ describe("semantic panel routing", () => {
     expect(resolvePanelRoute({ type, value: "" }).renderer).toBe(renderer);
   });
 
-  it("routes only an owner-authenticated private file URL to the native video player", () => {
+  it("routes only an owner-authenticated private file URL to native private media", () => {
     const route = resolvePanelRoute({ type: "private_video", value: "/api/files/file%2Fone" });
     expect(route.renderer).toBe("private_video");
     expect(route.presentation).toBe("workspace");
     expect(route.keepOrbVisible).toBe(false);
     expect(resolvePanelRoute({ type: "private_video", value: "https://untrusted.example/video.mp4" }).renderer).toBe("markdown");
     expect(resolvePanelRoute({ type: "private_video", value: "/api/files/file-1?download=1" }).renderer).toBe("markdown");
+    const pdf = resolvePanelRoute({ type: "private_pdf", value: "/api/files/file%2Fone" });
+    expect(pdf.renderer).toBe("pdf");
+    expect(pdf.presentation).toBe("workspace");
+    expect(resolvePanelRoute({ type: "private_pdf", value: "https://untrusted.example/file.pdf" }).renderer).toBe("markdown");
+    expect(resolvePanelRoute({ type: "private_pdf", value: "/api/files/file-1?download=1" }).renderer).toBe("markdown");
   });
 
   it("routes widget presentation from its semantic payload", () => {
@@ -37,7 +42,7 @@ describe("semantic panel routing", () => {
     expect(route.keepOrbVisible).toBe(false);
   });
 
-  it.each(["trip", "travel", "fleet", "pdf", "site", "url"])(
+  it.each(["trip", "travel", "fleet", "pdf", "private_pdf", "site", "url"])(
     "gives %s the complete workspace instead of a squeezed side stage",
     (type) => {
       expect(resolvePanelRoute({ type, value: "" }).presentation).toBe("workspace");
