@@ -38,10 +38,15 @@ import {
 } from "./mission-supervisor";
 
 describe("mission supervisor rollout runtime gates", () => {
-  it.each(["dormant", "rollback"])("does no dependency work for %s queued ticks", async (mode) => {
+  it.each(["dormant", "rollback"])("skips queued ticks and quarantines active missions for %s", async (mode) => {
     const prior = process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT;
     process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = mode;
-    const dependenciesFactory = vi.fn(() => { throw new Error("must not construct dependencies"); });
+    const tickDependenciesFactory = vi.fn(() => { throw new Error("must not construct tick dependencies"); });
+    const sweepDependencies: MissionSupervisorSweepDependencies = {
+      convex: vi.fn().mockResolvedValue({ examined: 3, quarantined: 3 }),
+      dispatchTick: vi.fn().mockResolvedValue({ id: "must-not-dispatch" }),
+    };
+    const sweepDependenciesFactory = vi.fn(() => sweepDependencies);
     try {
       await expect(runMissionSupervisorTickForRollout(
         {
@@ -53,11 +58,18 @@ describe("mission supervisor rollout runtime gates", () => {
           expectedInputRevision: 0,
         },
         { runId: "run-gated", signal: new AbortController().signal },
-        dependenciesFactory,
+        tickDependenciesFactory,
       )).resolves.toMatchObject({ status: "disabled", mode, missionId: "mission-gated" });
-      await expect(runMissionSupervisorDeadmanSweep(dependenciesFactory as never))
-        .resolves.toMatchObject({ skipped: true, mode, due: 0 });
-      expect(dependenciesFactory).not.toHaveBeenCalled();
+      await expect(runMissionSupervisorDeadmanSweep(sweepDependenciesFactory))
+        .resolves.toMatchObject({ skipped: true, mode, examined: 3, quarantined: 3, due: 0 });
+      expect(tickDependenciesFactory).not.toHaveBeenCalled();
+      expect(sweepDependenciesFactory).toHaveBeenCalledOnce();
+      expect(sweepDependencies.convex).toHaveBeenCalledWith(
+        "mutation",
+        "missionSupervisor:quarantineDisabledV1",
+        { limit: MISSION_SUPERVISOR_MAX_DUE },
+      );
+      expect(sweepDependencies.dispatchTick).not.toHaveBeenCalled();
     } finally {
       if (prior === undefined) delete process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT;
       else process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT = prior;

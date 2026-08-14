@@ -43,6 +43,9 @@ const supervisorApi = {
   startV1: makeFunctionReference<"mutation">("missionSupervisor:startV1"),
   controlV1: makeFunctionReference<"mutation">("missionSupervisor:controlV1"),
   dueV1: makeFunctionReference<"query">("missionSupervisor:dueV1"),
+  quarantineDisabledV1: makeFunctionReference<"mutation">(
+    "missionSupervisor:quarantineDisabledV1",
+  ),
   claimV1: makeFunctionReference<"mutation">("missionSupervisor:claimV1"),
   renewV1: makeFunctionReference<"mutation">("missionSupervisor:renewV1"),
   releaseFailureV1: makeFunctionReference<"mutation">(
@@ -3526,6 +3529,73 @@ describe("dormant mission supervisor authority", () => {
     expect(returned.has(String(starts[3].missionId))).toBe(false);
     expect(returned.has(String(starts[4].missionId))).toBe(false);
     expect(returned.has(String(starts[5].missionId))).toBe(false);
+  });
+
+  it("quarantines active supervised states when the supervisor rollout is disabled", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission();
+    const ready = await start(t, "rollout-quarantine-ready", { projectAdmissions: [admission] });
+    const waiting = await start(t, "rollout-quarantine-waiting", { projectAdmissions: [admission] });
+    const leased = await start(t, "rollout-quarantine-leased", { projectAdmissions: [admission] });
+    const paused = await start(t, "rollout-quarantine-paused", { projectAdmissions: [admission] });
+    const active = [ready, waiting, leased];
+    const now = Date.now();
+
+    await t.run(async (ctx) => {
+      const rows = await Promise.all(active.map(async (started) =>
+        (await ctx.db
+          .query("missionSupervisorState")
+          .withIndex("by_mission", (q) => q.eq("missionId", started.missionId))
+          .unique())!
+      ));
+      const pausedRow = (await ctx.db
+        .query("missionSupervisorState")
+        .withIndex("by_mission", (q) => q.eq("missionId", paused.missionId))
+        .unique())!;
+      await ctx.db.patch(rows[0]._id, { state: "ready", nextTickAt: now + 60_000 });
+      await ctx.db.patch(rows[1]._id, { state: "waiting", nextTickAt: now + 120_000 });
+      await ctx.db.patch(rows[2]._id, {
+        state: "leased",
+        nextTickAt: undefined,
+        leaseOwner: "disabled-rollout-worker",
+        leaseToken: "lease-token-disabled-rollout-worker-0001",
+        leaseHeartbeatAt: now,
+        leaseUntil: now + 180_000,
+      });
+      await ctx.db.patch(pausedRow._id, { state: "paused", nextTickAt: undefined });
+    });
+
+    await expect(t.mutation(supervisorApi.quarantineDisabledV1, {
+      limit: MISSION_SUPERVISOR_MAX_DUE,
+      workerToken: WORKER,
+    })).resolves.toEqual({ examined: 3, quarantined: 3 });
+
+    for (const started of active) {
+      const [state, mission, command] = await Promise.all([
+        supervisorState(t, started.missionId),
+        t.run(async (ctx) => await ctx.db.get(started.missionId)),
+        supervisorCommand(t, started.missionId),
+      ]);
+      expect(state).toMatchObject({
+        state: "needs_input",
+        lastErrorCode: "supervisor_rollout_disabled",
+      });
+      expect(state?.nextTickAt).toBeUndefined();
+      expect(state?.leaseOwner).toBeUndefined();
+      expect(state?.leaseToken).toBeUndefined();
+      expect(state?.leaseUntil).toBeUndefined();
+      expect(mission).toMatchObject({ status: "needs_input", phase: "needs_input" });
+      expect(command).toMatchObject({ state: "needs_input", question: expect.stringContaining("disabled") });
+    }
+    expect(await supervisorState(t, paused.missionId)).toMatchObject({ state: "paused" });
+    const persisted = await t.run(async (ctx) => ({
+      attention: await ctx.db.query("attentionItems").collect(),
+      jobs: await ctx.db.query("jobs").collect(),
+    }));
+    expect(persisted.jobs).toEqual([]);
+    expect(persisted.attention.filter((item) =>
+      item.evidence?.includes("supervisor_rollout_disabled")
+    )).toHaveLength(3);
   });
 
   it("claims exclusively and reclaims only after the exact ten-minute lease expires", async () => {

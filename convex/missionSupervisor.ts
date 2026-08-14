@@ -2663,6 +2663,67 @@ export const dueV1 = query({
   },
 });
 
+// A supervisor rollout may be intentionally parked while durable states from
+// an earlier rollout still exist. Do not leave those states ready, waiting, or
+// leased with no planner able to service them: quarantine a small bounded batch
+// into a visible owner decision without creating new retries or dispatches.
+export const quarantineDisabledV1 = mutation({
+  args: {
+    limit: v.optional(v.number()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const limit = boundedInteger(
+      args.limit,
+      "limit",
+      1,
+      MISSION_SUPERVISOR_MAX_DUE,
+      MISSION_SUPERVISOR_MAX_DUE,
+    );
+    const [ready, waiting, leased] = await Promise.all([
+      ctx.db
+        .query("missionSupervisorState")
+        .withIndex("by_state_due", (q) => q.eq("state", "ready"))
+        .order("asc")
+        .take(limit),
+      ctx.db
+        .query("missionSupervisorState")
+        .withIndex("by_state_due", (q) => q.eq("state", "waiting"))
+        .order("asc")
+        .take(limit),
+      ctx.db
+        .query("missionSupervisorState")
+        .withIndex("by_state_lease", (q) => q.eq("state", "leased"))
+        .order("asc")
+        .take(limit),
+    ]);
+    const states = [...ready, ...waiting, ...leased]
+      .sort((left, right) =>
+        left.updatedAt - right.updatedAt
+        || String(left.missionId).localeCompare(String(right.missionId))
+      )
+      .slice(0, limit);
+    const now = Date.now();
+    let quarantined = 0;
+    for (const state of states) {
+      const mission = await ctx.db.get(state.missionId);
+      if (!mission || mission.mode !== "supervised") continue;
+      await holdMissionForInput(
+        ctx,
+        state,
+        mission,
+        "supervisor_rollout_disabled",
+        "Mission supervision is currently disabled by the rollout gate. No further supervisor planning, retries, or dispatches will run; re-enable supervision and provide a follow-up to resume, or stop active work from the controls.",
+        state.consecutiveFailures,
+        now,
+      );
+      quarantined += 1;
+    }
+    return { examined: states.length, quarantined };
+  },
+});
+
 export const claimV1 = mutation({
   args: {
     missionId: v.id("missions"),

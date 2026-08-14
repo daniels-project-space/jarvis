@@ -578,6 +578,11 @@ const dueEntrySchema = z.object({
   leaseUntil: nonNegativeInteger.optional(),
 }).strict();
 
+const rolloutQuarantineSchema = z.object({
+  examined: nonNegativeInteger,
+  quarantined: nonNegativeInteger,
+}).strict();
+
 const claimSuccessSchema = z.object({
   claimed: z.literal(true),
   missionId: boundedString(160),
@@ -2828,7 +2833,26 @@ export async function runMissionSupervisorDeadmanSweep(
 ) {
   const mode = missionSupervisorRolloutMode();
   if (mode === "dormant" || mode === "rollback") {
-    return { mode, skipped: true, due: 0, dispatched: 0, failed: 0, launches: [] };
+    const dependencies = dependenciesFactory();
+    const quarantine = parseWithCode(
+      rolloutQuarantineSchema,
+      await dependencies.convex(
+        "mutation",
+        "missionSupervisor:quarantineDisabledV1",
+        { limit: MISSION_SUPERVISOR_MAX_DUE },
+      ),
+      "rollout_quarantine_invalid",
+      "Mission supervisor rollout quarantine response is invalid",
+    );
+    return {
+      mode,
+      skipped: true,
+      ...quarantine,
+      due: 0,
+      dispatched: 0,
+      failed: 0,
+      launches: [],
+    };
   }
   return { mode, skipped: false, ...(await runMissionSupervisorSweep(dependenciesFactory())) };
 }
