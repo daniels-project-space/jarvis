@@ -8,7 +8,8 @@ import schema from "../../convex/schema";
 import { testMissionAdmission } from "../../convex/testSourceAdmission";
 import { workGroupAuthority } from "../lib/work-scheduler";
 import { canonicalWorkspaceCheckpoint } from "../lib/workspace-checkpoint";
-import { CloudWorkspaceError } from "./cloud-workspace";
+import { CloudWorkspaceError, type CloudWorkspace } from "./cloud-workspace";
+import type { CloudWorkspaceCleanupProvider } from "./cloud-workspace-providers";
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- the Trigger task registration and convex-test bridge expose dynamic production handler boundaries */
 
@@ -34,6 +35,9 @@ const boundaries = vi.hoisted(() => ({
   resolveSubscriptionAgentBin: vi.fn<() => string | null>(() => null),
   configuredCloudWorkspaceProvider: vi.fn(() => {
     throw new Error("cloud provider must not be reached by this authority harness");
+  }),
+  configuredCloudWorkspaceCleanupProvider: vi.fn<() => CloudWorkspaceCleanupProvider>(() => {
+    throw new Error("cloud cleanup provider must not be reached by this authority harness");
   }),
 }));
 const notifications = vi.hoisted(() => ({
@@ -65,6 +69,7 @@ vi.mock("./subscription-runtime", async (importOriginal) => ({
 vi.mock("./cloud-workspace-providers", async (importOriginal) => ({
   ...await importOriginal<typeof import("./cloud-workspace-providers")>(),
   configuredCloudWorkspaceProvider: boundaries.configuredCloudWorkspaceProvider,
+  configuredCloudWorkspaceCleanupProvider: boundaries.configuredCloudWorkspaceCleanupProvider,
 }));
 
 vi.mock("./push-send", () => ({ sendPush: notifications.sendPush }));
@@ -73,9 +78,13 @@ import {
   AGENT_WORKER_CHECKPOINT_MARGIN_MS,
   AGENT_WORKER_MAX_DURATION_SECONDS,
   AGENT_WORKER_SOFT_DEADLINE_MS,
+  CLOUD_WORKSPACE_CLEANUP_BATCH_SIZE,
+  CLOUD_WORKSPACE_CLEANUP_TIMEOUT_MS,
+  awaitCloudWorkspaceCleanup,
   agentWorker,
   createProductionAgentRunnerDependencies,
   handoffCompletedAgentWorker,
+  runAgentMaintenance,
   runAgentHarness,
   type AgentRunnerBoundaryObservation,
   type AgentRunnerDependencies,
@@ -508,6 +517,10 @@ beforeEach(() => {
   boundaries.resolveSubscriptionAgentBin.mockReset();
   boundaries.resolveSubscriptionAgentBin.mockReturnValue(null);
   boundaries.configuredCloudWorkspaceProvider.mockClear();
+  boundaries.configuredCloudWorkspaceCleanupProvider.mockReset();
+  boundaries.configuredCloudWorkspaceCleanupProvider.mockImplementation(() => {
+    throw new Error("cloud cleanup provider must not be reached by this authority harness");
+  });
   trigger.batchTrigger.mockClear();
   trigger.metadata.set.mockClear();
   trigger.metadata.flush.mockClear();
@@ -529,6 +542,82 @@ describe("production Trigger worker authority harness", () => {
     expect(AGENT_WORKER_SOFT_DEADLINE_MS).toBe(28 * 60_000);
     expect(trigger.definitions.get("jarvis-agent-worker").maxDuration).toBe(AGENT_WORKER_MAX_DURATION_SECONDS);
     expect(trigger.definitions.get("jarvis-agent-fleet-supervisor").cron).toBe("*/1 * * * *");
+  });
+
+  it("turns a hung cloud-workspace cleanup into a typed timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const cleanup = awaitCloudWorkspaceCleanup(new Promise<void>(() => {}), "sandbox0", 25);
+      const timedOut = expect(cleanup).rejects.toMatchObject({ provider: "sandbox0", code: "timeout" });
+      await vi.advanceTimersByTimeAsync(25);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds and times out concurrent orphan cleanup so a hung teardown cannot starve routine maintenance", async () => {
+    expect(CLOUD_WORKSPACE_CLEANUP_BATCH_SIZE).toBe(2);
+    expect(CLOUD_WORKSPACE_CLEANUP_TIMEOUT_MS).toBe(20_000);
+    const started: string[] = [];
+    const terminate = vi.fn((workspace: CloudWorkspace) => {
+      started.push(workspace.providerWorkspaceId);
+      if (workspace.providerWorkspaceId === "workspace-blocked") {
+        return new Promise<void>(() => {});
+      }
+      return Promise.resolve();
+    });
+    const cleanupProvider: CloudWorkspaceCleanupProvider = { name: "sandbox0", terminate };
+    const requests: MutationTrace[] = [];
+    boundaries.configuredCloudWorkspaceCleanupProvider.mockReturnValue(cleanupProvider);
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = init?.body ? JSON.parse(String(init.body)) as MutationTrace : null;
+      if (!body) {
+        return new Response(JSON.stringify({ status: "success", value: null }), { status: 200 });
+      }
+      requests.push(body);
+      const value = (() => {
+        switch (body.path) {
+          case "jobs:migrateControlPlane":
+            return { steps: 0, complete: true, phase: null };
+          case "jobs:reapStale":
+            return { requeued: [], releasedDispatches: [], abandoned: [], expiredCloudWorkspaceHolds: [], quarantinedDispatches: [] };
+          case "incidents:claimForRepair":
+            return { claims: [], escalations: [] };
+          case "jobs:cloudWorkspaceOrphans":
+            return [
+              { jobId: "job-blocked", attempt: 1, providerName: "sandbox0", providerWorkspaceId: "workspace-blocked", providerSessionId: "session-blocked" },
+              { jobId: "job-fast", attempt: 1, providerName: "sandbox0", providerWorkspaceId: "workspace-fast", providerSessionId: "session-fast" },
+              { jobId: "job-outside-batch", attempt: 1, providerName: "sandbox0", providerWorkspaceId: "workspace-outside-batch", providerSessionId: "session-outside-batch" },
+            ];
+          case "reminders:due":
+            return [];
+          default:
+            return null;
+        }
+      })();
+      return new Response(JSON.stringify({ status: "success", value }), { status: 200 });
+    }));
+
+    vi.useFakeTimers();
+    try {
+      const maintenance = runAgentMaintenance();
+      await vi.waitFor(() => {
+        expect(started).toEqual(expect.arrayContaining(["workspace-blocked", "workspace-fast"]));
+      }, { interval: 10, timeout: 300 });
+      expect(started).not.toContain("workspace-outside-batch");
+      await vi.advanceTimersByTimeAsync(CLOUD_WORKSPACE_CLEANUP_TIMEOUT_MS);
+      await maintenance;
+
+      expect(terminate).toHaveBeenCalledTimes(CLOUD_WORKSPACE_CLEANUP_BATCH_SIZE);
+      expect(requests).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: "jobs:noteCloudWorkspaceCleanupBlocked", args: expect.objectContaining({ jobId: "job-blocked", code: "timeout" }) }),
+        expect.objectContaining({ path: "jobs:markCloudWorkspaceTerminated", args: expect.objectContaining({ jobId: "job-fast" }) }),
+        expect.objectContaining({ path: "reminders:due" }),
+      ]));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("checkpoints an expired worker watchdog instead of leaving its lease running", async () => {

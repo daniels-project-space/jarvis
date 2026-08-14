@@ -1577,6 +1577,12 @@ export default defineSchema({
     // the same mutation as the complete immutable receipt so replay never
     // has to scan historical attempts or infer availability from fragments.
     checkpointAvailable: v.optional(v.boolean()),
+    // Terminal cloud workspaces are retried independently from job dispatch.
+    // Keeping the due time on the attempt prevents a provider outage from
+    // repeatedly monopolizing the fleet supervisor's minute sweep.
+    cloudWorkspaceCleanupEligible: v.optional(v.boolean()),
+    cleanupAttempts: v.optional(v.number()),
+    cleanupNextRetryAt: v.optional(v.number()),
     cleanupBlockedCode: v.optional(v.string()),
     cleanupBlockedReason: v.optional(v.string()),
     cleanupBlockedAt: v.optional(v.number()),
@@ -1591,7 +1597,9 @@ export default defineSchema({
   })
     .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_job_checkpoint_available_attempt", ["jobId", "checkpointAvailable", "attempt"])
-    .index("by_status_progress", ["status", "progressAt"]),
+    .index("by_status_progress", ["status", "progressAt"])
+    .index("by_cloud_workspace_cleanup_status", ["cloudWorkspaceCleanupEligible", "status", "providerTerminatedAt", "cleanupNextRetryAt"])
+    .index("by_provider_termination_cleanup_retry", ["providerName", "providerTerminatedAt", "cleanupNextRetryAt"]),
 
   // Convex is the sole authority for one logical Trigger launch. A receipt is
   // append-only across generations; transport ambiguity only changes its

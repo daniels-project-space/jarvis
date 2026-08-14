@@ -145,6 +145,33 @@ export const AGENT_WORKER_MAX_DURATION_SECONDS = 30 * 60;
 export const AGENT_WORKER_CHECKPOINT_MARGIN_MS = 2 * 60_000;
 export const AGENT_WORKER_SOFT_DEADLINE_MS =
   AGENT_WORKER_MAX_DURATION_SECONDS * 1_000 - AGENT_WORKER_CHECKPOINT_MARGIN_MS;
+// Provider teardown can spend up to its control deadline. Keep this small and
+// concurrent so a provider outage cannot consume the fleet supervisor window.
+export const CLOUD_WORKSPACE_CLEANUP_BATCH_SIZE = 2;
+export const CLOUD_WORKSPACE_CLEANUP_TIMEOUT_MS = 20_000;
+
+export async function awaitCloudWorkspaceCleanup<T>(
+  operation: Promise<T>,
+  provider: HistoricalCloudWorkspaceProviderName,
+  timeoutMs = CLOUD_WORKSPACE_CLEANUP_TIMEOUT_MS,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timeout = setTimeout(() => {
+        reject(new CloudWorkspaceError(
+          provider,
+          "timeout",
+          `Cloud workspace cleanup exceeded ${timeoutMs}ms`,
+        ));
+      }, timeoutMs);
+      operation.then(resolve, reject);
+    });
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
 const streamLimits = (
   maxBytes: number,
   maxChunks: number,
@@ -891,7 +918,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     /* recovery must never block fleet dispatch */
   }
   const orphans: any[] = await convexQuery("jobs:cloudWorkspaceOrphans", { olderThan: Date.now() - 5 * 60_000 }).catch(() => []) ?? [];
-  for (const orphan of orphans) {
+  await Promise.allSettled(orphans.slice(0, CLOUD_WORKSPACE_CLEANUP_BATCH_SIZE).map(async (orphan) => {
     const providerName = String(orphan.providerName) as HistoricalCloudWorkspaceProviderName;
     try {
       const cleanupProvider = configuredCloudWorkspaceCleanupProvider(process.env, providerName);
@@ -902,7 +929,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
         root: "/workspace/repository",
         createdAt: 0,
       };
-      await cleanupProvider.terminate(workspace, "orphan");
+      await awaitCloudWorkspaceCleanup(cleanupProvider.terminate(workspace, "orphan"), providerName);
       await convexMutation("jobs:markCloudWorkspaceTerminated", {
         jobId: orphan.jobId, expectedAttempt: Number(orphan.attempt),
         providerWorkspaceId: String(orphan.providerWorkspaceId),
@@ -918,7 +945,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
         reason: failure?.message ?? "persisted provider cleanup failed",
       }).catch(() => false);
     }
-  }
+  }));
   try {
     const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
     for (const reminder of due) {

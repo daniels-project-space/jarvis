@@ -88,6 +88,15 @@ const DELIVERY_LEASE_MS = 45_000;
 const DELIVERY_RETRY_LIMIT = 6;
 const ACTIVE_RUNTIME_REPAIR_LIMIT = 3;
 const REVIEW_RECEIPT_MAX_CHARS = 300_000;
+const CLOUD_WORKSPACE_CLEANUP_RETRY_BASE_MS = 60_000;
+const CLOUD_WORKSPACE_CLEANUP_RETRY_MAX_MS = 30 * 60_000;
+const CLOUD_WORKSPACE_ORPHAN_PER_STATUS_LIMIT = 12;
+const CLOUD_WORKSPACE_ORPHAN_LIMIT = 24;
+const CLOUD_WORKSPACE_LEGACY_PER_PROVIDER_LIMIT = 2;
+const TERMINAL_CLOUD_WORKSPACE_STATUSES = ["checkpointed", "paused", "cancelled", "done", "error", "needs_input"] as const;
+// bindCloudWorkspace has only ever accepted these providers. Keep a small
+// migration lane for pre-marker attempts without reopening a table-wide scan.
+const CLOUD_WORKSPACE_PROVIDER_NAMES = ["e2b", "sandbox0", "vercel", "cloudflare", "daytona"] as const;
 const GIT_OID = /^[0-9a-f]{40,64}$/i;
 const DELIVERY_OUTCOMES = new Set([
   "protected_draft", "read_only_complete", "no_change",
@@ -4432,6 +4441,7 @@ export const bindCloudWorkspace = mutation({
       providerWorkspaceId: a.providerWorkspaceId.slice(0, 240),
       providerSessionId: a.providerSessionId.slice(0, 240),
       providerCreatedAt: now,
+      cloudWorkspaceCleanupEligible: true,
       workspaceBaseSha: a.baseSha,
       workspaceRuntime: a.runtime.slice(0, 120),
       workspaceLockfileDigest: a.lockfileDigest,
@@ -4800,13 +4810,46 @@ export const cloudWorkspaceOrphans = query({
   args: { olderThan: v.number(), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    const rows: any[] = [];
-    for (const status of ["checkpointed", "paused", "cancelled", "done", "error", "needs_input"]) {
-      rows.push(...await ctx.db.query("workAttempts")
-        .withIndex("by_status_progress", (q: any) => q.eq("status", status).lte("progressAt", a.olderThan)).take(50));
-    }
-    return rows.filter((row) => row.providerName && row.providerWorkspaceId && row.providerSessionId && !row.providerTerminatedAt)
-      .slice(0, 100)
+    const now = Date.now();
+    const markedPages = await Promise.all(TERMINAL_CLOUD_WORKSPACE_STATUSES.map(async (status) =>
+      await ctx.db.query("workAttempts")
+        .withIndex("by_cloud_workspace_cleanup_status", (q: any) => q
+          .eq("cloudWorkspaceCleanupEligible", true)
+          .eq("status", status)
+          .eq("providerTerminatedAt", undefined)
+          .lte("cleanupNextRetryAt", now))
+        .filter((q: any) => q.and(
+          q.lte(q.field("progressAt"), a.olderThan),
+          q.neq(q.field("providerName"), undefined),
+          q.neq(q.field("providerWorkspaceId"), undefined),
+          q.neq(q.field("providerSessionId"), undefined),
+        ))
+        .take(CLOUD_WORKSPACE_ORPHAN_PER_STATUS_LIMIT),
+    ));
+    // Pre-marker attempts are limited to the historical provider names and
+    // migrate into the indexed lane on their first failed cleanup. This keeps
+    // old stranded workspaces recoverable without allowing ordinary terminal
+    // workAttempts to consume the cleanup read budget.
+    const legacyPages = await Promise.all(CLOUD_WORKSPACE_PROVIDER_NAMES.map(async (providerName) =>
+      await ctx.db.query("workAttempts")
+        .withIndex("by_provider_termination_cleanup_retry", (q: any) => q
+          .eq("providerName", providerName)
+          .eq("providerTerminatedAt", undefined)
+          .lte("cleanupNextRetryAt", now))
+        .filter((q: any) => q.and(
+          q.eq(q.field("cloudWorkspaceCleanupEligible"), undefined),
+          q.lte(q.field("progressAt"), a.olderThan),
+          q.neq(q.field("providerWorkspaceId"), undefined),
+          q.neq(q.field("providerSessionId"), undefined),
+          q.or(...TERMINAL_CLOUD_WORKSPACE_STATUSES.map((status) => q.eq(q.field("status"), status))),
+        ))
+        .take(CLOUD_WORKSPACE_LEGACY_PER_PROVIDER_LIMIT),
+    ));
+    const rows = [...markedPages.flat(), ...legacyPages.flat()];
+    return [...new Map(rows.map((row: any) => [String(row._id), row])).values()]
+      .sort((left: any, right: any) =>
+        Number(left.cleanupNextRetryAt ?? left.progressAt) - Number(right.cleanupNextRetryAt ?? right.progressAt))
+      .slice(0, CLOUD_WORKSPACE_ORPHAN_LIMIT)
       .map((row) => ({
         jobId: row.jobId, attempt: row.attempt, providerName: row.providerName,
         providerWorkspaceId: row.providerWorkspaceId, providerSessionId: row.providerSessionId,
@@ -4823,7 +4866,20 @@ export const markCloudWorkspaceTerminated = mutation({
     requireWorker(a.workerToken);
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!attempt || attempt.providerWorkspaceId !== a.providerWorkspaceId || attempt.providerSessionId !== a.providerSessionId) return false;
-    await ctx.db.patch(attempt._id, { providerTerminatedAt: Date.now(), lastEventAt: Date.now() });
+    const now = Date.now();
+    await ctx.db.patch(attempt._id, {
+      providerTerminatedAt: now,
+      cloudWorkspaceCleanupEligible: undefined,
+      cleanupAttempts: undefined,
+      cleanupNextRetryAt: undefined,
+      lastEventAt: now,
+    });
+    const fingerprint = `cloud-cleanup-blocked:${String(a.jobId)}:${a.expectedAttempt}:${a.providerWorkspaceId.slice(0, 80)}`;
+    const attention = await ctx.db.query("attentionItems")
+      .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", fingerprint)).first();
+    if (attention && attention.status !== "resolved" && attention.status !== "dismissed") {
+      await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
+    }
     return true;
   },
 });
@@ -4839,8 +4895,16 @@ export const noteCloudWorkspaceCleanupBlocked = mutation({
     if (!attempt || attempt.providerWorkspaceId !== a.providerWorkspaceId
       || attempt.providerSessionId !== a.providerSessionId || attempt.providerTerminatedAt) return false;
     const now = Date.now();
+    const cleanupAttempts = Math.max(0, Math.floor(attempt.cleanupAttempts ?? 0)) + 1;
+    const cleanupRetryDelay = Math.min(
+      CLOUD_WORKSPACE_CLEANUP_RETRY_MAX_MS,
+      CLOUD_WORKSPACE_CLEANUP_RETRY_BASE_MS * 2 ** Math.min(cleanupAttempts - 1, 5),
+    );
     const reason = redactSensitiveText(a.reason).slice(0, 500);
     await ctx.db.patch(attempt._id, {
+      cloudWorkspaceCleanupEligible: true,
+      cleanupAttempts,
+      cleanupNextRetryAt: now + cleanupRetryDelay,
       cleanupBlockedCode: a.code.slice(0, 80),
       cleanupBlockedReason: reason,
       cleanupBlockedAt: now, lastEventAt: now,
