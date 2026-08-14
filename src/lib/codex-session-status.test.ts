@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   codexSessionUnavailableCode,
+  controllerSessionAutonomousWorkStatus,
   controllerSessionStatusPresentation,
 } from "./codex-session-status";
 
@@ -29,5 +30,18 @@ describe("controller session status", () => {
     });
     expect(controllerSessionStatusPresentation("repair_required", "rotation_uncertain").hint)
       .toContain("rotation_uncertain");
+  });
+
+  it("admits autonomous maintenance only after a clear durable status", () => {
+    expect(controllerSessionAutonomousWorkStatus({ state: "clear" })).toBe("clear");
+    expect(controllerSessionAutonomousWorkStatus({
+      state: "repair_required",
+      code: "rotation_uncertain",
+    })).toBe("repair_required");
+    expect(controllerSessionAutonomousWorkStatus({
+      state: "repair_required",
+      code: "not_a_real_code",
+    })).toBe("unknown");
+    expect(controllerSessionAutonomousWorkStatus(undefined)).toBe("unknown");
   });
 });

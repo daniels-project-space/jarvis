@@ -46,6 +46,20 @@ export type ControllerSessionReadiness =
   | { state: "clear" }
   | { state: "repair_required"; code: CodexSessionUnavailableCode };
 
+/**
+ * A worker-safe narrowing helper for the durable status query. Treat an
+ * absent, stale, or malformed status as unknown rather than declaring the
+ * controller safe for a new autonomous run.
+ */
+export function controllerSessionAutonomousWorkStatus(value: unknown): "clear" | "repair_required" | "unknown" {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "unknown";
+  const record = value as Record<string, unknown>;
+  if (record.state === "clear") return "clear";
+  return record.state === "repair_required" && isCodexSessionUnavailableCode(record.code)
+    ? "repair_required"
+    : "unknown";
+}
+
 export function controllerSessionStatusPresentation(
   status: ControllerSessionStatus,
   code?: CodexSessionUnavailableCode | null,

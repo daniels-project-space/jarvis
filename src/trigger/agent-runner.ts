@@ -38,7 +38,10 @@ import {
   type AgentProvider,
 } from "./subscription-runtime";
 import { backgroundSubscriptionValidityMs } from "./subscription-validity";
-import { codexSessionUnavailableCode } from "../lib/codex-session-status";
+import {
+  codexSessionUnavailableCode,
+  controllerSessionAutonomousWorkStatus,
+} from "../lib/codex-session-status";
 import {
   GOAL_PLAN_RESULT_MAX_CHARS,
   parseGoalPlan,
@@ -979,6 +982,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
   let cloudWorkspaceResumed = 0;
   let expiredCloudWorkspaceHolds = 0;
   let quarantinedDispatches = 0;
+  let controllerSession = "unknown" as ReturnType<typeof controllerSessionAutonomousWorkStatus>;
   if (runtimeAttestation) {
     try {
       // Construction validates the exact deployment-bound probe receipt but
@@ -1008,52 +1012,61 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
         threadId: await chatThread(),
         text: `I've stopped the background job "${title}" because its worker reservation could not be verified. It is waiting for review; I have not started a replacement.`,
       }).catch(() => {});
-    const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
-    repairs = Number(healer?.claims?.length ?? 0);
-    for (const inc of healer?.claims ?? []) {
-      const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
-      const protocolV2 = v2AdmissionEnabled();
-      const projectAdmission = protocolV2
-        ? await observeGitHubProjectSource({ repository: repo, token: process.env.GITHUB_TOKEN || undefined })
-        : undefined;
-      const originThreadId = await chatThread();
-      const missionId = await convexMutation(admissionMutationName("mission"), {
-        goal: `Repair ${String(inc.message ?? inc.signature ?? "production incident")}`.slice(0, 500),
-        agentCount: 1,
-        ...(protocolV2 ? { mode: "single", projectAdmissions: [projectAdmission!] } : {}),
-        originThreadId,
-        managerAgentId: "jarvis",
-        priority: 90,
-        risk: "high",
-      });
-      const repairJobId = await convexMutation(admissionMutationName("job"), {
-        task: repairPrompt(inc, repo),
-        repo: projectAdmission?.repository ?? repo,
-        missionId: String(missionId),
-        model: "sol",
-        modelReason: "Paul uses the highest tier for production root-cause repair",
-        agentId: "paul",
-        risk: "high",
-        priority: 90,
-        originThreadId,
-        visibility: "system",
-        acceptanceCriteria: [
-          "Reproduce or evidence the root cause before editing",
-          "Implement the smallest safe repair on an isolated branch",
-          "Verify the relevant build or live surface and report evidence",
-        ],
-        incidentId: String(inc.id),
-      });
-      if (repairJobId) {
-        await convexMutation("incidents:linkJob", { id: inc.id, jobId: String(repairJobId) }).catch(() => {});
+    controllerSession = controllerSessionAutonomousWorkStatus(
+      await convexQuery("controllerSession:status", {}),
+    );
+    // A held managed session is a fleet-level prerequisite failure. Starting
+    // an incident repair while it is unresolved only spends a specialist
+    // attempt to rediscover the identical preflight hold. If the status read
+    // itself is unavailable, fail closed for this optional autonomous launch.
+    if (controllerSession === "clear") {
+      const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
+      repairs = Number(healer?.claims?.length ?? 0);
+      for (const inc of healer?.claims ?? []) {
+        const repo = inc.app && inc.app !== "jarvis" ? inc.app : "jarvis";
+        const protocolV2 = v2AdmissionEnabled();
+        const projectAdmission = protocolV2
+          ? await observeGitHubProjectSource({ repository: repo, token: process.env.GITHUB_TOKEN || undefined })
+          : undefined;
+        const originThreadId = await chatThread();
+        const missionId = await convexMutation(admissionMutationName("mission"), {
+          goal: `Repair ${String(inc.message ?? inc.signature ?? "production incident")}`.slice(0, 500),
+          agentCount: 1,
+          ...(protocolV2 ? { mode: "single", projectAdmissions: [projectAdmission!] } : {}),
+          originThreadId,
+          managerAgentId: "jarvis",
+          priority: 90,
+          risk: "high",
+        });
+        const repairJobId = await convexMutation(admissionMutationName("job"), {
+          task: repairPrompt(inc, repo),
+          repo: projectAdmission?.repository ?? repo,
+          missionId: String(missionId),
+          model: "sol",
+          modelReason: "Paul uses the highest tier for production root-cause repair",
+          agentId: "paul",
+          risk: "high",
+          priority: 90,
+          originThreadId,
+          visibility: "system",
+          acceptanceCriteria: [
+            "Reproduce or evidence the root cause before editing",
+            "Implement the smallest safe repair on an isolated branch",
+            "Verify the relevant build or live surface and report evidence",
+          ],
+          incidentId: String(inc.id),
+        });
+        if (repairJobId) {
+          await convexMutation("incidents:linkJob", { id: inc.id, jobId: String(repairJobId) }).catch(() => {});
+        }
       }
-    }
-    for (const esc of healer?.escalations ?? []) {
-      await convexMutation("chatQueue:postAssistant", {
-        threadId: await chatThread(),
-        text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
-      });
-      await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/");
+      for (const esc of healer?.escalations ?? []) {
+        await convexMutation("chatQueue:postAssistant", {
+          threadId: await chatThread(),
+          text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
+        });
+        await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/");
+      }
     }
   } catch {
     /* recovery must never block fleet dispatch */
@@ -1118,6 +1131,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     cloudWorkspaceResumed,
     expiredCloudWorkspaceHolds,
     quarantinedDispatches,
+    controllerSession,
     migration,
   };
 }
