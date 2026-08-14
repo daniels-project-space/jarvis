@@ -54,9 +54,13 @@ describe("bounded private video frame extraction", () => {
       expect(preview.contentType).toBe("image/webp");
       expect(preview.bytes.byteLength).toBeGreaterThan(0);
       expect(preview.bytes.byteLength).toBeLessThanOrEqual(1_000_000);
-      expect(metadata.width).toBeGreaterThan(0);
-      expect(metadata.height).toBeGreaterThan(0);
+      expect(metadata.width).toBe(1_024);
+      expect(metadata.height).toBe(576);
       expect(preview.durationSeconds).toBeCloseTo(1, 1);
+      expect(preview.timestamps).toHaveLength(4);
+      expect(preview.timestamps).toEqual([...preview.timestamps].sort((left, right) => left - right));
+      expect(preview.timestamps[0]).toBeGreaterThanOrEqual(0);
+      expect(preview.timestamps[3]).toBeLessThan(preview.durationSeconds!);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

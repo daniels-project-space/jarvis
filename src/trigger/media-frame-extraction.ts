@@ -11,6 +11,10 @@ const MAX_VIDEO_WIDTH = 4_096;
 const MAX_VIDEO_HEIGHT = 4_096;
 const MAX_PREVIEW_BYTES = 1_000_000;
 const PREVIEW_MAX_PIXELS = 16_000_000;
+const TEMPORAL_FRAME_COUNT = 4;
+const TEMPORAL_FRAME_WIDTH = 512;
+const TEMPORAL_FRAME_HEIGHT = 288;
+const MAX_RAW_TEMPORAL_FRAME_BYTES = 350_000;
 const PROCESS_TIMEOUT_MS = 45_000;
 // Cast-then-assign (not a `: NodeJS.ProcessEnv` literal annotation, and not a
 // literal `as` cast either): Next.js augments ProcessEnv with a required
@@ -37,6 +41,8 @@ export type VideoPreviewResult = {
   contentType: "image/webp";
   durationSeconds: number | null;
   hasAudio: boolean;
+  /** Timestamps represented in the private temporal contact sheet, in order. */
+  timestamps: number[];
 };
 
 export class MediaFrameExtractionError extends Error {
@@ -74,6 +80,33 @@ function requiredZeroExit(result: { code: number | null }, code: string): void {
 function numeric(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function temporalTimestamps(durationSeconds: number): number[] {
+  // Keep the first/last seek away from potentially empty stream boundaries.
+  // Every value comes from ffprobe's bounded numeric duration, never input text.
+  const lastFrameAt = Math.max(0, durationSeconds - Math.min(0.25, durationSeconds / 4));
+  return [0.08, 0.35, 0.65, 0.92].map((fraction) =>
+    Number(Math.min(lastFrameAt, Math.max(0, durationSeconds * fraction)).toFixed(3)));
+}
+
+function formatTimestamp(seconds: number): string {
+  const totalMilliseconds = Math.max(0, Math.round(seconds * 1_000));
+  const wholeSeconds = Math.floor(totalMilliseconds / 1_000);
+  const minutes = Math.floor(wholeSeconds / 60);
+  const remainingSeconds = wholeSeconds % 60;
+  const tenths = Math.floor((totalMilliseconds % 1_000) / 100);
+  return `${minutes}:${String(remainingSeconds).padStart(2, "0")}.${tenths}`;
+}
+
+function timestampBadge(seconds: number): Buffer {
+  // The label is produced solely from a numeric probe result, so embedding it
+  // in the SVG cannot turn an upload name or media metadata into markup.
+  const label = formatTimestamp(seconds);
+  return Buffer.from(
+    `<svg width="84" height="26" xmlns="http://www.w3.org/2000/svg"><rect width="84" height="26" rx="5" fill="#111827" fill-opacity="0.88"/><text x="9" y="18" font-family="sans-serif" font-size="14" font-weight="600" fill="#ffffff">${label}</text></svg>`,
+    "utf8",
+  );
 }
 
 function parseProbe(stdout: Uint8Array, expectedKind: PrivateMediaKind): PrivateMediaProbeResult {
@@ -141,9 +174,11 @@ export async function probePrivateMedia(input: {
 }
 
 /**
- * Derive one bounded representative WebP entirely inside the trusted Trigger
- * worker. Untrusted bytes are written only to an owned 0700 temp directory,
- * passed as a generated path, and processed with no inherited credentials.
+ * Derive one bounded, timestamped four-frame contact sheet entirely inside the
+ * trusted Trigger worker. It gives chat temporal video context without ever
+ * uploading the source container or multiplying the durable object surface.
+ * Untrusted bytes are written only to an owned 0700 temp directory, passed as
+ * generated paths, and processed with no inherited credentials.
  */
 export async function extractVideoPreview(input: {
   bytes: Uint8Array;
@@ -155,7 +190,7 @@ export async function extractVideoPreview(input: {
   }
   const directory = await mkdtemp(join(tmpdir(), "jarvis-private-video-"));
   const source = join(directory, "source.media");
-  const rawPreview = join(directory, "preview.webp");
+  const rawFrames = Array.from({ length: TEMPORAL_FRAME_COUNT }, (_, index) => join(directory, `frame-${index}.webp`));
   try {
     await chmod(directory, 0o700);
     await writeFile(source, input.bytes, { mode: 0o600 });
@@ -170,31 +205,70 @@ export async function extractVideoPreview(input: {
     ], directory));
     requiredZeroExit(probe, "media_probe_failed");
     const metadata = parseProbe(probe.stdout, "video");
+    if (metadata.durationSeconds === null) throw new MediaFrameExtractionError("video_decode_bounds_exceeded");
+    const timestamps = temporalTimestamps(metadata.durationSeconds);
     const frame = await runBoundedProcess(boundedProcessOptions(ffmpegPath, [
       "-v", "error",
       "-nostdin",
       "-protocol_whitelist", "file,pipe",
       "-threads", "1",
-      "-i", source,
-      "-map", "0:v:0",
-      "-vf", "thumbnail=50,scale=1024:-2:force_original_aspect_ratio=decrease",
-      "-frames:v", "1",
-      "-an",
-      "-c:v", "libwebp",
-      "-quality", "78",
-      "-compression_level", "4",
-      "-y",
-      rawPreview,
+      ...timestamps.flatMap((timestamp, index) => [
+        "-ss", timestamp.toFixed(3),
+        "-i", source,
+        "-map", `${index}:v:0`,
+        "-frames:v", "1",
+        "-an",
+        "-vf", `scale=${TEMPORAL_FRAME_WIDTH}:${TEMPORAL_FRAME_HEIGHT}:force_original_aspect_ratio=decrease`,
+        "-c:v", "libwebp",
+        "-quality", "70",
+        "-compression_level", "4",
+        "-fs", String(MAX_RAW_TEMPORAL_FRAME_BYTES),
+        "-y",
+        rawFrames[index],
+      ]),
     ], directory));
     requiredZeroExit(frame, "media_frame_extraction_failed");
-    const preview = await readFile(rawPreview);
-    if (!preview.byteLength || preview.byteLength > MAX_PREVIEW_BYTES) {
-      throw new MediaFrameExtractionError("media_preview_bounds_exceeded");
-    }
-    const normalized = await sharp(preview, { failOn: "error", limitInputPixels: PREVIEW_MAX_PIXELS })
-      .rotate()
-      .resize({ width: 1_024, height: 1_024, fit: "inside", withoutEnlargement: true })
-      .webp({ quality: 78, effort: 4 })
+    const normalizedFrames = await Promise.all(rawFrames.map(async (rawFrame) => {
+      const bytes = await readFile(rawFrame);
+      if (!bytes.byteLength || bytes.byteLength > MAX_RAW_TEMPORAL_FRAME_BYTES) {
+        throw new MediaFrameExtractionError("media_preview_bounds_exceeded");
+      }
+      const normalizedFrame = await sharp(bytes, { failOn: "error", limitInputPixels: PREVIEW_MAX_PIXELS })
+        .rotate()
+        .resize({
+          width: TEMPORAL_FRAME_WIDTH,
+          height: TEMPORAL_FRAME_HEIGHT,
+          fit: "contain",
+          background: { r: 15, g: 23, b: 42, alpha: 1 },
+        })
+        .webp({ quality: 70, effort: 4 })
+        .toBuffer();
+      if (!normalizedFrame.byteLength || normalizedFrame.byteLength > MAX_RAW_TEMPORAL_FRAME_BYTES) {
+        throw new MediaFrameExtractionError("media_preview_bounds_exceeded");
+      }
+      return normalizedFrame;
+    }));
+    const normalized = await sharp({
+      create: {
+        width: TEMPORAL_FRAME_WIDTH * 2,
+        height: TEMPORAL_FRAME_HEIGHT * 2,
+        channels: 4,
+        background: { r: 15, g: 23, b: 42, alpha: 1 },
+      },
+    })
+      .composite([
+        ...normalizedFrames.map((image, index) => ({
+          input: image,
+          left: (index % 2) * TEMPORAL_FRAME_WIDTH,
+          top: Math.floor(index / 2) * TEMPORAL_FRAME_HEIGHT,
+        })),
+        ...timestamps.map((timestamp, index) => ({
+          input: timestampBadge(timestamp),
+          left: (index % 2) * TEMPORAL_FRAME_WIDTH + 10,
+          top: Math.floor(index / 2) * TEMPORAL_FRAME_HEIGHT + 10,
+        })),
+      ])
+      .webp({ quality: 74, effort: 4 })
       .toBuffer();
     if (!normalized.byteLength || normalized.byteLength > MAX_PREVIEW_BYTES) {
       throw new MediaFrameExtractionError("media_preview_bounds_exceeded");
@@ -204,6 +278,7 @@ export async function extractVideoPreview(input: {
       contentType: "image/webp",
       durationSeconds: metadata.durationSeconds,
       hasAudio: metadata.hasAudio,
+      timestamps,
     };
   } catch (error) {
     if (error instanceof MediaFrameExtractionError) throw error;

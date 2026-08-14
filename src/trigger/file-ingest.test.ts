@@ -136,7 +136,11 @@ describe("private media file ingest", () => {
     mocks.privateR2Put.mockResolvedValue(undefined);
     mocks.privateR2Delete.mockResolvedValue(undefined);
     mocks.extractPrivateFile.mockResolvedValue(storedVideo());
-    mocks.extractVideoPreview.mockResolvedValue({ bytes: new Uint8Array([9, 8, 7]), contentType: "image/webp" });
+    mocks.extractVideoPreview.mockResolvedValue({
+      bytes: new Uint8Array([9, 8, 7]),
+      contentType: "image/webp",
+      timestamps: [0.1, 0.4, 0.7, 0.9],
+    });
     mocks.transcribePrivateMedia.mockResolvedValue({ provider: "local-faster-whisper", text: "Meet at ten." });
     mocks.applyPrivateMediaAnalysis.mockImplementation(analyzedMedia);
   });
@@ -162,6 +166,12 @@ describe("private media file ingest", () => {
       extractedTextR2Key: "owners/daniel/files/file-1/v1/extracted.txt",
       previewR2Key: "owners/daniel/files/file-1/v1/preview.webp",
     });
+    expect(mocks.applyPrivateMediaAnalysis).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        preview: expect.objectContaining({ timestamps: [0.1, 0.4, 0.7, 0.9] }),
+      }),
+    );
   });
 
   it("removes every derived media object when completion loses its claim", async () => {

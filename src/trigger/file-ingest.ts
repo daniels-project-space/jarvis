@@ -125,7 +125,7 @@ export async function runFileIngest(payload: IngestPayload) {
       const transcription = await transcribePrivateMedia({ bytes: original, mimeType: claim.mimeType })
         .catch((error) => error instanceof MediaTranscriptionError ? undefined : Promise.reject(error));
       result = applyPrivateMediaAnalysis(result, {
-        preview: preview ? { bytes: preview.bytes, contentType: preview.contentType } : undefined,
+        preview: preview ? { bytes: preview.bytes, contentType: preview.contentType, timestamps: preview.timestamps } : undefined,
         transcription,
       });
     }

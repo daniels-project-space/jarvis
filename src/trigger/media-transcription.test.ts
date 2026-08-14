@@ -142,7 +142,7 @@ describe("private media transcription", () => {
       media: { kind: "video" },
     };
     const result = applyPrivateMediaAnalysis(source, {
-      preview: { bytes: new Uint8Array([1, 2, 3]), contentType: "image/webp" },
+      preview: { bytes: new Uint8Array([1, 2, 3]), contentType: "image/webp", timestamps: [0.1, 0.4, 0.7, 0.9] },
       transcription: {
         provider: "local-faster-whisper",
         text: "Daniel walks through the old town and says dinner is at eight.",
@@ -151,7 +151,7 @@ describe("private media transcription", () => {
 
     expect(result.status).toBe("ready");
     expect(result.chunks[0]?.text).toContain("old town");
-    expect(result.summary).toContain("representative frame ready for visual analysis");
+    expect(result.summary).toContain("4 timestamped frames ready for visual analysis");
     expect(result.summary).toContain("transcript characters indexed");
     expect(result.preview?.contentType).toBe("image/webp");
   });

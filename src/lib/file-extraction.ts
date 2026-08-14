@@ -28,7 +28,7 @@ export type FileExtractionResult = {
   chunks: ExtractedChunk[];
   pageCount?: number;
   sheetNames?: string[];
-  preview?: { bytes: Uint8Array; contentType: "image/webp" };
+  preview?: { bytes: Uint8Array; contentType: "image/webp"; timestamps?: number[] };
   /** Present only for verified containers that the private Trigger worker may
    * send to Daniel's configured transcription services. */
   media?: { kind: TranscribableMediaKind };

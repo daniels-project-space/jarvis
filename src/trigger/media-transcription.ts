@@ -201,19 +201,24 @@ export function applyMediaTranscription(
 export function applyPrivateMediaAnalysis(
   source: FileExtractionResult,
   analysis: {
-    preview?: { bytes: Uint8Array; contentType: "image/webp" };
+    preview?: { bytes: Uint8Array; contentType: "image/webp"; timestamps?: number[] };
     transcription?: MediaTranscriptionResult;
   },
 ): FileExtractionResult {
   if (!source.media) throw new Error("media extraction result was required");
   const text = analysis.transcription?.text ?? "";
   const visualReady = Boolean(analysis.preview);
+  const temporalFrameCount = analysis.preview?.timestamps?.length ?? 0;
   const transcriptReady = Boolean(analysis.transcription);
   const status = visualReady || transcriptReady ? "ready" : "stored_only" as const;
   const summary = source.media.kind === "video"
     ? [
       "Video",
-      visualReady ? "representative frame ready for visual analysis in chat" : "no visual frame is available",
+      visualReady
+        ? temporalFrameCount >= 2
+          ? `${temporalFrameCount} timestamped frames ready for visual analysis in chat`
+          : "visual preview ready for analysis in chat"
+        : "no visual frame is available",
       transcriptReady
         ? text
           ? `${text.length.toLocaleString("en-US")} transcript characters indexed`

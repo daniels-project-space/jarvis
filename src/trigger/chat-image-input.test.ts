@@ -154,7 +154,7 @@ describe("bounded Codex image materialization", () => {
 
     expect(images).toMatchObject([{
       status: "ready",
-      label: expect.stringContaining("derived representative frame"),
+      label: expect.stringContaining("derived video visual preview"),
     }]);
     expect(getPrivate).toHaveBeenCalledWith(
       "owners/daniel/files/video-1/v1/preview.webp",

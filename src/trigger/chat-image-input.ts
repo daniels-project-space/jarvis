@@ -156,7 +156,7 @@ export async function materializeCodexChatImages(
       derivedVideoPreview ? 1_000_000 : Math.max(1, Math.floor(file.sizeBytes)),
     );
     sources.push({
-      label: `${derivedVideoPreview ? "derived representative frame for" : "attachment"} fileId=${serializeUntrustedFileValue(file.fileId, 128)} name=${serializeUntrustedFileValue(file.relativePath || file.name, 512)}`,
+      label: `${derivedVideoPreview ? "derived video visual preview for" : "attachment"} fileId=${serializeUntrustedFileValue(file.fileId, 128)} name=${serializeUntrustedFileValue(file.relativePath || file.name, 512)}`,
       maximumBytes,
       read: async (readSignal) => await deps.getPrivate(
         derivedVideoPreview ? file.previewR2Key! : file.r2Key,
