@@ -3404,7 +3404,7 @@ export const scrubSensitiveOutput = mutation({
     const row = await ctx.db.get(a.jobId);
     if (!row) return { scrubbed: false, fields: [] as string[] };
     const patch: Record<string, string> = {};
-    for (const field of ["result", "checkpoint", "log", "progress", "verificationNote", "question"] as const) {
+    for (const field of ["result", "checkpoint", "log", "progress", "verificationNote"] as const) {
       if (typeof row[field] !== "string") continue;
       const redacted = redactSensitiveText(row[field]);
       if (redacted !== row[field]) patch[field] = redacted;
