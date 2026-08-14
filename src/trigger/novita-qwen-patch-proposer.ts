@@ -87,7 +87,8 @@ function sameAttestation(
 function chatCompletionUrl(base: string): URL | null {
   try {
     const url = new URL(base);
-    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return null;
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash
+      || (url.hostname !== "api.novita.ai" && !url.hostname.endsWith(".novita.ai"))) return null;
     url.pathname = `${url.pathname.replace(/\/$/, "")}/v1/chat/completions`;
     return url;
   } catch {
@@ -186,7 +187,12 @@ export async function requestNovitaPatchProposal(input: Readonly<{
   const url = chatCompletionUrl(config.endpointUrl);
   if (!url) return Object.freeze({ status: "unavailable" as const, reason: "invalid_endpoint_url" });
 
-  const apiKey = await input.getApiKey();
+  let apiKey: string;
+  try {
+    apiKey = await input.getApiKey();
+  } catch {
+    return Object.freeze({ status: "unavailable" as const, reason: "api_key_unavailable" });
+  }
   if (!apiKey) return Object.freeze({ status: "unavailable" as const, reason: "missing_api_key" });
   const fetchImpl = input.fetchImpl ?? fetch;
   const controller = new AbortController();

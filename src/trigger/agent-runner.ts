@@ -3,7 +3,7 @@ import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, existsSync, lstatSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { sendPush } from "./push-send";
 import { projectProviderBoundary } from "../lib/project-registry";
@@ -367,10 +367,16 @@ function novitaSourceFilesForTask(
   }
   let bytes = 0;
   const files: NovitaProposalSourceFile[] = [];
+  let root: string;
+  try { root = realpathSync(repoDir); } catch { return Object.freeze(files); }
   for (const path of paths) {
     const fullPath = join(repoDir, path);
     if (!existsSync(fullPath)) continue;
     try {
+      const stat = lstatSync(fullPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) continue;
+      const resolved = realpathSync(fullPath);
+      if (!resolved.startsWith(`${root}/`)) continue;
       const content = readFileSync(fullPath, "utf8");
       const next = Buffer.byteLength(path, "utf8") + Buffer.byteLength(content, "utf8") + 32;
       if (content.includes("\0") || bytes + next > maxInputBytes) continue;

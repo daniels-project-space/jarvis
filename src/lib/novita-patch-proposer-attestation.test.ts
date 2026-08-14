@@ -26,9 +26,9 @@ describe("Novita patch-proposer attestation", () => {
 
   it("admits only a strict HTTPS runtime configuration", () => {
     const runtime = configuredNovitaPatchProposer({
-      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "https://example.test/qwen", ...attestation }),
+      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", ...attestation }),
     });
-    expect(runtime).toMatchObject({ endpointUrl: "https://example.test/qwen", attestation });
+    expect(runtime).toMatchObject({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", attestation });
     expect(configuredNovitaPatchProposer({
       JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "http://example.test", ...attestation }),
     })).toBeNull();
@@ -36,7 +36,7 @@ describe("Novita patch-proposer attestation", () => {
 
   it("selects the delegate only for bounded low-risk owned coding work", () => {
     const previous = process.env.JARVIS_NOVITA_QWEN_ATTESTATION;
-    process.env.JARVIS_NOVITA_QWEN_ATTESTATION = JSON.stringify({ endpointUrl: "https://example.test/qwen", ...attestation });
+    process.env.JARVIS_NOVITA_QWEN_ATTESTATION = JSON.stringify({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", ...attestation });
     try {
       expect(novitaPatchProposerForWorkOrder({
         task: "Fix src/lib/example.ts so it handles the null result.",

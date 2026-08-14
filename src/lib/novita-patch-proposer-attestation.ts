@@ -120,7 +120,8 @@ export function configuredNovitaPatchProposer(
     if (typeof raw.endpointUrl !== "string") return null;
     const url = new URL(raw.endpointUrl);
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash
-      || !url.pathname.startsWith("/")) return null;
+      || !url.pathname.startsWith("/")
+      || (url.hostname !== "api.novita.ai" && !url.hostname.endsWith(".novita.ai"))) return null;
     const attestationValue = Object.fromEntries(
       Object.entries(raw).filter(([key]) => key !== "endpointUrl"),
     );

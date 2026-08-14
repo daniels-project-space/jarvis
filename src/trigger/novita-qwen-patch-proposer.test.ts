@@ -6,7 +6,7 @@ import { parseNovitaPatchProposal, requestNovitaPatchProposal } from "./novita-q
 
 function runtimeConfig() {
   const withoutDigest = {
-    endpointUrl: "https://qwen.example.test/private-endpoint",
+    endpointUrl: "https://qwen.endpoint.novita.ai/private-endpoint",
     adapterId: "novita-qwen-patch-proposer-v1",
     endpointId: "endpoint_123456",
     modelId: "Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4",
@@ -55,7 +55,7 @@ describe("Novita Qwen patch proposer", () => {
     expect(getApiKey).toHaveBeenCalledTimes(1);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const [url, init] = fetchImpl.mock.calls[0];
-    expect(String(url)).toBe("https://qwen.example.test/private-endpoint/v1/chat/completions");
+    expect(String(url)).toBe("https://qwen.endpoint.novita.ai/private-endpoint/v1/chat/completions");
     expect(init).toMatchObject({ method: "POST", redirect: "error" });
     expect(init.headers.authorization).toBe("Bearer secret-not-in-result");
     expect(JSON.parse(init.body)).toMatchObject({
