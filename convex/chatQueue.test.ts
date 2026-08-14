@@ -650,3 +650,117 @@ describe("chat history deletion", () => {
     expect(durable.keptLinks).toHaveLength(1);
   });
 });
+
+describe("legacy creation media cards", () => {
+  it("rewrites a legacy card to authenticated routes for every history reader", async () => {
+    const t = convexTest(schema, modules);
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/card.png";
+    const legacyDownloadUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/card.pdf";
+    const ids = await t.run(async (ctx) => ({
+      image: await ctx.db.insert("creations", {
+        kind: "image",
+        title: "Historic card",
+        url: legacyUrl,
+        thumb: legacyUrl,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }),
+      pdf: await ctx.db.insert("creations", {
+        kind: "pdf",
+        title: "Historic card PDF",
+        thumb: legacyDownloadUrl,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }),
+    }));
+    await t.mutation(api.chatQueue.postCard, {
+      threadId: "legacy-cards",
+      type: "image",
+      value: legacyUrl,
+      title: "Historic card",
+      downloadUrl: legacyDownloadUrl,
+      workerToken: WORKER,
+    });
+    const privateKey = "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset";
+    await t.run((ctx) => ctx.db.insert("chatMessages", {
+      threadId: "legacy-cards",
+      role: "assistant",
+      text: `Historic card ${legacyUrl} ${privateKey}`,
+      status: "done",
+      delivery: "foreground",
+      attachment: {
+        type: "image",
+        value: `${legacyUrl}?download=1`,
+        title: "Historic raw card",
+        downloadUrl: `${legacyDownloadUrl}#download`,
+      },
+      createdAt: Date.now() + 1,
+    }));
+
+    const [listed, recent, paginated, stored] = await Promise.all([
+      t.query(api.chatQueue.listMessages, { threadId: "legacy-cards", workerToken: WORKER }),
+      t.query(api.chatQueue.listRecentMessages, { threadId: "legacy-cards", workerToken: WORKER }),
+      t.query(api.chatQueue.paginatedMessages, {
+        threadId: "legacy-cards",
+        paginationOpts: { cursor: null, numItems: 20 },
+        workerToken: WORKER,
+      }),
+      t.run((ctx) => ctx.db.query("chatMessages").withIndex("by_thread", (q) => q.eq("threadId", "legacy-cards")).collect()),
+    ]);
+    const mediaUrl = `/api/creation-media?id=${encodeURIComponent(String(ids.image))}&variant=asset`;
+    const downloadUrl = `/api/creation-download?id=${encodeURIComponent(String(ids.pdf))}`;
+    const cards = [
+      listed.find((row) => row.attachment?.title === "Historic raw card"),
+      recent.find((row) => row.attachment?.title === "Historic raw card"),
+      paginated.page.find((row) => row.attachment?.title === "Historic raw card"),
+      stored.find((row) => row.attachment?.title === "Historic card"),
+    ];
+
+    for (const card of cards) {
+      expect(card?.attachment).toMatchObject({ value: mediaUrl, downloadUrl });
+      expect(JSON.stringify(card)).not.toContain(legacyUrl);
+      expect(JSON.stringify(card)).not.toContain(legacyDownloadUrl);
+    }
+    const visibleHistory = JSON.stringify({ listed, recent, paginated });
+    expect(visibleHistory).not.toContain(legacyUrl);
+    expect(visibleHistory).not.toContain(legacyDownloadUrl);
+    expect(visibleHistory).not.toContain(privateKey);
+  });
+
+  it("returns an inert notice when a legacy card has no matching creation", async () => {
+    const t = convexTest(schema, modules);
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/missing.png";
+    await t.mutation(api.chatQueue.postCard, {
+      threadId: "legacy-orphan",
+      type: "image",
+      value: legacyUrl,
+      title: "Missing historic card",
+      workerToken: WORKER,
+    });
+
+    const [card] = await t.query(api.chatQueue.listMessages, { threadId: "legacy-orphan", workerToken: WORKER });
+
+    expect(card?.attachment).toMatchObject({ type: "markdown", title: "Missing historic card" });
+    expect(JSON.stringify(card)).not.toContain(legacyUrl);
+  });
+
+  it("removes an unmatched legacy download without replacing a safe card value", async () => {
+    const t = convexTest(schema, modules);
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/missing.pdf";
+    const safeUrl = "https://example.com/preview.png";
+    await t.run((ctx) => ctx.db.insert("chatMessages", {
+      threadId: "legacy-download-only",
+      role: "assistant",
+      text: "Saved card",
+      status: "done",
+      attachment: { type: "image", value: safeUrl, downloadUrl: legacyUrl },
+      createdAt: Date.now(),
+    }));
+
+    const [card] = await t.query(api.chatQueue.listMessages, { threadId: "legacy-download-only", workerToken: WORKER });
+
+    expect(card?.attachment).toMatchObject({ type: "image", value: safeUrl });
+    expect(card?.attachment?.downloadUrl).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain(legacyUrl);
+  });
+});

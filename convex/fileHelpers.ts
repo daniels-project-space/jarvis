@@ -1,5 +1,6 @@
 import { ConvexError } from "convex/values";
 import { CHAT_FILE_LIMITS, FILE_READY_STATUSES } from "../src/lib/chat-files";
+import { isLegacyCreationUrlForRedaction, legacyCreationLookupUrl, redactLegacyCreationUrls } from "../src/lib/legacy-creation-url";
 
 export type ReadyMessageFile = {
   _id: any;
@@ -12,6 +13,70 @@ export type ReadyMessageFile = {
   summary?: string;
   r2Key: string;
 };
+
+type ChatAttachment = {
+  type: string;
+  value: string;
+  title?: string;
+  downloadUrl?: string;
+};
+
+function creationMediaUrl(id: unknown): string {
+  return `/api/creation-media?id=${encodeURIComponent(String(id))}&variant=asset`;
+}
+
+function creationDownloadUrl(id: unknown): string {
+  return `/api/creation-download?id=${encodeURIComponent(String(id))}`;
+}
+
+async function creationForLegacyUrl(ctx: { db: any }, url: string) {
+  const [byUrl, byThumb] = await Promise.all([
+    ctx.db.query("creations").withIndex("by_url", (q: any) => q.eq("url", url)).order("desc").first(),
+    ctx.db.query("creations").withIndex("by_thumb", (q: any) => q.eq("thumb", url)).order("desc").first(),
+  ]);
+  return byUrl ?? byThumb;
+}
+
+// Public message projections never expose the retired public R2 origin. A
+// matched historic card keeps its preview/download behavior through the same
+// owner-authorized creation routes as the current private asset flow. An
+// orphaned legacy card becomes a harmless notice rather than a raw URL.
+export async function safeChatAttachment(ctx: { db: any }, attachment: ChatAttachment): Promise<ChatAttachment> {
+  const valueLegacy = isLegacyCreationUrlForRedaction(attachment.value);
+  const downloadLegacy = isLegacyCreationUrlForRedaction(attachment.downloadUrl);
+  const valueUrl = legacyCreationLookupUrl(attachment.value);
+  const downloadUrl = legacyCreationLookupUrl(attachment.downloadUrl);
+  const safeAttachment: ChatAttachment = {
+    ...attachment,
+    value: redactLegacyCreationUrls(attachment.value),
+    ...(attachment.title ? { title: redactLegacyCreationUrls(attachment.title) } : {}),
+    ...(attachment.downloadUrl ? { downloadUrl: redactLegacyCreationUrls(attachment.downloadUrl) } : {}),
+  };
+  if (!valueLegacy && !downloadLegacy) return safeAttachment;
+
+  const legacyUrls = [...new Set([valueUrl, downloadUrl].filter((url): url is string => Boolean(url)))];
+  const resolved = new Map(await Promise.all(legacyUrls.map(async (url) => [url, await creationForLegacyUrl(ctx, url).catch(() => null)] as const)));
+  const valueCreation = valueUrl ? resolved.get(valueUrl) : null;
+  const downloadCreation = downloadUrl ? resolved.get(downloadUrl) : null;
+  if (valueLegacy && !valueCreation) {
+    return {
+      type: "markdown",
+      value: "This legacy creation media is no longer available in the secure library.",
+      title: safeAttachment.title ?? "Legacy creation media unavailable",
+    };
+  }
+  if (downloadLegacy && !downloadCreation) {
+    const { downloadUrl: _downloadUrl, ...withoutLegacyDownload } = safeAttachment;
+    return valueCreation
+      ? { ...withoutLegacyDownload, value: creationMediaUrl(valueCreation._id) }
+      : withoutLegacyDownload;
+  }
+  return {
+    ...safeAttachment,
+    ...(valueCreation ? { value: creationMediaUrl(valueCreation._id) } : {}),
+    ...(downloadCreation ? { downloadUrl: creationDownloadUrl(downloadCreation._id) } : {}),
+  };
+}
 
 export async function validateReadyMessageFiles(
   ctx: { db: any },
@@ -327,17 +392,23 @@ export async function attachFileBadgesToMessages(ctx: { db: any }, threadId: str
     });
     byMessage.set(String(link.messageId), badges);
   });
-  return rows.map((row) => {
+  const withFiles = rows.map((row) => {
     const badges = byMessage.get(String(row._id));
+    const publicRow = typeof row.text === "string"
+      ? { ...row, text: redactLegacyCreationUrls(row.text) }
+      : row;
     return badges?.length
       ? {
-          ...row,
+          ...publicRow,
           files: badges.sort((left, right) => left.position - right.position).map((badge) => {
             const file = { ...badge };
             delete file.position;
             return file;
           }),
         }
-      : row;
+      : publicRow;
   });
+  return await Promise.all(withFiles.map(async (row) =>
+    row.attachment ? { ...row, attachment: await safeChatAttachment(ctx, row.attachment) } : row,
+  ));
 }

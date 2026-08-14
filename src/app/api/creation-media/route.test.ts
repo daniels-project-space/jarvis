@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mock = vi.hoisted(() => ({
   adminSessionHash: vi.fn(),
@@ -41,6 +41,10 @@ describe("private creation media", () => {
     }));
   });
 
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("streams a private object only after owner authentication and media lookup", async () => {
     const response = await GET(request());
 
@@ -66,6 +70,54 @@ describe("private creation media", () => {
     expect(mock.privateR2Get).toHaveBeenCalledWith(media.assetR2Key, "bytes=1-1");
     expect(response.headers.get("content-range")).toBe("bytes 1-1/3");
     expect(response.headers.get("content-disposition")).toContain("attachment");
+  });
+
+  it("proxies a trusted legacy object only through the authenticated media route", async () => {
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/legacy.png";
+    mock.controlQuery.mockResolvedValue({ legacyUrl, title: "Legacy image", kind: "image" });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new Uint8Array([4, 5]), {
+      status: 200,
+      headers: { "content-type": "image/png", "content-length": "2" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(request("id=legacy-1", { range: "bytes=0-1" }));
+
+    expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledWith(legacyUrl, {
+      cache: "no-store",
+      redirect: "error",
+      headers: { range: "bytes=0-1" },
+    });
+    expect(mock.privateR2Get).not.toHaveBeenCalled();
+    expect(response.headers.get("content-type")).toBe("image/png");
+    await expect(response.arrayBuffer()).resolves.toEqual(new Uint8Array([4, 5]).buffer);
+  });
+
+  it("rejects malformed legacy ranges without fetching the historical object", async () => {
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/legacy.png";
+    mock.controlQuery.mockResolvedValue({ legacyUrl, title: "Legacy image", kind: "image" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(request("id=legacy-1", { range: "bytes=0-1,4-5" }));
+
+    expect(response.status).toBe(416);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized legacy object before returning its body", async () => {
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/large.png";
+    mock.controlQuery.mockResolvedValue({ legacyUrl, title: "Large legacy image", kind: "image" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new Uint8Array([1]), {
+      status: 200,
+      headers: { "content-type": "image/png", "content-length": String(30 * 1024 * 1024 + 1) },
+    })));
+
+    const response = await GET(request("id=legacy-large"));
+
+    expect(response.status).toBe(413);
+    expect(mock.privateR2Get).not.toHaveBeenCalled();
   });
 
   it("fails closed without a media row and never asks storage for an arbitrary key", async () => {

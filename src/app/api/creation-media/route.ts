@@ -1,16 +1,23 @@
 import type { NextRequest } from "next/server";
 import { adminSessionHash, controlQuery, validateAdminSession } from "@/lib/control-session";
+import { fetchTrustedLegacyCreation } from "@/lib/legacy-creation-url";
 import { privateR2Get } from "@/lib/private-r2";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-type CreationMedia = {
+type PrivateCreationMedia = {
   assetR2Key: string;
   assetContentType?: string;
   title: string;
   kind: string;
 };
+type LegacyCreationMedia = {
+  legacyUrl: string;
+  title: string;
+  kind: string;
+};
+type CreationMedia = PrivateCreationMedia | LegacyCreationMedia;
 
 function safeName(value: string): string {
   return (
@@ -58,12 +65,18 @@ export async function GET(req: NextRequest) {
   if (!row) return Response.json({ error: "creation media not found" }, { status: 404 });
 
   const range = req.headers.get("range") ?? undefined;
-  const upstream = await privateR2Get(row.assetR2Key, range).catch(() => null);
+  const upstream = "assetR2Key" in row
+    ? await privateR2Get(row.assetR2Key, range).catch(() => null)
+    : await fetchTrustedLegacyCreation(row.legacyUrl, range);
   if (!upstream || !upstream.ok || !upstream.body) {
-    return Response.json({ error: "creation media unavailable" }, { status: upstream?.status === 404 ? 404 : 502 });
+    return Response.json({ error: "creation media unavailable" }, {
+      status: upstream?.status === 404 ? 404 : upstream?.status === 413 ? 413 : upstream?.status === 416 ? 416 : 502,
+    });
   }
 
-  const contentType = safeMediaType(upstream.headers.get("content-type") || row.assetContentType);
+  const contentType = safeMediaType(
+    upstream.headers.get("content-type") || ("assetContentType" in row ? row.assetContentType : undefined),
+  );
   const filename = `${safeName(row.title)}.${extensionFor(contentType, row.kind)}`;
   const download = req.nextUrl.searchParams.get("download") === "1";
   const headers = new Headers({

@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, hasWorkerCapability, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { tripCanvas } from "./tripCanvas";
+import { redactLegacyCreationUrls } from "../src/lib/legacy-creation-url";
 
 // V2 adds durable multi-city context metadata inside the opaque TripDoc. The
 // document parser deliberately still accepts V1 rows so they are upgraded only
@@ -306,7 +307,12 @@ export const get = query({
     if (row.state === "draft" && row.expiresAt <= Date.now()) return null;
     if (sourceMessageRequired(a.workerToken, a.sourceMessageId)) return null;
     if (hasWorkerCapability(a.workerToken) && !(await sourceMessageMatchesThread(ctx, a.sourceMessageId, row.threadId))) return null;
-    return row;
+    return {
+      ...row,
+      title: redactLegacyCreationUrls(row.title),
+      destination: redactLegacyCreationUrls(row.destination),
+      data: redactLegacyCreationUrls(row.data),
+    };
   },
 });
 

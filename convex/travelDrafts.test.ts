@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import { LEGACY_CREATION_URL_REDACTION, PRIVATE_CREATION_ASSET_KEY_REDACTION } from "../src/lib/legacy-creation-url";
 
 declare global {
   interface ImportMeta {
@@ -368,5 +369,38 @@ describe("conversation-scoped travel drafts", () => {
       sourceMessageId: lisbonMessage,
       workerToken: WORKER,
     })).resolves.toMatchObject({ ok: false, reason: "locked", lockedCreationId: firstLock.creationId });
+  });
+
+  it("redacts creation storage references from a viewer-visible travel draft", async () => {
+    const t = convexTest(schema, modules);
+    const sourceMessageId = await sourceMessage(t, "thread-private-draft");
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/draft.png";
+    const privateKey = "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset";
+    const created = await t.mutation(travelDrafts.createDraft, {
+      threadId: "thread-private-draft",
+      title: legacyUrl,
+      destination: privateKey,
+      data: JSON.stringify({
+        kind: "trip",
+        title: legacyUrl,
+        destination: privateKey,
+        status: "scouting",
+        notes: { legacyUrl, privateKey },
+      }),
+      sourceMessageId,
+      workerToken: WORKER,
+    });
+
+    const viewer = await t.query(travelDrafts.get, { id: created.id, sourceMessageId, workerToken: WORKER });
+    const stored = await t.run((ctx) => ctx.db.get(created.id)) as { title?: string; destination?: string } | null;
+
+    expect(viewer?.title).toContain(LEGACY_CREATION_URL_REDACTION);
+    expect(viewer?.destination).toContain(PRIVATE_CREATION_ASSET_KEY_REDACTION);
+    expect(viewer?.data).toContain(LEGACY_CREATION_URL_REDACTION);
+    expect(viewer?.data).toContain(PRIVATE_CREATION_ASSET_KEY_REDACTION);
+    expect(viewer?.data).not.toContain(legacyUrl);
+    expect(viewer?.data).not.toContain(privateKey);
+    expect(stored?.title).toBe(legacyUrl);
+    expect(stored?.destination).toBe(privateKey);
   });
 });

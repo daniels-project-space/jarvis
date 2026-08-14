@@ -11,13 +11,25 @@ import {
   requireViewer,
   viewerAuthArgs,
 } from "./controlAuth";
+import { safeChatAttachment } from "./fileHelpers";
+
+async function safePanel(ctx: { db: any }, row: any) {
+  if (!row) return null;
+  const attachment = await safeChatAttachment(ctx, {
+    type: row.type,
+    value: row.value,
+    title: row.title,
+  });
+  return { ...row, type: attachment.type, value: attachment.value, title: attachment.title };
+}
 
 export const setPanel = mutation({
   args: { type: v.string(), value: v.string(), title: v.optional(v.string()), ...dispatcherAuthArgs },
   handler: async (ctx, a) => {
     await requireDispatcher(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
-    const doc = { key: "panel", type: a.type, value: a.value, title: a.title, updatedAt: Date.now() };
+    const attachment = await safeChatAttachment(ctx, { type: a.type, value: a.value, title: a.title });
+    const doc = { key: "panel", type: attachment.type, value: attachment.value, title: attachment.title, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
   },
@@ -36,7 +48,7 @@ export const getPanel = query({
   args: { ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    return ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first();
+    return await safePanel(ctx, await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first());
   },
 });
 

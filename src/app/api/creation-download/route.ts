@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { adminSessionHash, controlQuery, validateAdminSession } from "@/lib/control-session";
+import { fetchTrustedLegacyCreation, trustedLegacyCreationUrl } from "@/lib/legacy-creation-url";
 import { markdownToPdf } from "@/lib/pdf";
 import { privateR2Get } from "@/lib/private-r2";
 
@@ -28,7 +29,13 @@ type PrivateCreationMedia = {
   kind: string;
 };
 
-const LEGACY_PUBLIC_CREATION_ORIGIN = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev";
+type LegacyCreationMedia = {
+  legacyUrl: string;
+  title: string;
+  kind: string;
+};
+
+type CreationMedia = PrivateCreationMedia | LegacyCreationMedia;
 
 function safeName(value: string): string {
   return (
@@ -75,24 +82,6 @@ function contentTypeAndExtension(
                 ? "svg"
                 : "bin";
   return { contentType, extension };
-}
-
-function trustedLegacyCreationUrl(value: string | undefined): string | null {
-  if (!value || value.length > 2_048) return null;
-  try {
-    const url = new URL(value);
-    if (
-      url.origin !== LEGACY_PUBLIC_CREATION_ORIGIN
-      || url.username
-      || url.password
-      || url.search
-      || url.hash
-      || !url.pathname.startsWith("/creations/")
-    ) return null;
-    return url.toString();
-  } catch {
-    return null;
-  }
 }
 
 function sourceDownload(row: Creation): { body: string; extension: string; contentType: string } {
@@ -165,8 +154,8 @@ export async function GET(req: NextRequest) {
   }
 
   if (row.hasPrivateAsset) {
-    const media = (await controlQuery("creations:getForMedia", { id, authTokenHash }).catch(() => null)) as PrivateCreationMedia | null;
-    if (!media) return Response.json({ error: "creation asset unavailable" }, { status: 404 });
+    const media = (await controlQuery("creations:getForMedia", { id, authTokenHash }).catch(() => null)) as CreationMedia | null;
+    if (!media || !("assetR2Key" in media)) return Response.json({ error: "creation asset unavailable" }, { status: 404 });
     const upstream = await privateR2Get(media.assetR2Key).catch(() => null);
     if (upstream?.ok && upstream.body) {
       const stored = contentTypeAndExtension(upstream.headers.get("content-type") || media.assetContentType, media.kind);
@@ -175,15 +164,23 @@ export async function GET(req: NextRequest) {
     return Response.json({ error: "creation asset unavailable" }, { status: upstream?.status === 404 ? 404 : 502 });
   }
 
-  // Existing public objects are retained for compatibility, but only the
-  // historical Jarvis R2 origin is ever fetched. This closes an SSRF path in
-  // old rows while the new private storage route takes over all new writes.
-  const legacyUrl = trustedLegacyCreationUrl(row.url);
+  // Historical public objects are retained for compatibility, but their raw
+  // URL is only returned by the server-only media query. Newer viewer records
+  // contain the authenticated first-party proxy URL instead, so use the same
+  // protected lookup as previews before falling back to old data shapes.
+  const media = (await controlQuery("creations:getForMedia", { id, authTokenHash }).catch(() => null)) as CreationMedia | null;
+  const legacyMedia = media && "legacyUrl" in media ? media : null;
+  const legacyUrl = legacyMedia?.legacyUrl ?? trustedLegacyCreationUrl(row.url);
   if (legacyUrl) {
-    const upstream = await fetch(legacyUrl, { cache: "no-store", redirect: "error" }).catch(() => null);
+    const upstream = await fetchTrustedLegacyCreation(legacyUrl);
     if (upstream?.ok && upstream.body) {
-      const media = contentTypeAndExtension(upstream.headers.get("content-type"), row.kind);
-      return attachment(upstream.body, `${base}.${media.extension}`, media.contentType);
+      const stored = contentTypeAndExtension(upstream.headers.get("content-type"), legacyMedia?.kind ?? row.kind);
+      return attachment(upstream.body, `${safeName(legacyMedia?.title ?? row.title)}.${stored.extension}`, stored.contentType);
+    }
+    if (legacyMedia) {
+      return Response.json({ error: "creation asset unavailable" }, {
+        status: upstream?.status === 404 ? 404 : upstream?.status === 413 ? 413 : upstream?.status === 416 ? 416 : 502,
+      });
     }
   }
 

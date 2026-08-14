@@ -29,6 +29,7 @@ import {
   messageFileManifests,
   namedThreadFileManifest,
   recentThreadFileManifest,
+  safeChatAttachment,
   threadFileCatalog,
   validateReadyMessageFiles,
 } from "./fileHelpers";
@@ -1472,7 +1473,7 @@ export const postCard = mutation({
       text: "",
       status: "done",
       delivery: "foreground",
-      attachment: { type: a.type, value: a.value, title: a.title, downloadUrl: a.downloadUrl },
+      attachment: await safeChatAttachment(ctx, { type: a.type, value: a.value, title: a.title, downloadUrl: a.downloadUrl }),
       createdAt: Date.now(),
     });
   },

@@ -2197,6 +2197,8 @@ export default defineSchema({
     .index("by_folder", ["folder", "updatedAt"])
     .index("by_project", ["project", "updatedAt"])
     .index("by_thread", ["threadId", "updatedAt"])
+    .index("by_url", ["url", "updatedAt"])
+    .index("by_thumb", ["thumb", "updatedAt"])
     .index("by_updatedAt", ["updatedAt"]),
 
   // Conversational travel remains deliberately separate from Daniel's saved

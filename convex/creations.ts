@@ -5,6 +5,7 @@ import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./co
 import { inferCreationFiling } from "./creationFiling";
 import { linkMessageFilesToCreation } from "./fileHelpers";
 import { MAX_TRIP_CANVAS_BYTES, tripCanvas, type TripCanvasRecord } from "./tripCanvas";
+import { redactLegacyCreationUrls, trustedLegacyCreationUrl } from "../src/lib/legacy-creation-url";
 
 // JARVIS's atelier — everything he makes (mind maps, charts, images, PDFs,
 // docs) is saved here so nothing he creates is ever lost. The UI lists it
@@ -16,7 +17,7 @@ type TripCanvasWrite = {
   data: string;
 };
 
-function privateCreationMediaUrl(id: Id<"creations">): string {
+function creationMediaUrl(id: Id<"creations">): string {
   return `/api/creation-media?id=${encodeURIComponent(String(id))}&variant=asset`;
 }
 
@@ -24,18 +25,28 @@ function isPrivateCreationAssetKey(value: string | undefined): value is string {
   return Boolean(value && /^owners\/daniel\/creations\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/asset$/i.test(value));
 }
 
-function viewerCreation(row: any) {
+export function viewerCreation(row: any) {
   const { assetR2Key: _assetR2Key, assetContentType: _assetContentType, ...publicRow } = row;
+  for (const field of ["title", "data", "category", "folder", "project", "inquiry"] as const) {
+    if (typeof publicRow[field] === "string") publicRow[field] = redactLegacyCreationUrls(publicRow[field]);
+  }
   const filing = inferCreationFiling(row);
-  if (!isPrivateCreationAssetKey(row.assetR2Key)) return { ...publicRow, ...filing, hasPrivateAsset: false };
-  const mediaUrl = privateCreationMediaUrl(row._id);
-  return {
-    ...publicRow,
-    ...filing,
-    url: mediaUrl,
-    thumb: mediaUrl,
-    hasPrivateAsset: true,
-  };
+  const mediaUrl = creationMediaUrl(row._id);
+  if (isPrivateCreationAssetKey(row.assetR2Key)) {
+    return {
+      ...publicRow,
+      ...filing,
+      url: mediaUrl,
+      thumb: mediaUrl,
+      hasPrivateAsset: true,
+    };
+  }
+  // Historical public objects remain readable through the owner-authorized
+  // media route, but never leave Convex as raw public bucket URLs.
+  if (trustedLegacyCreationUrl(row.url) || trustedLegacyCreationUrl(row.thumb)) {
+    return { ...publicRow, ...filing, url: mediaUrl, thumb: mediaUrl, hasPrivateAsset: false };
+  }
+  return { ...publicRow, ...filing, hasPrivateAsset: false };
 }
 
 function isRecord(value: unknown): value is TripCanvasRecord {
@@ -224,13 +235,18 @@ export const getForMedia = query({
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const row = await ctx.db.get(a.id);
-    if (!row || !isPrivateCreationAssetKey(row.assetR2Key)) return null;
-    return {
-      assetR2Key: row.assetR2Key,
-      assetContentType: typeof row.assetContentType === "string" ? row.assetContentType.slice(0, 160) : undefined,
-      title: row.title,
-      kind: row.kind,
-    };
+    if (!row) return null;
+    if (isPrivateCreationAssetKey(row.assetR2Key)) {
+      return {
+        assetR2Key: row.assetR2Key,
+        assetContentType: typeof row.assetContentType === "string" ? row.assetContentType.slice(0, 160) : undefined,
+        title: row.title,
+        kind: row.kind,
+      };
+    }
+    const legacyUrl = trustedLegacyCreationUrl(row.url) || trustedLegacyCreationUrl(row.thumb);
+    if (!legacyUrl) return null;
+    return { legacyUrl, title: row.title, kind: row.kind };
   },
 });
 

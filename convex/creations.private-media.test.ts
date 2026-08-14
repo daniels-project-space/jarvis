@@ -51,6 +51,29 @@ describe("private creation media records", () => {
     });
   });
 
+  it("masks trusted legacy public creation URLs behind the media route", async () => {
+    const t = convexTest(schema, modules);
+    const legacyUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/legacy.png";
+    const id = await t.run((ctx) => ctx.db.insert("creations", {
+      kind: "image",
+      title: "Legacy image",
+      url: legacyUrl,
+      thumb: legacyUrl,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+
+    const viewer = await t.query(api.creations.get, { id, workerToken: WORKER });
+    const mediaUrl = `/api/creation-media?id=${encodeURIComponent(String(id))}&variant=asset`;
+    expect(viewer).toMatchObject({ hasPrivateAsset: false, url: mediaUrl, thumb: mediaUrl });
+    expect(JSON.stringify(viewer)).not.toContain("r2.dev");
+    await expect(t.query(api.creations.getForMedia, { id, workerToken: WORKER })).resolves.toEqual({
+      legacyUrl,
+      title: "Legacy image",
+      kind: "image",
+    });
+  });
+
   it("rejects non-opaque asset keys before any creation is persisted", async () => {
     const t = convexTest(schema, modules);
 

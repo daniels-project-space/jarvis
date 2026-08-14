@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import { LEGACY_CREATION_URL_REDACTION, LEGACY_PUBLIC_CREATION_ORIGIN } from "../src/lib/legacy-creation-url";
 
 declare global {
   interface ImportMeta {
@@ -140,5 +141,51 @@ describe("brain context active travel workspace", () => {
     const expired = convexTest(schema, modules);
     await insertPanelAndDraft(expired, { expiresAt: Date.now() - 1 });
     await expect(expired.query(brainContext.snapshot, { workerToken: WORKER })).resolves.toMatchObject({ activeTravel: null });
+  });
+
+  it("projects trip and draft media through the safe creation view", async () => {
+    const t = convexTest(schema, modules);
+    const now = Date.now();
+    const legacyUrl = `${LEGACY_PUBLIC_CREATION_ORIGIN}/creations/2026-08/legacy-draft.png`;
+    const privateKey = "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset";
+    const ids = await t.run(async (ctx) => ({
+      tripId: String(await ctx.db.insert("creations", {
+        kind: "trip",
+        title: "Private Sevilla plan",
+        data: JSON.stringify({ imageUrls: { cover: legacyUrl } }),
+        url: legacyUrl,
+        thumb: legacyUrl,
+        assetR2Key: privateKey,
+        assetContentType: "image/png",
+        createdAt: now,
+        updatedAt: now,
+      })),
+      draftId: String(await ctx.db.insert("creations", {
+        kind: "doc",
+        title: "Legacy travel draft",
+        data: JSON.stringify({ imageUrls: { cover: legacyUrl } }),
+        url: legacyUrl,
+        thumb: legacyUrl,
+        createdAt: now,
+        updatedAt: now,
+      })),
+    }));
+
+    const snapshot = await t.query(brainContext.snapshot, { workerToken: WORKER, userText: "continue my travel plan" });
+    const serialized = JSON.stringify({ trip: snapshot.trip, draft: snapshot.draft });
+
+    expect(snapshot.trip).toMatchObject({
+      url: `/api/creation-media?id=${ids.tripId}&variant=asset`,
+      thumb: `/api/creation-media?id=${ids.tripId}&variant=asset`,
+      hasPrivateAsset: true,
+    });
+    expect(snapshot.draft).toMatchObject({
+      url: `/api/creation-media?id=${ids.draftId}&variant=asset`,
+      thumb: `/api/creation-media?id=${ids.draftId}&variant=asset`,
+      hasPrivateAsset: false,
+    });
+    expect(snapshot.draft?.data).toContain(LEGACY_CREATION_URL_REDACTION);
+    expect(serialized).not.toContain(legacyUrl);
+    expect(serialized).not.toContain(privateKey);
   });
 });

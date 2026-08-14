@@ -73,23 +73,33 @@ describe("creation downloads", () => {
   });
 
   it("only fetches legacy assets from the historical Jarvis public origin", async () => {
+    const legacyAssetUrl = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/plan.pdf";
     const legacyRow = {
       _id: "legacy-1",
       kind: "pdf",
       title: "Legacy plan",
-      url: "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev/creations/2026-08/plan.pdf",
+      url: "/api/creation-media?id=legacy-1&variant=asset",
+      thumb: "/api/creation-media?id=legacy-1&variant=thumb",
+      hasPrivateAsset: false,
     };
-    mock.controlQuery.mockResolvedValue(legacyRow);
+    mock.controlQuery.mockImplementation(async (path: string) => {
+      if (path === "creations:get") return legacyRow;
+      if (path === "creations:getForMedia") {
+        return { legacyUrl: legacyAssetUrl, title: legacyRow.title, kind: legacyRow.kind };
+      }
+      return null;
+    });
     const fetchMock = vi.fn().mockResolvedValue(new Response(new Uint8Array([9]), {
       status: 200,
-      headers: { "content-type": "application/pdf" },
+      headers: { "content-type": "application/pdf", "content-length": "1" },
     }));
     vi.stubGlobal("fetch", fetchMock);
 
     const response = await GET(request("legacy-1"));
 
     expect(response.status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledWith(legacyRow.url, { cache: "no-store", redirect: "error" });
+    expect(mock.controlQuery).toHaveBeenNthCalledWith(2, "creations:getForMedia", { id: "legacy-1", authTokenHash: OWNER });
+    expect(fetchMock).toHaveBeenCalledWith(legacyAssetUrl, { cache: "no-store", redirect: "error" });
     expect(response.headers.get("content-type")).toBe("application/pdf");
   });
 

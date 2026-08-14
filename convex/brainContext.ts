@@ -1,6 +1,8 @@
 import { query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireViewer, viewerAuthArgs } from "./controlAuth";
+import { viewerCreation } from "./creations";
+import { safeChatAttachment } from "./fileHelpers";
 
 const ACTIVE_TRAVEL_BOOKING_REFERENCE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 
@@ -28,6 +30,16 @@ function activePanelDraftId(panel: unknown) {
   } catch {
     return "";
   }
+}
+
+async function viewerPanel(ctx: { db: any }, panel: any) {
+  if (!panel) return null;
+  const attachment = await safeChatAttachment(ctx, {
+    type: String(panel.type ?? "markdown"),
+    value: String(panel.value ?? ""),
+    title: typeof panel.title === "string" ? panel.title : undefined,
+  });
+  return { ...panel, type: attachment.type, value: attachment.value, title: attachment.title };
 }
 
 function activeTravelSummary(draft: any, activeThreadId: string, now: number) {
@@ -260,10 +272,10 @@ export const snapshot = query({
         })),
       jobs: activeJobs.map((job: any) => ({ ...job, _id: job.jobId })),
       findings,
-      trip,
-      draft,
+      trip: trip ? viewerCreation(trip) : null,
+      draft: draft ? viewerCreation(draft) : null,
       location,
-      panel,
+      panel: await viewerPanel(ctx, panel),
       activeTravel,
       creations: creations.map((creation: any) => ({
         id: String(creation._id),
