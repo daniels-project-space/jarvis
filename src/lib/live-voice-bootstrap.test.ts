@@ -95,6 +95,24 @@ describe("live voice bootstrap policy", () => {
     expect(toggleLive).not.toContain("const microphone = ensurePersistentLiveMic");
   });
 
+  it("takes an origin-wide browser lease before a guest or overlay can open capture", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    const toggleLive = source.slice(
+      source.indexOf("async function toggleLive"),
+      source.indexOf("async function enableMicrophone"),
+    );
+    expect(toggleLive).toContain("await tryAcquireBrowserVoiceLease({");
+    expect(toggleLive).toContain("if (guest) return true;");
+    expect(toggleLive).not.toContain("guest\n      ? Promise.resolve(true)");
+    expect(toggleLive).toContain("releaseLiveLease: releaseStartLease");
+  });
+
+  it("keeps the single spoken transcript slightly smaller and lower than the orb", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    expect(source).toContain("text-base font-semibold leading-snug tracking-tight md:text-[1.4rem] lg:text-[1.6rem]");
+    expect(source).toContain('"top-[60%] inset-x-0"');
+  });
+
   it("opens capture only after its shared live lease wins across documents", async () => {
     const firstLease = deferred<boolean>();
     const secondLease = deferred<boolean>();

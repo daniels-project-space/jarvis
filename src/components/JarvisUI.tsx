@@ -35,6 +35,11 @@ import {
   startLiveWithLease,
 } from "@/lib/live-voice-bootstrap";
 import {
+  tryAcquireBrowserVoiceLease,
+  type BrowserVoiceLease,
+  type BrowserVoiceLeaseResult,
+} from "@/lib/browser-voice-lease";
+import {
   LIVE_SPEAKER_TAIL_MS,
   LIVE_BARGE_SAMPLE_MS,
   advanceLiveVad,
@@ -1436,7 +1441,7 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
       ref={boxRef}
       data-jarvis-caption
       data-caption-phase={caption.phase ?? "ready"}
-      className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[24vh] max-w-[min(780px,86%)] overflow-hidden text-center text-lg font-semibold leading-snug tracking-tight md:text-[1.55rem] lg:text-[1.75rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
+      className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[24vh] max-w-[min(780px,86%)] overflow-hidden text-center text-base font-semibold leading-snug tracking-tight md:text-[1.4rem] lg:text-[1.6rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
     >
       {caption.text}
     </div>
@@ -1904,6 +1909,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const recRef = useRef<MediaRecorder | null>(null);
   const liveMicRef = useRef<LiveMicrophoneResources | null>(null);
   const liveMicOpeningRef = useRef<Promise<LiveMicrophoneResources> | null>(null);
+  const browserLiveLeaseRef = useRef<BrowserVoiceLease | null>(null);
+  const browserLiveLeaseReleaseRef = useRef<Promise<void> | null>(null);
   const liveSessionEpoch = useRef(0);
   const liveInterruptionEpoch = useRef(0);
   const voiceInterruptionPendingRef = useRef(false);
@@ -2421,6 +2428,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           keepalive: true,
         }).catch(() => {});
       }
+      void releaseBrowserLiveLease();
       if (guest || !liveRef.current) return;
       const liveBody = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
       void viewerFetch("/api/client-mutation", {
@@ -3791,6 +3799,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     void resources?.context.close().catch(() => {});
     recRef.current = null;
   }
+  function releaseBrowserLiveLease(lease = browserLiveLeaseRef.current): Promise<void> {
+    if (!lease) return browserLiveLeaseReleaseRef.current ?? Promise.resolve();
+    if (browserLiveLeaseRef.current === lease) browserLiveLeaseRef.current = null;
+    const release = lease.release().catch(() => {});
+    browserLiveLeaseReleaseRef.current = release;
+    void release.finally(() => {
+      if (browserLiveLeaseReleaseRef.current === release) browserLiveLeaseReleaseRef.current = null;
+    });
+    return release;
+  }
   function cancelFreeRearm() {
     if (freeRearmTimer.current) clearTimeout(freeRearmTimer.current);
     freeRearmTimer.current = null;
@@ -3805,6 +3823,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   function releaseLive() {
     cancelFreeRearm();
     closePersistentLiveMic();
+    void releaseBrowserLiveLease();
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = null;
     captionRef.current = null;
@@ -3857,16 +3876,43 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     freeLoop.current = true;
     liveRef.current = true;
     setLive("connecting");
-    const ownership = guest
-      ? Promise.resolve(true)
-      : setLiveOn({ client: me.current, on: true });
+    let browserLease: BrowserVoiceLease | null = null;
+    let browserLeaseOutcome: BrowserVoiceLeaseResult["status"] | null = null;
+    let remoteLeaseOwned = false;
+    const releaseStartLease = async () => {
+      await releaseBrowserLiveLease(browserLease);
+      if (!guest && remoteLeaseOwned) {
+        remoteLeaseOwned = false;
+        await setLiveOn({ client: me.current, on: false }).catch(() => {});
+      }
+    };
     const started = await startLiveWithLease({
       acquireLiveLease: async () => {
+        // Wait only for this document's just-released lock. Waiting for other
+        // documents would silently queue a second microphone session.
+        await browserLiveLeaseReleaseRef.current?.catch(() => {});
+        const browserLeaseResult = await tryAcquireBrowserVoiceLease({
+          isStillWanted: () => liveRef.current && sessionEpoch === liveSessionEpoch.current,
+        });
+        browserLeaseOutcome = browserLeaseResult.status;
+        if (browserLeaseResult.status !== "acquired") return false;
+        browserLease = browserLeaseResult.lease;
+        if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
+          await releaseBrowserLiveLease(browserLease);
+          return false;
+        }
+        browserLiveLeaseRef.current = browserLease;
+        if (guest) return true;
+        const ownership = setLiveOn({ client: me.current, on: true });
         try {
-          return await withClientDeadline(ownership, 5_000, "live ownership");
+          const owned = await withClientDeadline(ownership, 5_000, "live ownership");
+          if (!owned) await releaseBrowserLiveLease(browserLease);
+          remoteLeaseOwned = owned;
+          return owned;
         } catch (error) {
           // A late successful claim must not leave a ghost live owner after
           // this UI has already recovered to standby.
+          await releaseBrowserLiveLease(browserLease);
           void ownership.then((claimed) => {
             if (!guest && claimed && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
           }, () => undefined);
@@ -3874,14 +3920,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
       },
       openMicrophone: ensurePersistentLiveMic,
-      releaseLiveLease: async () => {
-        if (!guest) await setLiveOn({ client: me.current, on: false }).catch(() => {});
-      },
-      isStillWanted: () => liveRef.current,
+      releaseLiveLease: releaseStartLease,
+      isStillWanted: () => liveRef.current && sessionEpoch === liveSessionEpoch.current,
       closeMicrophone: () => closePersistentLiveMic(),
     });
     if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
       if (started.status === "ready" && !liveRef.current) closePersistentLiveMic();
+      await releaseStartLease();
       return false;
     }
     if (started.status === "not-owned" || (started.status === "failed" && started.stage === "lease")) {
@@ -3889,7 +3934,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       liveRef.current = false;
       setLive("off");
       closePersistentLiveMic();
-      showCaption({ who: "jarvis", text: "I could not start live listening. Check the connection, then tap the mic to retry." });
+      const reason = browserLeaseOutcome === "busy"
+        ? "Live listening is already active in another Jarvis window."
+        : browserLeaseOutcome === "unsupported"
+          ? "This browser cannot safely share the microphone across Jarvis windows. Open Jarvis in a current browser, then retry."
+          : "I could not start live listening. Check the connection, then tap the mic to retry.";
+      showCaption({ who: "jarvis", text: reason });
       rearmWake();
       return false;
     }
@@ -3931,6 +3981,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     liveRef.current = false;
     cancelFreeRearm();
     closePersistentLiveMic();
+    void releaseBrowserLiveLease();
   }, []);
 
   useEffect(() => {
@@ -5377,7 +5428,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               finalization and narration. Compact overlays keep it beside their
               visible orb; only a truly full-screen workspace owns the surface. */}
           {caption && !fullBleed && (
-            <div className={`pointer-events-none absolute ${compactAside || (commandExpanded && !overlayUp) ? "top-[72%] hidden md:flex md:left-[62%] md:right-0" : "top-[57%] inset-x-0"} z-30 flex justify-center px-6`}>
+            <div className={`pointer-events-none absolute ${compactAside || (commandExpanded && !overlayUp) ? "top-[72%] hidden md:flex md:left-[62%] md:right-0" : "top-[60%] inset-x-0"} z-30 flex justify-center px-6`}>
               <SpokenCaption caption={caption} />
             </div>
           )}

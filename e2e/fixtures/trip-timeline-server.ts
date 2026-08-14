@@ -14,6 +14,9 @@ const contentTypes: Record<string, string> = {
   "/": "text/html; charset=utf-8",
   "/fixture.js": "text/javascript; charset=utf-8",
   "/fixture.css": "text/css; charset=utf-8",
+  "/voice": "text/html; charset=utf-8",
+  "/voice-child": "text/html; charset=utf-8",
+  "/voice.js": "text/javascript; charset=utf-8",
 };
 
 const csp = [
@@ -42,6 +45,33 @@ const fixtureHtml = `<!doctype html>
   </body>
 </html>`;
 
+const voiceFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser voice lease fixture</title>
+  </head>
+  <body>
+    <main aria-label="Browser voice lease fixture">
+      <h1>Browser voice lease fixture</h1>
+      <iframe title="Main Jarvis" src="/voice-child?frame=main"></iframe>
+      <iframe title="Overlay Jarvis" src="/voice-child?frame=overlay"></iframe>
+    </main>
+  </body>
+</html>`;
+
+const voiceChildHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <script src="/voice.js" defer></script>
+  </body>
+</html>`;
+
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
 
@@ -49,8 +79,11 @@ async function main() {
   absWorkingDir: projectRoot,
   bundle: true,
   define: { "process.env.NODE_ENV": JSON.stringify("test") },
-  entryNames: "fixture",
-  entryPoints: { fixture: join(projectRoot, "e2e/fixtures/trip-timeline.browser.tsx") },
+  entryNames: "[name]",
+  entryPoints: {
+    fixture: join(projectRoot, "e2e/fixtures/trip-timeline.browser.tsx"),
+    voice: join(projectRoot, "e2e/fixtures/browser-voice-lease.browser.ts"),
+  },
   format: "iife",
   jsx: "automatic",
   loader: { ".css": "css", ".svg": "dataurl" },
@@ -65,7 +98,8 @@ async function main() {
 
   const fixtureJsPath = join(outputDir, "fixture.js");
   const fixtureCssPath = join(outputDir, "fixture.css");
-  await Promise.all([access(fixtureJsPath), access(fixtureCssPath)]);
+  const voiceJsPath = join(outputDir, "voice.js");
+  await Promise.all([access(fixtureJsPath), access(fixtureCssPath), access(voiceJsPath)]);
 
   const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
@@ -97,9 +131,25 @@ async function main() {
     response.end(fixtureHtml);
     return;
   }
+  if (pathname === "/voice") {
+    response.writeHead(200);
+    response.end(voiceFixtureHtml);
+    return;
+  }
+  if (pathname === "/voice-child") {
+    response.writeHead(200);
+    response.end(voiceChildHtml);
+    return;
+  }
 
   response.writeHead(200);
-  response.end(await readFile(pathname === "/fixture.js" ? fixtureJsPath : fixtureCssPath));
+  response.end(await readFile(
+    pathname === "/fixture.js"
+      ? fixtureJsPath
+      : pathname === "/fixture.css"
+        ? fixtureCssPath
+        : voiceJsPath,
+  ));
   });
 
   const cleanup = async () => {

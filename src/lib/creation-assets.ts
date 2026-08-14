@@ -74,7 +74,7 @@ export async function storePrivateCreationAssetFromUrl(
   return await putPrivateCreationAsset(bytes, response.headers.get("content-type") ?? "application/octet-stream", purpose);
 }
 
-export async function deletePrivateCreationAsset(asset: Pick<PrivateCreationAsset, "key"> | string): Promise<void> {
+export async function deletePrivateCreationAsset(asset: PrivateCreationAsset | string): Promise<void> {
   const key = typeof asset === "string" ? asset : asset.key;
   await privateR2Delete(key);
 }
