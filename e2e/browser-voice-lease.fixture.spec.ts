@@ -59,6 +59,13 @@ test.describe("Browser live microphone lease fixture", () => {
       overlay.getByRole("button", { name: "Start live listening" }).click(),
     ]);
 
+    await expect.poll(async () => {
+      const statuses = await Promise.all([
+        main.getByLabel("Live microphone status").textContent(),
+        overlay.getByLabel("Live microphone status").textContent(),
+      ]);
+      return statuses.sort();
+    }).toEqual(["busy", "live"]);
     const [mainStatus, overlayStatus] = await Promise.all([
       main.getByLabel("Live microphone status").textContent(),
       overlay.getByLabel("Live microphone status").textContent(),

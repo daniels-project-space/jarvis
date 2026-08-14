@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
@@ -56,6 +56,35 @@ describe("standby listener lease", () => {
       on: true,
       authTokenHash: OWNER,
     })).resolves.toBe(true);
+  });
+
+  it("expires exactly at the handoff boundary so another listener can claim", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-14T10:00:00Z"));
+      const t = convexTest(schema, modules);
+      await ownerSession(t);
+
+      await expect(t.mutation(api.ui.setStandbyListener, {
+        client: "main-tab",
+        on: true,
+        authTokenHash: OWNER,
+      })).resolves.toBe(true);
+
+      vi.advanceTimersByTime(24_999);
+      await expect(t.query(api.ui.getStandbyListener, { workerToken: WORKER }))
+        .resolves.toMatchObject({ value: "main-tab" });
+
+      vi.advanceTimersByTime(1);
+      await expect(t.query(api.ui.getStandbyListener, { workerToken: WORKER })).resolves.toBeNull();
+      await expect(t.mutation(api.ui.setStandbyListener, {
+        client: "overlay-frame",
+        on: true,
+        authTokenHash: OWNER,
+      })).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not expose or mutate the lease without an owner capability", async () => {

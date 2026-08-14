@@ -110,6 +110,15 @@ describe("live voice bootstrap policy", () => {
     expect(toggleLive).toContain("releaseLiveLease: releaseStartLease");
   });
 
+  it("stops standby recognition before a disconnected server lease can hand off", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    expect(source).toContain("createStandbyListenerLeaseFence");
+    expect(source).toContain("renewStandbyListenerLease");
+    expect(source).toContain("onRenewed: () => {");
+    expect(source).toContain("onLost: releaseStandbyListener");
+    expect(source).toContain("standbyLeaseFence.clear()");
+  });
+
   it("keeps the single spoken transcript slightly smaller and lower than the orb", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
     expect(source).toContain("SPOKEN_CAPTION_TEXT_CLASS");

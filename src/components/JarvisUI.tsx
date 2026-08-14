@@ -88,6 +88,11 @@ import {
   type FinalDeliveryCursor,
 } from "@/lib/final-delivery";
 import { withClientDeadline } from "@/lib/client-deadline";
+import {
+  createStandbyListenerLeaseFence,
+  renewStandbyListenerLease,
+  STANDBY_LISTENER_RENEWAL_INTERVAL_MS,
+} from "@/lib/standby-listener-lease";
 import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
 import {
   SpeechRecognitionRequestError,
@@ -1949,6 +1954,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const standbyClaimingRef = useRef(false);
   const standbyEpochRef = useRef(0);
   const standbyHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const standbyLeaseExpiryRef = useRef<() => void>(() => {});
+  const [standbyLeaseFence] = useState(() => createStandbyListenerLeaseFence({
+    onExpiry: () => standbyLeaseExpiryRef.current(),
+  }));
   const voiceRef = useRef<{ value: string; updatedAt: number } | null>(null);
   const localVoiceLeaseUntilRef = useRef(0);
   const localVoiceClaimedAtRef = useRef(0);
@@ -2293,6 +2302,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const releaseStandbyListener = () => {
     standbyEpochRef.current += 1;
     clearStandbyHeartbeat();
+    standbyLeaseFence.clear();
     const owned = standbyLeaseOwnedRef.current;
     standbyLeaseOwnedRef.current = false;
     stopStandbyRecognition();
@@ -2307,15 +2317,27 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         releaseStandbyListener();
         return;
       }
-      void setStandbyListener({ client: me.current, on: true })
-        .then((held) => {
-          // Fail closed. If this browser cannot renew its fence, it must not
-          // keep a native recognizer alive past the server-side lease.
-          if (held !== true) releaseStandbyListener();
-        })
-        .catch(() => releaseStandbyListener());
-    }, 8_000);
+      const renewalEpoch = standbyEpochRef.current;
+      void renewStandbyListenerLease({
+        renewRemote: () => setStandbyListener({ client: me.current, on: true }),
+        stillOwnsLease: () => (
+          renewalEpoch === standbyEpochRef.current
+          && standbyLeaseOwnedRef.current
+        ),
+        onRenewed: () => {
+          if (document.hidden || !standbyIsEligible()) {
+            releaseStandbyListener();
+            return;
+          }
+          // Only a completed renewal extends the local fence, so a
+          // disconnected tab stops before the server can hand the lease over.
+          standbyLeaseFence.renew();
+        },
+        onLost: releaseStandbyListener,
+      });
+    }, STANDBY_LISTENER_RENEWAL_INTERVAL_MS);
   };
+  standbyLeaseExpiryRef.current = releaseStandbyListener;
   const onWakeDetected = () => {
     setWake(false);
     setChatMode(embedded ? "off" : "full", false);
@@ -2389,10 +2411,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
       standbyLeaseOwnedRef.current = true;
+      standbyLeaseFence.renew();
       if (wakeOwnedByHost()) {
         postToParent({ jarvis: "host-listener-grant" });
       } else {
         const m = await import("../lib/wakeword");
+        if (
+          epoch !== standbyEpochRef.current
+          || !standbyLeaseOwnedRef.current
+          || document.hidden
+          || !standbyIsEligible()
+        ) {
+          m.stopWake();
+          return;
+        }
         if (!m.wakeSupported()) {
           releaseStandbyListener();
           return;
@@ -2439,7 +2471,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     rearmWake(); // resume standby across reloads if Daniel left it on
     // release the live lock instantly if the tab closes mid-session
     const bye = () => {
+      standbyEpochRef.current += 1;
       clearStandbyHeartbeat();
+      standbyLeaseFence.clear();
       const standbyOwned = standbyLeaseOwnedRef.current;
       standbyLeaseOwnedRef.current = false;
       stopStandbyRecognition();
