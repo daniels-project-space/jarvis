@@ -79,6 +79,11 @@ import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { googleOAuthReturnNotice, type GoogleOAuthReturnNotice } from "@/lib/google-oauth-return";
 import { hubContextStatusPresentation, type HubContextStatus } from "@/lib/hub-context-status";
+import {
+  isNovitaPatchProposerStatus,
+  novitaPatchProposerStatusPresentation,
+  type NovitaPatchProposerStatus,
+} from "@/lib/novita-patch-proposer-status";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
 import {
   authoritativeCancellationReceipt,
@@ -599,6 +604,24 @@ function OptionsPanel({
     return () => controller.abort();
   }, []);
   const hubContext = hubContextStatusPresentation(hubContextStatus);
+  const [novitaPatchProposerStatus, setNovitaPatchProposerStatus] = useState<NovitaPatchProposerStatus>("checking");
+  useEffect(() => {
+    const controller = new AbortController();
+    void viewerFetch("/api/novita-patch-proposer/status", { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        const body = await response.json().catch(() => null) as { configured?: unknown; code?: unknown } | null;
+        if (!response.ok || typeof body?.configured !== "boolean" || !isNovitaPatchProposerStatus(body.code)) {
+          throw new Error("Novita patch-proposer status unavailable");
+        }
+        setNovitaPatchProposerStatus(body.code);
+      })
+      .catch((error) => {
+        if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
+        setNovitaPatchProposerStatus("unavailable");
+      });
+    return () => controller.abort();
+  }, []);
+  const novitaPatchProposer = novitaPatchProposerStatusPresentation(novitaPatchProposerStatus);
   return (
     <>
       <div className="fixed inset-0 z-[55]" onClick={onClose} />
@@ -668,6 +691,11 @@ function OptionsPanel({
           <Row label="Project Hub context" hint={hubContext.hint}>
             <span className={`rounded-lg border px-3 py-1 text-[11px] ${hubContext.tone === "ready" ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : hubContext.tone === "attention" ? "border-amber-300/30 bg-amber-300/10 text-amber-100" : "border-white/10 bg-black/20 text-slate"}`}>
               {hubContext.label}
+            </span>
+          </Row>
+          <Row label="Novita code drafts" hint={novitaPatchProposer.hint}>
+            <span className={`rounded-lg border px-3 py-1 text-[11px] ${novitaPatchProposer.tone === "ready" ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : novitaPatchProposer.tone === "attention" ? "border-amber-300/30 bg-amber-300/10 text-amber-100" : "border-white/10 bg-black/20 text-slate"}`}>
+              {novitaPatchProposer.label}
             </span>
           </Row>
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>

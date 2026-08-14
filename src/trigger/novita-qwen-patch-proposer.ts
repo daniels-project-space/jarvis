@@ -1,10 +1,11 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHmac } from "node:crypto";
 
 import {
   canonicalNovitaPatchProposerAttestation,
   configuredNovitaPatchProposer,
   type NovitaPatchProposerAttestation,
 } from "../lib/novita-patch-proposer-attestation";
+import { novitaPatchProposerRuntimeConfigDigest } from "../lib/novita-patch-proposer-runtime-config.server";
 import { redactSensitiveText } from "../lib/secret-redaction";
 
 export type NovitaProposalSourceFile = Readonly<{
@@ -62,24 +63,6 @@ function normaliseSourceFiles(
     normalised.push(Object.freeze({ path: file.path, content: file.content }));
   }
   return Object.freeze(normalised);
-}
-
-export function novitaPatchProposerRuntimeConfigDigest(
-  config: NonNullable<ReturnType<typeof configuredNovitaPatchProposer>>,
-): string {
-  const value = {
-    endpointUrl: config.endpointUrl,
-    adapterId: config.attestation.adapterId,
-    endpointId: config.attestation.endpointId,
-    modelId: config.attestation.modelId,
-    modelRevision: config.attestation.modelRevision,
-    imageDigest: config.attestation.imageDigest,
-    quantization: config.attestation.quantization,
-    api: config.attestation.api,
-    endpointAuth: config.attestation.endpointAuth,
-    requestLimits: config.attestation.requestLimits,
-  };
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function sameAttestation(

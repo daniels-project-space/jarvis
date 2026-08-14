@@ -1,7 +1,7 @@
 import {
   configuredNovitaPatchProposer,
 } from "../src/lib/novita-patch-proposer-attestation";
-import { novitaPatchProposerRuntimeConfigDigest } from "../src/trigger/novita-qwen-patch-proposer";
+import { novitaPatchProposerRuntimeConfigDigest } from "../src/lib/novita-patch-proposer-runtime-config.server";
 
 const config = configuredNovitaPatchProposer(process.env);
 
