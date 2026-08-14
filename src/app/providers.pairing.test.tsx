@@ -18,9 +18,20 @@ import Providers, { viewerRetryDelayMs } from "./providers";
 describe("open owner provider boundary", () => {
   it("bootstraps every route without rendering a lock state", () => {
     const html = renderToStaticMarkup(<Providers><main>Private workspace</main></Providers>);
-    expect(html).toContain("Initializing Jarvis");
+    expect(html).toContain("Ready when you are.");
     expect(html).not.toContain("Private workspace");
     expect(html).not.toMatch(/locked|pair/i);
+  });
+
+  it("renders the live workspace immediately when the server provides a viewer capability", () => {
+    const html = renderToStaticMarkup(
+      <Providers initialViewerToken="server-issued.viewer.capability">
+        <main>Private workspace</main>
+      </Providers>,
+    );
+
+    expect(html).toContain("Private workspace");
+    expect(html).not.toContain("Initializing Jarvis");
   });
 
   it("backs off outages with bounded jitter instead of polling every few seconds forever", () => {

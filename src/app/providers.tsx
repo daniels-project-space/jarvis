@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -14,6 +15,7 @@ import { resolveConvexUrl } from "@/lib/convex-url";
 import { ViewerSessionProvider } from "@/lib/viewer-session";
 import { setViewerRequestToken } from "@/lib/viewer-request";
 import { ConvexAuthGate } from "./ConvexAuthGate";
+import { JarvisBootShell } from "./JarvisBootShell";
 
 const convex = new ConvexReactClient(resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL), {
   // The viewer JWT is already fresh when this provider mounts. Reusing it lets
@@ -25,6 +27,10 @@ const convex = new ConvexReactClient(resolveConvexUrl(process.env.NEXT_PUBLIC_CO
 type ViewerAuth = {
   fetchAccessToken: (args: { forceRefreshToken: boolean }) => Promise<string | null>;
 };
+type ViewerCapability = {
+  token: string;
+  expiresAt: number | null;
+};
 const ViewerAuthContext = createContext<ViewerAuth | null>(null);
 
 class ViewerTokenError extends Error {
@@ -35,7 +41,7 @@ class ViewerTokenError extends Error {
 
 type AuthFailure = "offline";
 
-async function requestViewerToken(): Promise<string> {
+async function requestViewerToken(): Promise<ViewerCapability> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -46,7 +52,12 @@ async function requestViewerToken(): Promise<string> {
       if (!response.ok) throw new ViewerTokenError(response.status);
       const payload = await response.json();
       if (typeof payload.viewerToken !== "string") throw new Error("viewer capability missing");
-      return payload.viewerToken;
+      return {
+        token: payload.viewerToken,
+        expiresAt: typeof payload.expiresAt === "number" && Number.isFinite(payload.expiresAt)
+          ? payload.expiresAt
+          : null,
+      };
     } catch (error) {
       lastError = error;
       if (error instanceof ViewerTokenError && (error.status === 401 || error.status === 403)) break;
@@ -71,14 +82,57 @@ function useJarvisConvexAuth() {
   }), [auth]);
 }
 
-export default function Providers({ children }: { children: ReactNode }) {
-  return <OwnerProviders>{children}</OwnerProviders>;
+export default function Providers({
+  children,
+  /** A short-lived signed capability issued after server-side session validation. */
+  initialViewerToken,
+  initialViewerTokenExpiresAt,
+}: {
+  children: ReactNode;
+  initialViewerToken?: string | null;
+  initialViewerTokenExpiresAt?: number | null;
+}) {
+  return (
+    <OwnerProviders
+      initialViewerToken={initialViewerToken}
+      initialViewerTokenExpiresAt={initialViewerTokenExpiresAt}
+    >
+      {children}
+    </OwnerProviders>
+  );
 }
 
-function OwnerProviders({ children }: { children: ReactNode }) {
-  const [viewerToken, setViewerToken] = useState<string | null>(null);
-  const viewerTokenRef = useRef<string | null>(null);
-  const refreshPromiseRef = useRef<Promise<string> | null>(null);
+function OwnerProviders({
+  children,
+  initialViewerToken,
+  initialViewerTokenExpiresAt,
+}: {
+  children: ReactNode;
+  initialViewerToken?: string | null;
+  initialViewerTokenExpiresAt?: number | null;
+}) {
+  // The app shell used to render black until this client component finished a
+  // POST to /api/auth/viewer. A server-issued JWT is already the same bounded
+  // capability Convex expects, so use it synchronously. A missing bootstrap
+  // value keeps the established client recovery path intact.
+  const bootstrapTokenRef = useRef<string | null>(
+    typeof initialViewerToken === "string" && initialViewerToken.trim() ? initialViewerToken : null,
+  );
+  const [viewerToken, setViewerToken] = useState<string | null>(bootstrapTokenRef.current);
+  const viewerTokenRef = useRef<string | null>(bootstrapTokenRef.current);
+  const viewerTokenExpiresAtRef = useRef<number | null>(
+    bootstrapTokenRef.current && typeof initialViewerTokenExpiresAt === "number"
+      ? initialViewerTokenExpiresAt
+      : null,
+  );
+  // `viewerFetch` is module-scoped so its Authorization header must be ready
+  // during hydration, before descendant passive effects can issue a same-origin
+  // API call. A layout effect runs before paint without mutating browser state
+  // from an abandoned React render.
+  useLayoutEffect(() => {
+    if (bootstrapTokenRef.current) setViewerRequestToken(bootstrapTokenRef.current);
+  }, []);
+  const refreshPromiseRef = useRef<Promise<ViewerCapability> | null>(null);
   const [error, setError] = useState<AuthFailure | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
   const retryViewerToken = useCallback(() => {
@@ -86,8 +140,9 @@ function OwnerProviders({ children }: { children: ReactNode }) {
     setRetryNonce((value) => value + 1);
   }, []);
 
-  const acceptViewerToken = useCallback((token: string) => {
+  const acceptViewerToken = useCallback(({ token, expiresAt }: ViewerCapability) => {
     viewerTokenRef.current = token;
+    viewerTokenExpiresAtRef.current = expiresAt;
     // The short-lived signed owner viewer capability is also verified at the
     // server API boundary. This keeps third-party-cookie-blocked overlays fully
     // functional without popup pairing or a second Convex control session.
@@ -98,9 +153,9 @@ function OwnerProviders({ children }: { children: ReactNode }) {
   const refreshViewerToken = useCallback(async () => {
     if (refreshPromiseRef.current) return refreshPromiseRef.current;
     const request = requestViewerToken()
-      .then((token) => {
-        acceptViewerToken(token);
-        return token;
+      .then((capability) => {
+        acceptViewerToken(capability);
+        return capability;
       })
       .finally(() => {
         refreshPromiseRef.current = null;
@@ -118,7 +173,7 @@ function OwnerProviders({ children }: { children: ReactNode }) {
     const current = viewerTokenRef.current;
     if (!forceRefreshToken && current) return current;
     try {
-      return await refreshViewerToken();
+      return (await refreshViewerToken()).token;
     } catch {
       // A short network transition should not discard a still-valid six-hour
       // capability. Convex can retry after the socket recovers.
@@ -132,33 +187,41 @@ function OwnerProviders({ children }: { children: ReactNode }) {
     let active = true;
     let retryQueued = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const tokenNeedsRefresh = () => {
+      const expiresAt = viewerTokenExpiresAtRef.current;
+      return !viewerTokenRef.current || !expiresAt || expiresAt <= Date.now() + 2 * 60_000;
+    };
     const retryWhenAvailable = () => {
       if (retryQueued || document.hidden || !navigator.onLine) return;
+      if (!tokenNeedsRefresh()) return;
       retryQueued = true;
       retryViewerToken();
     };
     const load = async () => {
-      const token = await requestViewerToken();
-      if (active) acceptViewerToken(token);
+      if (!tokenNeedsRefresh()) return;
+      await refreshViewerToken();
     };
     void load().catch(() => {
         if (!active) return;
-        setError("offline");
-        window.addEventListener("online", retryWhenAvailable);
-        document.addEventListener("visibilitychange", retryWhenAvailable);
+        // A server-bootstrap token remains usable during a brief offline
+        // transition. Keep Jarvis visible and let the retry loop refresh it
+        // rather than replacing the running UI with a full-screen error.
+        if (!viewerTokenRef.current) setError("offline");
         if (!document.hidden && navigator.onLine) {
           retryTimer = setTimeout(retryWhenAvailable, viewerRetryDelayMs(retryNonce));
         }
       });
+    window.addEventListener("online", retryWhenAvailable);
+    document.addEventListener("visibilitychange", retryWhenAvailable);
     return () => {
       active = false;
       if (retryTimer) clearTimeout(retryTimer);
       window.removeEventListener("online", retryWhenAvailable);
       document.removeEventListener("visibilitychange", retryWhenAvailable);
     };
-  }, [acceptViewerToken, retryNonce, retryViewerToken]);
+  }, [acceptViewerToken, refreshViewerToken, retryNonce, retryViewerToken]);
 
-  if (error) {
+  if (error && !viewerToken) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[#050506] px-6 text-[#f4f2ed]">
         <section className="w-full max-w-lg overflow-hidden rounded-[28px] border border-white/10 bg-[radial-gradient(circle_at_top,rgba(245,166,35,0.13),transparent_45%),rgba(14,14,16,0.96)] p-7 shadow-[0_30px_100px_rgba(0,0,0,0.6)] sm:p-9">
@@ -183,7 +246,7 @@ function OwnerProviders({ children }: { children: ReactNode }) {
       </main>
     );
   }
-  if (!viewerToken) return <main aria-label="Initializing Jarvis" className="min-h-screen bg-black" />;
+  if (!viewerToken) return <JarvisBootShell />;
   return (
     <ViewerAuthContext.Provider value={auth}>
       <ViewerSessionProvider token={viewerToken}>

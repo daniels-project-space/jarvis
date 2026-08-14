@@ -9,6 +9,7 @@
     "lint": "eslint",
     "test": "vitest run",
     "test:browser:trip": "playwright test -c playwright.trip.config.ts",
+    "test:browser:startup": "playwright test -c playwright.startup.config.ts",
     "test:browser:voice": "playwright test -c playwright.voice.config.ts",
     "deploy:trigger": "npx --yes trigger.dev@4.5.1 deploy",
     "harness:codex-session": "tsx scripts/codex-session-concurrency-harness.ts",

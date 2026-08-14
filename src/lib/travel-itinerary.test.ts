@@ -258,6 +258,7 @@ describe("durable trip day scheduling", () => {
       name: "Alhambra",
       lat: 37.176,
       lng: -3.5881,
+      mapsLink: "https://www.openstreetmap.org/node/alhambra",
       city: "Granada",
       cityContextId: granadaId,
     }];

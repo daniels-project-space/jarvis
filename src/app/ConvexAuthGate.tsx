@@ -2,12 +2,13 @@
 
 import { useConvexAuth } from "convex/react";
 import type { ReactNode } from "react";
+import { JarvisBootShell } from "./JarvisBootShell";
 
 export function ConvexAuthGate({ children }: { children: ReactNode }) {
   const { isLoading, isAuthenticated } = useConvexAuth();
 
   if (isLoading) {
-    return <main aria-label="Connecting Jarvis" className="min-h-screen bg-black" />;
+    return <JarvisBootShell phase="Connecting your live workspace" />;
   }
   if (!isAuthenticated) {
     return (

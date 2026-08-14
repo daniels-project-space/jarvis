@@ -18,6 +18,8 @@ describe("ConvexAuthGate", () => {
   it("does not mount protected queries before the Convex JWT handshake", () => {
     const pending = renderToStaticMarkup(<ConvexAuthGate><div>protected-chat</div></ConvexAuthGate>);
     expect(pending).not.toContain("protected-chat");
+    expect(pending).toContain("Ready when you are.");
+    expect(pending).toContain("Connecting your live workspace");
 
     auth.isLoading = false;
     auth.isAuthenticated = true;
