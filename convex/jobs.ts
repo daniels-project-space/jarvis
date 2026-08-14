@@ -4392,6 +4392,7 @@ export const authorizeExecutionBoundary = mutation({
       dispatchPayloadDigest: receipt.payloadDigest,
       minimumModel: authority.workOrder.minimumModel,
       minimumReasoningEffort: authority.workOrder.minimumReasoningEffort,
+      ...(a.phase === "novita_delegate" ? { policyTask: authority.workOrder.policyTask } : {}),
       backgroundExecutionProfile: executionProfile.profile,
       toolScope: authority.workOrder.toolScope,
       mcpScope: authority.workOrder.mcpScope,
@@ -4415,6 +4416,7 @@ export const reserveNovitaPatchProposal = mutation({
     dispatchReceiptDigest: v.string(),
     dispatchPayloadDigest: v.string(),
     receiptId: v.string(),
+    policyTaskDigest: v.string(),
     requestDigest: v.string(),
     sourceFileCount: v.number(),
     inputBytes: v.number(),
@@ -4432,6 +4434,7 @@ export const reserveNovitaPatchProposal = mutation({
       || row.dispatchReceiptDigest !== a.dispatchReceiptDigest
       || row.dispatchPayloadDigest !== a.dispatchPayloadDigest
       || !/^[a-f0-9]{64}$/.test(a.receiptId)
+      || !/^[a-f0-9]{64}$/.test(a.policyTaskDigest)
       || !/^[a-f0-9]{64}$/.test(a.requestDigest)
       || !/^[a-f0-9]{64}$/.test(a.reservationDigest)
       || !Number.isSafeInteger(a.sourceFileCount) || a.sourceFileCount < 1 || a.sourceFileCount > 3
@@ -4451,9 +4454,14 @@ export const reserveNovitaPatchProposal = mutation({
     if (!executionProfile.accepted || executionProfile.profile.version !== 2) return null;
     const attestation = executionProfile.profile.novitaPatchProposer;
     if (a.inputBytes > attestation.requestLimits.maxInputBytes) return null;
+    // A valid worker claim alone is not enough: paid egress stays bound to
+    // the policy task sealed into this exact immutable work-order revision.
+    const expectedPolicyTaskDigest = await sha256Hex(authority.workOrder.policyTask);
+    if (a.policyTaskDigest !== expectedPolicyTaskDigest) return null;
     const expectedReservationDigest = await sha256Hex(canonicalNovitaPatchProposalReservation({
       workOrderRevisionDigest: authority.workOrderRevisionDigest,
       attestation,
+      policyTaskDigest: expectedPolicyTaskDigest,
       requestDigest: a.requestDigest,
       sourceFileCount: a.sourceFileCount,
       inputBytes: a.inputBytes,
@@ -4488,6 +4496,7 @@ export const reserveNovitaPatchProposal = mutation({
       adapterId: attestation.adapterId,
       configDigest: attestation.configDigest,
       endpointId: attestation.endpointId,
+      policyTaskDigest: expectedPolicyTaskDigest,
       requestDigest: a.requestDigest,
       sourceFileCount: a.sourceFileCount,
       inputBytes: a.inputBytes,

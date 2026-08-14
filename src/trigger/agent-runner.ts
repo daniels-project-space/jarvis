@@ -407,6 +407,7 @@ export function novitaSourceFilesForTask(
 
 type NovitaPatchProposalReservation = Readonly<{
   receiptId: string;
+  policyTaskDigest: string;
   requestDigest: string;
   reservationDigest: string;
   sourceFileCount: number;
@@ -426,14 +427,16 @@ function novitaPatchProposalReservation(
     0,
   );
   if (!task || sourceFileCount < 1 || sourceFileCount > 3 || inputBytes > attestation.requestLimits.maxInputBytes) return null;
+  const policyTaskDigest = sha256Bytes(task);
   const requestDigest = sha256Bytes(canonicalNovitaPatchProposalRequest({
     attestation,
-    taskDigest: sha256Bytes(task),
+    policyTaskDigest,
     sourceFiles: files.map((file) => ({ path: file.path, contentDigest: sha256Bytes(file.content) })),
   }));
   const reservationDigest = sha256Bytes(canonicalNovitaPatchProposalReservation({
     workOrderRevisionDigest,
     attestation,
+    policyTaskDigest,
     requestDigest,
     sourceFileCount,
     inputBytes,
@@ -444,6 +447,7 @@ function novitaPatchProposalReservation(
       workOrderRevisionId,
       reservationDigest,
     ].join(":")),
+    policyTaskDigest,
     requestDigest,
     reservationDigest,
     sourceFileCount,
@@ -843,6 +847,8 @@ export type AgentRunnerBoundaryObservation = Readonly<{
   workOrderRevisionId: string;
   workOrderRevision: number;
   workOrderRevisionDigest: string;
+  /** Present only at the Novita boundary and read from immutable authority. */
+  policyTask?: string;
   backgroundExecutionProfile?: BackgroundExecutionProfile;
   schedulingBindingDigest: string;
   repository: string | null;
@@ -2206,7 +2212,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             return;
           }
           dependencies.onAuthorityBoundary("novita_delegate", novitaAuthority);
-          const novitaTask = String(job.policyTask ?? job.task);
+          // This endpoint may receive only the task returned by the just-
+          // checked immutable authority, never the mutable job projection.
+          const novitaTask = typeof novitaAuthority.policyTask === "string"
+            ? novitaAuthority.policyTask
+            : "";
           const sourceFiles = novitaSourceFilesForTask(
             repoDir,
             novitaTask,

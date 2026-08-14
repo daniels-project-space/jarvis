@@ -762,10 +762,12 @@ describe("production Trigger worker authority harness", () => {
       const profile = job?.backgroundExecutionProfile;
       if (!profile) throw new Error("fixture is missing its derived execution profile");
       await ctx.db.patch(jobId, {
+        // Deliberately violate the schema-shaped profile at the test fixture
+        // boundary; production writes cannot express this forged value.
         backgroundExecutionProfile: {
           ...profile,
           modelTier: profile.modelTier === "sol" ? "terra" : "sol",
-        },
+        } as never,
       });
     });
     const bridge = bridgeProductionRunnerToConvex(t);

@@ -35,7 +35,8 @@ export type NovitaProposalSourceDigest = Readonly<{
 
 export function canonicalNovitaPatchProposalRequest(input: Readonly<{
   attestation: NovitaPatchProposerAttestation;
-  taskDigest: string;
+  /** SHA-256 of the policy task sealed in the immutable work-order revision. */
+  policyTaskDigest: string;
   sourceFiles: readonly NovitaProposalSourceDigest[];
 }>): string {
   return JSON.stringify({
@@ -47,7 +48,7 @@ export function canonicalNovitaPatchProposalRequest(input: Readonly<{
     modelRevision: input.attestation.modelRevision,
     imageDigest: input.attestation.imageDigest,
     api: input.attestation.api,
-    taskDigest: input.taskDigest,
+    policyTaskDigest: input.policyTaskDigest,
     sourceFiles: input.sourceFiles.map((file) => ({ path: file.path, contentDigest: file.contentDigest })),
   });
 }
@@ -55,6 +56,8 @@ export function canonicalNovitaPatchProposalRequest(input: Readonly<{
 export function canonicalNovitaPatchProposalReservation(input: Readonly<{
   workOrderRevisionDigest: string;
   attestation: NovitaPatchProposerAttestation;
+  /** Server-validated SHA-256 of the immutable policy task. */
+  policyTaskDigest: string;
   requestDigest: string;
   sourceFileCount: number;
   inputBytes: number;
@@ -65,6 +68,7 @@ export function canonicalNovitaPatchProposalReservation(input: Readonly<{
     adapterId: input.attestation.adapterId,
     configDigest: input.attestation.configDigest,
     endpointId: input.attestation.endpointId,
+    policyTaskDigest: input.policyTaskDigest,
     requestDigest: input.requestDigest,
     sourceFileCount: input.sourceFileCount,
     inputBytes: input.inputBytes,

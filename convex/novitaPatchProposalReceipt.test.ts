@@ -77,12 +77,14 @@ async function claimedNovitaFixture() {
 }
 
 function reserveInput(fixture: Awaited<ReturnType<typeof claimedNovitaFixture>>) {
+  const policyTaskDigest = sha256(fixture.claim.policyTask);
   const requestDigest = sha256("request-digest");
   const sourceFileCount = 1;
   const inputBytes = 120;
   const reservationDigest = sha256(canonicalNovitaPatchProposalReservation({
     workOrderRevisionDigest: fixture.claim.workOrderRevisionDigest,
     attestation: fixture.attestation,
+    policyTaskDigest,
     requestDigest,
     sourceFileCount,
     inputBytes,
@@ -103,6 +105,7 @@ function reserveInput(fixture: Awaited<ReturnType<typeof claimedNovitaFixture>>)
     dispatchReceiptDigest: fixture.reservation.dispatchReceiptDigest,
     dispatchPayloadDigest: fixture.reservation.dispatchPayloadDigest,
     receiptId,
+    policyTaskDigest,
     requestDigest,
     sourceFileCount,
     inputBytes,
@@ -125,6 +128,7 @@ describe("Novita patch-proposal receipt authority", () => {
     expect(receipts[0]).toMatchObject({
       status: "reserved",
       workOrderRevisionDigest: fixture.claim.workOrderRevisionDigest,
+      policyTaskDigest: input.policyTaskDigest,
       requestDigest: input.requestDigest,
     });
 
@@ -164,5 +168,38 @@ describe("Novita patch-proposal receipt authority", () => {
       outputBytes: 0,
       failureClass: "response",
     })).toBe(false);
+  });
+
+  it("refuses an otherwise valid reservation whose policy-task proof is not the sealed work order", async () => {
+    const fixture = await claimedNovitaFixture();
+    const sourceFileCount = 1;
+    const inputBytes = 120;
+    const policyTaskDigest = sha256("different bounded task");
+    const requestDigest = sha256("request-digest");
+    const reservationDigest = sha256(canonicalNovitaPatchProposalReservation({
+      workOrderRevisionDigest: fixture.claim.workOrderRevisionDigest,
+      attestation: fixture.attestation,
+      policyTaskDigest,
+      requestDigest,
+      sourceFileCount,
+      inputBytes,
+    }));
+    const receiptId = sha256([
+      "jarvis-novita-patch-proposal-receipt-v1",
+      String(fixture.claim.workOrderRevisionId),
+      reservationDigest,
+    ].join(":"));
+
+    await expect(fixture.t.mutation(api.jobs.reserveNovitaPatchProposal, {
+      ...reserveInput(fixture),
+      policyTaskDigest,
+      requestDigest,
+      sourceFileCount,
+      inputBytes,
+      reservationDigest,
+      receiptId,
+    })).resolves.toBeNull();
+    const receipts = await fixture.t.run(async (ctx) => await ctx.db.query("novitaPatchProposalReceipts").collect());
+    expect(receipts).toHaveLength(0);
   });
 });

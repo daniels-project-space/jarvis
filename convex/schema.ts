@@ -2061,6 +2061,10 @@ export default defineSchema({
     adapterId: v.literal("novita-qwen-patch-proposer-v1"),
     configDigest: v.string(),
     endpointId: v.string(),
+    // New reservations always write this immutable work-order proof. Optional
+    // preserves readability of any pre-hardening receipt, which remains held
+    // and can never trigger another paid call.
+    policyTaskDigest: v.optional(v.string()),
     requestDigest: v.string(),
     sourceFileCount: v.number(),
     inputBytes: v.number(),
