@@ -93,6 +93,7 @@ import {
   novitaPatchProposerStatusPresentation,
   type NovitaPatchProposerStatus,
 } from "@/lib/novita-patch-proposer-status";
+import { BackgroundReadinessControl } from "./BackgroundReadinessControl";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
 import {
   authoritativeCancellationReceipt,
@@ -557,7 +558,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice, controllerSessionReadiness,
+  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice, controllerSessionReadiness, owner,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -577,6 +578,7 @@ function OptionsPanel({
   onMacSetup: () => void;
   googleOAuthNotice: GoogleOAuthReturnNotice | null;
   controllerSessionReadiness: ControllerSessionReadiness | undefined;
+  owner: boolean;
 }) {
   const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
     <div className="flex items-center justify-between gap-4 py-2.5">
@@ -677,6 +679,11 @@ function OptionsPanel({
               {controllerSession.label}
             </span>
           </Row>
+          {owner && (
+            <Row label="Background readiness" hint="Manual no-spend check · no workspace or model run">
+              <BackgroundReadinessControl />
+            </Row>
+          )}
           <Row label="Voice" hint="private neural speech · free no-silence fallback">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Jarvis · private neural</span>
           </Row>
@@ -5688,6 +5695,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             setPanelMin(false);
             void setPanel({ type: "widget", value: JSON.stringify({ kind: "mac_setup" }), title: "Mac shortcut setup" });
           }}
+          owner={Boolean(viewerToken) && !guest}
           googleOAuthNotice={googleOAuthNotice}
           controllerSessionReadiness={controllerSessionReadiness}
         />
