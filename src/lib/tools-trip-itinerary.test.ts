@@ -11,6 +11,14 @@ const mock = vi.hoisted(() => ({
   hubAction: vi.fn(),
   scheduleTripDay: vi.fn(),
   addTripPlaceToDay: vi.fn(),
+  discoverTripPlaces: vi.fn(),
+  tripActivityId: vi.fn((activity: { id?: string; name: string }) => activity.id ?? `osm:${activity.name}`),
+  tripStayId: vi.fn((stay: { id?: string; name: string }) => stay.id ?? `stay:${stay.name}`),
+  bookingsForTripWindow: vi.fn(),
+  replaceConfirmedBookings: vi.fn(),
+  setTripBookingReference: vi.fn(),
+  verifyTripCityBookingReference: vi.fn(),
+  scanGmailBookingConfirmations: vi.fn(),
   searchOpenStreetMapPlaces: vi.fn(),
 }));
 
@@ -19,7 +27,7 @@ vi.mock("./control-context", () => ({
   withAdminSession: async (_authTokenHash: unknown, operation: () => Promise<unknown>) => await operation(),
 }));
 vi.mock("./vault", () => ({ getSecret: vi.fn(), getServiceSecrets: vi.fn() }));
-vi.mock("./booking-email", () => ({ lookupGmailBookingsReadOnly: vi.fn(), scanGmailBookingConfirmations: vi.fn() }));
+vi.mock("./booking-email", () => ({ lookupGmailBookingsReadOnly: vi.fn(), scanGmailBookingConfirmations: mock.scanGmailBookingConfirmations }));
 vi.mock("./icloud-calendar", () => ({ createICloudEvent: vi.fn(), deleteICloudEvent: vi.fn(), findICloudEvents: vi.fn(), listICloudEvents: vi.fn() }));
 vi.mock("./openstreetmap", () => ({ searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces }));
 vi.mock("./travel", () => ({
@@ -29,6 +37,13 @@ vi.mock("./travel", () => ({
   hubAction: mock.hubAction,
   scheduleTripDay: mock.scheduleTripDay,
   addTripPlaceToDay: mock.addTripPlaceToDay,
+  discoverTripPlaces: mock.discoverTripPlaces,
+  tripActivityId: mock.tripActivityId,
+  tripStayId: mock.tripStayId,
+  bookingsForTripWindow: mock.bookingsForTripWindow,
+  replaceConfirmedBookings: mock.replaceConfirmedBookings,
+  setTripBookingReference: mock.setTripBookingReference,
+  verifyTripCityBookingReference: mock.verifyTripCityBookingReference,
 }));
 
 import { executeTool } from "./tools";
@@ -59,6 +74,11 @@ describe("trip itinerary tool actions", () => {
     mock.getTrip.mockResolvedValue({ id: "trip-1", doc });
     mock.scheduleTripDay.mockResolvedValue(routed);
     mock.addTripPlaceToDay.mockResolvedValue(routed);
+    mock.scanGmailBookingConfirmations.mockResolvedValue([]);
+    mock.bookingsForTripWindow.mockReturnValue([]);
+    mock.replaceConfirmedBookings.mockReturnValue(0);
+    mock.setTripBookingReference.mockReturnValue([]);
+    mock.verifyTripCityBookingReference.mockResolvedValue(undefined);
     mock.searchOpenStreetMapPlaces.mockResolvedValue([{
       name: "Neighbourhood Gallery",
       address: "Alfama, Lisbon",
@@ -110,5 +130,26 @@ describe("trip itinerary tool actions", () => {
         note: "OpenStreetMap · Alfama, Lisbon",
       }),
     }));
+  });
+
+  it("refreshes a live draft's booked-location facts through its exact draft id", async () => {
+    const bookingTrip = {
+      ...doc,
+      departDate: "2026-09-01",
+      returnDate: "2026-09-04",
+      destinationCenter: { lat: 38.7223, lng: -9.1393 },
+      discoveries: [],
+      bookingReferences: [],
+    };
+    mock.getTrip.mockResolvedValueOnce({ id: "draft-1", doc: bookingTrip, storage: "draft" });
+    mock.scanGmailBookingConfirmations.mockResolvedValueOnce([{ marker: "stay-1", kind: "stay", location: "Lisbon", start: Date.parse("2026-09-02T14:00:00Z"), end: Date.parse("2026-09-03T11:00:00Z") }]);
+    mock.bookingsForTripWindow.mockReturnValueOnce([{ marker: "stay-1", kind: "stay", location: "Lisbon", start: Date.parse("2026-09-02T14:00:00Z"), end: Date.parse("2026-09-03T11:00:00Z") }]);
+    mock.convexMutation.mockResolvedValue({});
+
+    await expect(executeTool("bookings_check", { draft_id: "draft-1" })).resolves.toContain("refreshed into");
+
+    expect(mock.getTrip).toHaveBeenCalledWith("draft-1", expect.objectContaining({ storage: "draft" }));
+    expect(mock.saveTrip).toHaveBeenCalledWith("draft-1", bookingTrip, true, expect.objectContaining({ storage: "draft" }));
+    expect(mock.verifyTripCityBookingReference).toHaveBeenCalledWith(expect.objectContaining({ city: "Lisbon" }));
   });
 });

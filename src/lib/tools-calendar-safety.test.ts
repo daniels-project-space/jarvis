@@ -16,7 +16,8 @@ const mock = vi.hoisted(() => ({
   refreshTripItineraryRoutes: vi.fn(),
   saveTripItinerary: vi.fn(),
   tripToCalendar: vi.fn(),
-  tripToMindmap: vi.fn(),
+  lockTripDraft: vi.fn(),
+  tripStayId: vi.fn(),
 }));
 
 vi.mock("./context", () => ({
@@ -45,7 +46,8 @@ vi.mock("./travel", () => ({
   refreshTripItineraryRoutes: mock.refreshTripItineraryRoutes,
   saveTripItinerary: mock.saveTripItinerary,
   tripToCalendar: mock.tripToCalendar,
-  tripToMindmap: mock.tripToMindmap,
+  lockTripDraft: mock.lockTripDraft,
+  tripStayId: mock.tripStayId,
 }));
 
 import { executeTool, TOOL_DEFS } from "./tools";
@@ -73,7 +75,6 @@ describe("legacy calendar write boundary", () => {
     mock.buildItinerary.mockReturnValue([]);
     mock.refreshTripItineraryRoutes.mockResolvedValue([]);
     mock.saveTripItinerary.mockResolvedValue(undefined);
-    mock.tripToMindmap.mockResolvedValue("");
     mock.saveTrip.mockResolvedValue(undefined);
   });
 

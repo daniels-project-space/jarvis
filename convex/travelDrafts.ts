@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, hasWorkerCapability, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { tripCanvas } from "./tripCanvas";
 
 const SCHEMA_VERSION = 1;
 const MAX_DATA_BYTES = 120_000;
@@ -138,6 +139,56 @@ function draftUnavailable(row: any, now: number): "locked" | "expired" | null {
 function sourceMessageRequired(workerToken: string | undefined, sourceMessageId: unknown): boolean {
   return hasWorkerCapability(workerToken) && sourceMessageId === undefined;
 }
+
+function finiteNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function safeText(value: unknown, max: number, fallback = ""): string {
+  return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, max) : fallback;
+}
+
+/** Mirrors the derived live-map fields on permanent trips without touching the owner-plan revision. */
+function refreshProviderDerivedState(doc: JsonRecord, providers: JsonRecord, now: number): void {
+  const stays = Array.isArray(doc.stays) ? doc.stays.filter(isRecord) : [];
+  const activities = Array.isArray(doc.activities) ? doc.activities.filter(isRecord) : [];
+  const points = [...stays, ...activities].filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng));
+  if (points.length) {
+    doc.center = {
+      lat: points.reduce((sum, item) => sum + finiteNumber(item.lat), 0) / points.length,
+      lng: points.reduce((sum, item) => sum + finiteNumber(item.lng), 0) / points.length,
+    };
+  }
+
+  const locked = isRecord(doc.locked) ? doc.locked : {};
+  const flight = isRecord(locked.flight) ? locked.flight : stays[0];
+  const stay = isRecord(locked.stay) ? locked.stay : stays[0];
+  const nights = Math.max(1, Math.round((Date.parse(String(doc.returnDate ?? "")) - Date.parse(String(doc.departDate ?? ""))) / 86_400_000) || 1);
+  const adults = Math.max(1, finiteNumber(doc.adults) || 1);
+  const flightCost = finiteNumber(flight?.priceGbp) * adults;
+  const stayCost = finiteNumber(stay?.totalGbp) || finiteNumber(stay?.priceGbp) * nights;
+  const activityCount = Array.isArray(locked.activities) ? locked.activities.length : 0;
+  const activitiesEst = activityCount * 25 * adults;
+  const lockedFlightCost = finiteNumber(isRecord(locked.flight) ? locked.flight.priceGbp : undefined) * adults;
+  const lockedStayRecord = isRecord(locked.stay) ? locked.stay : undefined;
+  const lockedStayCost = finiteNumber(lockedStayRecord?.totalGbp) || finiteNumber(lockedStayRecord?.priceGbp) * nights;
+  doc.totals = {
+    flights: Math.round(flightCost),
+    stay: Math.round(stayCost),
+    activitiesEst: Math.round(activitiesEst),
+    total: Math.round(flightCost + stayCost + activitiesEst),
+    projectedTotal: Math.round(flightCost + stayCost + activitiesEst),
+    lockedTotal: Math.round(lockedFlightCost + lockedStayCost + activitiesEst),
+  };
+
+  const states = Object.values(providers).filter(isRecord).map((provider) => provider.status);
+  if (states.length && states.every((status) => ["ready", "error", "skipped"].includes(String(status)))) {
+    doc.searchCompletedAt = now;
+  } else {
+    delete doc.searchCompletedAt;
+  }
+}
+
 
 /** Creates an opaque, conversation-scoped draft; it is intentionally absent from creations. */
 export const createDraft = mutation({
@@ -281,11 +332,12 @@ export const patchProvider = mutation({
     if (!parsed) return { ok: false as const, reason: "invalid_draft" as const };
     const doc = parsed.doc;
     const providers = isRecord(doc.providers) ? { ...doc.providers } : {};
+    const now = Date.now();
     providers[a.provider as Provider] = {
       status: a.status as ProviderStatus,
       source: a.source,
       count: items === undefined ? Number((providers[a.provider as Provider] as JsonRecord | undefined)?.count ?? 0) || 0 : itemCount(items),
-      checkedAt: Date.now(),
+      checkedAt: now,
       ...(a.error !== undefined ? { error: a.error } : {}),
     };
     doc.providers = providers;
@@ -293,9 +345,10 @@ export const patchProvider = mutation({
       const target = a.provider === "airport" ? "airport" : a.provider;
       doc[target] = items;
     }
+    refreshProviderDerivedState(doc, providers, now);
     const data = JSON.stringify(doc);
     if (data.length > MAX_DATA_BYTES) return { ok: false as const, reason: "invalid" as const };
-    const updatedAt = Date.now();
+    const updatedAt = now;
     await ctx.db.patch(a.id, { data, updatedAt });
     return { ok: true as const, planRevision: row.planRevision, updatedAt };
   },
@@ -325,7 +378,20 @@ export const lockDraft = mutation({
       return { ok: false as const, reason: "source_message_mismatch" as const };
     }
     if (row.state === "locked" && row.lockedCreationId) {
-      return { ok: true as const, creationId: row.lockedCreationId, alreadyLocked: true as const, planRevision: row.planRevision };
+      const existing = await ctx.db.get(row.lockedCreationId);
+      let mindmapCreationId: unknown;
+      try {
+        mindmapCreationId = existing?.data ? JSON.parse(existing.data)?.mindmapCreationId : undefined;
+      } catch {
+        mindmapCreationId = undefined;
+      }
+      return {
+        ok: true as const,
+        creationId: row.lockedCreationId,
+        ...(typeof mindmapCreationId === "string" ? { mindmapCreationId } : {}),
+        alreadyLocked: true as const,
+        planRevision: row.planRevision,
+      };
     }
     if (row.state !== "draft" || row.expiresAt <= Date.now()) return { ok: false as const, reason: "expired" as const };
     if (a.expectedPlanRevision !== row.planRevision) {
@@ -333,6 +399,8 @@ export const lockDraft = mutation({
     }
     const parsed = parseTripDoc(row.data, row.title, row.destination, row.threadId, row.planRevision, "planned");
     if (!parsed) return { ok: false as const, reason: "invalid_draft" as const };
+    const canvas = tripCanvas(parsed.doc);
+    if (!canvas) return { ok: false as const, reason: "invalid_draft" as const };
     const now = Date.now();
     const creationId = await ctx.db.insert("creations", {
       kind: "trip",
@@ -344,12 +412,29 @@ export const lockDraft = mutation({
       createdAt: now,
       updatedAt: now,
     });
+    canvas.tripId = String(creationId);
+    const canvasData = JSON.stringify(canvas);
+    if (canvasData.length > MAX_DATA_BYTES) throw new Error("Travel canvas exceeded its safe size");
+    const mindmapCreationId = await ctx.db.insert("creations", {
+      kind: "canvas",
+      title: safeText(canvas.title, MAX_TITLE_LENGTH, `Trip map · ${row.destination}`),
+      data: canvasData,
+      category: "mind maps",
+      folder: "Travel / Plans",
+      threadId: row.threadId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    parsed.doc.mindmapCreationId = String(mindmapCreationId);
+    const data = JSON.stringify(parsed.doc);
+    if (data.length > MAX_DATA_BYTES) throw new Error("Locked trip exceeded its safe size");
+    await ctx.db.patch(creationId, { data, updatedAt: now });
     await ctx.db.patch(a.id, {
       state: "locked",
       lockedCreationId: creationId,
       updatedAt: now,
       expiresAt: Math.max(row.expiresAt, now + LOCK_RECEIPT_LIFETIME_MS),
     });
-    return { ok: true as const, creationId, alreadyLocked: false as const, planRevision: row.planRevision };
+    return { ok: true as const, creationId, mindmapCreationId, alreadyLocked: false as const, planRevision: row.planRevision };
   },
 });

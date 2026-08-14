@@ -25,6 +25,25 @@ describe("TripTimeline", () => {
     expect(markup).toContain("Read-only Gmail");
   });
 
+  it("hides an expired booked-location reference instead of relabelling it as upcoming", () => {
+    const now = Date.UTC(2026, 8, 12, 12, 0);
+    const markup = renderToStaticMarkup(
+      <TripBookedStayReference
+        now={now}
+        booking={{
+          city: "Amsterdam",
+          bookingName: "Old Canal House",
+          location: "42 Water Street, Amsterdam, Netherlands",
+          start: now - 172_800_000,
+          end: now - 86_400_000,
+          verifiedAt: now - 60_000,
+        }}
+      />,
+    );
+
+    expect(markup).toBe("");
+  });
+
   it("renders persisted stop and transfer timing without drawing a made-up connection", () => {
     const markup = renderToStaticMarkup(
       <TripTimeline

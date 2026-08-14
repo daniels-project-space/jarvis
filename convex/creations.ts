@@ -1,12 +1,85 @@
 import { mutation, query } from "./_generated/server";
+import { type Id } from "./_generated/dataModel";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { inferCreationFiling } from "./creationFiling";
 import { linkMessageFilesToCreation } from "./fileHelpers";
+import { MAX_TRIP_CANVAS_BYTES, tripCanvas, type TripCanvasRecord } from "./tripCanvas";
 
 // JARVIS's atelier — everything he makes (mind maps, charts, images, PDFs,
 // docs) is saved here so nothing he creates is ever lost. The UI lists it
 // reactively; tools upsert while he works.
+
+type TripCanvasWrite = {
+  id: Id<"creations">;
+  title: string;
+  data: string;
+};
+
+function isRecord(value: unknown): value is TripCanvasRecord {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function tripCanvasTitle(canvas: TripCanvasRecord, fallback: string): string {
+  return typeof canvas.title === "string" ? canvas.title.slice(0, 120) : fallback.slice(0, 120);
+}
+
+/**
+ * A linked travel map is an integrity boundary: only the canvas created for
+ * this exact trip and conversation can be rewritten.  The caller performs
+ * both patches inside one Convex mutation, so rejection leaves the plan and
+ * map unchanged together.
+ */
+async function linkedTripCanvasWrite(
+  ctx: { db: any },
+  trip: { _id: Id<"creations">; title: string; threadId?: string },
+  doc: TripCanvasRecord,
+): Promise<{ ok: true; write?: TripCanvasWrite } | { ok: false; reason: "invalid_mindmap" | "invalid_trip" }> {
+  const mindmapCreationId = typeof doc.mindmapCreationId === "string" ? doc.mindmapCreationId : undefined;
+  if (!mindmapCreationId) return { ok: true };
+
+  let canvasRow: any;
+  try {
+    canvasRow = await ctx.db.get(mindmapCreationId as Id<"creations">);
+  } catch {
+    return { ok: false, reason: "invalid_mindmap" };
+  }
+  if (!canvasRow || canvasRow.kind !== "canvas" || canvasRow.threadId !== trip.threadId || typeof canvasRow.data !== "string") {
+    return { ok: false, reason: "invalid_mindmap" };
+  }
+
+  let existing: unknown;
+  try {
+    existing = JSON.parse(canvasRow.data);
+  } catch {
+    return { ok: false, reason: "invalid_mindmap" };
+  }
+  if (!isRecord(existing) || existing.tripId !== String(trip._id)) return { ok: false, reason: "invalid_mindmap" };
+
+  const canvas = tripCanvas(doc);
+  if (!canvas) return { ok: false, reason: "invalid_trip" };
+  canvas.tripId = String(trip._id);
+  const data = JSON.stringify(canvas);
+  if (data.length > MAX_TRIP_CANVAS_BYTES) return { ok: false, reason: "invalid_trip" };
+  return { ok: true, write: { id: canvasRow._id, title: tripCanvasTitle(canvas, trip.title), data } };
+}
+
+async function patchLinkedTripCanvas(
+  ctx: { db: any },
+  write: TripCanvasWrite | undefined,
+  trip: { threadId?: string },
+  updatedAt: number,
+): Promise<void> {
+  if (!write) return;
+  await ctx.db.patch(write.id, {
+    title: write.title,
+    data: write.data,
+    category: "mind maps",
+    folder: "Travel / Plans",
+    ...(trip.threadId ? { threadId: trip.threadId } : {}),
+    updatedAt,
+  });
+}
 
 export const list = query({
   args: {
@@ -132,9 +205,33 @@ export const update = mutation({
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const existing = a.data !== undefined ? await ctx.db.get(a.id) : null;
+    let tripData = a.data;
+    let canvasWrite: TripCanvasWrite | undefined;
+    if (existing?.kind === "trip" && typeof a.data === "string") {
+      let candidate: unknown;
+      let persisted: unknown;
+      try {
+        candidate = JSON.parse(a.data);
+        persisted = existing.data ? JSON.parse(existing.data) : undefined;
+      } catch {
+        candidate = undefined;
+      }
+      if (isRecord(candidate) && candidate.kind === "trip") {
+        // A generic save should never accidentally sever a durable map link
+        // merely because a caller was holding an older TripDoc snapshot.
+        if (typeof candidate.mindmapCreationId !== "string" && isRecord(persisted) && typeof persisted.mindmapCreationId === "string") {
+          candidate.mindmapCreationId = persisted.mindmapCreationId;
+          tripData = JSON.stringify(candidate);
+        }
+        const linked = await linkedTripCanvasWrite(ctx, existing, candidate);
+        if (!linked.ok) throw new Error(`Trip plan could not update its linked map: ${linked.reason}`);
+        canvasWrite = linked.write;
+      }
+    }
     const patch: Record<string, unknown> = { updatedAt: Date.now() };
     if (a.title !== undefined) patch.title = a.title.slice(0, 120);
-    if (a.data !== undefined) patch.data = a.data;
+    if (tripData !== undefined) patch.data = tripData;
     if (a.url !== undefined) patch.url = a.url;
     if (a.thumb !== undefined) patch.thumb = a.thumb;
     if (a.category !== undefined) patch.category = a.category.slice(0, 80);
@@ -143,6 +240,7 @@ export const update = mutation({
     if (a.inquiry !== undefined) patch.inquiry = a.inquiry.slice(0, 80);
     if (a.threadId !== undefined) patch.threadId = a.threadId.slice(0, 120);
     await ctx.db.patch(a.id, patch);
+    await patchLinkedTripCanvas(ctx, canvasWrite, existing ?? {}, Number(patch.updatedAt));
     await linkMessageFilesToCreation(ctx, a.id, a.sourceMessageId);
     return a.id;
   },
@@ -278,11 +376,14 @@ export const updateTripProvider = mutation({
     if (states.length && states.every((state) => ["ready", "error", "skipped"].includes(String(state)))) {
       doc.searchCompletedAt = now;
     }
+    const linked = isRecord(doc) ? await linkedTripCanvasWrite(ctx, row, doc) : { ok: false as const, reason: "invalid_trip" as const };
+    if (!linked.ok) return false;
     await ctx.db.patch(a.id, {
       data: JSON.stringify(doc),
       thumb: row.thumb ?? doc.stays?.[0]?.thumb ?? doc.activities?.[0]?.photo,
       updatedAt: now,
     });
+    await patchLinkedTripCanvas(ctx, linked.write, row, now);
     return true;
   },
 });
@@ -377,6 +478,9 @@ export const updateTripItinerary = mutation({
     // rejected instead of overwriting a newer itinerary.
     planRevision: v.number(),
     mindmapCreationId: v.optional(v.string()),
+    // Used only when finalizing a legacy permanent plan that predates
+    // conversation-scoped drafts and therefore has no linked travel map yet.
+    ensureMindmap: v.optional(v.boolean()),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
@@ -422,19 +526,55 @@ export const updateTripItinerary = mutation({
       return { ok: false as const, reason: "stale" as const, planRevision: currentRevision, updatedAt: row.updatedAt };
     }
 
+    const currentMindmapCreationId = typeof doc.mindmapCreationId === "string" ? doc.mindmapCreationId : undefined;
+    if (a.mindmapCreationId !== undefined && currentMindmapCreationId && a.mindmapCreationId !== currentMindmapCreationId) {
+      return { ok: false as const, reason: "invalid_mindmap" as const };
+    }
     doc.itinerary = itinerary;
     doc.planRevision = a.planRevision;
     if (a.mindmapCreationId !== undefined) doc.mindmapCreationId = a.mindmapCreationId;
 
     const updatedAt = Date.now();
+    let canvasWrite: TripCanvasWrite | undefined;
+    if (typeof doc.mindmapCreationId === "string") {
+      const linked = await linkedTripCanvasWrite(ctx, row, doc);
+      if (!linked.ok) return { ok: false as const, reason: linked.reason };
+      canvasWrite = linked.write;
+    } else if (a.ensureMindmap) {
+      const canvas = tripCanvas(doc);
+      if (!canvas) return { ok: false as const, reason: "invalid_trip" as const };
+      canvas.tripId = String(a.id);
+      const canvasData = JSON.stringify(canvas);
+      if (canvasData.length > MAX_TRIP_CANVAS_BYTES) return { ok: false as const, reason: "invalid_trip" as const };
+      const mindmapCreationId = await ctx.db.insert("creations", {
+        kind: "canvas",
+        title: tripCanvasTitle(canvas, row.title),
+        data: canvasData,
+        category: "mind maps",
+        folder: "Travel / Plans",
+        threadId: row.threadId,
+        createdAt: updatedAt,
+        updatedAt,
+      });
+      doc.mindmapCreationId = String(mindmapCreationId);
+    }
+
+    const data = JSON.stringify(doc);
+    if (data.length > MAX_TRIP_CANVAS_BYTES) return { ok: false as const, reason: "invalid_trip" as const };
     await ctx.db.patch(a.id, {
       // Retain the durable creation title; an itinerary patch must not roll
       // back an unrelated title edit encoded in a stale TripDoc payload.
       title: row.title.slice(0, 120),
-      data: JSON.stringify(doc),
+      data,
       updatedAt,
     });
-    return { ok: true as const, planRevision: a.planRevision, updatedAt };
+    await patchLinkedTripCanvas(ctx, canvasWrite, row, updatedAt);
+    return {
+      ok: true as const,
+      planRevision: a.planRevision,
+      updatedAt,
+      ...(typeof doc.mindmapCreationId === "string" ? { mindmapCreationId: doc.mindmapCreationId } : {}),
+    };
   },
 });
 

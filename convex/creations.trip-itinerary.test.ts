@@ -36,8 +36,32 @@ function day() {
       lng: -9.14,
       link: "https://www.openstreetmap.org/node/1",
       source: "owner",
+    }, {
+      id: "2026-09-12:activity:gallery:1",
+      date: "2026-09-12",
+      time: "12:00",
+      durationMinutes: 75,
+      title: "Riverside Gallery",
+      kind: "activity",
+      lat: 38.716,
+      lng: -9.13,
+      link: "https://www.openstreetmap.org/node/2",
+      source: "owner",
     }],
-    route: { mode: "walking", status: "unavailable", calculatedAt: Date.now() },
+    route: {
+      mode: "walking",
+      status: "ready",
+      coordinates: [[-9.14, 38.72], [-9.13, 38.716]],
+      durationSeconds: 900,
+      distanceMeters: 1100,
+      legs: [{
+        fromItemId: "2026-09-12:activity:museum:0",
+        toItemId: "2026-09-12:activity:gallery:1",
+        durationSeconds: 900,
+        distanceMeters: 1100,
+      }],
+      calculatedAt: Date.now(),
+    },
   }];
 }
 
@@ -58,6 +82,22 @@ describe("atomic trip itinerary persistence", () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     }));
+    const mindmapCreationId = await t.run(async (ctx) => {
+      const canvasId = await ctx.db.insert("creations", {
+        kind: "canvas",
+        title: "Trip map · Lisbon",
+        data: JSON.stringify({ title: "Trip map · Lisbon", tripId: String(id), nodes: [], edges: [] }),
+        category: "mind maps",
+        folder: "Travel / Plans",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      const trip = await ctx.db.get(id);
+      await ctx.db.patch(id, {
+        data: JSON.stringify({ ...JSON.parse(trip?.data ?? "{}"), mindmapCreationId: String(canvasId) }),
+      });
+      return canvasId;
+    });
 
     await expect(t.mutation(api.creations.updateTripItinerary, {
       id,
@@ -72,8 +112,19 @@ describe("atomic trip itinerary persistence", () => {
       planRevision: 1,
       providers: { stays: { status: "ready", source: "Google Hotels", count: 8 } },
       stays: [{ name: "Hotel Tejo" }],
+      mindmapCreationId: String(mindmapCreationId),
       itinerary: [expect.objectContaining({ date: "2026-09-12" })],
     });
+    const mapAfterFirst = await t.run(async (ctx) => ctx.db.get(mindmapCreationId));
+    const mapData = JSON.parse(mapAfterFirst?.data ?? "{}");
+    expect(mapData).toMatchObject({ tripId: String(id), title: "Trip map · Lisbon" });
+    expect(mapData.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "day-1:2026-09-12:activity:museum:0", label: "City Museum" }),
+      expect.objectContaining({ id: "day-1:2026-09-12:activity:gallery:1", label: "Riverside Gallery" }),
+    ]));
+    expect(mapData.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ label: "walking · 15 min · 1.1 km" }),
+    ]));
 
     await expect(t.mutation(api.creations.updateTripItinerary, {
       id,
@@ -92,5 +143,114 @@ describe("atomic trip itinerary persistence", () => {
     const afterRejected = JSON.parse((await t.run(async (ctx) => ctx.db.get(id)))?.data ?? "{}");
     expect(afterRejected.planRevision).toBe(1);
     expect(afterRejected.itinerary[0].items[0].link).toBe("https://www.openstreetmap.org/node/1");
+    const mapAfterRejected = await t.run(async (ctx) => ctx.db.get(mindmapCreationId));
+    expect(mapAfterRejected?.data).toBe(mapAfterFirst?.data);
+    expect(mapAfterRejected?.updatedAt).toBe(mapAfterFirst?.updatedAt);
+  });
+
+  it("creates and links a legacy permanent trip map in the itinerary transaction", async () => {
+    const t = convexTest(schema, modules);
+    const id = await t.run((ctx) => ctx.db.insert("creations", {
+      kind: "trip",
+      title: "Lisbon · saved plan",
+      threadId: "trip-thread",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Lisbon · saved plan",
+        destination: "Lisbon",
+        budgetGbp: 900,
+        adults: 2,
+        planRevision: 0,
+      }),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+
+    const result = await t.mutation(api.creations.updateTripItinerary, {
+      id,
+      itinerary: JSON.stringify(day()),
+      planRevision: 1,
+      ensureMindmap: true,
+      workerToken: WORKER,
+    });
+    expect(result).toMatchObject({ ok: true, planRevision: 1, mindmapCreationId: expect.any(String) });
+
+    const trip = await t.run((ctx) => ctx.db.get(id));
+    const doc = JSON.parse(trip?.data ?? "{}");
+    const map = await t.run((ctx) => ctx.db.get(doc.mindmapCreationId as any)) as {
+      kind: string;
+      category?: string;
+      folder?: string;
+      threadId?: string;
+      updatedAt: number;
+      data?: string;
+    } | null;
+    expect(map).toMatchObject({
+      kind: "canvas",
+      category: "mind maps",
+      folder: "Travel / Plans",
+      threadId: "trip-thread",
+      updatedAt: trip?.updatedAt,
+    });
+    expect(JSON.parse(map?.data ?? "{}")).toMatchObject({ tripId: String(id), title: "Trip map · Lisbon" });
+  });
+
+  it("keeps the linked map current for later saved-plan changes", async () => {
+    const t = convexTest(schema, modules);
+    const id = await t.run((ctx) => ctx.db.insert("creations", {
+      kind: "trip",
+      title: "Lisbon · saved plan",
+      threadId: "trip-thread",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Lisbon · saved plan",
+        destination: "Lisbon",
+        budgetGbp: 900,
+        adults: 2,
+        totals: { total: 800 },
+        locked: { activities: [], stay: { name: "Old Stay", totalGbp: 350 } },
+        itinerary: day(),
+        planRevision: 1,
+      }),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+    const mindmapCreationId = await t.run(async (ctx) => {
+      const canvasId = await ctx.db.insert("creations", {
+        kind: "canvas",
+        title: "Trip map · Lisbon",
+        threadId: "trip-thread",
+        data: JSON.stringify({ title: "Trip map · Lisbon", tripId: String(id), nodes: [], edges: [] }),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      const trip = await ctx.db.get(id);
+      await ctx.db.patch(id, {
+        data: JSON.stringify({ ...JSON.parse(trip?.data ?? "{}"), mindmapCreationId: String(canvasId) }),
+      });
+      return canvasId;
+    });
+
+    const existing = await t.run((ctx) => ctx.db.get(id));
+    await t.mutation(api.creations.update, {
+      id,
+      title: "Lisbon · saved plan",
+      data: JSON.stringify({
+        ...JSON.parse(existing?.data ?? "{}"),
+        budgetGbp: 1200,
+        totals: { total: 975 },
+        locked: { activities: [], stay: { name: "New Stay", totalGbp: 420 } },
+      }),
+      workerToken: WORKER,
+    });
+
+    const trip = await t.run((ctx) => ctx.db.get(id));
+    const map = await t.run((ctx) => ctx.db.get(mindmapCreationId));
+    const mapData = JSON.parse(map?.data ?? "{}");
+    expect(map?.updatedAt).toBe(trip?.updatedAt);
+    expect(mapData.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "trip", detail: "£975 of £1200 · 2 adults" }),
+      expect.objectContaining({ id: "hotel", label: "🏨 New Stay" }),
+    ]));
   });
 });

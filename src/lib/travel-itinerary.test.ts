@@ -17,7 +17,7 @@ vi.mock("./openstreetmap", () => ({
   searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces,
 }));
 
-import { addTripPlaceToDay, bookingsForTripWindow, buildItinerary, scheduleTripDay, tripToMindmap, type TripDoc } from "./travel";
+import { addTripPlaceToDay, bookingsForTripWindow, buildItinerary, scheduleTripDay, type TripDoc } from "./travel";
 
 function trip(): TripDoc {
   return {
@@ -174,8 +174,41 @@ describe("durable trip day scheduling", () => {
     expect(day?.route).toMatchObject({ status: "ready", mode: "walking" });
   });
 
-  it("carries persisted route legs into the durable trip mind map", async () => {
-    const updated = await scheduleTripDay({
+  it("keeps an exact cross-town discovery selectable after the day is saved", async () => {
+    const doc = trip();
+    doc.activities.push({
+      id: "discovery:granada:alhambra",
+      name: "Alhambra",
+      lat: 37.1761,
+      lng: -3.5881,
+      mapsLink: "https://www.openstreetmap.org/node/4",
+      city: "Granada",
+    });
+    const updated = await addTripPlaceToDay({
+      id: "trip-1",
+      doc,
+      date: "2026-09-02",
+      mode: "walking",
+      place: { id: "discovery:granada:alhambra", name: "Alhambra", lat: 37.1761, lng: -3.5881 },
+    });
+
+    const rescheduled = await scheduleTripDay({
+      id: "trip-1",
+      doc: updated,
+      date: "2026-09-02",
+      activityNames: ["discovery:granada:alhambra", "Tile Museum"],
+      times: ["09:30", "13:00"],
+      mode: "walking",
+    });
+    const day = rescheduled.itinerary?.find((entry) => entry.date === "2026-09-02");
+    expect(day?.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "Alhambra", placeId: "discovery:granada:alhambra", time: "09:30" }),
+      expect.objectContaining({ title: "Tile Museum" }),
+    ]));
+  });
+
+  it("persists route legs for the server-owned durable trip mind map", async () => {
+    await scheduleTripDay({
       id: "trip-1",
       doc: trip(),
       date: "2026-09-02",
@@ -183,11 +216,12 @@ describe("durable trip day scheduling", () => {
       mode: "walking",
     });
 
-    await expect(tripToMindmap(updated, "trip-1")).resolves.toBe("canvas-1");
-    const canvas = JSON.parse(mock.convexMutation.mock.calls.find(([name]) => name === "creations:create")?.[1]?.data ?? "{}");
-    expect(canvas.edges).toEqual(expect.arrayContaining([
-      expect.objectContaining({ label: "walking · 8 min · 620 m" }),
-      expect.objectContaining({ label: "walking · 13 min · 1.2 km" }),
+    const payload = mock.convexMutation.mock.calls.find(([name]) => name === "creations:updateTripItinerary")?.[1];
+    const persisted = JSON.parse(payload?.itinerary ?? "[]");
+    const persistedDay = persisted.find((day: { date?: string }) => day.date === "2026-09-02");
+    expect(persistedDay?.route?.legs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ durationSeconds: 480, distanceMeters: 620 }),
+      expect.objectContaining({ durationSeconds: 780, distanceMeters: 1180 }),
     ]));
   });
 });

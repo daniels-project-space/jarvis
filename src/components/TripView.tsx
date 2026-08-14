@@ -48,7 +48,7 @@ type ItineraryDay = {
   route?: ItineraryRoute;
 };
 type TripDoc = { itinerary?: ItineraryDay[]; [key: string]: any };
-type Marker = { key: string; lat: number; lng: number; kind: "stay" | "activity" | "airport"; name: string; locked?: boolean };
+type Marker = { key: string; lat: number; lng: number; kind: "stay" | "activity" | "airport"; name: string; locked?: boolean; discoveryId?: string };
 
 const KIND_COLOR: Record<string, string> = { stay: "#00ff88", activity: "#5cc8ff", airport: "#ffb454" };
 const GLASS = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
@@ -94,12 +94,15 @@ const distanceText = (meters: unknown) => {
 };
 
 export type TripBookedStayReferenceValue = {
+  city?: string;
   title?: string;
   bookingName?: string;
   location?: string;
   start?: number;
   end?: number;
   timeZone?: string;
+  distanceKm?: number;
+  verifiedAt?: number;
 };
 
 const bookingDateText = (value: number | undefined, timeZone?: string) => {
@@ -118,16 +121,17 @@ const bookingDateText = (value: number | undefined, timeZone?: string) => {
 };
 
 export function TripBookedStayReference({ booking, checkedAt, now = Date.now() }: { booking: TripBookedStayReferenceValue; checkedAt?: number; now?: number }) {
+  if (typeof booking.end === "number" && booking.end < now) return null;
   const active = typeof booking.start === "number" && booking.start <= now && (!booking.end || booking.end >= now);
   const start = bookingDateText(booking.start, booking.timeZone);
   const end = bookingDateText(booking.end, booking.timeZone);
   const checked = bookingDateText(checkedAt, booking.timeZone);
   return (
     <div aria-label="Booked stay reference" className="pointer-events-none absolute bottom-9 left-3 max-w-[calc(100%-1.5rem)] rounded-lg border border-emerald-300/25 bg-black/65 px-2.5 py-2 text-left shadow-lg backdrop-blur">
-      <div className="hud-label !text-[8px] !text-emerald-200">booked location · {active ? "active" : "upcoming"}</div>
+      <div className="hud-label !text-[8px] !text-emerald-200">booked location{booking.city ? ` · ${booking.city}` : ""} · {active ? "active" : "upcoming"}</div>
       <div className="mt-0.5 truncate text-[11px] font-medium text-ice">{booking.bookingName || booking.title || "confirmed stay"}</div>
       {booking.location && <div className="mt-0.5 line-clamp-2 text-[9px] leading-snug text-slate">{booking.location}</div>}
-      {(start || end || checked) && <div className="mt-1 text-[8px] text-slate">Read-only Gmail · {[start, end].filter(Boolean).join(" → ")}{checked ? ` · checked ${checked}` : ""}</div>}
+      {(start || end || checked) && <div className="mt-1 text-[8px] text-slate">Read-only Gmail · {[start, end].filter(Boolean).join(" → ")}{typeof booking.distanceKm === "number" ? ` · verified ${booking.distanceKm} km from centre` : ""}{checked ? ` · checked ${checked}` : ""}</div>}
     </div>
   );
 }
@@ -298,13 +302,20 @@ function MapView({
   return <div ref={mountRef} className="h-full w-full [&_.maplibregl-ctrl-attrib]:!bg-black/40 [&_.maplibregl-ctrl-attrib]:!text-[9px]" />;
 }
 
-async function tripTool(tripId: string, action: string, extra: Record<string, unknown> = {}) {
+type TripWorkspace = { id: string; storage: "draft" | "creation" };
+
+function tripWorkspaceArgs(workspace: TripWorkspace): Record<string, string> {
+  return workspace.storage === "draft" ? { draft_id: workspace.id } : { creation_id: workspace.id };
+}
+
+async function tripTool(workspace: TripWorkspace, action: string, extra: Record<string, unknown> = {}) {
+  const workspaceArgs = tripWorkspaceArgs(workspace);
   const response = await viewerFetch("/api/tools", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       name: action === "finalize" ? "trip_finalize" : "trip_update",
-      args: action === "finalize" ? { trip_id: tripId, ...extra } : { trip_id: tripId, action, ...extra },
+      args: action === "finalize" ? { ...workspaceArgs, ...extra } : { ...workspaceArgs, action, ...extra },
     }),
   });
   const body = await response.json().catch(() => ({ result: "Travel action failed" }));
@@ -313,14 +324,14 @@ async function tripTool(tripId: string, action: string, extra: Record<string, un
   return result;
 }
 
-async function retryTrip(tripId: string, doc: any) {
+async function retryTrip(workspace: TripWorkspace, doc: any) {
   const response = await viewerFetch("/api/tools", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       name: "trip_plan",
       args: {
-        trip_id: tripId,
+        ...tripWorkspaceArgs(workspace),
         destination: doc.destination,
         dest_iata: doc.destIata,
         origin_iata: doc.origin,
@@ -335,6 +346,18 @@ async function retryTrip(tripId: string, doc: any) {
   });
   const body = await response.json().catch(() => ({ result: "Travel search failed" }));
   if (!response.ok || /^Tool failed:/i.test(String(body.result ?? ""))) throw new Error(String(body.result ?? "Travel search failed"));
+}
+
+async function refreshTripBookingReferences(workspace: TripWorkspace) {
+  const response = await viewerFetch("/api/tools", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "bookings_check", args: tripWorkspaceArgs(workspace) }),
+  });
+  const body = await response.json().catch(() => ({ result: "Booking refresh failed" }));
+  const result = String(body.result ?? "");
+  if (!response.ok || /^Tool failed:/i.test(result)) throw new Error(result || "Booking refresh failed");
+  return result;
 }
 
 const gbp = (n?: number) => (n != null ? `£${Math.round(n).toLocaleString("en-GB")}` : "£?");
@@ -460,7 +483,7 @@ export function TripTimeline({
   );
 }
 
-type EditableDayStop = { name: string; time: string };
+type EditableDayStop = { id: string; name: string; time: string };
 
 /**
  * A compact, owner-operated editor for the active day. It sends semantic
@@ -476,7 +499,7 @@ export function TripDayControls({
   onLock,
 }: {
   day: ItineraryDay;
-  availableActivities: Array<{ name: string }>;
+  availableActivities: Array<{ id?: string; name: string }>;
   busy: boolean;
   onSelectDay: (date: string) => void;
   onSave: (payload: { activities: string[]; times: string[]; transport_mode: string }) => void;
@@ -490,7 +513,7 @@ export function TripDayControls({
   const initialRows = (): EditableDayStop[] =>
     (day.items ?? [])
       .filter((item) => item.kind === "activity")
-      .map((item) => ({ name: item.placeId ?? item.title, time: item.time ?? "" }));
+      .map((item) => ({ id: item.placeId ?? item.title, name: item.title, time: item.time ?? "" }));
   const [rows, setRows] = useState<EditableDayStop[]>(initialRows);
   const [mode, setMode] = useState(day.route?.mode ?? "walking");
   const [addName, setAddName] = useState("");
@@ -505,7 +528,7 @@ export function TripDayControls({
   }, [signature]);
 
   const locked = day.status === "locked";
-  const choices = availableActivities.filter((activity) => !rows.some((row) => row.name === activity.name));
+  const choices = availableActivities.filter((activity) => !rows.some((row) => row.id === (activity.id ?? activity.name)));
   const updateRow = (index: number, patch: Partial<EditableDayStop>) =>
     setRows((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
   const move = (index: number, direction: -1 | 1) =>
@@ -549,7 +572,7 @@ export function TripDayControls({
 
       <div className="space-y-1.5">
         {rows.map((row, index) => (
-          <div key={row.name} className="flex items-center gap-1.5 rounded-lg border border-white/8 bg-black/20 px-2 py-1.5">
+          <div key={row.id} className="flex items-center gap-1.5 rounded-lg border border-white/8 bg-black/20 px-2 py-1.5">
             <input
               aria-label={`Time for ${row.name}`}
               type="time"
@@ -577,14 +600,16 @@ export function TripDayControls({
             className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-cyan/50 disabled:opacity-45"
           >
             <option value="">add a mapped place…</option>
-            {choices.map((activity) => <option key={activity.name} value={activity.name}>{activity.name}</option>)}
+            {choices.map((activity) => <option key={activity.id ?? activity.name} value={activity.id ?? activity.name}>{activity.name}</option>)}
           </select>
           <button
             type="button"
             disabled={busy || locked || !addName}
             onClick={() => {
               if (!addName) return;
-              setRows((current) => [...current, { name: addName, time: "" }]);
+              const activity = availableActivities.find((candidate) => (candidate.id ?? candidate.name) === addName);
+              if (!activity) return;
+              setRows((current) => [...current, { id: activity.id ?? activity.name, name: activity.name, time: "" }]);
               setAddName("");
             }}
             className="rounded-md bg-white/5 px-2 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan disabled:opacity-35"
@@ -602,7 +627,7 @@ export function TripDayControls({
             <button
               type="button"
               disabled={busy || rows.length === 0}
-              onClick={() => onSave({ activities: rows.map((row) => row.name), times: rows.map((row) => row.time), transport_mode: mode })}
+              onClick={() => onSave({ activities: rows.map((row) => row.id), times: rows.map((row) => row.time), transport_mode: mode })}
               className="rounded-md bg-cyan/15 px-2 py-1 text-[10px] text-cyan ring-1 ring-cyan/35 hover:bg-cyan/25 disabled:opacity-35"
             >
               save route & times
@@ -616,14 +641,27 @@ export function TripDayControls({
   );
 }
 
+const BOOKING_REFERENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 export default function TripView({ value }: { value: string }) {
+  let draftId = "";
   let creationId = "";
   try {
-    creationId = JSON.parse(value)?.creationId ?? "";
+    const workspace = JSON.parse(value);
+    draftId = typeof workspace?.draftId === "string" ? workspace.draftId : "";
+    creationId = typeof workspace?.creationId === "string" ? workspace.creationId : "";
   } catch {
     /* noop */
   }
-  const row = useJarvisQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as any;
+  const creationRow = useJarvisQuery(api.creations.get, creationId ? { id: creationId as never } : "skip") as any;
+  const draftRow = useJarvisQuery(api.travelDrafts.get, draftId ? { id: draftId as never } : "skip") as any;
+  const row = draftId ? draftRow : creationRow;
+  const workspace: TripWorkspace | null = draftId
+    ? { id: draftId, storage: "draft" }
+    : creationId
+      ? { id: creationId, storage: "creation" }
+      : null;
+  const draftLocked = draftId !== "" && draftRow?.state === "locked";
   const doc: TripDoc | null = useMemo(() => {
     try {
       return row?.data ? JSON.parse(row.data) : null;
@@ -632,9 +670,14 @@ export default function TripView({ value }: { value: string }) {
     }
   }, [row?.data]);
 
-  const [tab, setTab] = useState<"stays" | "flights" | "activities" | "plan">("stays");
+  const [tab, setTab] = useState<"stays" | "flights" | "activities" | "explore" | "plan">("stays");
   const [selected, setSelected] = useState<string | null>(null);
+  const [activeDiscoveryId, setActiveDiscoveryId] = useState<string | null>(null);
   const [activePlanDate, setActivePlanDate] = useState<string | null>(null);
+  const [exploreCity, setExploreCity] = useState("");
+  const [exploreQuery, setExploreQuery] = useState("");
+  const [exploreMode, setExploreMode] = useState("walking");
+  const [exploreDate, setExploreDate] = useState("");
   const [maxNight, setMaxNight] = useState<number>(0);
   const [minRating, setMinRating] = useState<number>(0);
   const [freeCancel, setFreeCancel] = useState(false);
@@ -662,38 +705,45 @@ export default function TripView({ value }: { value: string }) {
         : [],
     [doc?.itinerary],
   );
+  const discoveries = useMemo(
+    () => (Array.isArray(doc?.discoveries) ? doc.discoveries.filter((entry: any) => entry && typeof entry.id === "string" && Array.isArray(entry.items)) : []),
+    [doc?.discoveries],
+  );
+  const activePlanDay = useMemo(
+    () => itineraryDays.find((day) => day.date === activePlanDate) ?? itineraryDays[0] ?? null,
+    [activePlanDate, itineraryDays],
+  );
+  const activeDiscovery = useMemo(
+    () => discoveries.find((entry: any) => entry.id === activeDiscoveryId) ?? (tab === "explore" ? discoveries.at(-1) : undefined),
+    [activeDiscoveryId, discoveries, tab],
+  );
+  const mapCenter = tab === "explore" && validLatLng(activeDiscovery?.center?.lat, activeDiscovery?.center?.lng)
+    ? activeDiscovery.center
+    : doc?.center ?? { lat: 51.5074, lng: -0.1278 };
+  const mapRoute: ItineraryRoute | undefined = tab === "explore" ? activeDiscovery?.route : activePlanDay?.route;
   const bookedStay = useMemo((): TripBookedStayReferenceValue | null => {
-    if (!bookingNow || !Array.isArray(doc?.confirmedBookings)) return null;
-    const tripStart = Date.parse(`${doc?.departDate ?? ""}T00:00:00Z`);
-    const tripEnd = Date.parse(`${doc?.returnDate ?? ""}T23:59:59Z`);
-    return (doc.confirmedBookings as any[])
+    if (!bookingNow || !Array.isArray(doc?.bookingReferences)) return null;
+    const city = String(activeDiscovery?.city ?? doc?.destination ?? "").trim().toLocaleLowerCase("en-GB");
+    return (doc.bookingReferences as any[])
       .filter((booking) => {
-        if (booking?.kind !== "stay" || !booking.location) return false;
-        const start = Number(booking.start);
-        const end = Number(booking.end ?? booking.start);
-        if (!Number.isFinite(start) || !Number.isFinite(end) || end < bookingNow) return false;
-        if (Number.isFinite(tripStart) && Number.isFinite(tripEnd) && (end < tripStart || start > tripEnd)) return false;
-        return true;
+        const start = Number(booking?.start);
+        const end = Number(booking?.end ?? booking?.start);
+        const verifiedAt = Number(booking?.verifiedAt);
+        return Boolean(booking?.city && booking?.location) && booking.city.trim().toLocaleLowerCase("en-GB") === city && Number.isFinite(start) && Number.isFinite(end) && end >= bookingNow && Number.isFinite(verifiedAt) && bookingNow - verifiedAt <= BOOKING_REFERENCE_MAX_AGE_MS;
       })
-      .sort((left, right) => {
-        const leftActive = Number(left.start) <= bookingNow && Number(left.end ?? left.start) >= bookingNow;
-        const rightActive = Number(right.start) <= bookingNow && Number(right.end ?? right.start) >= bookingNow;
-        if (leftActive !== rightActive) return leftActive ? -1 : 1;
-        return Number(left.start) - Number(right.start);
-      })
+      .sort((left, right) => Number(left.start) - Number(right.start))
       .map((booking) => ({
+        city: String(booking.city),
         title: String(booking.title ?? ""),
         bookingName: typeof booking.bookingName === "string" ? booking.bookingName : undefined,
         location: String(booking.location),
         start: Number(booking.start),
         end: Number(booking.end ?? booking.start),
         timeZone: typeof booking.timeZone === "string" ? booking.timeZone : undefined,
+        distanceKm: Number(booking.distanceKm),
+        verifiedAt: Number(booking.verifiedAt),
       }))[0] ?? null;
-  }, [bookingNow, doc?.confirmedBookings, doc?.departDate, doc?.returnDate]);
-  const activePlanDay = useMemo(
-    () => itineraryDays.find((day) => day.date === activePlanDate) ?? itineraryDays[0] ?? null,
-    [activePlanDate, itineraryDays],
-  );
+  }, [activeDiscovery?.city, bookingNow, doc?.bookingReferences, doc?.destination]);
 
   const markers: Marker[] = useMemo(() => {
     if (!doc) return [];
@@ -702,10 +752,16 @@ export default function TripView({ value }: { value: string }) {
       if (!ms.some((existing) => existing.lat === marker.lat && existing.lng === marker.lng && existing.kind === marker.kind)) ms.push(marker);
     };
     for (const s of doc.stays ?? [])
-      if (validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.name}`, lat: s.lat, lng: s.lng, kind: "stay", name: s.name, locked: doc.locked?.stay?.name === s.name });
+      if (validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.id ?? `${s.name}:${s.city ?? doc.destination}`}`, lat: s.lat, lng: s.lng, kind: "stay", name: `${s.name}${s.city ? ` · ${s.city}` : ""}`, locked: doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name });
+    for (const booking of doc.bookingReferences ?? [])
+      if (validLatLng(booking.lat, booking.lng) && Number(booking.end) >= bookingNow && Number(booking.verifiedAt) + BOOKING_REFERENCE_MAX_AGE_MS >= bookingNow)
+        addMarker({ key: `booking:${booking.city}:${booking.start}`, lat: booking.lat, lng: booking.lng, kind: "stay", name: `Booked location · ${booking.city}`, locked: true });
+    for (const discovery of discoveries)
+      for (const item of discovery.items ?? [])
+        if (validLatLng(item.lat, item.lng)) addMarker({ key: `disc:${discovery.id}:${item.id}`, lat: item.lat, lng: item.lng, kind: "activity", name: `${item.name} · ${discovery.city}`, discoveryId: discovery.id });
     for (const a of doc.activities ?? [])
       if (validLatLng(a.lat, a.lng))
-        addMarker({ key: `act:${a.name}`, lat: a.lat, lng: a.lng, kind: "activity", name: a.name, locked: (doc.locked?.activities ?? []).includes(a.name) });
+        addMarker({ key: `act:${a.id ?? a.name}`, lat: a.lat, lng: a.lng, kind: "activity", name: `${a.name}${a.city ? ` · ${a.city}` : ""}`, locked: (doc.locked?.activities ?? []).includes(a.id ?? a.name) || (doc.locked?.activities ?? []).includes(a.name) });
     if (validLatLng(doc.airport?.lat, doc.airport?.lng)) addMarker({ key: "airport", lat: doc.airport.lat, lng: doc.airport.lng, kind: "airport", name: doc.airport.name });
     for (const day of itineraryDays) {
       day.items.forEach((item, index) => {
@@ -719,12 +775,12 @@ export default function TripView({ value }: { value: string }) {
           lng,
           kind,
           name: item.title,
-          locked: item.source === "confirmed" || doc.status === "planned",
+          locked: item.source === "confirmed" || item.source === "gmail" || doc.status === "planned",
         });
       });
     }
     return ms;
-  }, [doc, itineraryDays]);
+  }, [bookingNow, discoveries, doc, itineraryDays]);
 
   if (!doc)
     return (
@@ -734,10 +790,30 @@ export default function TripView({ value }: { value: string }) {
     );
 
   const act = async (label: string, action: string, extra: Record<string, unknown> = {}) => {
+    if (!workspace || draftLocked) {
+      setActionError(draftLocked ? "This draft has just been saved. Opening the permanent plan…" : "This trip workspace is unavailable.");
+      return;
+    }
     setBusy(label);
     setActionError("");
     try {
-      await tripTool(creationId, action, extra);
+      await tripTool(workspace, action, extra);
+    } catch (error: any) {
+      setActionError(String(error?.message ?? error));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const refreshBookings = async () => {
+    if (!workspace || draftLocked) {
+      setActionError(draftLocked ? "This draft has just been saved. Opening the permanent plan…" : "This trip workspace is unavailable.");
+      return;
+    }
+    setBusy("refreshing booked stays");
+    setActionError("");
+    try {
+      await refreshTripBookingReferences(workspace);
     } catch (error: any) {
       setActionError(String(error?.message ?? error));
     } finally {
@@ -778,14 +854,20 @@ export default function TripView({ value }: { value: string }) {
 
   const onMapSelect = (key: string) => {
     setSelected(key);
-    if (key.startsWith("stay:")) setTab("stays");
+    const marker = markers.find((entry) => entry.key === key);
+    if (marker?.discoveryId) {
+      setActiveDiscoveryId(marker.discoveryId);
+      setTab("explore");
+    } else if (key.startsWith("stay:")) setTab("stays");
     else if (key.startsWith("act:")) setTab("activities");
     else if (key.startsWith("it:")) setTab("plan");
     const name = key.split(":").slice(1).join(":");
     setTimeout(() => {
-      const target = key.startsWith("it:")
+      const target = key.startsWith("disc:")
+        ? listRef.current?.querySelector(`[data-discovery-marker="${CSS.escape(key)}"]`)
+        : key.startsWith("it:")
         ? listRef.current?.querySelector(`[data-itinerary-item="${CSS.escape(name)}"]`)
-        : listRef.current?.querySelector(`[data-name="${CSS.escape(name)}"]`);
+        : listRef.current?.querySelector(`[data-name="${CSS.escape(key.split(":").slice(1).join(":"))}"]`);
       target?.scrollIntoView({ behavior: "smooth", block: "center" });
     }, 60);
   };
@@ -795,27 +877,27 @@ export default function TripView({ value }: { value: string }) {
     <div className="flex min-h-0 flex-1 flex-col @min-[760px]:flex-row">
       {/* the map */}
       <div className="relative h-[30dvh] shrink-0 border-b border-white/5 @min-[760px]:h-auto @min-[760px]:w-[44%] @min-[760px]:border-b-0 @min-[760px]:border-r">
-        <MapView center={doc.center ?? { lat: 51.5074, lng: -0.1278 }} markers={markers} route={activePlanDay?.route} selected={selected} onSelect={onMapSelect} />
+        <MapView center={mapCenter} markers={markers} route={mapRoute} selected={selected} onSelect={onMapSelect} />
         <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-black/50 px-2 py-1 backdrop-blur">
-          <div className="text-sm font-semibold text-ice">{doc.destination}</div>
+          <div className="text-sm font-semibold text-ice">{tab === "explore" && activeDiscovery ? activeDiscovery.city : doc.destination}</div>
           <div className="hud-label !text-[9px]">
-            {doc.departDate || "dates tbd"}{doc.returnDate ? ` → ${doc.returnDate}` : ""} · {doc.adults} adults
+            {tab === "explore" && activeDiscovery ? `${activeDiscovery.query} · OpenStreetMap` : `${doc.departDate || "dates tbd"}${doc.returnDate ? ` → ${doc.returnDate}` : ""} · ${doc.adults} adults`}
           </div>
         </div>
-        {activePlanDay?.route && (
+        {mapRoute && (
           <div className="pointer-events-none absolute right-3 top-3 max-w-[52%] rounded-lg border border-white/10 bg-black/55 px-2 py-1.5 text-right backdrop-blur">
-            <div className="text-[10px] font-medium text-ice">{activePlanDay.label ?? activePlanDay.date}</div>
+            <div className="text-[10px] font-medium text-ice">{tab === "explore" && activeDiscovery ? activeDiscovery.city : activePlanDay?.label ?? activePlanDay?.date}</div>
             <div className="mt-0.5 text-[9px] uppercase tracking-wider text-cyan">
-              {[routeModeLabel(activePlanDay.route.mode), routeStatusText(activePlanDay.route)].filter(Boolean).join(" · ")}
+              {[routeModeLabel(mapRoute.mode), routeStatusText(mapRoute)].filter(Boolean).join(" · ")}
             </div>
-            {[durationSecondsText(activePlanDay.route.durationSeconds), distanceText(activePlanDay.route.distanceMeters)].filter(Boolean).length > 0 && (
+            {[durationSecondsText(mapRoute.durationSeconds), distanceText(mapRoute.distanceMeters)].filter(Boolean).length > 0 && (
               <div className="mt-0.5 text-[10px] text-slate">
-                {[durationSecondsText(activePlanDay.route.durationSeconds), distanceText(activePlanDay.route.distanceMeters)].filter(Boolean).join(" · ")}
+                {[durationSecondsText(mapRoute.durationSeconds), distanceText(mapRoute.distanceMeters)].filter(Boolean).join(" · ")}
               </div>
             )}
           </div>
         )}
-        {bookedStay && <TripBookedStayReference booking={bookedStay} checkedAt={Number(doc.bookingsCheckedAt) || undefined} now={bookingNow} />}
+        {bookedStay && <TripBookedStayReference booking={bookedStay} checkedAt={bookedStay.verifiedAt} now={bookingNow} />}
         <div className="pointer-events-none absolute bottom-2 left-3 flex gap-3 rounded-lg bg-black/50 px-2 py-1 text-[9px] uppercase tracking-widest text-slate backdrop-blur">
           <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: KIND_COLOR.stay }} />stays</span>
           <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: KIND_COLOR.activity }} />activities</span>
@@ -857,7 +939,12 @@ export default function TripView({ value }: { value: string }) {
                   onClick={() => {
                     setBusy("retrying providers");
                     setActionError("");
-                    void retryTrip(creationId, doc)
+                    if (!workspace || draftLocked) {
+                      setActionError(draftLocked ? "This draft has just been saved. Opening the permanent plan…" : "This trip workspace is unavailable.");
+                      setBusy("");
+                      return;
+                    }
+                    void retryTrip(workspace, doc)
                       .catch((error: any) => setActionError(String(error?.message ?? error)))
                       .finally(() => setBusy(""));
                   }}
@@ -889,14 +976,14 @@ export default function TripView({ value }: { value: string }) {
           </div>
         </div>
         <div className="flex items-center gap-1 overflow-x-auto border-b border-white/5 px-2 py-1.5">
-          {(["stays", "flights", "activities", "plan"] as const).map((t) => (
+          {(["stays", "flights", "activities", "explore", "plan"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
               className={`shrink-0 rounded-full px-3 py-1 text-[11px] uppercase tracking-widest transition ${tab === t ? "bg-cyan/15 text-cyan ring-1 ring-cyan/40" : "text-slate hover:text-ice"}`}
             >
               {t}
-              {t === "stays" ? ` ${stays.length}` : t === "flights" ? ` ${(doc.flights ?? []).length}` : t === "activities" ? ` ${(doc.activities ?? []).length}` : ""}
+              {t === "stays" ? ` ${stays.length}` : t === "flights" ? ` ${(doc.flights ?? []).length}` : t === "activities" ? ` ${(doc.activities ?? []).length}` : t === "explore" ? ` ${discoveries.length}` : ""}
             </button>
           ))}
           {busy && <span className="ml-auto shrink-0 animate-pulse text-[10px] text-cyan">{busy}…</span>}
@@ -950,10 +1037,12 @@ export default function TripView({ value }: { value: string }) {
                 <div className={`${glass} p-5 text-center text-sm text-slate`}>No stays match these filters. Clear one or more filters to see the full shortlist.</div>
               )}
               {stays.map((s: any) => {
-                const locked = doc.locked?.stay?.name === s.name;
-                const sel = selected === `stay:${s.name}`;
+                const stayRef = String(s.id ?? `${s.name}:${s.city ?? doc.destination}`);
+                const stayKey = `stay:${stayRef}`;
+                const locked = doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name;
+                const sel = selected === stayKey;
                 return (
-                  <div key={s.name} data-name={s.name} className={`${glass} card-lift flex gap-3 p-2.5 ${locked ? "ring-1 ring-cyan/60" : sel ? "ring-1 ring-white/30" : ""}`}>
+                  <div key={stayKey} data-name={stayRef} className={`${glass} card-lift flex gap-3 p-2.5 ${locked ? "ring-1 ring-cyan/60" : sel ? "ring-1 ring-white/30" : ""}`}>
                     {s.image || s.thumb ? (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img src={s.image ?? s.thumb} alt="" className="h-24 w-32 shrink-0 rounded-lg object-cover" />
@@ -968,7 +1057,7 @@ export default function TripView({ value }: { value: string }) {
                         </span>
                       </div>
                       <div className="mt-0.5 text-[11px] text-slate">
-                        ★{s.rating ? Math.round(s.rating * 10) / 10 : "?"} {s.hotelClass ? "· " + "⭑".repeat(s.hotelClass) : ""} {s.propertyType ? `· ${s.propertyType}` : ""} {s.freeCancellation ? "· free cancellation" : ""}
+                        {s.city ? `${s.city} · ` : ""}★{s.rating ? Math.round(s.rating * 10) / 10 : "?"} {s.hotelClass ? "· " + "⭑".repeat(s.hotelClass) : ""} {s.propertyType ? `· ${s.propertyType}` : ""} {s.freeCancellation ? "· free cancellation" : ""}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-1">
                         {(s.amenities ?? []).map((a: string) => (
@@ -985,7 +1074,7 @@ export default function TripView({ value }: { value: string }) {
                           </a>
                         )}
                         <button
-                          onClick={() => void act(`locking ${s.name}`, "lock_stay", { stay: s.name })}
+                          onClick={() => void act(`locking ${s.name}`, "lock_stay", { stay: stayRef })}
                           className={`ml-auto rounded-lg px-3 py-1 text-[11px] font-medium ${locked ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "bg-white/5 text-slate ring-1 ring-white/10 hover:text-ice"}`}
                         >
                           {locked ? "locked ✓" : "lock in"}
@@ -1061,10 +1150,11 @@ export default function TripView({ value }: { value: string }) {
                 <div className={`${glass} p-5 text-center text-sm text-slate`}>No activities were returned for this destination.</div>
               )}
               {(doc.activities ?? []).map((a: any) => {
-              const picked = (doc.locked?.activities ?? []).includes(a.name);
-              const sel = selected === `act:${a.name}`;
+              const activityId = String(a.id ?? a.name);
+              const picked = (doc.locked?.activities ?? []).includes(activityId) || (doc.locked?.activities ?? []).includes(a.name);
+              const sel = selected === `act:${activityId}`;
               return (
-                <div key={a.name} data-name={a.name} className={`${glass} card-lift flex items-center gap-3 p-2.5 ${picked ? "ring-1 ring-sky-400/60" : sel ? "ring-1 ring-white/30" : ""}`}>
+                <div key={activityId} data-name={activityId} className={`${glass} card-lift flex items-center gap-3 p-2.5 ${picked ? "ring-1 ring-sky-400/60" : sel ? "ring-1 ring-white/30" : ""}`}>
                   {a.photo ? (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={a.photo} alt="" className="h-20 w-28 shrink-0 rounded-lg object-cover" />
@@ -1073,7 +1163,7 @@ export default function TripView({ value }: { value: string }) {
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[13px] font-semibold text-ice">{a.name}</div>
-                    <div className="text-[10px] text-slate">OpenStreetMap place · venue details can change</div>
+                    <div className="text-[10px] text-slate">OpenStreetMap place{a.city ? ` · ${a.city}` : ""} · venue details can change</div>
                     {a.address && <div className="truncate text-[10px] text-slate/70">{a.address}</div>}
                     {(a.openingHours || a.charge) && (
                       <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-slate">
@@ -1086,7 +1176,7 @@ export default function TripView({ value }: { value: string }) {
                       {a.websiteUrl && <a href={a.websiteUrl} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">venue ↗</a>}
                       {a.wikipediaArticle?.articleUrl && <a href={a.wikipediaArticle.articleUrl} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">guide ↗</a>}
                       <button
-                        onClick={() => void act(picked ? "removing" : "adding", "toggle_activity", { activity: a.name })}
+                        onClick={() => void act(picked ? "removing" : "adding", "toggle_activity", { activity: activityId })}
                         className={`ml-auto rounded-lg px-3 py-1 text-[11px] font-medium ${picked ? "bg-sky-400/20 text-sky-300 ring-1 ring-sky-400/50" : "bg-white/5 text-slate ring-1 ring-white/10 hover:text-ice"}`}
                       >
                         {picked ? "in plan ✓" : "+ add"}
@@ -1097,6 +1187,154 @@ export default function TripView({ value }: { value: string }) {
                 </div>
               );
               })}
+            </>
+          )}
+
+          {tab === "explore" && (
+            <>
+              <section className={`${glass} space-y-2.5 p-3`} aria-label="Explore another place">
+                <div>
+                  <div className="hud-label">explore the same live globe</div>
+                  <p className="mt-1 text-[11px] text-slate">Find real places or stays in any city without changing this trip’s destination. Results, map pins, routes, and read-only booking references stay with the plan.</p>
+                </div>
+                <div className="grid gap-2 @min-[500px]:grid-cols-2">
+                  <label className="grid gap-1 text-[9px] uppercase tracking-wider text-slate">
+                    City or town
+                    <input
+                      aria-label="Explore city or town"
+                      value={exploreCity}
+                      onChange={(event) => setExploreCity(event.target.value)}
+                      placeholder={doc.destination}
+                      className="rounded-md border border-white/10 bg-black/25 px-2 py-1.5 text-[11px] normal-case text-ice outline-none focus:border-cyan/50"
+                    />
+                  </label>
+                  <label className="grid gap-1 text-[9px] uppercase tracking-wider text-slate">
+                    Places to find
+                    <input
+                      aria-label="Explore places query"
+                      value={exploreQuery}
+                      onChange={(event) => setExploreQuery(event.target.value)}
+                      placeholder={doc.vibe || "museums, food, hikes…"}
+                      className="rounded-md border border-white/10 bg-black/25 px-2 py-1.5 text-[11px] normal-case text-ice outline-none focus:border-cyan/50"
+                    />
+                  </label>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  <select
+                    aria-label="Explore transport mode"
+                    value={exploreMode}
+                    onChange={(event) => setExploreMode(event.target.value)}
+                    className="rounded-md border border-white/10 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-cyan/50"
+                  >
+                    <option value="walking">walk route</option>
+                    <option value="bicycling">cycle route</option>
+                    <option value="driving">drive route</option>
+                    <option value="transit">transit markers</option>
+                  </select>
+                  <button
+                    type="button"
+                    disabled={Boolean(busy)}
+                    onClick={() => void act("finding places", "discover_places", { location: exploreCity || doc.destination, query: exploreQuery || doc.vibe || "attractions", route: true, transport_mode: exploreMode })}
+                    className="rounded-md bg-cyan/15 px-2.5 py-1 text-[10px] text-cyan ring-1 ring-cyan/35 hover:bg-cyan/25 disabled:opacity-35"
+                  >
+                    find mapped places
+                  </button>
+                  <button
+                    type="button"
+                    disabled={Boolean(busy)}
+                    onClick={() => void act("finding stays", "rescout_stays", { location: exploreCity || doc.destination })}
+                    className="rounded-md bg-white/5 px-2.5 py-1 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan disabled:opacity-35"
+                  >
+                    find stays here
+                  </button>
+                  <button
+                    type="button"
+                    disabled={Boolean(busy)}
+                    onClick={() => void refreshBookings()}
+                    className="rounded-md bg-emerald-300/10 px-2.5 py-1 text-[10px] text-emerald-100 ring-1 ring-emerald-300/25 hover:bg-emerald-300/15 disabled:opacity-35"
+                  >
+                    refresh booked locations
+                  </button>
+                </div>
+              </section>
+
+              {discoveries.length > 1 && (
+                <label className={`${glass} grid gap-1 p-2.5 text-[9px] uppercase tracking-wider text-slate`}>
+                  Saved exploration
+                  <select
+                    aria-label="Saved exploration"
+                    value={activeDiscovery?.id ?? ""}
+                    onChange={(event) => setActiveDiscoveryId(event.target.value || null)}
+                    className="rounded-md border border-white/10 bg-black/25 px-2 py-1 text-[11px] normal-case text-ice outline-none focus:border-cyan/50"
+                  >
+                    {discoveries.map((entry: any) => <option key={entry.id} value={entry.id}>{entry.city} · {entry.query}</option>)}
+                  </select>
+                </label>
+              )}
+
+              {activeDiscovery ? (
+                <>
+                  <section className={`${glass} flex flex-wrap items-start justify-between gap-2 p-3`}>
+                    <div>
+                      <div className="text-[13px] font-semibold text-ice">{activeDiscovery.city} · {activeDiscovery.query}</div>
+                      <div className="mt-0.5 text-[10px] text-slate">OpenStreetMap · saved {new Date(activeDiscovery.fetchedAt).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</div>
+                    </div>
+                    <div className="text-right text-[10px] text-cyan">
+                      {activeDiscovery.route?.status === "ready" ? `${routeModeLabel(activeDiscovery.route.mode)} · ${durationSecondsText(activeDiscovery.route.durationSeconds) ?? "timing"}` : activeDiscovery.route?.mode === "transit" ? "transit timing unavailable" : "markers only"}
+                    </div>
+                    {activeDiscovery.bookingReference && <div className="w-full rounded-lg border border-emerald-300/15 bg-emerald-300/5 px-2 py-1.5 text-[10px] text-emerald-100">Read-only Gmail stay verified near {activeDiscovery.city}: {activeDiscovery.bookingReference.bookingName || activeDiscovery.bookingReference.title} · {activeDiscovery.bookingReference.distanceKm} km from centre.</div>}
+                  </section>
+                  {(activeDiscovery.items ?? []).map((item: any) => {
+                    const markerKey = `disc:${activeDiscovery.id}:${item.id}`;
+                    const addDate = exploreDate || activePlanDay?.date || doc.departDate;
+                    return (
+                      <article
+                        key={item.id}
+                        data-discovery-marker={markerKey}
+                        onClick={() => { setActiveDiscoveryId(activeDiscovery.id); setSelected(markerKey); }}
+                        className={`${glass} card-lift cursor-pointer p-2.5 ${selected === markerKey ? "ring-1 ring-cyan/55" : ""}`}
+                      >
+                        <div className="flex gap-3">
+                          {item.photo ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={item.photo} alt="" className="h-20 w-24 shrink-0 rounded-lg object-cover" />
+                          ) : (
+                            <span className="flex h-20 w-24 shrink-0 items-center justify-center rounded-lg bg-sky-400/10 text-xl">📍</span>
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-[13px] font-semibold text-ice">{item.name}</div>
+                            <div className="mt-0.5 text-[10px] text-slate">{activeDiscovery.city} · OpenStreetMap</div>
+                            {item.address && <div className="mt-0.5 truncate text-[10px] text-slate/70">{item.address}</div>}
+                            {(item.openingHours || item.charge) && <div className="mt-1 flex flex-wrap gap-x-2 text-[10px] text-slate">{item.openingHours && <span>hours (OSM): {item.openingHours}</span>}{item.charge && <span>charge (OSM): {item.charge}</span>}</div>}
+                            <div className="mt-1 flex flex-wrap gap-1.5">
+                              {item.mapsLink && <a onClick={(event) => event.stopPropagation()} href={item.mapsLink} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan">maps ↗</a>}
+                              {item.websiteUrl && <a onClick={(event) => event.stopPropagation()} href={item.websiteUrl} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan">venue ↗</a>}
+                              {item.wikipediaArticle?.articleUrl && <a onClick={(event) => event.stopPropagation()} href={item.wikipediaArticle.articleUrl} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan">guide ↗</a>}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="mt-2 flex flex-wrap items-end gap-1.5 border-t border-white/8 pt-2">
+                          <label className="grid gap-1 text-[8px] uppercase tracking-wider text-slate">
+                            Add to date
+                            <input aria-label={`Date for ${item.name}`} type="date" value={addDate} onClick={(event) => event.stopPropagation()} onChange={(event) => setExploreDate(event.target.value)} className="rounded-md border border-white/10 bg-black/25 px-1.5 py-1 text-[10px] text-ice outline-none focus:border-cyan/50" />
+                          </label>
+                          <button
+                            type="button"
+                            disabled={Boolean(busy) || !/^\d{4}-\d{2}-\d{2}$/.test(addDate)}
+                            onClick={(event) => { event.stopPropagation(); void act("adding place", "add_discovery_to_day", { discovery_id: activeDiscovery.id, candidate_id: item.id, date: addDate, transport_mode: exploreMode }); }}
+                            className="ml-auto rounded-md bg-sky-400/15 px-2.5 py-1.5 text-[10px] text-sky-200 ring-1 ring-sky-400/35 hover:bg-sky-400/25 disabled:opacity-35"
+                          >
+                            + add to itinerary
+                          </button>
+                        </div>
+                        {item.photo && item.wikipediaArticle?.attribution && <div className="mt-1 text-[9px] text-slate/60">image · {item.wikipediaArticle.attribution}</div>}
+                      </article>
+                    );
+                  })}
+                </>
+              ) : (
+                <div className={`${glass} p-5 text-center text-[11px] text-slate`}>Search a city, town, or nearby place to keep a source-backed exploration on this globe.</div>
+              )}
             </>
           )}
 
@@ -1142,8 +1380,8 @@ export default function TripView({ value }: { value: string }) {
               {activePlanDay && (
                 <TripDayControls
                   day={activePlanDay}
-                  availableActivities={(doc.activities ?? []).map((activity: any) => ({ name: String(activity.name ?? "") })).filter((activity: { name: string }) => activity.name)}
-                  busy={Boolean(busy)}
+                  availableActivities={(doc.activities ?? []).map((activity: any) => ({ id: String(activity.id ?? activity.name ?? ""), name: String(activity.name ?? "") })).filter((activity: { id: string; name: string }) => activity.id && activity.name)}
+                  busy={Boolean(busy) || draftLocked}
                   onSelectDay={setActivePlanDate}
                   onSave={(payload) => void act("routing day", "schedule_day", { date: activePlanDay.date, ...payload })}
                   onLock={(locked) => void act(locked ? "locking day" : "unlocking day", locked ? "lock_day" : "unlock_day", { date: activePlanDay.date })}

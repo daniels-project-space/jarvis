@@ -189,8 +189,13 @@ describe("conversation-scoped travel drafts", () => {
       sourceMessageId: lisbonMessage,
       workerToken: WORKER,
     });
-    expect(firstLock).toMatchObject({ ok: true, alreadyLocked: false, planRevision: 0 });
-    expect(retry).toMatchObject({ ok: true, alreadyLocked: true, creationId: firstLock.creationId });
+    expect(firstLock).toMatchObject({ ok: true, alreadyLocked: false, planRevision: 0, mindmapCreationId: expect.any(String) });
+    expect(retry).toMatchObject({
+      ok: true,
+      alreadyLocked: true,
+      creationId: firstLock.creationId,
+      mindmapCreationId: firstLock.mindmapCreationId,
+    });
 
     const creation = await t.run((ctx) => ctx.db.get(firstLock.creationId)) as {
       kind?: string;
@@ -201,9 +206,23 @@ describe("conversation-scoped travel drafts", () => {
     expect(creation?.kind).toBe("trip");
     expect(creation?.category).toBe("travel plans");
     expect(creation?.folder).toBe("Travel / Plans");
-    expect(JSON.parse(creation?.data ?? "{}")).toMatchObject({ status: "planned", threadId: "thread-lisbon", planRevision: 0 });
+    expect(JSON.parse(creation?.data ?? "{}")).toMatchObject({
+      status: "planned",
+      threadId: "thread-lisbon",
+      planRevision: 0,
+      mindmapCreationId: firstLock.mindmapCreationId,
+    });
+    const mindmap = await t.run((ctx) => ctx.db.get(firstLock.mindmapCreationId)) as {
+      kind?: string;
+      category?: string;
+      folder?: string;
+      threadId?: string;
+      data?: string;
+    } | null;
+    expect(mindmap).toMatchObject({ kind: "canvas", category: "mind maps", folder: "Travel / Plans", threadId: "thread-lisbon" });
+    expect(JSON.parse(mindmap?.data ?? "{}")).toMatchObject({ tripId: firstLock.creationId, title: "Trip map · Lisbon" });
     const allTrips = await t.run((ctx) => ctx.db.query("creations").collect());
-    expect(allTrips).toHaveLength(1);
+    expect(allTrips).toHaveLength(2);
 
     await expect(t.mutation(travelDrafts.patchProvider, {
       id: created.id,

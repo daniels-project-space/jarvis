@@ -2,9 +2,12 @@ import "server-only";
 import { convexMutation, convexQuery } from "./context";
 import { lookupGmailBookingsReadOnly, type ConfirmedBooking } from "./booking-email";
 import {
+  enrichOpenStreetMapPlacesWithWikimedia,
+  openStreetMapDistanceKm,
   openStreetMapDirectionsUrl,
   routeOpenStreetMapItinerary,
   searchOpenStreetMapPlaces,
+  type OpenStreetMapPlace,
   type OpenStreetMapWikipediaSource,
   type WikimediaPlaceArticle,
 } from "./openstreetmap";
@@ -61,6 +64,8 @@ export type TripFlight = {
   roundTrip?: boolean;
 };
 export type TripStay = {
+  /** Stable provider candidate key, including city so comparisons never collide. */
+  id?: string;
   name: string;
   priceGbp?: number;
   totalGbp?: number;
@@ -75,8 +80,14 @@ export type TripStay = {
   lng?: number;
   link?: string;
   googleLink?: string;
+  /** City/region supplied to the hotel provider for this result set. */
+  city?: string;
+  /** Provider label retained when multiple cities are compared on one globe. */
+  source?: string;
 };
 export type TripActivity = {
+  /** Stable source-backed key; allows duplicate venue names across towns. */
+  id?: string;
   name: string;
   rating?: number;
   ratings?: number;
@@ -95,6 +106,38 @@ export type TripActivity = {
   wikipedia?: OpenStreetMapWikipediaSource;
   /** Source-attributed Wikipedia/Wikimedia article and optional thumbnail. */
   wikipediaArticle?: WikimediaPlaceArticle;
+  /** City/region used to obtain this exact OpenStreetMap candidate. */
+  city?: string;
+  /** The persisted discovery collection that produced this candidate. */
+  discoveryId?: string;
+  source?: "OpenStreetMap";
+};
+export type TripBookingReference = {
+  city: string;
+  title: string;
+  bookingName?: string;
+  location: string;
+  start: number;
+  end: number;
+  timeZone?: string;
+  lat: number;
+  lng: number;
+  /** Geocoded distance from the named city centre, never inferred client-side. */
+  distanceKm: number;
+  state: "active" | "upcoming";
+  verifiedAt: number;
+};
+export type TripDiscovery = {
+  id: string;
+  city: string;
+  query: string;
+  center: { lat: number; lng: number };
+  fetchedAt: number;
+  provider: "OpenStreetMap";
+  items: TripActivity[];
+  route?: TripDayRoute;
+  /** Present only when a time-valid Gmail stay was geocoded near this city. */
+  bookingReference?: TripBookingReference;
 };
 export type TripProviderState = {
   status: "queued" | "searching" | "ready" | "error" | "skipped";
@@ -117,6 +160,8 @@ export type TripDoc = {
   vibe?: string;
   status: "scouting" | "planned";
   threadId?: string;
+  /** Immutable successful destination geocode; unlike `center`, providers never move it. */
+  destinationCenter?: { lat: number; lng: number };
   center: { lat: number; lng: number };
   airport?: { name: string; lat: number; lng: number };
   flights: TripFlight[];
@@ -141,7 +186,29 @@ export type TripDoc = {
   confirmedBookings?: ConfirmedBooking[];
   /** Timestamp of the last successful read-only Gmail booking refresh. */
   bookingsCheckedAt?: number;
+  /** Source-verified, city-scoped Gmail stay references for the active globe. */
+  bookingReferences?: TripBookingReference[];
+  /** Persisted arbitrary-city exploration result sets shown on the same globe. */
+  discoveries?: TripDiscovery[];
 };
+
+/** Keep live conversation workspaces distinct from permanent saved trip creations. */
+export type TripStorage = "draft" | "creation";
+export type TripWorkspaceRef = { draftId: string } | { creationId: string };
+export type TripStorageContext = {
+  storage: TripStorage;
+  /** Trusted host provenance only; never model-authored tool input. */
+  sourceMessageId?: string;
+};
+export type TripRecord = {
+  id: string;
+  doc: TripDoc;
+  storage: TripStorage;
+};
+
+export function tripWorkspaceRef(storage: TripStorage, id: string): TripWorkspaceRef {
+  return storage === "draft" ? { draftId: id } : { creationId: id };
+}
 
 export function bookingsForTripWindow(bookings: ConfirmedBooking[], departDate?: string, returnDate?: string): ConfirmedBooking[] {
   const start = Date.parse(`${departDate ?? ""}T00:00:00Z`);
@@ -175,19 +242,22 @@ export async function placesActivities(destination: string, vibe?: string, limit
       if (seen.has(identity)) continue;
       seen.add(identity);
       out.push({
+        id: tripActivityId({ name: place.name, lat: place.lat, lng: place.lng }),
         name: place.name.slice(0, 70),
         lat: place.lat,
         lng: place.lng,
         address: place.address.slice(0, 100) || undefined,
         mapsLink: place.mapsUri,
-        openingHours: place.openingHours,
-        charge: place.charge,
-        websiteUrl: place.websiteUrl,
-        wikipedia: place.wikipedia,
-        wikipediaArticle: place.wikipediaArticle,
+        ...(place.openingHours ? { openingHours: place.openingHours } : {}),
+        ...(place.charge ? { charge: place.charge } : {}),
+        ...(place.websiteUrl ? { websiteUrl: place.websiteUrl } : {}),
+        ...(place.wikipedia ? { wikipedia: place.wikipedia } : {}),
+        ...(place.wikipediaArticle ? { wikipediaArticle: place.wikipediaArticle } : {}),
         // The adapter permits this only for an exact OpenStreetMap Wikipedia
         // tag and records the article/attribution alongside it above.
-        photo: place.wikipediaArticle?.thumbnailUrl,
+        ...(place.wikipediaArticle?.thumbnailUrl ? { photo: place.wikipediaArticle.thumbnailUrl } : {}),
+        city: destination,
+        source: "OpenStreetMap",
       });
       if (out.length >= limit) return out;
     }
@@ -218,21 +288,21 @@ export function tripTotals(doc: TripDoc): TripDoc["totals"] {
   };
 }
 
-// Spawn the globe the moment trip talk starts: a skeleton trip doc centred on
-// the destination (city geocode + airport marker), populated live by trip_plan.
+// Spawn the globe the moment trip talk starts. Until Daniel explicitly locks
+// it, this is a conversation-scoped draft rather than a saved library record.
 export async function openTrip(a: {
   destination: string;
   destIata?: string;
   departDate?: string;
   returnDate?: string;
-  /** Reopening is explicit; a same-city plan must never be guessed globally. */
-  reuseExisting?: boolean;
-}): Promise<{ id: string; doc: TripDoc }> {
+  /** Trusted host provenance when this starts from a chat message. */
+  sourceMessageId?: string;
+  /** Host-selected conversation thread; worker calls are verified by Convex. */
+  threadId?: string;
+}): Promise<TripRecord> {
   const destIata = a.destIata ? fixIata(a.destIata) : "";
-  const normalized = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const [threadId, existingRows, geocode, airport] = await Promise.all([
+  const [activeThread, geocode, airport] = await Promise.all([
     convexQuery("ui:getActiveThread", {}).then((value) => (typeof value === "string" && value ? value : "main")),
-    a.reuseExisting ? convexQuery("creations:list", { kind: "trip", limit: 30 }).catch(() => []) : Promise.resolve([]),
     fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(a.destination)}&count=1&language=en`, {
       signal: AbortSignal.timeout(6000),
     })
@@ -240,30 +310,14 @@ export async function openTrip(a: {
       .catch(() => null),
     destIata ? findAirport(destIata, a.destination) : Promise.resolve(undefined),
   ]);
-  for (const row of Array.isArray(existingRows) ? existingRows : []) {
-    try {
-      const existing = JSON.parse(row.data ?? "") as TripDoc;
-      if (
-        a.reuseExisting &&
-        normalized(existing.destination) === normalized(a.destination) &&
-        existing.threadId === threadId &&
-        (!a.departDate || existing.departDate === a.departDate) &&
-        (!a.returnDate || existing.returnDate === a.returnDate) &&
-        Date.now() - Number(row.updatedAt ?? 0) < 30 * 86_400_000
-      ) {
-        await convexMutation("ui:setPanel", {
-          type: "trip",
-          value: JSON.stringify({ creationId: String(row._id) }),
-          title: `trip · ${existing.title}`,
-        });
-        return { id: String(row._id), doc: existing };
-      }
-    } catch {
-      /* ignore malformed historical rows */
-    }
-  }
+  const threadId = a.threadId || activeThread;
   let center = { lat: 41.39, lng: 2.17 };
-  if ((geocode as any)?.results?.[0]) center = { lat: (geocode as any).results[0].latitude, lng: (geocode as any).results[0].longitude };
+  let destinationCenter: { lat: number; lng: number } | undefined;
+  const geocoded = (geocode as any)?.results?.[0];
+  if (Number.isFinite(geocoded?.latitude) && Number.isFinite(geocoded?.longitude)) {
+    center = { lat: geocoded.latitude, lng: geocoded.longitude };
+    destinationCenter = center;
+  }
   const doc: TripDoc = {
     kind: "trip",
     title: `${a.destination} · planning`,
@@ -278,6 +332,7 @@ export async function openTrip(a: {
     includeFlights: undefined,
     threadId,
     center,
+    destinationCenter,
     airport,
     flights: [],
     stays: [],
@@ -290,9 +345,18 @@ export async function openTrip(a: {
       airport: { status: airport ? "ready" : "queued", source: "OpenStreetMap", count: airport ? 1 : 0, checkedAt: airport ? Date.now() : undefined },
     },
   };
-  const id = await convexMutation("creations:create", { kind: "trip", title: doc.title, data: JSON.stringify(doc) });
-  await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ creationId: String(id) }), title: `trip · ${a.destination}` });
-  return { id: String(id), doc };
+  const created = await convexMutation("travelDrafts:createDraft", {
+    threadId,
+    title: doc.title,
+    destination: doc.destination,
+    data: JSON.stringify(doc),
+    ...(a.sourceMessageId ? { sourceMessageId: a.sourceMessageId } : {}),
+  });
+  if (!created?.ok || !created.id) throw new Error(`Trip draft could not be created${created?.reason ? `: ${created.reason}` : ""}`);
+  const id = String(created.id);
+  doc.planRevision = Number.isSafeInteger(created.planRevision) ? created.planRevision : 0;
+  await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ draftId: id }), title: `trip · ${a.destination}` });
+  return { id, doc, storage: "draft" };
 }
 
 // Progressive scout: the workspace appears immediately, and each provider
@@ -309,8 +373,10 @@ export async function scoutTrip(a: {
   maxPricePerNight?: number;
   vacationRentals?: boolean;
   includeFlights?: boolean; // Daniel doesn't always fly — never assume
-  reuseId?: string; // populate the already-open globe instead of spawning a new doc
-}): Promise<{ id: string; doc: TripDoc }> {
+  reuseId?: string; // populate the exact already-open workspace only
+  reuseStorage?: TripStorage;
+  sourceMessageId?: string;
+}): Promise<TripRecord> {
   const nights = Math.max(1, Math.round((Date.parse(a.returnDate) - Date.parse(a.departDate)) / 86_400_000));
   // Budget shaping: stays get ~45% of total budget unless caller overrides.
   const perNightCap = a.maxPricePerNight ?? Math.max(30, Math.round((a.budgetGbp * 0.45) / nights));
@@ -323,22 +389,31 @@ export async function scoutTrip(a: {
     .catch(() => ({ bookings: [] as ConfirmedBooking[], checkedAt: undefined }));
 
   let id = a.reuseId;
+  let storage: TripStorage = a.reuseStorage ?? "draft";
   let prior: TripDoc | undefined;
   if (id) {
-    const row: any = await convexQuery("creations:get", { id }).catch(() => null);
-    try {
-      prior = row?.data ? JSON.parse(row.data) : undefined;
-    } catch {
-      prior = undefined;
+    const existing = await getTrip(id, { storage, sourceMessageId: a.sourceMessageId });
+    if (existing) {
+      prior = existing.doc;
+      storage = existing.storage;
+    } else {
+      id = undefined;
     }
   }
   if (!id) {
-    const opened = await openTrip({ destination: a.destination, destIata, departDate: a.departDate, returnDate: a.returnDate });
+    const opened = await openTrip({
+      destination: a.destination,
+      destIata,
+      departDate: a.departDate,
+      returnDate: a.returnDate,
+      sourceMessageId: a.sourceMessageId,
+    });
     id = opened.id;
     prior = opened.doc;
+    storage = opened.storage;
   }
   if (!id) throw new Error("Trip workspace could not be created");
-  const creationId = id;
+  const tripId = id;
   const threadId = prior?.threadId || ((await convexQuery("ui:getActiveThread", {})) as string) || "main";
   const preservePlan = Boolean(prior && prior.departDate === a.departDate && prior.returnDate === a.returnDate);
   const doc: TripDoc = {
@@ -352,10 +427,11 @@ export async function scoutTrip(a: {
     adults: a.adults,
     budgetGbp: a.budgetGbp,
     vibe: a.vibe,
-    status: preservePlan && prior?.status === "planned" ? "planned" : "scouting",
+    status: storage === "creation" && preservePlan && prior?.status === "planned" ? "planned" : "scouting",
     includeFlights: a.includeFlights !== false,
     threadId,
     center: prior?.center ?? { lat: 41.39, lng: 2.17 },
+    destinationCenter: prior?.destinationCenter,
     airport: prior?.airport,
     flights: [],
     stays: [],
@@ -363,8 +439,8 @@ export async function scoutTrip(a: {
     locked: preservePlan ? prior?.locked ?? { activities: [] } : { activities: [] },
     transfer: preservePlan ? prior?.transfer : undefined,
     itinerary: preservePlan ? prior?.itinerary : undefined,
-    planRevision: preservePlan ? prior?.planRevision : undefined,
-    mindmapCreationId: preservePlan ? prior?.mindmapCreationId : undefined,
+    planRevision: storage === "draft" ? prior?.planRevision : preservePlan ? prior?.planRevision : undefined,
+    mindmapCreationId: storage === "creation" && preservePlan ? prior?.mindmapCreationId : undefined,
     confirmedBookings: preservePlan ? prior?.confirmedBookings : undefined,
     providers: {
       flights: { status: a.includeFlights === false ? "skipped" : "searching", source: "Google Flights", checkedAt: a.includeFlights === false ? Date.now() : undefined },
@@ -375,17 +451,56 @@ export async function scoutTrip(a: {
   };
   const freshBookings = await bookingLookup;
   const matchingBookings = bookingsForTripWindow(freshBookings.bookings, doc.departDate, doc.returnDate);
-  if (matchingBookings.length) doc.confirmedBookings = mergeTripBookings(doc.confirmedBookings, matchingBookings);
-  if (freshBookings.checkedAt) doc.bookingsCheckedAt = freshBookings.checkedAt;
+  if (freshBookings.checkedAt) {
+    // A successful Gmail refresh is authoritative for this trip window so a
+    // changed/cancelled confirmation cannot linger as a live map reference.
+    doc.confirmedBookings = matchingBookings;
+    doc.bookingsCheckedAt = freshBookings.checkedAt;
+  }
   doc.totals = tripTotals(doc);
-  await convexMutation("creations:update", { id: creationId, title: doc.title, data: JSON.stringify(doc) });
-  await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ creationId }), title: `trip · ${doc.title}` });
+  await saveTrip(tripId, doc, false, { storage, sourceMessageId: a.sourceMessageId });
+  const workspace = tripWorkspaceRef(storage, tripId);
+  await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify(workspace), title: `trip · ${doc.title}` });
   await convexMutation("chatQueue:postCard", {
     threadId,
     type: "trip",
-    value: JSON.stringify({ creationId }),
+    value: JSON.stringify(workspace),
     title: `trip · ${doc.title}`,
   }).catch(() => {});
+
+  const patchProvider = async (
+    provider: "flights" | "stays" | "activities" | "airport",
+    status: TripProviderState["status"],
+    source: string,
+    items?: unknown,
+    error?: string,
+  ) => {
+    if (storage === "draft") {
+      const result = await convexMutation("travelDrafts:patchProvider", {
+        id: tripId,
+        provider,
+        status,
+        source,
+        ...(items !== undefined ? { itemsJson: JSON.stringify(items) } : {}),
+        ...(error !== undefined ? { error: error.slice(0, 300) } : {}),
+        ...(a.sourceMessageId ? { sourceMessageId: a.sourceMessageId } : {}),
+      });
+      // A late scout result must never turn a newly locked permanent plan back
+      // into an error state. The lock is the terminal authority boundary.
+      if (!result?.ok && !["locked", "expired"].includes(String(result?.reason))) {
+        throw new Error(`Trip provider update failed${result?.reason ? `: ${result.reason}` : ""}`);
+      }
+      return;
+    }
+    await convexMutation("creations:updateTripProvider", {
+      id: tripId,
+      provider,
+      status,
+      source,
+      ...(items !== undefined ? { items } : {}),
+      ...(error !== undefined ? { error: error.slice(0, 300) } : {}),
+    });
+  };
 
   const updateProvider = async (
     provider: "flights" | "stays" | "activities" | "airport",
@@ -397,22 +512,9 @@ export async function scoutTrip(a: {
       const result = await task();
       const items = select(result);
       const available = result?.available !== false && (provider !== "airport" || Boolean(items));
-      await convexMutation("creations:updateTripProvider", {
-        id: creationId,
-        provider,
-        status: available ? "ready" : "error",
-        source,
-        items,
-        error: available ? undefined : String(result?.reason ?? `${source} returned no airport`).slice(0, 300),
-      });
+      await patchProvider(provider, available ? "ready" : "error", source, items, available ? undefined : String(result?.reason ?? `${source} returned no airport`));
     } catch (error: any) {
-      await convexMutation("creations:updateTripProvider", {
-        id: creationId,
-        provider,
-        status: "error",
-        source,
-        error: String(error?.message ?? error).slice(0, 300),
-      }).catch(() => {});
+      await patchProvider(provider, "error", source, undefined, String(error?.message ?? error)).catch(() => {});
     }
   };
 
@@ -428,54 +530,30 @@ export async function scoutTrip(a: {
     try {
       const first = await hubAction("travelActions:searchStays", { ...base, maxPages: 1 });
       if (first?.available === false) {
-        await convexMutation("creations:updateTripProvider", {
-          id: creationId,
-          provider: "stays",
-          status: "error",
-          source: "Google Hotels",
-          error: String(first?.reason ?? "No stays returned").slice(0, 300),
-        });
+        await patchProvider("stays", "error", "Google Hotels", undefined, String(first?.reason ?? "No stays returned"));
         return;
       }
-      const initial = (first?.options ?? []).slice(0, 16) as TripStay[];
-      await convexMutation("creations:updateTripProvider", {
-        id: creationId,
-        provider: "stays",
-        status: "ready",
-        source: "Google Hotels · first page",
-        items: initial,
+      const initial = ((first?.options ?? []).slice(0, 16) as TripStay[]).map((stay) => {
+        const scoped = { ...stay, city: a.destination, source: "Google Hotels" };
+        return { ...scoped, id: tripStayId(scoped) };
       });
+      await patchProvider("stays", "ready", "Google Hotels · first page", initial);
       if (!first?.nextPageToken) return;
-      await convexMutation("creations:updateTripProvider", {
-        id: creationId,
-        provider: "stays",
-        status: "searching",
-        source: "Google Hotels · enriching",
-      });
+      await patchProvider("stays", "searching", "Google Hotels · enriching");
       const more = await hubAction("travelActions:searchStays", {
         ...base,
         maxPages: 2,
         pageToken: first.nextPageToken,
       });
-      const merged = [...initial, ...((more?.options ?? []) as TripStay[])]
+      const merged = [...initial, ...((more?.options ?? []) as TripStay[]).map((stay) => {
+        const scoped = { ...stay, city: a.destination, source: "Google Hotels" };
+        return { ...scoped, id: tripStayId(scoped) };
+      })]
         .filter((stay, index, all) => all.findIndex((candidate) => candidate.name === stay.name) === index)
         .slice(0, 36);
-      await convexMutation("creations:updateTripProvider", {
-        id: creationId,
-        provider: "stays",
-        status: "ready",
-        source: "Google Hotels · 3 pages",
-        items: merged,
-        error: more?.available === false ? String(more?.reason ?? "Enrichment stopped").slice(0, 300) : undefined,
-      });
+      await patchProvider("stays", "ready", "Google Hotels · 3 pages", merged, more?.available === false ? String(more?.reason ?? "Enrichment stopped") : undefined);
     } catch (error: any) {
-      await convexMutation("creations:updateTripProvider", {
-        id: creationId,
-        provider: "stays",
-        status: "error",
-        source: "Google Hotels",
-        error: String(error?.message ?? error).slice(0, 300),
-      }).catch(() => {});
+      await patchProvider("stays", "error", "Google Hotels", undefined, String(error?.message ?? error)).catch(() => {});
     }
   };
 
@@ -502,41 +580,311 @@ export async function scoutTrip(a: {
       ),
     );
   await Promise.allSettled(work);
-  const finalRow: any = await convexQuery("creations:get", { id: creationId }).catch(() => null);
-  let finalDoc = doc;
-  try {
-    if (finalRow?.data) finalDoc = JSON.parse(finalRow.data);
-  } catch {
-    /* return the shell */
+  const finalTrip = await getTrip(tripId, { storage, sourceMessageId: a.sourceMessageId });
+  if (finalTrip && freshBookings.checkedAt && finalTrip.doc.destinationCenter) {
+    const reference = await verifyTripCityBookingReference({
+      doc: finalTrip.doc,
+      city: finalTrip.doc.destination,
+      center: finalTrip.doc.destinationCenter,
+      bookings: freshBookings.bookings,
+      now: freshBookings.checkedAt,
+    });
+    finalTrip.doc.bookingReferences = setTripBookingReference(finalTrip.doc.bookingReferences, reference, finalTrip.doc.destination);
+    try {
+      await saveTrip(finalTrip.id, finalTrip.doc, false, { storage: finalTrip.storage, sourceMessageId: a.sourceMessageId });
+    } catch (error: any) {
+      // Locking wins over a late read-only Gmail refresh; never surface it as a
+      // failed provider or overwrite the permanent plan after promotion.
+      if (!/already been locked/i.test(String(error?.message ?? error))) throw error;
+    }
   }
-  return { id: creationId, doc: finalDoc };
+  return finalTrip ?? { id: tripId, doc, storage };
 }
 
-export async function latestTrip(): Promise<{ id: string; doc: TripDoc } | null> {
+export async function latestTrip(): Promise<TripRecord | null> {
   const row: any = await convexQuery("creations:latest", { kind: "trip" });
   if (!row?.data) return null;
   try {
-    return { id: String(row._id), doc: JSON.parse(row.data) };
+    return { id: String(row._id), doc: JSON.parse(row.data), storage: "creation" };
   } catch {
     return null;
   }
 }
 
-export async function getTrip(id: string): Promise<{ id: string; doc: TripDoc } | null> {
+export async function getTrip(id: string, context: TripStorageContext = { storage: "creation" }): Promise<TripRecord | null> {
+  if (context.storage === "draft") {
+    const row: any = await convexQuery("travelDrafts:get", {
+      id,
+      ...(context.sourceMessageId ? { sourceMessageId: context.sourceMessageId } : {}),
+    }).catch(() => null);
+    if (!row?.data || row.state !== "draft") return null;
+    try {
+      return { id: String(row._id), doc: JSON.parse(row.data), storage: "draft" };
+    } catch {
+      return null;
+    }
+  }
   const row: any = await convexQuery("creations:get", { id }).catch(() => null);
   if (!row?.data || row.kind !== "trip") return null;
   try {
-    return { id: String(row._id), doc: JSON.parse(row.data) };
+    return { id: String(row._id), doc: JSON.parse(row.data), storage: "creation" };
   } catch {
     return null;
   }
 }
 
-export async function saveTrip(id: string, doc: TripDoc, showPanel = true): Promise<void> {
+export async function saveTrip(
+  id: string,
+  doc: TripDoc,
+  showPanel = true,
+  context: TripStorageContext = { storage: "creation" },
+): Promise<void> {
   doc.totals = tripTotals(doc);
+  if (context.storage === "draft") {
+    const expectedPlanRevision = Number.isSafeInteger(doc.planRevision) ? Number(doc.planRevision) : 0;
+    const result = await convexMutation("travelDrafts:updatePlan", {
+      id,
+      expectedPlanRevision,
+      title: doc.title,
+      destination: doc.destination,
+      data: JSON.stringify(doc),
+      ...(context.sourceMessageId ? { sourceMessageId: context.sourceMessageId } : {}),
+    });
+    if (!result?.ok) {
+      if (result?.reason === "stale") throw new Error("This trip changed while you were editing it. Reopen the live workspace and try again.");
+      if (result?.reason === "locked") throw new Error("This trip has already been locked into the saved travel library.");
+      throw new Error(`Trip draft could not be saved${result?.reason ? `: ${result.reason}` : ""}`);
+    }
+    doc.planRevision = result.planRevision;
+    if (showPanel)
+      await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify(tripWorkspaceRef("draft", id)), title: `trip · ${doc.title}` });
+    return;
+  }
   await convexMutation("creations:update", { id, title: doc.title, data: JSON.stringify(doc) });
   if (showPanel)
-    await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ creationId: id }), title: `trip · ${doc.title}` });
+    await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify(tripWorkspaceRef("creation", id)), title: `trip · ${doc.title}` });
+}
+
+const CITY_BOOKING_MAX_DISTANCE_KM = 35;
+const CITY_BOOKING_SEARCH_RADIUS_METRES = 48_000;
+
+const compactTravelKey = (value: string) =>
+  value.toLocaleLowerCase("en-GB").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 72) || "place";
+
+/** Stable across reopening/reordering, including places with the same name in different towns. */
+export function tripActivityId(activity: Pick<TripActivity, "id" | "name" | "lat" | "lng">): string {
+  if (activity.id?.trim()) return activity.id.slice(0, 180);
+  const lat = Number(activity.lat);
+  const lng = Number(activity.lng);
+  const coordinates = Number.isFinite(lat) && Number.isFinite(lng) ? `${lat.toFixed(5)}:${lng.toFixed(5)}` : "unmapped";
+  return `osm:${compactTravelKey(activity.name)}:${coordinates}`.slice(0, 180);
+}
+
+export function tripStayId(stay: Pick<TripStay, "id" | "name" | "lat" | "lng" | "city">, city = stay.city ?? ""): string {
+  if (stay.id?.trim()) return stay.id.slice(0, 180);
+  const lat = Number(stay.lat);
+  const lng = Number(stay.lng);
+  const coordinates = Number.isFinite(lat) && Number.isFinite(lng) ? `${lat.toFixed(5)}:${lng.toFixed(5)}` : "unmapped";
+  return `stay:${compactTravelKey(city)}:${compactTravelKey(stay.name)}:${coordinates}`.slice(0, 180);
+}
+
+function tripActivityFromPlace(place: OpenStreetMapPlace, city: string, discoveryId: string): TripActivity {
+  return {
+    id: `${discoveryId}:place:${compactTravelKey(place.name)}:${place.lat.toFixed(5)}:${place.lng.toFixed(5)}`.slice(0, 180),
+    name: place.name.slice(0, 120),
+    lat: place.lat,
+    lng: place.lng,
+    address: place.address.slice(0, 180) || undefined,
+    mapsLink: place.mapsUri,
+    ...(place.openingHours ? { openingHours: place.openingHours } : {}),
+    ...(place.charge ? { charge: place.charge } : {}),
+    ...(place.websiteUrl ? { websiteUrl: place.websiteUrl } : {}),
+    ...(place.wikipedia ? { wikipedia: place.wikipedia } : {}),
+    ...(place.wikipediaArticle ? { wikipediaArticle: place.wikipediaArticle } : {}),
+    ...(place.wikipediaArticle?.thumbnailUrl ? { photo: place.wikipediaArticle.thumbnailUrl } : {}),
+    city,
+    discoveryId,
+    source: "OpenStreetMap",
+  };
+}
+
+function liveTripStayCandidates(doc: TripDoc, candidates: ConfirmedBooking[], now: number): ConfirmedBooking[] {
+  return bookingsForTripWindow(candidates, doc.departDate, doc.returnDate)
+    .filter((booking) => {
+      const start = Number(booking.start);
+      const end = Number(booking.end ?? booking.start);
+      return booking.kind === "stay" && Boolean(booking.location?.trim()) && Number.isFinite(start) && Number.isFinite(end) && end >= now;
+    })
+    .sort((left, right) => {
+      const leftActive = Number(left.start) <= now && Number(left.end ?? left.start) >= now;
+      const rightActive = Number(right.start) <= now && Number(right.end ?? right.start) >= now;
+      if (leftActive !== rightActive) return leftActive ? -1 : 1;
+      return Number(left.start) - Number(right.start);
+    });
+}
+
+/**
+ * A Gmail stay is displayed only after its address was independently geocoded
+ * within the selected city. It remains a read-only reference, never a booking
+ * instruction or an inferred location.
+ */
+export async function verifyTripCityBookingReference(args: {
+  doc: TripDoc;
+  city: string;
+  center: { lat: number; lng: number };
+  bookings?: ConfirmedBooking[];
+  now?: number;
+}): Promise<TripBookingReference | undefined> {
+  const now = args.now ?? Date.now();
+  for (const booking of liveTripStayCandidates(args.doc, args.bookings ?? args.doc.confirmedBookings ?? [], now)) {
+    const lookup = await searchOpenStreetMapPlaces(booking.location!, {
+      center: args.center,
+      radiusMetres: CITY_BOOKING_SEARCH_RADIUS_METRES,
+      maxResults: 1,
+    }).catch(() => []);
+    const place = lookup[0];
+    if (!place) continue;
+    const distanceKm = openStreetMapDistanceKm(args.center, place);
+    if (!Number.isFinite(distanceKm) || distanceKm > CITY_BOOKING_MAX_DISTANCE_KM) continue;
+    const start = Number(booking.start);
+    const end = Number(booking.end ?? booking.start);
+    return {
+      city: args.city.slice(0, 120),
+      title: booking.title.slice(0, 180),
+      bookingName: booking.bookingName?.slice(0, 180),
+      location: booking.location!.slice(0, 300),
+      start,
+      end,
+      timeZone: booking.timeZone,
+      lat: place.lat,
+      lng: place.lng,
+      distanceKm: Math.round(distanceKm * 10) / 10,
+      state: start <= now && end >= now ? "active" : "upcoming",
+      verifiedAt: now,
+    };
+  }
+  return undefined;
+}
+
+export function setTripBookingReference(existing: TripBookingReference[] | undefined, reference: TripBookingReference | undefined, city: string): TripBookingReference[] | undefined {
+  const cityKey = compactTravelKey(city);
+  const retained = (existing ?? []).filter((entry) => compactTravelKey(entry.city) !== cityKey);
+  return reference ? [...retained, reference].slice(-8) : retained.length ? retained.slice(-8) : undefined;
+}
+
+async function routeTripDiscovery(items: TripActivity[], mode: TripTravelMode): Promise<TripDayRoute> {
+  const mapped = items.filter((item): item is TripActivity & { id: string; lat: number; lng: number } =>
+    Boolean(item.id) && Number.isFinite(item.lat) && Number.isFinite(item.lng),
+  );
+  const calculatedAt = Date.now();
+  if (mapped.length < 2 || mode === "transit") return { mode, status: "unavailable", calculatedAt };
+  const route = await routeOpenStreetMapItinerary({ points: mapped.map((item) => ({ lat: item.lat, lng: item.lng })), mode });
+  if (!route) return { mode, status: "unavailable", calculatedAt };
+  return {
+    mode,
+    status: "ready",
+    coordinates: route.coordinates,
+    durationSeconds: route.durationSeconds,
+    distanceMeters: route.distanceMeters,
+    legs: route.legs.map((leg, index) => ({
+      fromItemId: mapped[index]!.id,
+      toItemId: mapped[index + 1]!.id,
+      durationSeconds: leg.durationSeconds,
+      distanceMeters: leg.distanceMeters,
+    })),
+    attribution: route.attribution,
+    directionsUrl: openStreetMapDirectionsUrl({
+      origin: mapped[0]!,
+      destination: mapped[mapped.length - 1]!,
+      waypoints: mapped.slice(1, -1),
+      mode,
+    }),
+    calculatedAt,
+  };
+}
+
+/** Persist one real, source-backed arbitrary-city discovery on the trip itself. */
+export async function discoverTripPlaces(args: {
+  id: string;
+  doc: TripDoc;
+  storage?: TripStorage;
+  sourceMessageId?: string;
+  city: string;
+  query: string;
+  mode?: TripTravelMode;
+  includeRoute?: boolean;
+}): Promise<{ doc: TripDoc; discovery: TripDiscovery }> {
+  const city = args.city.trim().slice(0, 120);
+  const query = args.query.trim().slice(0, 120);
+  if (!city) throw new Error("Name the city or town to explore.");
+  if (!query) throw new Error("Name the kind of places to find.");
+  const cityLookup = await searchOpenStreetMapPlaces(city, { maxResults: 1 });
+  const cityMatch = cityLookup[0];
+  if (!cityMatch) throw new Error(`I couldn't locate ${city} on the map.`);
+  const center = { lat: cityMatch.lat, lng: cityMatch.lng };
+  const raw = await searchOpenStreetMapPlaces(`${query} in ${city}`, { center, radiusMetres: 28_000, maxResults: 10 });
+  const places = await enrichOpenStreetMapPlacesWithWikimedia(raw);
+  if (!places.length) throw new Error(`I couldn't find source-backed places for ${query} in ${city}.`);
+
+  const fetchedAt = Date.now();
+  const discoveryId = `discovery:${fetchedAt.toString(36)}:${compactTravelKey(city)}:${compactTravelKey(query)}`.slice(0, 180);
+  const items = places.map((place) => tripActivityFromPlace(place, city, discoveryId));
+  const mode = isTripTravelMode(args.mode) ? args.mode : "walking";
+  const route = args.includeRoute === false ? undefined : await routeTripDiscovery(items.slice(0, 8), mode);
+  const freshBookings = await lookupGmailBookingsReadOnly({ days: 730, maxResults: 24 }).catch(() => undefined);
+  if (freshBookings) {
+    const relevant = bookingsForTripWindow(freshBookings, args.doc.departDate, args.doc.returnDate);
+    if (relevant.length) args.doc.confirmedBookings = mergeTripBookings(args.doc.confirmedBookings, relevant);
+    args.doc.bookingsCheckedAt = fetchedAt;
+  }
+  const bookingReference = await verifyTripCityBookingReference({
+    doc: args.doc,
+    city,
+    center,
+    bookings: freshBookings ?? args.doc.confirmedBookings,
+    now: fetchedAt,
+  });
+  const discovery: TripDiscovery = { id: discoveryId, city, query, center, fetchedAt, provider: "OpenStreetMap", items, route, ...(bookingReference ? { bookingReference } : {}) };
+  const matchingCityAndQuery = (entry: TripDiscovery) => compactTravelKey(entry.city) === compactTravelKey(city) && compactTravelKey(entry.query) === compactTravelKey(query);
+  args.doc.discoveries = [...(args.doc.discoveries ?? []).filter((entry) => !matchingCityAndQuery(entry)), discovery].slice(-8);
+  const known = new Set(args.doc.activities.map((activity) => tripActivityId(activity)));
+  args.doc.activities = [...args.doc.activities, ...items.filter((item) => !known.has(tripActivityId(item)))];
+  args.doc.bookingReferences = setTripBookingReference(args.doc.bookingReferences, bookingReference, city);
+  await saveTrip(args.id, args.doc, true, { storage: args.storage ?? "creation", sourceMessageId: args.sourceMessageId });
+  return { doc: args.doc, discovery };
+}
+
+/** Atomically promotes an already-CAS-saved draft and its deterministic mind map. */
+export async function lockTripDraft(
+  id: string,
+  doc: TripDoc,
+  context: Omit<TripStorageContext, "storage"> = {},
+): Promise<{ creationId: string; mindmapCreationId?: string; alreadyLocked: boolean }> {
+  const expectedPlanRevision = Number.isSafeInteger(doc.planRevision) ? Number(doc.planRevision) : 0;
+  const result = await convexMutation("travelDrafts:lockDraft", {
+    id,
+    expectedPlanRevision,
+    ...(context.sourceMessageId ? { sourceMessageId: context.sourceMessageId } : {}),
+  });
+  if (!result?.ok || !result.creationId) {
+    if (result?.reason === "stale") throw new Error("This trip changed while it was being locked. Reopen the live workspace and try again.");
+    if (result?.reason === "expired") throw new Error("This travel draft expired before it could be locked. Start a fresh plan to continue.");
+    throw new Error(`Trip could not be locked${result?.reason ? `: ${result.reason}` : ""}`);
+  }
+  const creationId = String(result.creationId);
+  const mindmapCreationId = result.mindmapCreationId ? String(result.mindmapCreationId) : undefined;
+  await convexMutation("ui:setPanel", {
+    type: "trip",
+    value: JSON.stringify(tripWorkspaceRef("creation", creationId)),
+    title: `trip · ${doc.title}`,
+  });
+  await convexMutation("chatQueue:postCard", {
+    threadId: doc.threadId,
+    type: "trip",
+    value: JSON.stringify(tripWorkspaceRef("creation", creationId)),
+    title: `trip · ${doc.title}`,
+  }).catch(() => {});
+  return { creationId, mindmapCreationId, alreadyLocked: result.alreadyLocked === true };
 }
 
 function bookingDate(booking: ConfirmedBooking): string | undefined {
@@ -575,7 +923,8 @@ function bookingTime(booking: ConfirmedBooking): string | undefined {
 }
 
 function activityForItem(doc: TripDoc, item: TripItineraryItem): TripActivity | undefined {
-  return doc.activities.find((activity) => activity.name === item.placeId || activity.name === item.title);
+  return doc.activities.find((activity) => activity.id === item.placeId)
+    ?? doc.activities.find((activity) => activity.name === item.placeId || activity.name === item.title);
 }
 
 function itemCoordinates(doc: TripDoc, item: TripItineraryItem): { lat: number; lng: number } | undefined {
@@ -599,7 +948,7 @@ function defaultActivityItems(doc: TripDoc, date: string, pool: TripActivity[], 
       durationMinutes: 90,
       title: activity.name,
       kind: "activity" as const,
-      placeId: activity.name,
+      placeId: tripActivityId(activity),
       lat: Number.isFinite(activity.lat) ? activity.lat : undefined,
       lng: Number.isFinite(activity.lng) ? activity.lng : undefined,
       link: activity.mapsLink,
@@ -619,7 +968,7 @@ export function buildItinerary(doc: TripDoc): TripItineraryDay[] {
   const f = doc.locked.flight;
   const returnFlight = doc.locked.returnFlight;
   const stay = doc.locked.stay;
-  const picked = doc.activities.filter((activity) => doc.locked.activities.includes(activity.name));
+  const picked = doc.activities.filter((activity) => doc.locked.activities.includes(tripActivityId(activity)) || doc.locked.activities.includes(activity.name));
   const pool = picked.length ? picked : doc.activities.slice(0, 8);
   const nights = Math.max(1, Math.round((Date.parse(doc.returnDate) - Date.parse(doc.departDate)) / 86_400_000));
   const days: TripItineraryDay[] = [];
@@ -807,25 +1156,43 @@ export async function refreshTripDayRoute(doc: TripDoc, day: TripItineraryDay, m
   return { ...day, route: dayRoute };
 }
 
-export async function saveTripItinerary(id: string, doc: TripDoc, itinerary: TripItineraryDay[], mindmapCreationId?: string): Promise<TripDoc> {
+export async function saveTripItinerary(
+  id: string,
+  doc: TripDoc,
+  itinerary: TripItineraryDay[],
+  mindmapCreationId?: string,
+  context: TripStorageContext = { storage: "creation" },
+  ensureMindmap = false,
+): Promise<TripDoc> {
   const normalized = normalizeTripItinerary(itinerary);
+  if (context.storage === "draft") {
+    const next: TripDoc = { ...doc, itinerary: normalized, mindmapCreationId: mindmapCreationId ?? doc.mindmapCreationId };
+    await saveTrip(id, next, true, context);
+    return next;
+  }
   const planRevision = Math.max(0, Number(doc.planRevision) || 0) + 1;
   const result: any = await convexMutation("creations:updateTripItinerary", {
     id,
     itinerary: JSON.stringify(normalized),
     planRevision,
     mindmapCreationId,
+    ensureMindmap,
   });
   if (!result?.ok) {
     if (result?.reason === "stale") throw new Error("This trip changed while its route was being refreshed. Please try that day again.");
     throw new Error("Trip itinerary could not be saved.");
   }
-  return { ...doc, itinerary: normalized, planRevision, mindmapCreationId: mindmapCreationId ?? doc.mindmapCreationId };
+  const persistedMindmapCreationId = typeof result.mindmapCreationId === "string"
+    ? result.mindmapCreationId
+    : mindmapCreationId ?? doc.mindmapCreationId;
+  return { ...doc, itinerary: normalized, planRevision, mindmapCreationId: persistedMindmapCreationId };
 }
 
 export async function scheduleTripDay(args: {
   id: string;
   doc: TripDoc;
+  storage?: TripStorage;
+  sourceMessageId?: string;
   date: string;
   activityNames?: string[];
   times?: string[];
@@ -842,7 +1209,10 @@ export async function scheduleTripDay(args: {
     .filter((item) => item.kind === "activity")
     .map((item) => item.placeId ?? item.title)
     .filter(Boolean);
-  const activities = names.map((name) => args.doc.activities.find((activity) => activity.name === name)).filter(Boolean) as TripActivity[];
+  const activities = names.map((name) =>
+    args.doc.activities.find((activity) => activity.id === name)
+      ?? args.doc.activities.find((activity) => activity.name === name),
+  ).filter(Boolean) as TripActivity[];
   if (activities.length !== names.length) throw new Error("Choose activities from this trip's current place list.");
   const kept = args.activityNames ? day.items.filter((item) => item.kind !== "activity") : day.items.filter((item) => item.kind !== "activity");
   const activityItems = activities.map((activity, index) => ({
@@ -852,7 +1222,7 @@ export async function scheduleTripDay(args: {
     durationMinutes: 90,
     title: activity.name,
     kind: "activity" as const,
-    placeId: activity.name,
+    placeId: tripActivityId(activity),
     lat: activity.lat,
     lng: activity.lng,
     link: activity.mapsLink,
@@ -867,15 +1237,17 @@ export async function scheduleTripDay(args: {
   };
   const mode = isTripTravelMode(args.mode) ? args.mode : replacement.route?.mode ?? "walking";
   itinerary[dayIndex] = await refreshTripDayRoute(args.doc, replacement, mode);
-  return saveTripItinerary(args.id, args.doc, itinerary);
+  return saveTripItinerary(args.id, args.doc, itinerary, undefined, { storage: args.storage ?? "creation", sourceMessageId: args.sourceMessageId });
 }
 
 /** Adds one user-requested, geocoded place without pretending it came from the scout list. */
 export async function addTripPlaceToDay(args: {
   id: string;
   doc: TripDoc;
+  storage?: TripStorage;
+  sourceMessageId?: string;
   date: string;
-  place: { name: string; lat: number; lng: number; link?: string; note?: string };
+  place: { id?: string; name: string; lat: number; lng: number; link?: string; note?: string };
   time?: string;
   mode?: TripTravelMode;
 }): Promise<TripDoc> {
@@ -888,7 +1260,8 @@ export async function addTripPlaceToDay(args: {
   if (dayIndex < 0) throw new Error("That day is outside this trip's dates.");
   const day = itinerary[dayIndex];
   if (day.status === "locked") throw new Error("That day is locked. Explicitly unlock it before adding a new place.");
-  const duplicate = day.items.find((item) => item.title.toLowerCase() === args.place.name.trim().toLowerCase() && item.lat === args.place.lat && item.lng === args.place.lng);
+  const placeId = args.place.id?.trim().slice(0, 180) || tripActivityId(args.place);
+  const duplicate = day.items.find((item) => item.placeId === placeId || (item.title.toLowerCase() === args.place.name.trim().toLowerCase() && item.lat === args.place.lat && item.lng === args.place.lng));
   const item: TripItineraryItem = duplicate ?? {
     id: stableTripItemId(args.date, "activity", args.place.name, day.items.filter((entry) => entry.kind === "activity").length),
     date: args.date,
@@ -896,6 +1269,7 @@ export async function addTripPlaceToDay(args: {
     durationMinutes: 90,
     title: args.place.name.trim().slice(0, 180),
     kind: "activity",
+    placeId,
     lat: args.place.lat,
     lng: args.place.lng,
     link: args.place.link,
@@ -908,7 +1282,7 @@ export async function addTripPlaceToDay(args: {
   };
   const mode = isTripTravelMode(args.mode) ? args.mode : nextDay.route?.mode ?? "walking";
   itinerary[dayIndex] = await refreshTripDayRoute(args.doc, nextDay, mode);
-  return saveTripItinerary(args.id, args.doc, itinerary);
+  return saveTripItinerary(args.id, args.doc, itinerary, undefined, { storage: args.storage ?? "creation", sourceMessageId: args.sourceMessageId });
 }
 
 /** Bounded sequential refresh keeps public OSRM routing courteous and honest. */
@@ -960,6 +1334,13 @@ export function mergeConfirmedBookings(doc: TripDoc, bookings: ConfirmedBooking[
   return doc.confirmedBookings.length;
 }
 
+/** A successful Gmail scan is authoritative for this trip window. */
+export function replaceConfirmedBookings(doc: TripDoc, bookings: ConfirmedBooking[]): number {
+  doc.confirmedBookings = [...bookings].sort((left, right) => (left.start ?? Number.MAX_SAFE_INTEGER) - (right.start ?? Number.MAX_SAFE_INTEGER));
+  if (doc.departDate && doc.returnDate) doc.itinerary = buildItinerary(doc);
+  return doc.confirmedBookings.length;
+}
+
 export function londonTime(date: string, time?: string): number {
   const [year, month, day] = date.split("-").map(Number);
   if (!time) return Date.UTC(year, month - 1, day);
@@ -985,83 +1366,3 @@ export function londonTime(date: string, time?: string): number {
 
 // Locked trip → interactive connected-node map (canvas creation): clickable
 // links, times, transfer distances on the connectors — the whole trip at a glance.
-export async function tripToMindmap(doc: TripDoc, tripId: string): Promise<string> {
-  const f = doc.locked.flight;
-  const s = doc.locked.stay;
-  const nodes: any[] = [
-    { id: "trip", label: doc.title.slice(0, 50), detail: `£${doc.totals?.total ?? "?"} of £${doc.budgetGbp} · ${doc.adults} adults`, color: "green" },
-  ];
-  const edges: any[] = [];
-  if (f) {
-    nodes.push({
-      id: "flight-out",
-      label: `✈ ${doc.origin} → ${doc.destIata}`,
-      detail: `${f.airline ?? ""} · ${hhmm(f.departTime)} → ${hhmm(f.arriveTime)} · £${f.priceGbp ?? "?"}pp`,
-      parent: "trip",
-      color: "amber",
-      url: f.bookLink,
-    });
-  }
-  if (s) {
-    nodes.push({
-      id: "hotel",
-      label: `🏨 ${s.name.slice(0, 40)}`,
-      detail: `★${s.rating ?? "?"} · £${s.totalGbp ?? "?"} total · ${(s.amenities ?? []).slice(0, 2).join(", ")}`,
-      parent: f ? "flight-out" : "trip",
-      color: "green",
-      url: s.link,
-      image: s.image,
-    });
-    if (doc.transfer && f)
-      edges.push({ from: "flight-out", to: "hotel", label: `${doc.transfer.durationText} · ${doc.transfer.distanceText}` });
-  }
-  let d = 0;
-  const canvasStopIds = new Map<string, string>();
-  for (const day of doc.itinerary ?? []) {
-    d++;
-    const dayId = `day-${d}`;
-    nodes.push({ id: dayId, label: `Day ${d} · ${day.label}`, parent: s ? "hotel" : "trip", color: "slate" });
-    if (s) canvasStopIds.set(`stay:${day.date}`, "hotel");
-    for (const [itemIndex, item] of day.items.filter((entry) => entry.kind === "activity" || entry.kind === "booking").entries()) {
-      const stopId = item.id || stableTripItemId(day.date, item.kind, item.title, itemIndex);
-      const itemId = `${dayId}:${stopId}`;
-      canvasStopIds.set(stopId, itemId);
-      nodes.push({
-        id: itemId,
-        label: item.title.slice(0, 40),
-        detail: `${item.time ?? "time tbd"}${item.durationMinutes ? ` · allow ${item.durationMinutes} min` : ""}${item.note ? " · " + item.note : ""}`,
-        parent: dayId,
-        color: "blue",
-        url: item.link,
-      });
-    }
-    for (const leg of day.route?.legs ?? []) {
-      const from = canvasStopIds.get(leg.fromItemId);
-      const to = canvasStopIds.get(leg.toItemId);
-      if (!from || !to) continue;
-      const minutes = Math.max(1, Math.round(leg.durationSeconds / 60));
-      const distance = leg.distanceMeters >= 1_000 ? `${(leg.distanceMeters / 1_000).toFixed(1)} km` : `${Math.round(leg.distanceMeters)} m`;
-      edges.push({ from, to, label: `${day.route?.mode ?? "route"} · ${minutes} min · ${distance}` });
-    }
-  }
-  if (f) {
-    nodes.push({
-      id: "flight-home",
-      label: `✈ ${doc.destIata} → ${doc.origin}`,
-      detail: doc.returnDate,
-      parent: "hotel",
-      color: "amber",
-      url: f.bookLink,
-    });
-    if (doc.transfer)
-      edges.push({ from: "hotel", to: "flight-home", label: `${doc.transfer.durationText} to airport` });
-  }
-  const canvas = { title: `Trip map · ${doc.destination}`, nodes, edges, tripId };
-  const id = await convexMutation("creations:create", {
-    kind: "canvas",
-    title: canvas.title,
-    data: JSON.stringify(canvas),
-    thumb: s?.thumb,
-  });
-  return String(id);
-}

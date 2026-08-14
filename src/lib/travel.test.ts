@@ -32,11 +32,14 @@ describe("trip activity discovery", () => {
     expect(mock.searchOpenStreetMapPlaces).toHaveBeenCalledWith("attractions in Lisbon", { maxResults: 4 });
     expect(mock.searchOpenStreetMapPlaces).toHaveBeenCalledWith("contemporary art in Lisbon", { maxResults: 4 });
     expect(activities).toEqual([{
+      id: "osm:jarvis-test-museum:38.72000:-9.14000",
       name: "Jarvis Test Museum",
       address: "1 Test Square, Lisbon, Portugal",
       lat: 38.72,
       lng: -9.14,
       mapsLink: "https://www.openstreetmap.org/?mlat=38.72&mlon=-9.14",
+      city: "Lisbon",
+      source: "OpenStreetMap",
     }]);
   });
 

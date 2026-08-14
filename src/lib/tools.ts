@@ -565,12 +565,14 @@ export const TOOL_DEFS = [
   {
     name: "bookings_check",
     description:
-      "Check confirmed Gmail bookings and optionally merge matching confirmations into an existing Jarvis trip. It never creates Calendar events: calendar imports require a protected owner-approval flow that is not available through this tool. For checking bookings, finding a hotel/address, or proactive travel planning without writes, use bookings_lookup instead. Gmail itself is always read-only.",
+      "Check confirmed Gmail bookings and optionally refresh one exact Jarvis trip workspace. A booked location appears on a city globe only after its address is time-valid and independently verified near that city. Use draft_id while discussing or creation_id for a saved plan; legacy trip_id means a permanent plan only. It never creates Calendar events; Gmail remains read-only.",
     parameters: {
       type: "object",
       properties: {
         days: { type: "number", description: "How far back to scan, 7-730 days; default 365" },
-        trip_id: { type: "string", description: "Optional visible trip creation id to enrich with matching confirmed bookings" },
+        draft_id: { type: "string", description: "Optional exact live conversation draft id to refresh" },
+        creation_id: { type: "string", description: "Optional exact permanent trip id to refresh" },
+        trip_id: { type: "string", description: "Legacy optional permanent trip id only; do not use for a live draft" },
         sync_calendar: { type: "boolean", description: "Request a Calendar import. This tool will not write events; it returns an owner-approval-required result until a protected import flow exists." },
       },
     },
@@ -858,12 +860,13 @@ export const TOOL_DEFS = [
   {
     name: "trip_plan",
     description:
-      "Full travel scout — ONE call searches flights, hotels, and OpenStreetMap activities, then opens the interactive globe trip planner. BUDGET IS REQUIRED: if Daniel hasn't given one, ASK HIM FIRST instead of calling this. OpenStreetMap activity data does not include dependable ratings, opening hours, or photos.",
+      "Full travel scout — ONE call searches flights, hotels, and source-backed OpenStreetMap activities, then opens the interactive globe trip planner. BUDGET IS REQUIRED: if Daniel hasn't given one, ASK HIM FIRST instead of calling this. Preserve only provider-supplied hours, prices, images, and links; never invent ratings or availability.",
     parameters: {
       type: "object",
       properties: {
         destination: { type: "string", description: "city/region, e.g. 'Barcelona'" },
-        trip_id: { type: "string", description: "creation id returned by trip_open; use it to populate the exact visible draft" },
+        draft_id: { type: "string", description: "exact conversation draft id returned by trip_open; use it to populate that live workspace" },
+        creation_id: { type: "string", description: "exact saved plan id only when deliberately re-scouting that permanent plan" },
         dest_iata: { type: "string", description: "destination airport IATA, e.g. BCN" },
         origin_iata: { type: "string", description: "departure airport IATA, default LHR" },
         depart_date: { type: "string", description: "YYYY-MM-DD" },
@@ -881,38 +884,44 @@ export const TOOL_DEFS = [
   {
     name: "trip_update",
     description:
-      "Edit the current trip live: lock a flight or hotel, add/remove activities, re-search stays, discover and add a new mapped place, or arrange an exact day. schedule_day stores only real OSRM route geometry and timing between ordered places; transit is explicitly unavailable until a real provider is connected. Calendar writes are never performed here.",
+      "Edit the exact current trip live: lock a flight or hotel, compare provider stays in any city, discover source-backed mapped places in any town, add exact candidates to a dated itinerary, or arrange an exact day. Send exactly one of draft_id (while discussing) or creation_id (saved plan). Discoveries persist on the same globe; schedule_day stores only real OSRM route geometry and timing between ordered places. Calendar writes are never performed here.",
     parameters: {
       type: "object",
       properties: {
-        trip_id: { type: "string", description: "exact trip creation id shown in context/on the trip workspace" },
-        action: { type: "string", enum: ["lock_flight", "lock_stay", "toggle_activity", "set_budget", "rescout_stays", "add_place", "schedule_day", "set_day_transport", "lock_day", "unlock_day", "show"] },
+        draft_id: { type: "string", description: "exact live conversation draft id" },
+        creation_id: { type: "string", description: "exact permanent saved-plan id" },
+        action: { type: "string", enum: ["lock_flight", "lock_stay", "toggle_activity", "set_budget", "rescout_stays", "discover_places", "add_discovery_to_day", "add_place", "schedule_day", "set_day_transport", "lock_day", "unlock_day", "show"] },
         flight_index: { type: "number", description: "which flight from the list (1-based) for lock_flight" },
         stay: { type: "string", description: "hotel name (or fragment) for lock_stay" },
         activity: { type: "string", description: "activity name (or fragment) for toggle_activity" },
         budget_total_gbp: { type: "number" },
         max_price_per_night: { type: "number", description: "for rescout_stays" },
         vacation_rentals: { type: "boolean", description: "for rescout_stays" },
-        place: { type: "string", description: "specific new place to geocode and add for add_place; the actual OpenStreetMap result is shown, never invented" },
+        location: { type: "string", description: "explicit city, town, region, or address for rescout_stays, discover_places, or add_place; it never silently changes the trip destination" },
+        query: { type: "string", description: "what to discover in the named location, e.g. museums, cafes, hikes" },
+        route: { type: "boolean", description: "for discover_places: build a real OpenStreetMap route across the discovered markers when available" },
+        discovery_id: { type: "string", description: "exact persisted discovery id for add_discovery_to_day" },
+        candidate_id: { type: "string", description: "exact source-backed candidate id from that discovery" },
+        place: { type: "string", description: "specific new place to geocode and add for compatibility add_place; discover_places + add_discovery_to_day is preferred for intentional selection" },
         time: { type: "string", description: "optional local HH:mm for add_place" },
         date: { type: "string", description: "specific itinerary date YYYY-MM-DD for day actions" },
         activities: { type: "array", items: { type: "string" }, description: "ordered exact activity names for schedule_day (up to 8)" },
         times: { type: "array", items: { type: "string" }, description: "optional local HH:mm values aligned with activities; omitted means unscheduled" },
         transport_mode: { type: "string", enum: ["walking", "bicycling", "driving", "transit"], description: "route mode for the selected day; transit is honestly marked unavailable without a transit provider" },
       },
-      required: ["trip_id", "action"],
+      required: ["action"],
     },
   },
   {
     name: "trip_finalize",
     description:
-      "Lock the reviewed plan in: preserves owner-arranged days, refreshes source-backed route geometry and timings where available, and saves a reusable interactive trip map. This tool always leaves calendars untouched.",
+      "Lock the reviewed draft into one permanent travel plan: preserves owner-arranged days, refreshes source-backed route geometry and timings where available, and atomically saves a reusable interactive trip map. Send draft_id for a new plan or creation_id only to refresh a legacy saved plan. This tool always leaves calendars untouched.",
     parameters: {
       type: "object",
       properties: {
-        trip_id: { type: "string", description: "exact trip creation id" },
+        draft_id: { type: "string", description: "exact live conversation draft id to promote permanently" },
+        creation_id: { type: "string", description: "exact legacy saved-plan id" },
       },
-      required: ["trip_id"],
     },
   },
   {
@@ -2229,27 +2238,43 @@ async function bookingsLookup(args: any): Promise<string> {
   return `Read-only Gmail lookup found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"}${located ? `, including ${located} with a usable address` : ""}. Calendar and trip data were left untouched. Keep the booking board visible and summarise only what Daniel asked for.`;
 }
 
-async function bookingsCheck(args: any): Promise<string> {
+async function bookingsCheck(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
+  const workspaceResult = exactTravelWorkspace(args);
+  if (workspaceResult.error) return workspaceResult.error;
   const days = Math.max(7, Math.min(730, Math.round(Number(args.days) || 365)));
   const bookings = await scanGmailBookingConfirmations({ days });
   const syncCalendar = args.sync_calendar === true;
   let tripNote = "";
-  const tripId = String(args.trip_id ?? "").trim();
-  if (tripId) {
-    const { bookingsForTripWindow, getTrip, mergeConfirmedBookings, saveTrip } = await import("./travel");
-    const trip = await getTrip(tripId);
-    if (!trip) return `I found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"}, but trip ${tripId} was not found.`;
+  const workspace = workspaceResult.workspace;
+  if (workspace) {
+    const { bookingsForTripWindow, getTrip, replaceConfirmedBookings, saveTrip, setTripBookingReference, verifyTripCityBookingReference } = await import("./travel");
+    const tripContext = workspace.storage === "draft"
+      ? { storage: "draft" as const, ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}) }
+      : { storage: "creation" as const };
+    const trip = await getTrip(workspace.id, tripContext);
+    if (!trip) return `I found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"}, but ${workspace.field} ${workspace.id} was not found.`;
     const matching = bookingsForTripWindow(bookings, trip.doc.departDate, trip.doc.returnDate);
-    const total = mergeConfirmedBookings(trip.doc, matching);
-    trip.doc.bookingsCheckedAt = Date.now();
-    await saveTrip(trip.id, trip.doc);
-    tripNote = ` ${matching.length} matching confirmation${matching.length === 1 ? "" : "s"} merged into ${trip.doc.title}'s itinerary (${total} saved).`;
+    const total = replaceConfirmedBookings(trip.doc, matching);
+    const checkedAt = Date.now();
+    trip.doc.bookingsCheckedAt = checkedAt;
+    const cities = [
+      ...(trip.doc.destinationCenter ? [{ city: trip.doc.destination, center: trip.doc.destinationCenter }] : []),
+      ...((trip.doc.discoveries ?? []).flatMap((entry: any) => entry?.city && Number.isFinite(entry?.center?.lat) && Number.isFinite(entry?.center?.lng) ? [{ city: String(entry.city), center: entry.center }] : [])),
+    ];
+    let verified = 0;
+    for (const place of cities) {
+      const reference = await verifyTripCityBookingReference({ doc: trip.doc, city: place.city, center: place.center, bookings: matching, now: checkedAt });
+      trip.doc.bookingReferences = setTripBookingReference(trip.doc.bookingReferences, reference, place.city);
+      if (reference) verified++;
+    }
+    await saveTrip(trip.id, trip.doc, true, tripContext);
+    tripNote = ` ${matching.length} matching confirmation${matching.length === 1 ? "" : "s"} refreshed into ${trip.doc.title}'s itinerary (${total} saved; ${verified} city-verified booked-location reference${verified === 1 ? "" : "s"}).`;
   }
   await showWidget({
     kind: "bookings",
     label: `Confirmed bookings · last ${days} days`,
     calendarAdded: 0,
-    readOnly: !tripId,
+    readOnly: !workspace,
     items: bookings.map(bookingBoardItem),
   }, "confirmed bookings");
   const calendarNote = syncCalendar
@@ -3597,8 +3622,27 @@ async function marketAnalysisTool(args: any): Promise<string> {
   );
 }
 
+// ── Travel planner: drafts are explicit and never confused with saved trips ──
+type TravelToolWorkspace = { id: string; storage: "draft" | "creation"; field: "draft_id" | "creation_id" | "trip_id" };
+
+function exactTravelWorkspace(args: any): { workspace?: TravelToolWorkspace; error?: string } {
+  const read = (field: string) => typeof args?.[field] === "string" ? args[field].trim() : "";
+  const draftId = read("draft_id");
+  const creationId = read("creation_id");
+  const legacyTripId = read("trip_id");
+  const count = [draftId, creationId, legacyTripId].filter(Boolean).length;
+  if (count > 1) return { error: "Use exactly one travel workspace id: draft_id while planning or creation_id for a saved plan." };
+  if (draftId) return { workspace: { id: draftId, storage: "draft", field: "draft_id" } };
+  if (creationId) return { workspace: { id: creationId, storage: "creation", field: "creation_id" } };
+  // Compatibility only: pre-draft releases emitted trip_id for permanent
+  // creations. It never probes a draft table, so the authority boundary stays
+  // explicit for all new workspaces.
+  if (legacyTripId) return { workspace: { id: legacyTripId, storage: "creation", field: "trip_id" } };
+  return {};
+}
+
 // ── Travel planner: one scout call fans out to the hub's proven providers ──
-async function tripPlanTool(args: any): Promise<string> {
+async function tripPlanTool(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
   const destination = String(args.destination ?? "").trim();
   const destIata = String(args.dest_iata ?? "").trim();
   const depart = String(args.depart_date ?? "");
@@ -3617,8 +3661,9 @@ async function tripPlanTool(args: any): Promise<string> {
   // A same-city trip can be a different week, traveller set, or conversation.
   // Only the exact visible workspace may be reused; never fall back to a
   // global `latestTrip()` guess.
-  const reuseId: string | undefined = args.trip_id ? String(args.trip_id) : undefined;
-  const { id, doc } = await scoutTrip({
+  const workspace = exactTravelWorkspace(args);
+  if (workspace.error) return workspace.error;
+  const result = await scoutTrip({
     destination,
     destIata,
     origin: String(args.origin_iata ?? "LHR"),
@@ -3630,8 +3675,12 @@ async function tripPlanTool(args: any): Promise<string> {
     maxPricePerNight: Number(args.max_price_per_night) || undefined,
     vacationRentals: !!args.vacation_rentals,
     includeFlights: args.include_flights !== false,
-    reuseId,
+    reuseId: workspace.workspace?.id,
+    reuseStorage: workspace.workspace?.storage,
+    sourceMessageId: invocationContext?.userMessageId,
   });
+  const { id, doc } = result;
+  const idField = result.storage === "draft" ? "draft_id" : "creation_id";
   const f = doc.flights[0];
   const cheapStay = doc.stays[0];
   const providerIssues = Object.entries(doc.providers ?? {})
@@ -3643,20 +3692,29 @@ async function tripPlanTool(args: any): Promise<string> {
       `${doc.activities.length} activities (top: ${doc.activities.slice(0, 3).map((a) => a.name).join(", ")}). ` +
       (providerIssues.length ? `Provider issues shown with retry state: ${providerIssues.join("; ")}. ` : "") +
       `Budget £${budget}. Speak TWO short sentences with the single best flight + stay combo, then ask what he wants to lock in. ` +
-      `Use trip_update with trip_id ${id} to lock choices (hotel names: ${doc.stays.slice(0, 6).map((s) => s.name).join(" | ")}).`
+      `Use trip_update with ${idField} ${id} to lock choices (hotel names: ${doc.stays.slice(0, 6).map((s) => s.name).join(" | ")}).`
   );
 }
 
-async function tripUpdateTool(args: any): Promise<string> {
-  const { getTrip, saveTrip, computeTransfer, hubAction, scheduleTripDay, addTripPlaceToDay } = await import("./travel");
-  const tripId = String(args.trip_id ?? "").trim();
-  if (!tripId) return "TRIP ID MISSING — use the id on the visible trip workspace; never edit an implicit latest trip.";
-  const t = await getTrip(tripId);
-  if (!t) return `Trip ${tripId} was not found.`;
+async function tripUpdateTool(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
+  const { getTrip, saveTrip, computeTransfer, discoverTripPlaces, hubAction, scheduleTripDay, addTripPlaceToDay, tripActivityId, tripStayId } = await import("./travel");
+  const workspace = exactTravelWorkspace(args);
+  if (workspace.error) return workspace.error;
+  if (!workspace.workspace) return "TRIP ID MISSING — use draft_id for the live workspace or creation_id for a saved plan; never edit an implicit latest trip.";
+  const draftContext = workspace.workspace.storage === "draft"
+    ? { storage: "draft" as const, ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}) }
+    : undefined;
+  const t = await getTrip(workspace.workspace.id, draftContext);
+  if (!t) return `${workspace.workspace.field} ${workspace.workspace.id} was not found.`;
   const { doc } = t;
+  const storage = t.storage ?? workspace.workspace.storage;
+  const saveCurrent = async () => {
+    if (storage === "draft") return await saveTrip(t.id, doc, true, draftContext ?? { storage: "draft" });
+    return await saveTrip(t.id, doc);
+  };
   const action = String(args.action ?? "");
   if (action === "show") {
-    await saveTrip(t.id, doc);
+    await saveCurrent();
     return `Trip "${doc.title}" is back on the globe screen.`;
   }
   if (action === "lock_flight") {
@@ -3665,18 +3723,18 @@ async function tripUpdateTool(args: any): Promise<string> {
     const i = selected - 1;
     if (!doc.flights[i]) return `Only ${doc.flights.length} flights on the list.`;
     doc.locked.flight = doc.flights[i];
-    await saveTrip(t.id, doc);
+    await saveCurrent();
     const f = doc.locked.flight;
     return `Flight locked: ${f.airline} £${f.priceGbp}pp, ${f.departTime} → ${f.arriveTime}. Running total £${doc.totals?.total}.`;
   }
   if (action === "lock_stay") {
     const q = String(args.stay ?? "").toLowerCase().trim();
-    const hit = doc.stays.find((s) => s.name.toLowerCase().includes(q));
+    const hit = doc.stays.find((s) => String(s.id ?? "").toLowerCase() === q || s.name.toLowerCase().includes(q));
     if (!hit)
       return `No stay matches "${args.stay}". Options: ${doc.stays.slice(0, 8).map((s) => s.name).join(" | ")}.`;
     doc.locked.stay = hit;
     doc.transfer = await computeTransfer(doc);
-    await saveTrip(t.id, doc);
+    await saveCurrent();
     return (
       `Locked ${hit.name} (★${hit.rating ?? "?"}, £${hit.totalGbp ?? "?"} total, ${(hit.amenities ?? []).join(", ")}).` +
       (doc.transfer ? ` Airport transfer from the hotel: ${doc.transfer.durationText}, ${doc.transfer.distanceText} by car.` : "") +
@@ -3685,13 +3743,76 @@ async function tripUpdateTool(args: any): Promise<string> {
   }
   if (action === "toggle_activity") {
     const q = String(args.activity ?? "").toLowerCase().trim();
-    const hit = doc.activities.find((a) => a.name.toLowerCase().includes(q));
+    const hit = doc.activities.find((a) => String(a.id ?? "").toLowerCase() === q || a.name.toLowerCase().includes(q));
     if (!hit) return `No activity matches "${args.activity}". Have: ${doc.activities.map((a) => a.name).slice(0, 10).join(" | ")}.`;
-    const idx = doc.locked.activities.indexOf(hit.name);
+    const activityRef = String(hit.id ?? hit.name);
+    const idx = doc.locked.activities.indexOf(activityRef);
     if (idx >= 0) doc.locked.activities.splice(idx, 1);
-    else doc.locked.activities.push(hit.name);
-    await saveTrip(t.id, doc);
+    else doc.locked.activities.push(activityRef);
+    await saveCurrent();
     return `${idx >= 0 ? "Removed" : "Added"} ${hit.name}${idx >= 0 ? " from" : " to"} the plan (${doc.locked.activities.length} activities picked).`;
+  }
+  if (action === "discover_places") {
+    const city = String(args.location ?? args.city ?? doc.destination).trim();
+    const query = String(args.query ?? args.place ?? doc.vibe ?? "attractions").trim();
+    const mode = String(args.transport_mode ?? "").trim();
+    try {
+      const { discovery } = await discoverTripPlaces({
+        id: t.id,
+        doc,
+        storage,
+        sourceMessageId: storage === "draft" ? invocationContext?.userMessageId : undefined,
+        city,
+        query,
+        mode: ["walking", "bicycling", "driving", "transit"].includes(mode) ? mode as any : undefined,
+        includeRoute: args.route !== false,
+      });
+      const route = discovery.route;
+      const routeText = route?.status === "ready"
+        ? ` The linked ${route.mode} route is ${Math.max(1, Math.round((route.durationSeconds ?? 0) / 60))} min across ${Math.round((route.distanceMeters ?? 0) / 100) / 10} km.`
+        : route?.mode === "transit"
+          ? " Transit timing remains unavailable until a real provider is connected."
+          : " Markers are shown without invented route timing.";
+      const bookingText = discovery.bookingReference
+        ? ` A read-only Gmail stay was verified ${discovery.bookingReference.distanceKm} km from ${discovery.city}'s centre.`
+        : " No Gmail stay was claimed for this city unless its address could be verified locally.";
+      return `Found ${discovery.items.length} OpenStreetMap places in ${discovery.city} and kept them on the live globe.${routeText}${bookingText}`;
+    } catch (error: any) {
+      return String(error?.message ?? "That city could not be explored.");
+    }
+  }
+  if (action === "add_discovery_to_day") {
+    const date = String(args.date ?? "").trim();
+    const discoveryId = String(args.discovery_id ?? "").trim();
+    const candidateId = String(args.candidate_id ?? "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return "Choose the exact trip day first (YYYY-MM-DD).";
+    const discovery = doc.discoveries?.find((entry) => entry.id === discoveryId);
+    const candidate = discovery?.items.find((item) => item.id === candidateId);
+    if (!discovery || !candidate || !Number.isFinite(candidate.lat) || !Number.isFinite(candidate.lng))
+      return "Choose one exact mapped place from the current travel exploration before adding it.";
+    const mode = String(args.transport_mode ?? "").trim();
+    try {
+      const updated = await addTripPlaceToDay({
+        id: t.id,
+        doc,
+        ...(storage === "draft" ? draftContext : {}),
+        date,
+        place: {
+          id: candidate.id,
+          name: candidate.name,
+          lat: Number(candidate.lat),
+          lng: Number(candidate.lng),
+          link: candidate.mapsLink,
+          note: `OpenStreetMap · ${discovery.city}${candidate.address ? ` · ${candidate.address}` : ""}`,
+        },
+        time: args.time ? String(args.time) : undefined,
+        mode: ["walking", "bicycling", "driving", "transit"].includes(mode) ? mode as any : undefined,
+      });
+      const day = updated.itinerary?.find((item) => item.date === date);
+      return `Added ${candidate.name} from ${discovery.city} to ${day?.label ?? date}. The map now uses that exact source-backed place.`;
+    } catch (error: any) {
+      return String(error?.message ?? "That place could not be added to the day.");
+    }
   }
   if (action === "add_place") {
     const date = String(args.date ?? "").trim();
@@ -3699,18 +3820,38 @@ async function tripUpdateTool(args: any): Promise<string> {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return "Choose the exact trip day first (YYYY-MM-DD).";
     if (!query) return "Name the place you want to add and route.";
     const { searchOpenStreetMapPlaces } = await import("./openstreetmap");
-    const hits = await searchOpenStreetMapPlaces(`${query} in ${doc.destination}`, { maxResults: 5 }).catch(() => []);
+    const city = String(args.location ?? args.city ?? doc.destination).trim();
+    const hits = await searchOpenStreetMapPlaces(`${query} in ${city}`, { maxResults: 5 }).catch(() => []);
     const normalized = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
     const queryKey = normalized(query);
     const place = hits.find((candidate) => normalized(candidate.name).includes(queryKey) || queryKey.includes(normalized(candidate.name))) ?? hits[0];
-    if (!place) return `I couldn't find a mapped OpenStreetMap result for "${query}" in or near ${doc.destination}. Try a more specific name or neighbourhood.`;
+    if (!place) return `I couldn't find a mapped OpenStreetMap result for "${query}" in or near ${city}. Try a more specific name or neighbourhood.`;
+    const activity = {
+      id: tripActivityId({ name: place.name, lat: place.lat, lng: place.lng }),
+      name: place.name,
+      lat: place.lat,
+      lng: place.lng,
+      mapsLink: place.mapsUri,
+      address: place.address || undefined,
+      openingHours: place.openingHours,
+      charge: place.charge,
+      websiteUrl: place.websiteUrl,
+      wikipedia: place.wikipedia,
+      wikipediaArticle: place.wikipediaArticle,
+      photo: place.wikipediaArticle?.thumbnailUrl,
+      city,
+      source: "OpenStreetMap" as const,
+    };
+    if (!doc.activities.some((candidate) => tripActivityId(candidate) === activity.id)) doc.activities.push(activity);
     const mode = String(args.transport_mode ?? "").trim();
     try {
       const updated = await addTripPlaceToDay({
         id: t.id,
         doc,
+        ...(storage === "draft" ? draftContext : {}),
         date,
         place: {
+          id: activity.id,
           name: place.name,
           lat: place.lat,
           lng: place.lng,
@@ -3752,6 +3893,7 @@ async function tripUpdateTool(args: any): Promise<string> {
       const updated = await scheduleTripDay({
         id: t.id,
         doc,
+        ...(storage === "draft" ? draftContext : {}),
         date,
         activityNames,
         times,
@@ -3779,12 +3921,13 @@ async function tripUpdateTool(args: any): Promise<string> {
     const b = Number(args.budget_total_gbp) || 0;
     if (b <= 0) return "Give me the new total budget in pounds.";
     doc.budgetGbp = b;
-    await saveTrip(t.id, doc);
+    await saveCurrent();
     return `Budget set to £${b}. Currently at £${doc.totals?.total}.`;
   }
   if (action === "rescout_stays") {
+    const city = String(args.location ?? args.city ?? doc.destination).trim();
     const res = await hubAction("travelActions:searchStays", {
-      query: `${doc.destination} hotels`,
+      query: `${city} hotels`,
       checkIn: doc.departDate,
       checkOut: doc.returnDate,
       adults: doc.adults,
@@ -3792,21 +3935,30 @@ async function tripUpdateTool(args: any): Promise<string> {
       vacationRentals: !!args.vacation_rentals,
       maxPages: 1,
     }).catch(() => ({ options: [] }));
-    const stays = (res.options ?? []).slice(0, 24);
+    const stays = (res.options ?? []).slice(0, 24).map((stay: any) => {
+      const scoped = { ...stay, city, source: "Google Hotels" };
+      return { ...scoped, id: tripStayId(scoped) };
+    });
     if (!stays.length) return "That search came back empty — loosen the limits.";
-    doc.stays = stays;
-    await saveTrip(t.id, doc);
-    return `Re-scouted: ${stays.length} ${args.vacation_rentals ? "rentals" : "hotels"} now on the globe (top: ${stays.slice(0, 4).map((s: any) => `${s.name} £${s.totalGbp ?? s.priceGbp}`).join(", ")}).`;
+    const cityKey = city.toLocaleLowerCase("en-GB").trim();
+    const retained = doc.stays.filter((stay) => (stay.city ?? doc.destination).toLocaleLowerCase("en-GB").trim() !== cityKey);
+    doc.stays = [...retained, ...stays];
+    await saveCurrent();
+    return `Re-scouted ${city}: ${stays.length} ${args.vacation_rentals ? "rentals" : "hotels"} now share this globe without replacing other cities (top: ${stays.slice(0, 4).map((s: any) => `${s.name} £${s.totalGbp ?? s.priceGbp}`).join(", ")}).`;
   }
   return "Unknown trip action.";
 }
 
-async function tripFinalizeTool(args: any): Promise<string> {
-  const { getTrip, saveTrip, computeTransfer, buildItinerary, refreshTripItineraryRoutes, saveTripItinerary, tripToMindmap } = await import("./travel");
-  const tripId = String(args.trip_id ?? "").trim();
-  if (!tripId) return "TRIP ID MISSING — finalize the exact visible trip, never whichever draft happens to be newest.";
-  const t = await getTrip(tripId);
-  if (!t) return `Trip ${tripId} was not found.`;
+async function tripFinalizeTool(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
+  const { getTrip, saveTrip, computeTransfer, buildItinerary, refreshTripItineraryRoutes, saveTripItinerary, lockTripDraft } = await import("./travel");
+  const workspace = exactTravelWorkspace(args);
+  if (workspace.error) return workspace.error;
+  if (!workspace.workspace) return "TRIP ID MISSING — finalize the exact draft_id or creation_id shown on screen, never whichever trip happens to be newest.";
+  const draftContext = workspace.workspace.storage === "draft"
+    ? { storage: "draft" as const, ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}) }
+    : undefined;
+  const t = await getTrip(workspace.workspace.id, draftContext);
+  if (!t) return `${workspace.workspace.field} ${workspace.workspace.id} was not found.`;
   const { doc } = t;
   if (doc.includeFlights !== false && doc.flights.length && !doc.locked.flight)
     return "Choose and lock a specific flight first — I won't silently select option one.";
@@ -3817,14 +3969,29 @@ async function tripFinalizeTool(args: any): Promise<string> {
     ? " Calendar sync was requested, but no calendar items were created: protected owner approval is unavailable from this tool."
     : "";
   doc.status = "planned";
-  await saveTrip(t.id, doc);
-  // Finalization is idempotent: an already-saved canvas remains the trip's
-  // durable mind-map instead of each retry leaving a new orphan behind.
-  const mapId = doc.mindmapCreationId || (await tripToMindmap(doc, t.id).catch(() => ""));
-  if (mapId) {
-    doc.mindmapCreationId = mapId;
-    await saveTripItinerary(t.id, doc, doc.itinerary ?? [], mapId);
+  if (t.storage === "draft") {
+    await saveTrip(t.id, doc, true, draftContext ?? { storage: "draft" });
+    const locked = await lockTripDraft(t.id, doc, { sourceMessageId: invocationContext?.userMessageId });
+    return (
+      `Trip locked in: ${doc.itinerary?.length} days planned, total ≈ £${doc.totals?.total} of £${doc.budgetGbp}.` +
+      calNote +
+      (locked.mindmapCreationId ? " Interactive trip map saved to the creations library." : "") +
+      " The full permanent plan is on screen. Speak one short confident summary."
+    );
   }
+  await saveTrip(t.id, doc);
+  // This one mutation either updates the verified linked canvas or creates it
+  // beside the trip. It is idempotent and cannot leave a legacy retry with an
+  // orphaned mind map.
+  const finalized = await saveTripItinerary(
+    t.id,
+    doc,
+    doc.itinerary ?? [],
+    undefined,
+    { storage: "creation" },
+    true,
+  );
+  const mapId = finalized?.mindmapCreationId ?? doc.mindmapCreationId ?? "";
   return (
     `Trip locked in: ${doc.itinerary?.length} days planned, total ≈ £${doc.totals?.total} of £${doc.budgetGbp}.` +
     calNote +
@@ -4414,7 +4581,7 @@ export async function executeTool(
     case "bookings_lookup":
       return await bookingsLookup(args);
     case "bookings_check":
-      return await bookingsCheck(args);
+      return await bookingsCheck(args, invocationContext);
     case "open_app":
       return await openApp(args);
     case "host_ui":
@@ -4451,15 +4618,19 @@ export async function executeTool(
       const { openTrip } = await import("./travel");
       const destination = String(args.destination ?? "").trim();
       if (!destination) return "Which destination?";
-      const { id, doc } = await openTrip({ destination, destIata: args.dest_iata ? String(args.dest_iata) : undefined });
-      return `Trip ${id} is up on the globe, centred on ${destination}${doc.airport ? ` (${doc.airport.name} marked)` : ""}. It fills in live as you plan; use this exact trip_id for trip_plan and every later edit.`;
+      const { id, doc } = await openTrip({
+        destination,
+        destIata: args.dest_iata ? String(args.dest_iata) : undefined,
+        sourceMessageId: invocationContext?.userMessageId,
+      });
+      return `Trip draft ${id} is up on the globe, centred on ${destination}${doc.airport ? ` (${doc.airport.name} marked)` : ""}. It fills in live as you plan; use this exact draft_id for trip_plan and every later edit until you explicitly lock it.`;
     }
     case "trip_plan":
-      return await tripPlanTool(args);
+      return await tripPlanTool(args, invocationContext);
     case "trip_update":
-      return await tripUpdateTool(args);
+      return await tripUpdateTool(args, invocationContext);
     case "trip_finalize":
-      return await tripFinalizeTool(args);
+      return await tripFinalizeTool(args, invocationContext);
     case "creations_list":
       return await creationsList(args);
     case "orb_mood": {
