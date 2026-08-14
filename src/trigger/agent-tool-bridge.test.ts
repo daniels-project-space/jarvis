@@ -209,7 +209,7 @@ describe("foreground agent tool bridge", () => {
         requests.push(String(input));
         return Response.json([
           { name: "youtube_search", description: "Find YouTube videos." },
-          { name: "youtube_transcript", description: "Fetch captions and open the video panel." },
+          { name: "youtube_transcript", description: "Open verified metadata and report authorised-caption availability." },
           { name: "draft", description: "Unrelated creative tool." },
         ]);
       },

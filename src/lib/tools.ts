@@ -363,7 +363,8 @@ export const TOOL_DEFS = [
   },
   {
     name: "youtube_transcript",
-    description: "Fetch the transcript of a YouTube video (its content, so you can discuss it). Pass a URL or video ID.",
+    description:
+      "Open a user-shared YouTube video in the non-autoplay panel and retrieve verified public metadata. It does not bypass YouTube protections or fetch captions without an authorised source, so never claim to understand or summarise spoken content when captions are unavailable. Pass a URL or video ID.",
     parameters: { type: "object", properties: { video: { type: "string" } }, required: ["video"] },
   },
   {
@@ -1404,41 +1405,6 @@ async function youtubeSearch(query: string): Promise<string> {
       `youtube · ${query.slice(0, 36)}`,
     );
   };
-  // Free path: scrape ytInitialData from the results page.
-  try {
-    const r = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, {
-      headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "accept-language": "en" },
-    });
-    const html = await r.text();
-    const m = html.match(/var ytInitialData = (\{[\s\S]+?\});<\/script>/);
-    if (m) {
-      const vids: { id: string; title: string; channel: string; length: string }[] = [];
-      const walk = (o: any) => {
-        if (!o || typeof o !== "object" || vids.length >= 6) return;
-        if (o.videoRenderer?.videoId) {
-          const v = o.videoRenderer;
-          vids.push({
-            id: v.videoId,
-            title: v.title?.runs?.[0]?.text ?? "",
-            channel: v.ownerText?.runs?.[0]?.text ?? "",
-            length: v.lengthText?.simpleText ?? "",
-          });
-        } else for (const k of Object.keys(o)) walk(o[k]);
-      };
-      walk(JSON.parse(m[1]));
-      if (vids.length) {
-        await showList(vids);
-        return (
-          vids
-            .map((v, i) => `${i + 1}. ${v.title} — ${v.channel} (${v.length}) [id:${v.id}]`)
-            .join("\n") +
-          "\n(Thumbnail list is on Daniel's screen, ready to tap — NOTHING is playing. If he asks to play one, use show with the video id and play:true.)"
-        );
-      }
-    }
-  } catch {
-    /* fall through */
-  }
   const { searchVideos } = await import("./search");
   const vids = await searchVideos(query);
   if (!vids.length) return "No results found.";
@@ -1452,40 +1418,28 @@ async function youtubeSearch(query: string): Promise<string> {
 async function youtubeTranscript(video: string): Promise<string> {
   const id = YT_ID(video);
   if (!id) return "Couldn't parse a YouTube video ID from that.";
+  const watchUrl = `https://www.youtube.com/watch?v=${id}`;
   await convexMutation("ui:setPanel", {
     type: "video",
     value: `https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0`,
     title: "YouTube video",
   });
   try {
-    const r = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
-      method: "POST",
-      headers: { "content-type": "application/json", "user-agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)" },
-      body: JSON.stringify({
-        videoId: id,
-        context: { client: { clientName: "ANDROID", clientVersion: "20.10.38", androidSdkVersion: 34, hl: "en" } },
-      }),
+    // oEmbed is YouTube's public metadata surface. Deliberately do not use an
+    // undocumented player endpoint or download caption tracks: arbitrary video
+    // captions require an authorised source, and a failed caption lookup must
+    // never be confused with an understanding of the video's content.
+    const r = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl)}&format=json`, {
+      signal: AbortSignal.timeout(8_000),
     });
-    const j: any = await r.json();
-    const title = j?.videoDetails?.title ?? "";
-    const author = j?.videoDetails?.author ?? "";
-    const tracks = j?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
-    const track = tracks.find((t: any) => t.languageCode?.startsWith("en")) ?? tracks[0];
-    if (!track?.baseUrl) {
-      const desc = (j?.videoDetails?.shortDescription ?? "").slice(0, 1500);
-      return `No captions available for "${title}" by ${author}. Description:\n${desc}`;
-    }
-    const xml = await (await fetch(track.baseUrl)).text();
-    const text = xml
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&amp;/g, "&")
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/\s+/g, " ")
-      .trim();
-    return `"${title}" by ${author} — transcript:\n${text.slice(0, 12000)}`;
-  } catch (e: any) {
-    return `Transcript fetch failed: ${e?.message ?? e}`;
+    if (!r.ok) throw new Error(`metadata unavailable (${r.status})`);
+    const metadata = await r.json() as { title?: unknown; author_name?: unknown };
+    const title = typeof metadata.title === "string" ? metadata.title.trim().slice(0, 240) : "";
+    const author = typeof metadata.author_name === "string" ? metadata.author_name.trim().slice(0, 160) : "";
+    const label = title ? `“${title}”${author ? ` by ${author}` : ""}` : "this video";
+    return `Opened ${label} in the non-autoplay video panel. I do not have an authorised caption or transcript source for it, so I cannot truthfully summarise or analyse its spoken content. Paste its transcript, upload the video/audio, or connect an authorised caption source.`;
+  } catch {
+    return "Opened the video in the non-autoplay panel. Its verified public metadata is unavailable right now, and I do not have an authorised caption or transcript source, so I cannot truthfully summarise or analyse its spoken content. Paste its transcript, upload the video/audio, or connect an authorised caption source.";
   }
 }
 

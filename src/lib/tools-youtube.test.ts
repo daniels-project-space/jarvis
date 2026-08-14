@@ -42,24 +42,25 @@ describe("YouTube transcript handoff", () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it("opens the existing non-autoplay video panel while fetching captions for a pasted URL", async () => {
+  it("opens the existing non-autoplay video panel and reports that captions need an authorised source", async () => {
     const fetcher = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.includes("youtubei/v1/player")) {
+      if (url.startsWith("https://www.youtube.com/oembed?")) {
         return Response.json({
-          videoDetails: { title: "Jarvis walkthrough", author: "OpenAI" },
-          captions: { playerCaptionsTracklistRenderer: { captionTracks: [{ languageCode: "en", baseUrl: "https://captions.example/en" }] } },
+          title: "Jarvis walkthrough",
+          author_name: "OpenAI",
         });
-      }
-      if (url === "https://captions.example/en") {
-        return new Response("<transcript><text start=\"0\">Hello &amp; welcome</text></transcript>");
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
     vi.stubGlobal("fetch", fetcher);
 
     await expect(executeTool("youtube_transcript", { video: "https://youtu.be/abcDEF12345" }))
-      .resolves.toContain("Hello & welcome");
+      .resolves.toContain("do not have an authorised caption or transcript source");
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0]?.[0])).toMatch(/^https:\/\/www\.youtube\.com\/oembed\?/);
+    expect(String(fetcher.mock.calls[0]?.[0])).not.toContain("youtubei/");
 
     expect(mock.convexMutation).toHaveBeenCalledWith("ui:setPanel", {
       type: "video",
@@ -67,6 +68,18 @@ describe("YouTube transcript handoff", () => {
       title: "YouTube video",
     });
     expect(mock.convexMutation.mock.calls[0]?.[1]?.value).not.toContain("autoplay");
+  });
+
+  it("keeps the video open but refuses content analysis when public metadata is unavailable", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+
+    await expect(executeTool("youtube_transcript", { video: "abcDEF12345" }))
+      .resolves.toContain("cannot truthfully summarise or analyse its spoken content");
+
+    expect(mock.convexMutation).toHaveBeenCalledWith("ui:setPanel", expect.objectContaining({
+      type: "video",
+      value: "https://www.youtube.com/embed/abcDEF12345?enablejsapi=1&rel=0",
+    }));
   });
 });
 

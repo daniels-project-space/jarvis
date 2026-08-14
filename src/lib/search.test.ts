@@ -8,7 +8,7 @@ const vault = vi.hoisted(() => ({
 vi.mock("server-only", () => ({}));
 vi.mock("./vault", () => vault);
 
-import { searchWeb } from "./search";
+import { searchVideos, searchWeb } from "./search";
 
 function ddgResponse(title = "Sesame AI", target = "https://example.com/sesame") {
   const encoded = encodeURIComponent(target);
@@ -92,5 +92,24 @@ describe("bounded web search", () => {
     });
     await expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("provider-backed YouTube discovery", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+    delete process.env.SERPER_API_KEY;
+    delete process.env.SERPAPI_KEY;
+  });
+
+  it("does not scrape or proxy YouTube when no connected search provider is configured", async () => {
+    vault.getServiceSecrets.mockResolvedValue({});
+    vault.getSecret.mockResolvedValue("");
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(searchVideos("camera lighting")).resolves.toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
