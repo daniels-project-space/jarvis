@@ -23,6 +23,7 @@ import { listICloudEvents } from "./icloud-calendar";
 import { getManagedGooglePrimaryCalendarEvent, listGooglePrimaryCalendarEvents, type GoogleCalendarCreateInput } from "./google-calendar";
 import { googleCalendarApprovalMarker, issueGoogleCalendarApproval, issueGoogleCalendarApprovalProposal } from "./google-calendar-approval.server";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
+import { buildAppleMapsOfflinePreflight } from "./apple-maps-offline";
 import {
   gmailSearch,
   gmailReadMessage,
@@ -615,6 +616,20 @@ export const TOOL_DEFS = [
         trip_id: { type: "string", description: "Legacy optional permanent trip id only; do not use for a live draft" },
         sync_calendar: { type: "boolean", description: "Prepare one Google Calendar import for owner approval. No Calendar event is written by this tool." },
         booking_id: { type: "string", description: "Opaque booking selection ID returned when several dated confirmations need a choice; use only with sync_calendar=true" },
+      },
+    },
+  },
+  {
+    name: "travel_offline_maps_prepare",
+    description:
+      "For an exact Jarvis trip with an upcoming confirmed Gmail flight, schedule Jarvis's one-day-before Apple Maps offline preflight: a durable to-do, push/spoken reminder, and an Apple Maps city handoff. It never downloads or deletes an Apple offline map—only the owner can do that in Maps. It creates a protected Google Calendar approval card only when Google Calendar is connected; do not claim the Calendar item is written until Daniel approves it. Use after Daniel has asked for this travel automation, never for an unverified or implicit trip.",
+    parameters: {
+      type: "object",
+      properties: {
+        draft_id: { type: "string", description: "Exact live conversation trip id" },
+        creation_id: { type: "string", description: "Exact saved trip id" },
+        trip_id: { type: "string", description: "Legacy exact saved trip id only" },
+        days: { type: "number", description: "Gmail confirmation lookback, 7-730 days; default 365" },
       },
     },
   },
@@ -2450,6 +2465,142 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
     }
   }
   return `Found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"} in Gmail.${calendarNote}${tripNote} Speak one short summary and leave the full booking board on screen.${calendarApprovalMarker ? `\n${calendarApprovalMarker}` : ""}`;
+}
+
+type OfflineMapCalendarStatus = "approval_required" | "needs_connection" | "needs_reconnect";
+
+async function offlineMapCalendarStatus(): Promise<OfflineMapCalendarStatus> {
+  try {
+    const status = await convexQuery("googleAuth:getConnectionStatus", {}) as {
+      connected?: boolean;
+      capabilities?: { calendar?: boolean };
+    } | null;
+    if (!status?.connected) return "needs_connection";
+    return status.capabilities?.calendar ? "approval_required" : "needs_reconnect";
+  } catch {
+    return "needs_connection";
+  }
+}
+
+/**
+ * Schedules only Jarvis-owned preparation work. Apple keeps downloading and
+ * deleting offline map regions inside the Maps app, so the URL/card is a
+ * truthful handoff rather than a claimed device action.
+ */
+async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
+  const workspaceResult = exactTravelWorkspace(args);
+  if (workspaceResult.error) return workspaceResult.error;
+  if (!workspaceResult.workspace) return "Choose the exact trip first: use draft_id while planning or creation_id for a saved plan.";
+  const workspace = workspaceResult.workspace;
+  const { bookingsForTripWindow, getTrip, saveTrip } = await import("./travel");
+  const tripContext = workspace.storage === "draft"
+    ? { storage: "draft" as const, ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}) }
+    : { storage: "creation" as const };
+  const trip = await getTrip(workspace.id, tripContext);
+  if (!trip) return `${workspace.field} ${workspace.id} was not found.`;
+
+  const days = Math.max(7, Math.min(730, Math.round(Number(args.days) || 365)));
+  let bookings: ConfirmedBooking[];
+  try {
+    bookings = await scanGmailBookingConfirmations({ days });
+  } catch {
+    return "Apple Maps preflight is waiting for a readable Gmail connection. No reminder, to-do, or Calendar proposal was created.";
+  }
+  const matching = bookingsForTripWindow(bookings, trip.doc.departDate, trip.doc.returnDate);
+  const result = buildAppleMapsOfflinePreflight({ city: trip.doc.destination, flights: matching });
+  if (result.status === "needs_flight_confirmation") {
+    return `Apple Maps preflight is waiting: ${result.reason}. No reminder, to-do, or Calendar proposal was created.`;
+  }
+  if (result.status === "too_late") {
+    return `Apple Maps preflight was not scheduled because ${result.reason}. Open the trip now if you still want a manual Apple Maps handoff.`;
+  }
+  const preflight = result.preflight;
+
+  let todoStatus: "created" | "existing" | "needs_retry" = "needs_retry";
+  try {
+    const todos = await q_hub("todos:list");
+    const existing = Array.isArray(todos) && todos.some((todo: any) => !todo?.done && String(todo?.text ?? "") === preflight.todoText);
+    if (existing) {
+      todoStatus = "existing";
+    } else {
+      await m_hub("todos:add", {
+        text: preflight.todoText,
+        dueDate: preflight.at,
+        tags: ["jarvis", "travel", "apple-maps"],
+      });
+      todoStatus = "created";
+    }
+  } catch {
+    // Keep the rest of the preflight safe and durable; the trip card exposes
+    // this retry state instead of saying that Hub storage succeeded.
+    todoStatus = "needs_retry";
+  }
+
+  try {
+    await convexMutation("reminders:add", {
+      text: preflight.reminderText,
+      at: preflight.at,
+      sourceKey: preflight.sourceKey,
+      originThreadId: await activeThread(),
+    });
+  } catch {
+    return "Apple Maps preflight could not persist Jarvis's timed reminder. No Calendar proposal was created; retry this exact trip.";
+  }
+
+  let calendarStatus = await offlineMapCalendarStatus();
+  let calendarApprovalMarker = "";
+  if (calendarStatus === "approval_required") {
+    try {
+      const approval = issueGoogleCalendarApproval({
+        title: `Apple Maps offline · ${preflight.city}`,
+        start: preflight.at,
+        end: preflight.at + 30 * 60_000,
+        allDay: false,
+        timeZone: preflight.timeZone,
+        location: preflight.city,
+        notes: `Before ${preflight.flightTitle}: open the Apple Maps handoff, download ${preflight.city} for offline use, then remove an old unused map in Maps > Offline Maps. Jarvis cannot download or delete Apple offline maps.`,
+        reminderMinutesBefore: 5,
+        sourceDedupeKey: preflight.sourceKey,
+      });
+      calendarApprovalMarker = googleCalendarApprovalMarker(approval);
+    } catch {
+      calendarStatus = "needs_connection";
+    }
+  }
+
+  trip.doc.offlineMapPreflight = {
+    city: preflight.city,
+    flightMarker: preflight.flightMarker,
+    flightTitle: preflight.flightTitle,
+    flightStart: preflight.flightStart,
+    at: preflight.at,
+    timeZone: preflight.timeZone,
+    mapUrl: preflight.mapUrl,
+    sourceKey: preflight.sourceKey,
+    todoStatus,
+    reminderStatus: "scheduled",
+    calendarStatus,
+    updatedAt: Date.now(),
+  };
+  await saveTrip(trip.id, trip.doc, true, tripContext);
+  await convexMutation("chatQueue:postCard", {
+    threadId: await activeThread(),
+    type: "url",
+    value: preflight.mapUrl,
+    title: `Apple Maps · ${preflight.city} ↗`,
+  }).catch(() => {});
+
+  const todoNote = todoStatus === "created"
+    ? "A Hub to-do was added."
+    : todoStatus === "existing"
+      ? "The matching Hub to-do already exists."
+      : "The Hub to-do needs a retry; the saved trip card keeps that state visible.";
+  const calendarNote = calendarStatus === "approval_required"
+    ? "Google Calendar is ready for your protected one-click approval below; nothing has been written yet."
+    : calendarStatus === "needs_reconnect"
+      ? "Google Calendar needs a reconnect with Calendar access; its pending action is saved on the trip."
+      : "Google Calendar is not connected yet; its pending action is saved on the trip for a later retry.";
+  return `Apple Maps preflight is scheduled for ${preflight.city} one local calendar day before the confirmed flight: Jarvis push/spoken reminder is durable. ${todoNote} ${calendarNote} The Apple Maps card is a handoff only—on iPhone, choose Download, then remove the old unused map in Maps > Offline Maps.${calendarApprovalMarker ? `\n${calendarApprovalMarker}` : ""}`;
 }
 
 async function publishHostAction(action: JarvisHostAction): Promise<void> {
@@ -4866,6 +5017,8 @@ export async function executeTool(
       return await bookingsLookup(args);
     case "bookings_check":
       return await bookingsCheck(args, invocationContext);
+    case "travel_offline_maps_prepare":
+      return await travelOfflineMapsPrepare(args, invocationContext);
     case "open_app":
       return await openApp(args);
     case "host_ui":

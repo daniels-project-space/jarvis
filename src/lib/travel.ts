@@ -215,6 +215,25 @@ export type TripDoc = {
   activeCityContextId?: string;
   /** Persisted arbitrary-city exploration result sets shown on the same globe. */
   discoveries?: TripDiscovery[];
+  /**
+   * Owner-device Apple Maps offline handoff derived from one confirmed Gmail
+   * flight. This records only Jarvis-owned reminders/actions; Maps download
+   * and deletion remain an explicit action inside Apple's Maps app.
+   */
+  offlineMapPreflight?: {
+    city: string;
+    flightMarker: string;
+    flightTitle: string;
+    flightStart: number;
+    at: number;
+    timeZone: string;
+    mapUrl: string;
+    sourceKey: string;
+    todoStatus: "created" | "existing" | "needs_retry";
+    reminderStatus: "scheduled";
+    calendarStatus: "approval_required" | "needs_connection" | "needs_reconnect";
+    updatedAt: number;
+  };
 };
 
 /** Keep live conversation workspaces distinct from permanent saved trip creations. */

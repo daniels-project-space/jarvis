@@ -543,11 +543,15 @@ export default defineSchema({
     text: v.string(),
     at: v.number(), // epoch ms when it should fire
     status: v.string(), // pending | delivering | done | cancelled
+    /** Opaque server-derived identity for retry-safe automated reminders. */
+    sourceKey: v.optional(v.string()),
     originThreadId: v.optional(v.string()),
     deliverStartedAt: v.optional(v.number()),
     deliveryAttempts: v.optional(v.number()),
     createdAt: v.number(),
-  }).index("by_status", ["status", "at"]),
+  })
+    .index("by_status", ["status", "at"])
+    .index("by_sourceKey", ["sourceKey"]),
 
   jobs: defineTable({
     admissionProtocolVersion: v.optional(v.number()),
@@ -641,6 +645,10 @@ export default defineSchema({
     // separate from human-readable progress so bounded cleanup never parses
     // broad failure text.
     cloudWorkspaceBlockCode: v.optional(v.string()),
+    // Machine-readable terminal controller-session hold. This only records a
+    // known-safe, finite error code; session credentials never enter Convex.
+    controllerSessionHoldCode: v.optional(v.string()),
+    controllerSessionRepairRequired: v.optional(v.boolean()),
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
@@ -808,6 +816,8 @@ export default defineSchema({
     providerRunState: v.optional(v.string()),
     providerObservedAt: v.optional(v.number()),
     cloudWorkspaceBlockCode: v.optional(v.string()),
+    controllerSessionHoldCode: v.optional(v.string()),
+    controllerSessionRepairRequired: v.optional(v.boolean()),
     readonly: v.optional(v.boolean()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
@@ -874,6 +884,7 @@ export default defineSchema({
     ])
     .index("by_status_progress", ["status", "progressAt"])
     .index("by_status_dispatch_lease", ["status", "dispatchLeaseUntil"])
+    .index("by_controller_session_repair", ["controllerSessionRepairRequired", "status", "updatedAt"])
     .index("by_active_priority", ["active", "priority", "createdAt"])
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])

@@ -5,13 +5,35 @@ import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./co
 // Timed reminders: "remind me at 7pm to call mum" → push + spoken weave when
 // due. The agent-runner cron (*/2) sweeps `due` and delivers.
 export const add = mutation({
-  args: { text: v.string(), at: v.number(), originThreadId: v.optional(v.string()), ...actorAuthArgs },
+  args: { text: v.string(), at: v.number(), sourceKey: v.optional(v.string()), originThreadId: v.optional(v.string()), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const sourceKey = a.sourceKey?.trim();
+    if (sourceKey && !/^[a-f0-9]{64}$/.test(sourceKey)) throw new Error("Reminder source key is invalid");
+    // Automated travel and booking flows can retry after an interrupted web or
+    // calendar handoff. Re-use the same pending reminder rather than creating
+    // a second push/spoken alert, and refresh its timing if Gmail changed it.
+    if (sourceKey) {
+      const existing = await ctx.db
+        .query("reminders")
+        .withIndex("by_sourceKey", (q: any) => q.eq("sourceKey", sourceKey))
+        .unique();
+      if (existing) {
+        if (existing.status === "pending") {
+          await ctx.db.patch(existing._id, {
+            text: a.text.slice(0, 300),
+            at: a.at,
+            originThreadId: a.originThreadId,
+          });
+        }
+        return existing._id;
+      }
+    }
     return await ctx.db.insert("reminders", {
       text: a.text.slice(0, 300),
       at: a.at,
       status: "pending",
+      sourceKey,
       originThreadId: a.originThreadId,
       deliveryAttempts: 0,
       createdAt: Date.now(),

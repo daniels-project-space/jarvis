@@ -274,6 +274,62 @@ export function TripBookedStayReference({ booking, checkedAt, now = Date.now() }
   );
 }
 
+type OfflineMapPreflightValue = {
+  city?: unknown;
+  at?: unknown;
+  timeZone?: unknown;
+  mapUrl?: unknown;
+  todoStatus?: unknown;
+  reminderStatus?: unknown;
+  calendarStatus?: unknown;
+};
+
+function safeAppleMapsHandoff(value: unknown): string | null {
+  try {
+    const url = new URL(String(value ?? ""));
+    return url.protocol === "https:" && url.hostname === "maps.apple.com" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPreflightValue | undefined }) {
+  const city = cityName(preflight?.city);
+  const at = Number(preflight?.at);
+  const mapUrl = safeAppleMapsHandoff(preflight?.mapUrl);
+  if (!city || !Number.isFinite(at) || !mapUrl) return null;
+  const timeZone = typeof preflight?.timeZone === "string" ? preflight.timeZone : undefined;
+  let when = new Date(at).toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  try {
+    when = new Intl.DateTimeFormat("en-GB", { timeZone, weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(at);
+  } catch {
+    // A corrupted historic time zone must never prevent the saved travel plan
+    // from reopening; the server uses a validated zone when creating it.
+  }
+  const calendar = preflight?.calendarStatus === "approval_required"
+    ? "Calendar approval awaits your protected click in Jarvis chat."
+    : preflight?.calendarStatus === "needs_reconnect"
+      ? "Reconnect Google with Calendar access to prepare the calendar reminder."
+      : "Connect Google Calendar to prepare the calendar reminder.";
+  const todo = preflight?.todoStatus === "needs_retry"
+    ? "Hub to-do needs a retry."
+    : preflight?.todoStatus === "existing"
+      ? "Matching Hub to-do is already saved."
+      : "Hub to-do is saved.";
+  return (
+    <section aria-label="Apple Maps offline preflight" className={`${GLASS} mt-2 flex flex-wrap items-center justify-between gap-2 border-cyan/25 bg-cyan/[0.045] px-2.5 py-2`}>
+      <div className="min-w-0">
+        <div className="hud-label !text-cyan">Apple Maps · offline preflight</div>
+        <div className="mt-0.5 text-[11px] font-medium text-ice">{city} · {when}</div>
+        <p className="mt-0.5 max-w-xl text-[9px] leading-snug text-slate">Jarvis reminder is scheduled. {todo} {calendar} Download and deletion remain in Maps: download {city}, then remove an old unused map in Offline Maps (or use Optimize Storage).</p>
+      </div>
+      <a href={mapUrl} target="_blank" rel="noreferrer" className="shrink-0 rounded-lg bg-cyan/15 px-2.5 py-1.5 text-[10px] font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25" aria-label={`Open Apple Maps for ${city}`}>
+        Open Apple Maps ↗
+      </a>
+    </section>
+  );
+}
+
 const routeStatusText = (route?: ItineraryRoute | null) => {
   switch (route?.status) {
     case "ready":
@@ -1247,6 +1303,7 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
               )}
             </div>
           )}
+          <TripOfflineMapPreflight preflight={doc.offlineMapPreflight} />
           {actionError && <div className="mt-1.5 rounded border border-red-400/20 bg-red-400/5 px-2 py-1 text-[10px] text-red-300">{actionError}</div>}
         </div>
         {activeCityContext && (

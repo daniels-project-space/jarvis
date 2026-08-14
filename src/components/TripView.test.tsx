@@ -15,7 +15,7 @@ vi.mock("@/lib/secure-convex", () => ({
     args === "skip" || !tripViewFixture.doc ? undefined : { data: JSON.stringify(tripViewFixture.doc) },
 }));
 
-import TripView, { bookedStayMapMarker, isFreshTripBookedStayReference, mergeTripMapMarker, TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
+import TripView, { bookedStayMapMarker, isFreshTripBookedStayReference, mergeTripMapMarker, TripBookedStayReference, TripDayControls, TripOfflineMapPreflight, TripTimeline } from "./TripView";
 
 describe("TripTimeline", () => {
   it("keeps a time-valid Gmail stay visibly distinct from a hotel candidate", () => {
@@ -201,6 +201,26 @@ describe("TripTimeline", () => {
     expect(markup).toContain("save route &amp; times");
     expect(markup).toContain("lock day");
     expect(markup).toContain("Calendar remains separate and requires protected approval.");
+  });
+
+  it("renders a saved Apple Maps handoff without pretending it downloaded or deleted a map", () => {
+    const markup = renderToStaticMarkup(
+      <TripOfflineMapPreflight preflight={{
+        city: "Seville",
+        at: Date.parse("2026-09-02T09:15:00+02:00"),
+        timeZone: "Europe/Madrid",
+        mapUrl: "https://maps.apple.com/search?query=Seville",
+        todoStatus: "existing",
+        reminderStatus: "scheduled",
+        calendarStatus: "needs_connection",
+      }} />,
+    );
+
+    expect(markup).toContain('aria-label="Apple Maps offline preflight"');
+    expect(markup).toContain('href="https://maps.apple.com/search?query=Seville"');
+    expect(markup).toContain("Matching Hub to-do is already saved.");
+    expect(markup).toContain("Connect Google Calendar");
+    expect(markup).toContain("Download and deletion remain in Maps");
   });
 });
 

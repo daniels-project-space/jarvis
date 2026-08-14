@@ -33,6 +33,8 @@ const contentTypes: Record<string, string> = {
   "/location.js": "text/javascript; charset=utf-8",
   "/booking-marker": "text/html; charset=utf-8",
   "/booking-marker.js": "text/javascript; charset=utf-8",
+  "/offline-map": "text/html; charset=utf-8",
+  "/offline-map.js": "text/javascript; charset=utf-8",
 };
 
 const csp = [
@@ -175,6 +177,19 @@ const bookingMarkerFixtureHtml = `<!doctype html>
   </body>
 </html>`;
 
+const offlineMapFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Apple Maps offline preflight fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/offline-map.js" defer></script>
+  </body>
+</html>`;
+
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
   const fixtureVideoPath = join(outputDir, "fixture-video.mp4");
@@ -203,6 +218,7 @@ async function main() {
     caption: join(projectRoot, "e2e/fixtures/spoken-caption-layout.browser.tsx"),
     location: join(projectRoot, "e2e/fixtures/trip-location-follow.browser.tsx"),
     "booking-marker": join(projectRoot, "e2e/fixtures/trip-booked-stay-marker.browser.tsx"),
+    "offline-map": join(projectRoot, "e2e/fixtures/apple-maps-offline.browser.tsx"),
   },
   format: "iife",
   jsx: "automatic",
@@ -226,6 +242,7 @@ async function main() {
   const captionCssPath = join(outputDir, "caption.css");
   const locationJsPath = join(outputDir, "location.js");
   const bookingMarkerJsPath = join(outputDir, "booking-marker.js");
+  const offlineMapJsPath = join(outputDir, "offline-map.js");
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
@@ -237,6 +254,7 @@ async function main() {
     access(captionCssPath),
     access(locationJsPath),
     access(bookingMarkerJsPath),
+    access(offlineMapJsPath),
   ]);
 
   const server = createServer(async (request, response) => {
@@ -359,6 +377,11 @@ async function main() {
     response.end(bookingMarkerFixtureHtml);
     return;
   }
+  if (pathname === "/offline-map") {
+    response.writeHead(200);
+    response.end(offlineMapFixtureHtml);
+    return;
+  }
 
   response.writeHead(200);
   response.end(await readFile(
@@ -380,7 +403,9 @@ async function main() {
               ? locationJsPath
               : pathname === "/booking-marker.js"
                 ? bookingMarkerJsPath
-                : voiceJsPath,
+                : pathname === "/offline-map.js"
+                  ? offlineMapJsPath
+                  : voiceJsPath,
   ));
   });
 

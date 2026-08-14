@@ -61,6 +61,7 @@ const APPROVAL_KEY = Buffer.alloc(32, 9).toString("base64");
 
 afterEach(() => {
   delete process.env.GOOGLE_TOKEN_ENCRYPTION_KEY;
+  vi.unstubAllGlobals();
 });
 
 const doc = {
@@ -262,5 +263,86 @@ describe("trip itinerary tool actions", () => {
       action: "create",
       event: { title: "🏨 Hotel Aurora · confirmed" },
     });
+  });
+
+  it("creates one flight-verified Apple Maps preflight with a durable reminder, to-do, and protected Calendar proposal", async () => {
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = APPROVAL_KEY;
+    const flight = {
+      id: "gmail-flight-1",
+      marker: "jarvis-gmail-booking:gmail-flight-1",
+      kind: "flight" as const,
+      title: "✈ Iberia 123 · confirmed",
+      provider: "Iberia",
+      start: Date.parse("2030-09-10T09:15:00+02:00"),
+      allDay: false,
+      timeZone: "Europe/Madrid",
+    };
+    const automationTrip = {
+      ...doc,
+      destination: "Seville",
+      departDate: "2030-09-10",
+      returnDate: "2030-09-14",
+    };
+    mock.getTrip.mockResolvedValueOnce({ id: "draft-apple", doc: automationTrip, storage: "draft" });
+    mock.scanGmailBookingConfirmations.mockResolvedValueOnce([flight]);
+    mock.bookingsForTripWindow.mockReturnValueOnce([flight]);
+    mock.convexQuery.mockImplementation(async (path: string) => {
+      if (path === "googleAuth:getConnectionStatus") return { connected: true, capabilities: { calendar: true } };
+      if (path === "ui:getActiveThread") return "thread-apple";
+      return null;
+    });
+    mock.convexMutation.mockResolvedValue(undefined);
+    const hubFetch = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/query") return new Response(JSON.stringify({ value: [] }), { headers: { "content-type": "application/json" } });
+      if (url.pathname === "/api/mutation") return new Response(JSON.stringify({ value: "todo-apple" }), { headers: { "content-type": "application/json" } });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", hubFetch);
+
+    const result = await executeTool("travel_offline_maps_prepare", { draft_id: "draft-apple" });
+
+    expect(result).toContain("Apple Maps preflight is scheduled for Seville");
+    expect(result).toContain("nothing has been written yet");
+    expect(extractGoogleCalendarApproval(result)).toBeTruthy();
+    expect(mock.convexMutation).toHaveBeenCalledWith("reminders:add", expect.objectContaining({
+      sourceKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+      originThreadId: "thread-apple",
+    }));
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", expect.objectContaining({
+      type: "url",
+      value: "https://maps.apple.com/search?query=Seville",
+    }));
+    expect(hubFetch).toHaveBeenCalledTimes(2);
+    expect(mock.saveTrip).toHaveBeenCalledWith("draft-apple", expect.objectContaining({
+      offlineMapPreflight: expect.objectContaining({
+        city: "Seville",
+        reminderStatus: "scheduled",
+        todoStatus: "created",
+        calendarStatus: "approval_required",
+      }),
+    }), true, expect.objectContaining({ storage: "draft" }));
+  });
+
+  it("keeps a durable retry state when Google Calendar is not connected", async () => {
+    const flight = {
+      id: "gmail-flight-2", marker: "jarvis-gmail-booking:gmail-flight-2", kind: "flight" as const,
+      title: "✈ Iberia 456 · confirmed", provider: "Iberia", start: Date.parse("2030-09-12T09:15:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
+    };
+    const automationTrip = { ...doc, destination: "Seville", departDate: "2030-09-12", returnDate: "2030-09-14" };
+    mock.getTrip.mockResolvedValueOnce({ id: "draft-no-google", doc: automationTrip, storage: "draft" });
+    mock.scanGmailBookingConfirmations.mockResolvedValueOnce([flight]);
+    mock.bookingsForTripWindow.mockReturnValueOnce([flight]);
+    mock.convexQuery.mockImplementation(async (path: string) => path === "ui:getActiveThread" ? "thread-apple" : { connected: false });
+    mock.convexMutation.mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ value: [] }), { headers: { "content-type": "application/json" } })));
+
+    const result = await executeTool("travel_offline_maps_prepare", { draft_id: "draft-no-google" });
+
+    expect(result).toContain("Google Calendar is not connected yet");
+    expect(extractGoogleCalendarApproval(result)).toBeNull();
+    expect(mock.saveTrip).toHaveBeenCalledWith("draft-no-google", expect.objectContaining({
+      offlineMapPreflight: expect.objectContaining({ calendarStatus: "needs_connection" }),
+    }), true, expect.objectContaining({ storage: "draft" }));
   });
 });
