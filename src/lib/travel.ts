@@ -1,7 +1,13 @@
 import "server-only";
 import { convexMutation, convexQuery } from "./context";
-import type { ConfirmedBooking } from "./booking-email";
-import { openStreetMapDirectionsUrl, routeOpenStreetMapItinerary, searchOpenStreetMapPlaces } from "./openstreetmap";
+import { lookupGmailBookingsReadOnly, type ConfirmedBooking } from "./booking-email";
+import {
+  openStreetMapDirectionsUrl,
+  routeOpenStreetMapItinerary,
+  searchOpenStreetMapPlaces,
+  type OpenStreetMapWikipediaSource,
+  type WikimediaPlaceArticle,
+} from "./openstreetmap";
 import {
   isTripTime,
   isTripTravelMode,
@@ -79,6 +85,16 @@ export type TripActivity = {
   mapsLink: string;
   photo?: string;
   address?: string;
+  /** Exact `opening_hours` value supplied by OpenStreetMap; venue verification may still be needed. */
+  openingHours?: string;
+  /** Exact `charge` value supplied by OpenStreetMap; never normalized or inferred. */
+  charge?: string;
+  /** Source-tagged venue website, validated by the OpenStreetMap adapter. */
+  websiteUrl?: string;
+  /** Exact language/title article reference supplied by OpenStreetMap. */
+  wikipedia?: OpenStreetMapWikipediaSource;
+  /** Source-attributed Wikipedia/Wikimedia article and optional thumbnail. */
+  wikipediaArticle?: WikimediaPlaceArticle;
 };
 export type TripProviderState = {
   status: "queued" | "searching" | "ready" | "error" | "skipped";
@@ -123,7 +139,26 @@ export type TripDoc = {
   // Read-only Gmail confirmations are distilled into structured trip facts;
   // raw email bodies and OAuth data never enter the trip document.
   confirmedBookings?: ConfirmedBooking[];
+  /** Timestamp of the last successful read-only Gmail booking refresh. */
+  bookingsCheckedAt?: number;
 };
+
+export function bookingsForTripWindow(bookings: ConfirmedBooking[], departDate?: string, returnDate?: string): ConfirmedBooking[] {
+  const start = Date.parse(`${departDate ?? ""}T00:00:00Z`);
+  const end = Date.parse(`${returnDate ?? ""}T23:59:59Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return [];
+  return bookings.filter((booking) => {
+    const bookingStart = Number(booking.start);
+    const bookingEnd = Number(booking.end ?? booking.start);
+    return Number.isFinite(bookingStart) && Number.isFinite(bookingEnd) && bookingEnd >= start && bookingStart <= end;
+  });
+}
+
+function mergeTripBookings(existing: ConfirmedBooking[] | undefined, incoming: ConfirmedBooking[]): ConfirmedBooking[] {
+  const byMarker = new Map((existing ?? []).map((booking) => [booking.marker, booking]));
+  for (const booking of incoming) byMarker.set(booking.marker, booking);
+  return [...byMarker.values()].sort((left, right) => (left.start ?? Number.MAX_SAFE_INTEGER) - (right.start ?? Number.MAX_SAFE_INTEGER));
+}
 
 export async function placesActivities(destination: string, vibe?: string, limit = 14): Promise<TripActivity[]> {
   // The adapter serialises public Nominatim requests and never invents the
@@ -145,6 +180,14 @@ export async function placesActivities(destination: string, vibe?: string, limit
         lng: place.lng,
         address: place.address.slice(0, 100) || undefined,
         mapsLink: place.mapsUri,
+        openingHours: place.openingHours,
+        charge: place.charge,
+        websiteUrl: place.websiteUrl,
+        wikipedia: place.wikipedia,
+        wikipediaArticle: place.wikipediaArticle,
+        // The adapter permits this only for an exact OpenStreetMap Wikipedia
+        // tag and records the article/attribution alongside it above.
+        photo: place.wikipediaArticle?.thumbnailUrl,
       });
       if (out.length >= limit) return out;
     }
@@ -273,6 +316,11 @@ export async function scoutTrip(a: {
   const perNightCap = a.maxPricePerNight ?? Math.max(30, Math.round((a.budgetGbp * 0.45) / nights));
   const origin = fixIata(a.origin);
   const destIata = fixIata(a.destIata);
+  // This is read-only and intentionally starts alongside trip setup. A failed
+  // Gmail connection must never prevent an unrelated city plan from opening.
+  const bookingLookup = lookupGmailBookingsReadOnly({ days: 730, maxResults: 24 })
+    .then((bookings) => ({ bookings, checkedAt: Date.now() }))
+    .catch(() => ({ bookings: [] as ConfirmedBooking[], checkedAt: undefined }));
 
   let id = a.reuseId;
   let prior: TripDoc | undefined;
@@ -325,6 +373,10 @@ export async function scoutTrip(a: {
       airport: { status: "searching", source: "OpenStreetMap" },
     },
   };
+  const freshBookings = await bookingLookup;
+  const matchingBookings = bookingsForTripWindow(freshBookings.bookings, doc.departDate, doc.returnDate);
+  if (matchingBookings.length) doc.confirmedBookings = mergeTripBookings(doc.confirmedBookings, matchingBookings);
+  if (freshBookings.checkedAt) doc.bookingsCheckedAt = freshBookings.checkedAt;
   doc.totals = tripTotals(doc);
   await convexMutation("creations:update", { id: creationId, title: doc.title, data: JSON.stringify(doc) });
   await convexMutation("ui:setPanel", { type: "trip", value: JSON.stringify({ creationId }), title: `trip · ${doc.title}` });

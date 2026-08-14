@@ -1,8 +1,30 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { TripDayControls, TripTimeline } from "./TripView";
+import { TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
 
 describe("TripTimeline", () => {
+  it("keeps a time-valid Gmail stay visibly distinct from a hotel candidate", () => {
+    const now = Date.UTC(2026, 8, 12, 12, 0);
+    const markup = renderToStaticMarkup(
+      <TripBookedStayReference
+        now={now}
+        checkedAt={now - 60_000}
+        booking={{
+          bookingName: "Canal House",
+          location: "42 Water Street, Amsterdam, Netherlands",
+          start: now - 3_600_000,
+          end: now + 86_400_000,
+          timeZone: "Europe/Amsterdam",
+        }}
+      />,
+    );
+
+    expect(markup).toContain("booked location · active");
+    expect(markup).toContain("Canal House");
+    expect(markup).toContain("42 Water Street, Amsterdam, Netherlands");
+    expect(markup).toContain("Read-only Gmail");
+  });
+
   it("renders persisted stop and transfer timing without drawing a made-up connection", () => {
     const markup = renderToStaticMarkup(
       <TripTimeline

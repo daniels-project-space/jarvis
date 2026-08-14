@@ -2236,13 +2236,12 @@ async function bookingsCheck(args: any): Promise<string> {
   let tripNote = "";
   const tripId = String(args.trip_id ?? "").trim();
   if (tripId) {
-    const { getTrip, mergeConfirmedBookings, saveTrip } = await import("./travel");
+    const { bookingsForTripWindow, getTrip, mergeConfirmedBookings, saveTrip } = await import("./travel");
     const trip = await getTrip(tripId);
     if (!trip) return `I found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"}, but trip ${tripId} was not found.`;
-    const start = Date.parse(`${trip.doc.departDate}T00:00:00Z`) - 86_400_000;
-    const end = Date.parse(`${trip.doc.returnDate}T23:59:59Z`) + 86_400_000;
-    const matching = bookings.filter((booking) => booking.start && booking.start >= start && booking.start <= end);
+    const matching = bookingsForTripWindow(bookings, trip.doc.departDate, trip.doc.returnDate);
     const total = mergeConfirmedBookings(trip.doc, matching);
+    trip.doc.bookingsCheckedAt = Date.now();
     await saveTrip(trip.id, trip.doc);
     tripNote = ` ${matching.length} matching confirmation${matching.length === 1 ? "" : "s"} merged into ${trip.doc.title}'s itinerary (${total} saved).`;
   }

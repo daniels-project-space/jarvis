@@ -17,7 +17,7 @@ vi.mock("./openstreetmap", () => ({
   searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces,
 }));
 
-import { addTripPlaceToDay, buildItinerary, scheduleTripDay, tripToMindmap, type TripDoc } from "./travel";
+import { addTripPlaceToDay, bookingsForTripWindow, buildItinerary, scheduleTripDay, tripToMindmap, type TripDoc } from "./travel";
 
 function trip(): TripDoc {
   return {
@@ -60,6 +60,16 @@ describe("durable trip day scheduling", () => {
       ],
       attribution: "Route data © OpenStreetMap contributors · FOSSGIS OSRM",
     });
+  });
+
+  it("keeps only Gmail confirmations that overlap the exact trip window", () => {
+    const matches = bookingsForTripWindow([
+      { id: "overlap", kind: "stay", title: "Overlapping stay", provider: "Mail", start: Date.parse("2026-08-31T20:00:00Z"), end: Date.parse("2026-09-01T10:00:00Z"), allDay: false, location: "Lisbon", marker: "overlap" },
+      { id: "inside", kind: "stay", title: "Inside stay", provider: "Mail", start: Date.parse("2026-09-02T14:00:00Z"), end: Date.parse("2026-09-03T11:00:00Z"), allDay: false, location: "Lisbon", marker: "inside" },
+      { id: "outside", kind: "stay", title: "Other city week", provider: "Mail", start: Date.parse("2026-09-06T14:00:00Z"), end: Date.parse("2026-09-07T11:00:00Z"), allDay: false, location: "Porto", marker: "outside" },
+    ], "2026-09-01", "2026-09-04");
+
+    expect(matches.map((booking) => booking.marker)).toEqual(["overlap", "inside"]);
   });
 
   it("uses each Gmail booking's own time zone and preserves an owner-locked day", () => {

@@ -40,4 +40,54 @@ describe("trip activity discovery", () => {
     }]);
   });
 
+  it("keeps source-backed venue details and Wikimedia attribution with the activity", async () => {
+    mock.searchOpenStreetMapPlaces.mockResolvedValueOnce([
+      {
+        name: "Museu Nacional do Azulejo",
+        address: "Rua da Madre de Deus, Lisbon, Portugal",
+        lat: 38.725,
+        lng: -9.113,
+        dist: null,
+        mapsUri: "https://www.openstreetmap.org/?mlat=38.725&mlon=-9.113",
+        openingHours: "Tu-Su 10:00-18:00",
+        charge: "€10",
+        websiteUrl: "https://www.museudoazulejo.gov.pt/",
+        wikipedia: {
+          language: "en",
+          title: "National Tile Museum",
+          articleUrl: "https://en.wikipedia.org/wiki/National_Tile_Museum",
+        },
+        wikipediaArticle: {
+          title: "National Tile Museum",
+          articleUrl: "https://en.wikipedia.org/wiki/National_Tile_Museum",
+          thumbnailUrl: "https://upload.wikimedia.org/example.jpg",
+          attribution: "Wikimedia Commons",
+        },
+      },
+    ]);
+
+    const [activity] = await placesActivities("Lisbon", undefined, 1);
+
+    expect(activity).toMatchObject({
+      name: "Museu Nacional do Azulejo",
+      openingHours: "Tu-Su 10:00-18:00",
+      charge: "€10",
+      websiteUrl: "https://www.museudoazulejo.gov.pt/",
+      wikipedia: {
+        language: "en",
+        title: "National Tile Museum",
+        articleUrl: "https://en.wikipedia.org/wiki/National_Tile_Museum",
+      },
+      wikipediaArticle: {
+        title: "National Tile Museum",
+        articleUrl: "https://en.wikipedia.org/wiki/National_Tile_Museum",
+        thumbnailUrl: "https://upload.wikimedia.org/example.jpg",
+        attribution: "Wikimedia Commons",
+      },
+      photo: "https://upload.wikimedia.org/example.jpg",
+    });
+    expect(activity).not.toHaveProperty("rating");
+    expect(activity).not.toHaveProperty("ratings");
+  });
+
 });

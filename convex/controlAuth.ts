@@ -45,9 +45,13 @@ function constantTimeEqual(left: string | undefined, right: string | undefined):
   return mismatch === 0 && a.length > 0;
 }
 
-export function requireWorker(workerToken: string | undefined): void {
+export function hasWorkerCapability(workerToken: string | undefined): boolean {
   const expected = process.env.JARVIS_WORKER_TOKEN;
-  if (!expected || !constantTimeEqual(workerToken, expected)) throw new Error("Unauthorized worker capability");
+  return Boolean(expected && constantTimeEqual(workerToken, expected));
+}
+
+export function requireWorker(workerToken: string | undefined): void {
+  if (!hasWorkerCapability(workerToken)) throw new Error("Unauthorized worker capability");
 }
 
 export async function isAdminSession(ctx: any, tokenHash: string | undefined): Promise<boolean> {
@@ -67,8 +71,7 @@ export async function requireActor(
   ctx: any,
   credentials: { authTokenHash?: string; workerToken?: string },
 ): Promise<void> {
-  const worker = process.env.JARVIS_WORKER_TOKEN;
-  if (worker && constantTimeEqual(credentials.workerToken, worker)) return;
+  if (hasWorkerCapability(credentials.workerToken)) return;
   await requireAdmin(ctx, credentials.authTokenHash);
 }
 

@@ -48,6 +48,7 @@ import type * as sourceAdmission from "../sourceAdmission.js";
 import type * as supervisorFleetManifest from "../supervisorFleetManifest.js";
 import type * as supervisorJobControl from "../supervisorJobControl.js";
 import type * as testSourceAdmission from "../testSourceAdmission.js";
+import type * as travelDrafts from "../travelDrafts.js";
 import type * as ui from "../ui.js";
 import type * as visualContext from "../visualContext.js";
 import type * as voiceMetrics from "../voiceMetrics.js";
@@ -104,6 +105,7 @@ declare const fullApi: ApiFromModules<{
   supervisorFleetManifest: typeof supervisorFleetManifest;
   supervisorJobControl: typeof supervisorJobControl;
   testSourceAdmission: typeof testSourceAdmission;
+  travelDrafts: typeof travelDrafts;
   ui: typeof ui;
   visualContext: typeof visualContext;
   voiceMetrics: typeof voiceMetrics;

@@ -2130,6 +2130,27 @@ export default defineSchema({
     .index("by_thread", ["threadId", "updatedAt"])
     .index("by_updatedAt", ["updatedAt"]),
 
+  // Conversational travel remains deliberately separate from Daniel's saved
+  // creations until he explicitly locks a reviewed plan. `data` is a bounded
+  // TripDoc-compatible JSON snapshot; planRevision fences owner itinerary
+  // writes while providers can merge their own subtree without replacing it.
+  travelDrafts: defineTable({
+    threadId: v.string(),
+    state: v.union(v.literal("draft"), v.literal("locked")),
+    schemaVersion: v.number(),
+    title: v.string(),
+    destination: v.string(),
+    data: v.string(),
+    planRevision: v.number(),
+    sourceMessageId: v.optional(v.id("chatMessages")),
+    lockedCreationId: v.optional(v.id("creations")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_thread_state_updated", ["threadId", "state", "updatedAt"])
+    .index("by_expiry", ["expiresAt"]),
+
   // Storage-only archive from the retired model-generated insight loop. The
   // 50 historical rows remain untouched; attentionItems is the live queue.
   insights: defineTable({

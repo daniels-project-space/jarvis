@@ -93,6 +93,45 @@ const distanceText = (meters: unknown) => {
   return meters >= 1000 ? `${(meters / 1000).toFixed(meters >= 10_000 ? 0 : 1)} km` : `${Math.round(meters)} m`;
 };
 
+export type TripBookedStayReferenceValue = {
+  title?: string;
+  bookingName?: string;
+  location?: string;
+  start?: number;
+  end?: number;
+  timeZone?: string;
+};
+
+const bookingDateText = (value: number | undefined, timeZone?: string) => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  try {
+    return new Intl.DateTimeFormat("en-GB", {
+      timeZone: timeZone || "UTC",
+      day: "numeric",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(value);
+  } catch {
+    return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short" }).format(value);
+  }
+};
+
+export function TripBookedStayReference({ booking, checkedAt, now = Date.now() }: { booking: TripBookedStayReferenceValue; checkedAt?: number; now?: number }) {
+  const active = typeof booking.start === "number" && booking.start <= now && (!booking.end || booking.end >= now);
+  const start = bookingDateText(booking.start, booking.timeZone);
+  const end = bookingDateText(booking.end, booking.timeZone);
+  const checked = bookingDateText(checkedAt, booking.timeZone);
+  return (
+    <div aria-label="Booked stay reference" className="pointer-events-none absolute bottom-9 left-3 max-w-[calc(100%-1.5rem)] rounded-lg border border-emerald-300/25 bg-black/65 px-2.5 py-2 text-left shadow-lg backdrop-blur">
+      <div className="hud-label !text-[8px] !text-emerald-200">booked location · {active ? "active" : "upcoming"}</div>
+      <div className="mt-0.5 truncate text-[11px] font-medium text-ice">{booking.bookingName || booking.title || "confirmed stay"}</div>
+      {booking.location && <div className="mt-0.5 line-clamp-2 text-[9px] leading-snug text-slate">{booking.location}</div>}
+      {(start || end || checked) && <div className="mt-1 text-[8px] text-slate">Read-only Gmail · {[start, end].filter(Boolean).join(" → ")}{checked ? ` · checked ${checked}` : ""}</div>}
+    </div>
+  );
+}
+
 const routeStatusText = (route?: ItineraryRoute | null) => {
   switch (route?.status) {
     case "ready":
@@ -603,7 +642,15 @@ export default function TripView({ value }: { value: string }) {
   const [sortBy, setSortBy] = useState<"value" | "price" | "rating">("value");
   const [busy, setBusy] = useState("");
   const [actionError, setActionError] = useState("");
+  const [bookingNow, setBookingNow] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const update = () => setBookingNow(Date.now());
+    update();
+    const timer = window.setInterval(update, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const itineraryDays = useMemo(
     () =>
@@ -615,6 +662,34 @@ export default function TripView({ value }: { value: string }) {
         : [],
     [doc?.itinerary],
   );
+  const bookedStay = useMemo((): TripBookedStayReferenceValue | null => {
+    if (!bookingNow || !Array.isArray(doc?.confirmedBookings)) return null;
+    const tripStart = Date.parse(`${doc?.departDate ?? ""}T00:00:00Z`);
+    const tripEnd = Date.parse(`${doc?.returnDate ?? ""}T23:59:59Z`);
+    return (doc.confirmedBookings as any[])
+      .filter((booking) => {
+        if (booking?.kind !== "stay" || !booking.location) return false;
+        const start = Number(booking.start);
+        const end = Number(booking.end ?? booking.start);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end < bookingNow) return false;
+        if (Number.isFinite(tripStart) && Number.isFinite(tripEnd) && (end < tripStart || start > tripEnd)) return false;
+        return true;
+      })
+      .sort((left, right) => {
+        const leftActive = Number(left.start) <= bookingNow && Number(left.end ?? left.start) >= bookingNow;
+        const rightActive = Number(right.start) <= bookingNow && Number(right.end ?? right.start) >= bookingNow;
+        if (leftActive !== rightActive) return leftActive ? -1 : 1;
+        return Number(left.start) - Number(right.start);
+      })
+      .map((booking) => ({
+        title: String(booking.title ?? ""),
+        bookingName: typeof booking.bookingName === "string" ? booking.bookingName : undefined,
+        location: String(booking.location),
+        start: Number(booking.start),
+        end: Number(booking.end ?? booking.start),
+        timeZone: typeof booking.timeZone === "string" ? booking.timeZone : undefined,
+      }))[0] ?? null;
+  }, [bookingNow, doc?.confirmedBookings, doc?.departDate, doc?.returnDate]);
   const activePlanDay = useMemo(
     () => itineraryDays.find((day) => day.date === activePlanDate) ?? itineraryDays[0] ?? null,
     [activePlanDate, itineraryDays],
@@ -740,6 +815,7 @@ export default function TripView({ value }: { value: string }) {
             )}
           </div>
         )}
+        {bookedStay && <TripBookedStayReference booking={bookedStay} checkedAt={Number(doc.bookingsCheckedAt) || undefined} now={bookingNow} />}
         <div className="pointer-events-none absolute bottom-2 left-3 flex gap-3 rounded-lg bg-black/50 px-2 py-1 text-[9px] uppercase tracking-widest text-slate backdrop-blur">
           <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: KIND_COLOR.stay }} />stays</span>
           <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: KIND_COLOR.activity }} />activities</span>
@@ -997,12 +1073,18 @@ export default function TripView({ value }: { value: string }) {
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[13px] font-semibold text-ice">{a.name}</div>
-                    <div className="text-[11px] text-slate">★{a.rating ? Math.round(a.rating * 10) / 10 : "?"} ({(a.ratings ?? 0).toLocaleString("en-GB")} reviews)</div>
+                    <div className="text-[10px] text-slate">OpenStreetMap place · venue details can change</div>
                     {a.address && <div className="truncate text-[10px] text-slate/70">{a.address}</div>}
+                    {(a.openingHours || a.charge) && (
+                      <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-slate">
+                        {a.openingHours && <span>hours (OSM): {a.openingHours}</span>}
+                        {a.charge && <span>charge (OSM): {a.charge}</span>}
+                      </div>
+                    )}
                     <div className="mt-1 flex gap-2">
-                      <a href={a.mapsLink} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">
-                        maps ↗
-                      </a>
+                      {a.mapsLink && <a href={a.mapsLink} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">maps ↗</a>}
+                      {a.websiteUrl && <a href={a.websiteUrl} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">venue ↗</a>}
+                      {a.wikipediaArticle?.articleUrl && <a href={a.wikipediaArticle.articleUrl} target="_blank" rel="noreferrer" className="rounded-lg bg-white/5 px-2 py-1 text-[11px] text-ice ring-1 ring-white/10 transition hover:text-cyan">guide ↗</a>}
                       <button
                         onClick={() => void act(picked ? "removing" : "adding", "toggle_activity", { activity: a.name })}
                         className={`ml-auto rounded-lg px-3 py-1 text-[11px] font-medium ${picked ? "bg-sky-400/20 text-sky-300 ring-1 ring-sky-400/50" : "bg-white/5 text-slate ring-1 ring-white/10 hover:text-ice"}`}
@@ -1010,6 +1092,7 @@ export default function TripView({ value }: { value: string }) {
                         {picked ? "in plan ✓" : "+ add"}
                       </button>
                     </div>
+                    {a.photo && a.wikipediaArticle?.attribution && <div className="mt-1 text-[9px] text-slate/60">image · {a.wikipediaArticle.attribution}</div>}
                   </div>
                 </div>
               );
