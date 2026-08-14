@@ -62,8 +62,11 @@ import {
 } from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
 import { resolveEmbedLayoutMode, resolvePanelRoute } from "@/lib/panel-contract";
-import { parseFastAgentDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
+import { parseFastAgentDispatch, parseProjectFeatureDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
+import { resolveVoiceTurnAdmission } from "@/lib/voice-turn-admission";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
+import { resolveHostProjectContext } from "@/lib/host-project-context";
+import { shouldDismissEmbeddedHandoff } from "@/lib/overlay-handoff";
 import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch, viewerFetchWithTimeout } from "@/lib/viewer-request";
@@ -1662,9 +1665,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     | { value: string; updatedAt: number }
     | null
     | undefined;
+  // The main page shows Paul's (and every other specialist's) active
+  // conversation-origin work fleet-wide — not scoped to whichever thread
+  // happens to be the current shared active thread — so a job dispatched
+  // from an embedded overlay in another app stays visible here after focus
+  // moves on. The embedded overlay is untouched: it still skips this query.
   const commandSnapshot = useJarvisQuery(
-    api.commandCenter.snapshot,
-    embedded || guest || !activeThreadReady ? "skip" : { threadId: thread },
+    api.commandCenter.fleetSnapshot,
+    embedded || guest || !activeThreadReady ? "skip" : {},
   ) as CompactWorkSnapshot | undefined;
   const [workDetailJobId, setWorkDetailJobId] = useState<string | null>(null);
   const workDetail = useJarvisQuery(
@@ -1779,6 +1787,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     autoSubmitFileIdsRef.current.clear();
   }, [thread]);
   const [speaking, setSpeaking] = useState(false);
+  // The universal host owns the visible mute control. Persist the preference
+  // here, on Jarvis's origin, so it follows Daniel between embedded apps.
+  const [audioMuted, setAudioMuted] = useState(false);
+  const audioMutedRef = useRef(false);
+  const muteStateLoadedRef = useRef(false);
+  useEffect(() => {
+    try {
+      const muted = window.localStorage.getItem("jarvis_audio_muted") === "1";
+      audioMutedRef.current = muted;
+      muteStateLoadedRef.current = true;
+      setAudioMuted(muted);
+    } catch {
+      muteStateLoadedRef.current = true;
+    }
+  }, []);
   const [ttsRuntimeStatus, setTtsRuntimeStatus] = useState<TtsRuntimeStatus>("ready");
   useEffect(() => {
     const receive = (event: Event) => {
@@ -1830,6 +1853,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (!embedded || window.parent === window) return;
     postToParent({ jarvis: live === "off" ? "live-end" : "live-start" });
   }, [embedded, live, parentOrigin]);
+  useEffect(() => {
+    if (!embedded || window.parent === window || !muteStateLoadedRef.current) return;
+    postToParent({ jarvis: "mute-state", muted: audioMutedRef.current });
+  }, [audioMuted, embedded, parentOrigin]);
   const [caption, setCaption] = useState<Caption>(null);
   // Soft dismiss: mark the caption `exiting` so it fades out slowly (CSS), then
   // unmount after the fade. A fresh caption cancels a pending fade.
@@ -1944,6 +1971,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   } | null>(null);
   const [voiceReplayReady, setVoiceReplayReady] = useState(false);
   const mutedNarrationParentsRef = useRef(new Set<string>());
+  const setAudioMutedPreference = useCallback((muted: boolean) => {
+    audioMutedRef.current = muted;
+    muteStateLoadedRef.current = true;
+    setAudioMuted(muted);
+    try {
+      window.localStorage.setItem("jarvis_audio_muted", muted ? "1" : "0");
+    } catch {}
+    if (!muted) return;
+    // Mute must silence an in-flight utterance without invoking stopTalking(),
+    // whose live-loop behavior intentionally starts another capture turn.
+    finalNarrationGenerationRef.current += 1;
+    finalNarrationMessageRef.current = "";
+    voiceReplayRef.current = null;
+    setVoiceReplayReady(false);
+    void import("../lib/tts").then((module) => module.stopSpeaking());
+    setSpeaking(false);
+  }, []);
   const captionRef = useRef<Caption>(null);
   const energyRef = useRef(0);
   const recRef = useRef<MediaRecorder | null>(null);
@@ -2586,6 +2630,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         setChatMode("off", false);
         setEmbeddedExpanded(false);
       }
+      if (message.jarvis === "host-mute-set" && typeof message.muted === "boolean") {
+        setAudioMutedPreference(message.muted);
+        if (message.muted && liveRef.current) void toggleLive();
+      }
       if (message.jarvis === "host-hide" && liveRef.current) void toggleLive();
       if (message.jarvis === "host-wake-state") setWake(message.listening === true);
       if ((message.jarvis === "host-context" || message.jarvis === "context-response") && message.context) {
@@ -2640,6 +2688,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (message.jarvis === "host-listener-request") rearmWake();
       if (message.jarvis === "host-interrupt") stopTalking();
       if (message.jarvis === "host-wake-detected") {
+        if (audioMutedRef.current) return;
         setWake(true);
         setChatMode("off", false);
         showCaption({ who: "you", text: "Listening…" });
@@ -2651,6 +2700,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         if (transcript) showCaption({ who: "you", text: transcript });
       }
       if (message.jarvis === "host-command" && typeof message.text === "string") {
+        if (audioMutedRef.current) return;
         const command = message.text.trim().slice(0, 4000);
         if (command) {
           setWake(false);
@@ -2750,6 +2800,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       fadeCaption(captionText, 3_200);
       finishOneShotVoiceTurn();
     };
+    if (audioMutedRef.current) {
+      finishWithoutSpeech();
+      return false;
+    }
     const localNarrationOwner = Date.now() < localVoiceLeaseUntilRef.current
       || voiceRef.current?.value === me.current;
     if (document.hidden || (liveAnywhere() && !liveRef.current && !localNarrationOwner)) {
@@ -2763,7 +2817,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       ensureVoice(),
       import("../lib/tts"),
     ]);
-    if (!voiceGranted) {
+    if (audioMutedRef.current || !voiceGranted) {
       finishWithoutSpeech();
       return false;
     }
@@ -2798,6 +2852,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
       },
     );
+    if (audioMutedRef.current) return false;
     if (voiceReplayRef.current?.claim !== replay.claim) return played;
     if (played) {
       voiceReplayRef.current = null;
@@ -3496,22 +3551,69 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     void queueDurableTurn(active.text, active.visibleText, active.fileIds);
   }
 
-  async function openFastAgentDispatch(intent: FastAgentDispatch, requestedText: string) {
+  function dismissEmbeddedAfterHandoff() {
+    if (!embedded) return;
+    // A successful background job returns the overlay to standby. This ends
+    // persistent capture but intentionally re-arms the host wake listener so
+    // Daniel can call Jarvis again without reopening the panel himself.
+    if (activeDurableTurn.current?.messageId) {
+      mutedNarrationParentsRef.current.add(String(activeDurableTurn.current.messageId));
+    }
+    finalNarrationGenerationRef.current += 1;
+    finalNarrationMessageRef.current = "";
+    voiceReplayRef.current = null;
+    setVoiceReplayReady(false);
+    void import("../lib/tts").then((module) => module.stopSpeaking());
+    setSpeaking(false);
+    liveManuallyStopped.current = true;
+    resumeLiveWhenVisible.current = false;
+    endFreeVoiceSession();
+    setChatMode("off", false);
+    setEmbeddedExpanded(false);
+    hideEmbedded();
+  }
+
+  async function openFastAgentDispatch(
+    intent: FastAgentDispatch,
+    requestedText: string,
+    options: { background?: boolean; requireHostProject?: boolean } = {},
+  ) {
     const narrationId = `dispatch:${Date.now()}`;
+    const background = options.background === true;
     const owner = intent.agentId
       ? ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry" } as const)[intent.agentId]
       : "the right specialist";
+    const startingReply = `Starting ${owner}.`;
     document.documentElement.dataset.jarvisFirstTokenMs = "0";
-    setSending(true);
+    if (!background) setSending(true);
     showCaption({ who: "you", text: requestedText });
-    showCaption({ who: "jarvis", text: `Assigning ${owner}…`, phase: "streaming" });
+    showCaption({ who: "jarvis", text: `Starting ${owner}…`, phase: "streaming" });
+    if (!background) {
+      void narrateText({
+        text: startingReply,
+        claim: narrationClaim(`${narrationId}:starting`, startingReply),
+        captionText: startingReply,
+        final: false,
+      });
+    }
     try {
+      const hostContext = embedded
+        ? hostContextRef.current ?? await requestHostContext()
+        : null;
+      const hostProject = resolveHostProjectContext(hostContext);
+      if (options.requireHostProject && !hostProject) {
+        throw new Error("current project context unavailable");
+      }
       const response = await viewerFetch("/api/tools", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           name: "dispatch_agent",
-          args: { task: intent.task, agent_id: intent.agentId },
+          args: {
+            task: intent.task,
+            agent_id: intent.agentId,
+            ...(hostProject ? { host_context: hostProject.context } : {}),
+          },
         }),
       });
       const body = await response.json().catch(() => null);
@@ -3523,18 +3625,30 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const awaitingApproval = /consequential|Needs you|will not execute/i.test(result);
       const reply = awaitingApproval
         ? `${assigned} has the plan ready, but it needs your approval in the work card before anything consequential happens.`
-        : `${assigned} is on it. The work is live, and I’m still right here with you.`;
-      updateConversationMood(reply);
-      lastSpokenText.current = { text: reply, ts: Date.now() };
+        : `${assigned} is on it. The work is live.`;
+      if (!background) updateConversationMood(reply);
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
       void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-dispatch" });
-      await narrateText({ text: reply, claim: narrationClaim(narrationId, reply), captionText: reply });
+      if (shouldDismissEmbeddedHandoff({ embedded, awaitingApproval })) {
+        dismissEmbeddedAfterHandoff();
+        return;
+      }
+      // The short "Starting Paul" acknowledgement has already spoken on the
+      // normal path. Reserve a second voice turn for an approval requirement.
+      if (awaitingApproval) {
+        lastSpokenText.current = { text: reply, ts: Date.now() };
+        await narrateText({ text: reply, claim: narrationClaim(narrationId, reply), captionText: reply });
+      }
     } catch {
+      if (background) {
+        showCaption({ who: "jarvis", text: "I couldn’t start that background handoff. The current reply is still running safely." });
+        return;
+      }
       showCaption({ who: "jarvis", text: "The fast handoff slipped. I’m retrying it through the durable lane now." });
       await queueDurableTurn(requestedText);
     } finally {
-      setSending(false);
+      if (!background) setSending(false);
     }
   }
 
@@ -3659,7 +3773,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     if (!t && !fileIds.length) return;
     const visibleText = t || "Analyze the attached files.";
-    if (durableSubmissionInFlight.current || activeDurableTurn.current) {
+    const explicitFastDispatch = guest || fileIds.length ? null : parseFastAgentDispatch(t);
+    const projectFastDispatch = !explicitFastDispatch && embedded && !guest && !fileIds.length
+      && resolveHostProjectContext(hostContextRef.current)
+      ? parseProjectFeatureDispatch(t)
+      : null;
+    const fastDispatch = explicitFastDispatch ?? projectFastDispatch;
+    const foregroundBusy = Boolean(durableSubmissionInFlight.current || activeDurableTurn.current);
+    const admission = resolveVoiceTurnAdmission({ foregroundBusy, hasFastDispatch: fastDispatch !== null });
+    // A received specialist handoff is durable background work, not a second
+    // foreground model turn. Keep ordinary conversation serialization intact
+    // while allowing Daniel to keep using the live loop during the handoff.
+    if (admission === "blocked") {
       if (!options.interruptCurrent || durableSubmissionInFlight.current || !activeDurableTurn.current) {
         showCaption({ who: "jarvis", text: "I’m finishing the current reply first. You can recover or retry it from the status bar." });
         return;
@@ -3672,13 +3797,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
     }
-    // Typed/button calls reach this inside a user gesture. Live/STT calls have
-    // already been primed by the control that opened the microphone.
-    unlockSpeechPlayback();
     // double-tap / Enter+click within 2.5s = one send, not two
     const sendFingerprint = `${visibleText}\u0000${fileIds.join(",")}`;
     if (sendFingerprint === lastSent.current.text && Date.now() - lastSent.current.ts < 2500) return;
     lastSent.current = { text: sendFingerprint, ts: Date.now() };
+    setInput("");
+    const backgroundDispatch = admission === "background-dispatch";
+    if (fastDispatch) {
+      void openFastAgentDispatch(fastDispatch, t, {
+        background: backgroundDispatch,
+        requireHostProject: !explicitFastDispatch && projectFastDispatch !== null,
+      });
+      return;
+    }
+    // Typed/button calls reach this inside a user gesture. Live/STT calls have
+    // already been primed by the control that opened the microphone.
+    unlockSpeechPlayback();
     finalNarrationGenerationRef.current += 1;
     finalNarrationMessageRef.current = "";
     voiceReplayRef.current = null;
@@ -3704,7 +3838,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       void m.warm();
     });
     setSpeaking(false);
-    setInput("");
     const embeddedHostIntent = embedded && !fileIds.length ? parseEmbeddedHostIntent(t) : null;
     if (embeddedHostIntent) {
       showCaption({ who: "you", text: t });
@@ -3741,11 +3874,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setPanelFull(false);
       setPanelMin(true); // hide locally during the authenticated clear round-trip
       void clearPanel({});
-    }
-    const fastDispatch = guest || fileIds.length ? null : parseFastAgentDispatch(t);
-    if (fastDispatch) {
-      void openFastAgentDispatch(fastDispatch, t);
-      return;
     }
     const fastChart = !guest && !fileIds.length && !liveRef.current ? parseFastChartIntent(t) : null;
     if (fastChart) {

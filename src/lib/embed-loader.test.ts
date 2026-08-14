@@ -19,7 +19,7 @@ type JarvisApi = {
   getCodingProviderStatus: () => Promise<LocalCodingProviderStatus>;
   setCodingProvider: (provider: CodingProvider) => Promise<LocalCodingProviderStatus>;
   visible: boolean;
-  wake: { listening: boolean; needsPermission: boolean };
+  wake: { listening: boolean; needsPermission: boolean; muted: boolean };
 };
 type LoaderWindow = {
   JARVIS: JarvisApi;
@@ -406,20 +406,41 @@ describe("Project Hub Jarvis loader", () => {
     ]);
   });
 
-  it("mounts one universal Jarvis control with the visual selector beside it", () => {
+  it("mounts one universal Jarvis control with selector and mute controls", () => {
     const harness = createLoader();
     const controls = harness.createdElements.find((element) => "data-jarvis-universal-controls" in element.attributes);
 
     expect(controls).toBeDefined();
     expect(controls?.attributes["data-jarvis-edit-ui"]).toBe("controls");
-    expect(controls?.children).toHaveLength(2);
+    expect(controls?.children).toHaveLength(3);
     expect(controls?.children[0].attributes["aria-label"]).toContain("wake listening");
     expect(controls?.children[1].attributes["aria-label"]).toContain("Select an element");
+    expect(controls?.children[2].attributes["aria-label"]).toBe("Mute Jarvis");
     expect(controls?.children[1].onclick).toBeTypeOf("function");
 
     controls?.children[1].onclick?.();
     const editCard = harness.createdElements.find((element) => element.dataset.jarvisEditUi === "card");
     expect(editCard?.style.cssText).toContain("bottom:72px");
+  });
+
+  it("mutes wake recognition immediately and resumes it only from the explicit mute control", async () => {
+    const harness = createLoader();
+    const controls = harness.createdElements.find((element) => "data-jarvis-universal-controls" in element.attributes);
+    const mute = controls?.children[2];
+
+    expect(mute?.onclick).toBeTypeOf("function");
+    expect(harness.window.JARVIS.wake).toMatchObject({ listening: true, muted: false });
+
+    mute?.onclick?.();
+    expect(harness.FakeRecognition.instances[0].abort).toHaveBeenCalledOnce();
+    expect(harness.window.JARVIS.wake).toMatchObject({ listening: false, muted: true });
+    expect(mute?.attributes["aria-label"]).toBe("Unmute Jarvis");
+
+    mute?.onclick?.();
+    await Promise.resolve();
+    expect(harness.FakeRecognition.instances).toHaveLength(2);
+    expect(harness.window.JARVIS.wake).toMatchObject({ listening: true, muted: false });
+    expect(mute?.attributes["aria-label"]).toBe("Mute Jarvis");
   });
 
   it("defaults to a compact iframe and accepts only trusted semantic layout requests", () => {

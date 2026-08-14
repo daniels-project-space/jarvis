@@ -177,9 +177,15 @@ async function supervisorCommandPlanningRows(
   return { rows, commandsByMission };
 }
 
-export function isUserRelevantWork(row: RuntimeRow, threadId: string): boolean {
+// threadId === null means "any thread" — used only by the main page's
+// fleet-wide projection (see fleetSnapshot below), which surfaces every
+// active conversation-origin job Daniel owns regardless of which thread
+// dispatched it. Every other caller still passes an exact thread and keeps
+// its existing single-thread scoping unchanged.
+export function isUserRelevantWork(row: RuntimeRow, threadId: string | null): boolean {
   if (!RELEVANT.has(String(row.status ?? ""))) return false;
-  if (row.visibility !== "conversation" || row.originThreadId !== threadId) return false;
+  if (row.visibility !== "conversation") return false;
+  if (threadId !== null && row.originThreadId !== threadId) return false;
   // A provider configuration hold has no queued retry or running workspace.
   // Keep it in durable history until the verified maintenance path resumes or
   // expires it; do not present it as foreground work.
@@ -211,7 +217,7 @@ function stableRuntimeOrder(left: RuntimeRow, right: RuntimeRow) {
     || String(left.jobId ?? "").localeCompare(String(right.jobId ?? ""));
 }
 
-export function selectRelevantWork(rows: readonly RuntimeRow[], threadId: string): RuntimeRow[] {
+export function selectRelevantWork(rows: readonly RuntimeRow[], threadId: string | null): RuntimeRow[] {
   return rows.filter((row) => isUserRelevantWork(row, threadId)).sort(stableRuntimeOrder);
 }
 
@@ -447,7 +453,7 @@ type HierarchyMissionAccumulator = Omit<HierarchyMission, "projects"> & {
  * Persisted mission/project ids are the grouping keys; labels and repository
  * names are display-only and can never merge two authority groups.
  */
-export function buildActiveWorkHierarchy(rows: readonly RuntimeRow[], threadId: string, mission?: RuntimeRow | null) {
+export function buildActiveWorkHierarchy(rows: readonly RuntimeRow[], threadId: string | null, mission?: RuntimeRow | null) {
   const missions = new Map<string, HierarchyMissionAccumulator>();
   const seenJobs = new Set<string>();
   for (const row of selectRelevantWork(rows, threadId)) {
@@ -491,7 +497,7 @@ export function buildActiveWorkHierarchy(rows: readonly RuntimeRow[], threadId: 
 }
 
 export function buildFleetSnapshot(input: {
-  threadId: string;
+  threadId: string | null;
   activeRows: RuntimeRow[];
   mission?: RuntimeRow | null;
   supervisorCommand?: RuntimeRow | null;
@@ -632,6 +638,98 @@ export function buildFleetSnapshot(input: {
   };
 }
 
+// Shared by both `snapshot` (one thread) and `fleetSnapshot` (every thread).
+// threadId === null skips origin-thread scoping entirely and also skips the
+// supervisor "planning stage" projection, which is inherently thread-bound
+// (missionSupervisorCommand has no unscoped index); a mission only appears
+// fleet-wide once it has an actual dispatched job in jobRuntime.
+async function computeCommandCenterSnapshot(ctx: QueryCtx, threadId: string | null) {
+  const candidates = threadId !== null
+    ? await ctx.db.query("jobRuntime")
+      .withIndex("by_thread_visibility_active_priority", (q) => q
+        .eq("originThreadId", threadId)
+        .eq("visibility", "conversation")
+        .eq("active", true))
+      .order("desc")
+      .take(ACTIVE_CANDIDATE_LIMIT)
+    : await ctx.db.query("jobRuntime")
+      .withIndex("by_visibility_active_priority", (q) => q
+        .eq("visibility", "conversation")
+        .eq("active", true))
+      .order("desc")
+      .take(ACTIVE_CANDIDATE_LIMIT);
+  const relevantJobs = selectRelevantWork(candidates, threadId);
+  const supervisorProjection = threadId !== null
+    ? await supervisorCommandPlanningRows(ctx, threadId, relevantJobs)
+    : { rows: [] as RuntimeRow[], commandsByMission: new Map<string, RuntimeRow>() };
+  const relevant = selectRelevantWork([...relevantJobs, ...supervisorProjection.rows], threadId);
+  const primary = relevant[0];
+  if (!primary) return { active: null, fleet: null, hierarchy: [] };
+
+  const rawMissionId = primary.planParentMissionId ?? primary.missionId;
+  const missionId = rawMissionId ? ctx.db.normalizeId("missions", String(rawMissionId)) : null;
+  if (!missionId) return buildFleetSnapshot({ threadId, activeRows: relevant });
+  const supervisorCommand =
+    supervisorProjection.commandsByMission.get(String(missionId)) ?? null;
+  const mission = supervisorCommand
+    ? missionRuntimeFromSupervisorCommand(supervisorCommand)
+    : await ctx.db
+      .query("missionRuntime")
+      .withIndex("by_mission", (q) => q.eq("missionId", missionId))
+      .first();
+  if (!mission) return buildFleetSnapshot({ threadId, activeRows: relevant });
+  if (primary.projectionKind === SUPERVISOR_PLANNING_PROJECTION) {
+    return buildFleetSnapshot({
+      threadId,
+      activeRows: relevant,
+      mission,
+      supervisorCommand,
+    });
+  }
+
+  const generation = Number(mission.planGeneration ?? 0);
+  if (mission.planDigest && generation > 0) {
+    const [nodes, edges, handoffs, activities] = await Promise.all([
+      ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q) => q
+        .eq("parentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_NODES + 1),
+      ctx.db.query("goalPlanEdges").withIndex("by_parent_generation", (q) => q
+        .eq("parentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_EDGES + 1),
+      ctx.db.query("goalHandoffs").withIndex("by_parent_generation", (q) => q
+        .eq("parentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_NODES + 1),
+      ctx.db.query("jobRuntime").withIndex("by_plan_parent_generation_node", (q) => q
+        .eq("planParentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_NODES + 1),
+    ]);
+    if (nodes.length > FLEET_MAX_NODES || activities.length > FLEET_MAX_NODES || handoffs.length > FLEET_MAX_NODES) {
+      throw new Error("Fleet projection exceeds its 8-node hot bound");
+    }
+    if (edges.length > FLEET_MAX_EDGES) throw new Error("Fleet projection exceeds its 28-edge hot bound");
+    return buildFleetSnapshot({
+      threadId,
+      activeRows: relevant,
+      mission,
+      supervisorCommand,
+      nodes,
+      edges,
+      handoffs,
+      activities,
+    });
+  }
+
+  const activities = await ctx.db.query("jobRuntime")
+    .withIndex("by_mission_active_priority", (q) => q
+      .eq("missionId", String(missionId))
+      .eq("active", true))
+    .order("desc")
+    .take(FLEET_MAX_NODES);
+  return buildFleetSnapshot({
+    threadId,
+    activeRows: relevant,
+    mission,
+    supervisorCommand,
+    activities,
+  });
+}
+
 // One subscription owns both collapsed and expanded UI. It reads only compact
 // projections through bounded indexes; transcripts, tasks, checkpoints,
 // artifacts, approvals and archive rows never enter this result.
@@ -646,85 +744,21 @@ export const snapshot = query({
       threadId = activeThread?.value.trim() || "main";
     }
     if (!threadId) return { active: null, fleet: null, hierarchy: [] };
+    return computeCommandCenterSnapshot(ctx, threadId);
+  },
+});
 
-    const candidates = await ctx.db.query("jobRuntime")
-      .withIndex("by_thread_visibility_active_priority", (q) => q
-        .eq("originThreadId", threadId)
-        .eq("visibility", "conversation")
-        .eq("active", true))
-      .order("desc")
-      .take(ACTIVE_CANDIDATE_LIMIT);
-    const relevantJobs = selectRelevantWork(candidates, threadId);
-    const supervisorProjection = await supervisorCommandPlanningRows(
-      ctx,
-      threadId,
-      relevantJobs,
-    );
-    const relevant = selectRelevantWork([...relevantJobs, ...supervisorProjection.rows], threadId);
-    const primary = relevant[0];
-    if (!primary) return { active: null, fleet: null, hierarchy: [] };
-
-    const rawMissionId = primary.planParentMissionId ?? primary.missionId;
-    const missionId = rawMissionId ? ctx.db.normalizeId("missions", String(rawMissionId)) : null;
-    if (!missionId) return buildFleetSnapshot({ threadId, activeRows: relevant });
-    const supervisorCommand =
-      supervisorProjection.commandsByMission.get(String(missionId)) ?? null;
-    const mission = supervisorCommand
-      ? missionRuntimeFromSupervisorCommand(supervisorCommand)
-      : await ctx.db
-        .query("missionRuntime")
-        .withIndex("by_mission", (q) => q.eq("missionId", missionId))
-        .first();
-    if (!mission) return buildFleetSnapshot({ threadId, activeRows: relevant });
-    if (primary.projectionKind === SUPERVISOR_PLANNING_PROJECTION) {
-      return buildFleetSnapshot({
-        threadId,
-        activeRows: relevant,
-        mission,
-        supervisorCommand,
-      });
-    }
-
-    const generation = Number(mission.planGeneration ?? 0);
-    if (mission.planDigest && generation > 0) {
-      const [nodes, edges, handoffs, activities] = await Promise.all([
-        ctx.db.query("goalPlanNodes").withIndex("by_parent_generation", (q) => q
-          .eq("parentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_NODES + 1),
-        ctx.db.query("goalPlanEdges").withIndex("by_parent_generation", (q) => q
-          .eq("parentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_EDGES + 1),
-        ctx.db.query("goalHandoffs").withIndex("by_parent_generation", (q) => q
-          .eq("parentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_NODES + 1),
-        ctx.db.query("jobRuntime").withIndex("by_plan_parent_generation_node", (q) => q
-          .eq("planParentMissionId", missionId).eq("planGeneration", generation)).take(FLEET_MAX_NODES + 1),
-      ]);
-      if (nodes.length > FLEET_MAX_NODES || activities.length > FLEET_MAX_NODES || handoffs.length > FLEET_MAX_NODES) {
-        throw new Error("Fleet projection exceeds its 8-node hot bound");
-      }
-      if (edges.length > FLEET_MAX_EDGES) throw new Error("Fleet projection exceeds its 28-edge hot bound");
-      return buildFleetSnapshot({
-        threadId,
-        activeRows: relevant,
-        mission,
-        supervisorCommand,
-        nodes,
-        edges,
-        handoffs,
-        activities,
-      });
-    }
-
-    const activities = await ctx.db.query("jobRuntime")
-      .withIndex("by_mission_active_priority", (q) => q
-        .eq("missionId", String(missionId))
-        .eq("active", true))
-      .order("desc")
-      .take(FLEET_MAX_NODES);
-    return buildFleetSnapshot({
-      threadId,
-      activeRows: relevant,
-      mission,
-      supervisorCommand,
-      activities,
-    });
+// The main (non-embedded) page's command center. Unlike `snapshot`, this is
+// never scoped to one thread: Paul (and every other specialist)'s dispatched
+// work should stay visible here even after the shared active-thread pointer
+// (ui.getActiveThread) has moved on to a different conversation — including
+// one dispatched from an embedded overlay in another app entirely. Embedded
+// surfaces keep using `snapshot` unchanged.
+export const fleetSnapshot = query({
+  args: { ...viewerAuthArgs },
+  returns: v.any(),
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    return computeCommandCenterSnapshot(ctx, null);
   },
 });

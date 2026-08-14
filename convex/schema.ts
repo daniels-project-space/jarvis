@@ -878,6 +878,10 @@ export default defineSchema({
     .index("by_visibility_status_priority", ["visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_status_priority", ["originThreadId", "visibility", "status", "priority", "createdAt"])
     .index("by_thread_visibility_active_priority", ["originThreadId", "visibility", "active", "priority", "createdAt"])
+    // Powers the main (non-embedded) page's fleet-wide command center: every
+    // active conversation-visibility job across every thread, not just the
+    // one currently active thread. See convex/commandCenter.ts:fleetSnapshot.
+    .index("by_visibility_active_priority", ["visibility", "active", "priority", "createdAt"])
     .index("by_plan_parent_generation_node", ["planParentMissionId", "planGeneration", "planNodeId"])
     .index("by_mission", ["missionId", "createdAt"])
     .index("by_mission_active_priority", [

@@ -68,6 +68,17 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(isUserRelevantWork(runtime({ status }), threadId)).toBe(true);
   });
 
+  it("threadId=null (the main page's fleet-wide view) ignores origin thread but still excludes non-conversation or routine work", () => {
+    expect(isUserRelevantWork(runtime({ originThreadId: "another-thread" }), null)).toBe(true);
+    expect(isUserRelevantWork(runtime({ visibility: "system" }), null)).toBe(false);
+    expect(isUserRelevantWork(runtime({ label: "Cloud health audit" }), null)).toBe(false);
+    const rows = selectRelevantWork([
+      runtime({ jobId: "job-thread-one", originThreadId: "thread-one", priority: 10 }),
+      runtime({ jobId: "job-thread-two", originThreadId: "thread-two", priority: 90 }),
+    ], null);
+    expect(rows.map((row) => row.jobId)).toEqual(["job-thread-two", "job-thread-one"]);
+  });
+
   it("keeps a paused provider configuration hold out of the foreground snapshot", () => {
     const held = runtime({
       status: "paused",

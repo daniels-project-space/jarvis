@@ -33,6 +33,10 @@
   var MAX_PENDING_CODING_PROVIDER_REQUESTS = 4;
   var speechBlocked = false;
   var liveBlocked = false;
+  // This is a deliberate privacy control, distinct from a temporary speech
+  // or live-capture handoff. When muted, the host owns the stop immediately
+  // and only its visible control may resume wake recognition.
+  var wakeMuted = false;
   var recognition = null;
   var recognitionWanted = true;
   // The authenticated Jarvis iframe owns the cross-app listener lease. The
@@ -141,14 +145,25 @@
     "all:unset;box-sizing:border-box;display:grid;place-items:center;width:38px;height:38px;border-radius:13px;cursor:pointer;" +
     "color:#8fdff5;background:rgba(255,255,255,.045);font:500 23px/1 system-ui,sans-serif;" +
     "transition:background .18s ease,color .18s ease,box-shadow .18s ease;";
+  var muteButton = document.createElement("button");
+  muteButton.type = "button";
+  muteButton.setAttribute("aria-label", "Mute Jarvis");
+  muteButton.setAttribute("aria-pressed", "false");
+  muteButton.title = "Mute Jarvis voice and wake listening";
+  muteButton.textContent = "🔊";
+  muteButton.style.cssText =
+    "all:unset;box-sizing:border-box;display:grid;place-items:center;width:38px;height:38px;border-radius:13px;cursor:pointer;" +
+    "color:#8fdff5;background:rgba(255,255,255,.045);font:500 16px/1 system-ui,sans-serif;" +
+    "transition:background .18s ease,color .18s ease,box-shadow .18s ease;";
   controls.appendChild(jarvisButton);
   controls.appendChild(selectorButton);
+  controls.appendChild(muteButton);
 
   var framePhase = "online";
   var frameProgress = 0;
 
   function paintUniversalControls() {
-    var awake = Boolean(recognition) && !speechBlocked && !liveBlocked;
+    var awake = Boolean(recognition) && !speechBlocked && !liveBlocked && !wakeMuted;
     var active = framePhase !== "online";
     var phaseColors = {
       connecting: "#fbbf24",
@@ -165,13 +180,17 @@
       "aria-label",
       active
         ? "Jarvis is " + framePhase
+      : wakeMuted
+        ? "Open Jarvis; wake listening is muted"
         : awake
           ? "Open Jarvis; wake listening is active"
           : "Open Jarvis; tap once to enable wake listening",
     );
     jarvisButton.title = active
       ? "Jarvis is " + framePhase
-      : awake
+      : wakeMuted
+        ? "Open Jarvis; wake listening is muted"
+        : awake
         ? "Jarvis is always listening — say ‘Hey Jarvis’ or tap to open"
         : "Open Jarvis and enable the wake word";
     jarvisButton.style.background = active || visible ? "rgba(34,211,238,.18)" : "rgba(64,208,255,.08)";
@@ -180,7 +199,7 @@
     progressTrack.style.opacity = active ? "1" : "0";
     progressFill.style.background = activeColor;
     progressFill.style.transform = "scaleX(" + (active ? frameProgress : 0) + ")";
-    wakeDot.style.background = active ? activeColor : awake ? "#67e8f9" : recognitionNeedsGesture ? "#fbbf24" : "#64748b";
+    wakeDot.style.background = active ? activeColor : awake ? "#67e8f9" : wakeMuted ? "#f87171" : recognitionNeedsGesture ? "#fbbf24" : "#64748b";
     wakeDot.style.transform = active ? "scale(1.22)" : "scale(1)";
     wakeDot.style.transition = "background .2s ease,box-shadow .2s ease,transform .2s ease";
     wakeDot.style.boxShadow = active
@@ -188,6 +207,15 @@
       : awake
       ? "0 0 0 4px rgba(103,232,249,.1),0 0 16px rgba(103,232,249,.7)"
       : "0 0 0 4px rgba(148,163,184,.08)";
+    muteButton.setAttribute("aria-pressed", wakeMuted ? "true" : "false");
+    muteButton.setAttribute("aria-label", wakeMuted ? "Unmute Jarvis" : "Mute Jarvis");
+    muteButton.title = wakeMuted
+      ? "Unmute Jarvis voice and wake listening"
+      : "Mute Jarvis voice and wake listening";
+    muteButton.textContent = wakeMuted ? "🔇" : "🔊";
+    muteButton.style.color = wakeMuted ? "#fecaca" : "#8fdff5";
+    muteButton.style.background = wakeMuted ? "rgba(248,113,113,.14)" : "rgba(255,255,255,.045)";
+    muteButton.style.boxShadow = wakeMuted ? "inset 0 0 0 1px rgba(248,113,113,.35)" : "none";
   }
 
   jarvisButton.onclick = function () {
@@ -199,6 +227,11 @@
     enableWakeFromGesture();
     show();
     startEditMode("");
+  };
+  muteButton.onclick = function () {
+    var muted = !wakeMuted;
+    setWakeMuted(muted, !muted);
+    post({ jarvis: "host-mute-set", muted: muted });
   };
 
   function frameIsAtJarvisOrigin() {
@@ -782,6 +815,7 @@
       && listenerLeaseGranted
       && !speechBlocked
       && !liveBlocked
+      && !wakeMuted
       && document.visibilityState === "visible";
   }
 
@@ -794,6 +828,27 @@
       try { active.abort(); } catch {}
     }
     wakeState(false, reason || "paused");
+  }
+
+  function setWakeMuted(nextMuted, resumeFromGesture) {
+    var muted = nextMuted === true;
+    if (wakeMuted === muted) {
+      paintUniversalControls();
+      return;
+    }
+    wakeMuted = muted;
+    pendingTranscript = "";
+    commandModeUntil = 0;
+    if (commandTimer) clearTimeout(commandTimer);
+    commandTimer = null;
+    if (muted) {
+      pauseRecognition("muted");
+    }
+    paintUniversalControls();
+    // Cross-frame messages do not reliably retain browser user activation.
+    // Only the host mute button passes this true, keeping unmute permission
+    // acquisition tied to an explicit local gesture.
+    if (!muted && resumeFromGesture) enableWakeFromGesture();
   }
 
   function scheduleRecognition(delay) {
@@ -844,7 +899,7 @@
   }
 
   function handleRecognitionResult(event) {
-    if (speechBlocked || liveBlocked) return;
+    if (wakeMuted || speechBlocked || liveBlocked) return;
     for (var i = event.resultIndex; i < event.results.length; i++) {
       var result = event.results[i];
       var text = String(result[0] && result[0].transcript || "").trim();
@@ -975,6 +1030,7 @@
         supported: Boolean(speechRecognitionClass()),
         listening: Boolean(recognition),
         needsPermission: recognitionNeedsGesture,
+        muted: wakeMuted,
         mode: Date.now() < commandModeUntil ? "command" : "wake",
       };
     },
@@ -1006,7 +1062,7 @@
       flushCodingProviderRequests();
       dispatchEmbedEvent("jarvis:ready", { state: "online" });
       paintUniversalControls();
-      if (recognitionWanted && !listenerLeaseGranted) {
+      if (recognitionWanted && !wakeMuted && !listenerLeaseGranted) {
         post({ jarvis: "host-listener-request" });
       }
     } else if (data.jarvis === "host-listener-grant") {
@@ -1041,6 +1097,8 @@
         return;
       }
       waiter.resolve(providerStatus);
+    } else if (data.jarvis === "mute-state" && typeof data.muted === "boolean") {
+      setWakeMuted(data.muted, false);
     } else if (data.jarvis === "status") {
       var allowedPhases = ["online", "connecting", "listening", "researching", "thinking", "responding", "buffering", "speaking"];
       var nextPhase = typeof data.phase === "string" && allowedPhases.indexOf(data.phase) !== -1
