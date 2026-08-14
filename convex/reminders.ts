@@ -19,11 +19,19 @@ export const add = mutation({
         .withIndex("by_sourceKey", (q: any) => q.eq("sourceKey", sourceKey))
         .unique();
       if (existing) {
-        if (existing.status === "pending") {
+        // A rescheduled future trip may have already delivered its earlier
+        // preflight. Re-arm that one durable reminder, but never revive a
+        // reminder the owner explicitly cancelled.
+        if (existing.status === "pending" || (existing.status === "done" && a.at > Date.now())) {
           await ctx.db.patch(existing._id, {
             text: a.text.slice(0, 300),
             at: a.at,
             originThreadId: a.originThreadId,
+            ...(existing.status === "done" ? {
+              status: "pending",
+              deliveryAttempts: 0,
+              deliverStartedAt: undefined,
+            } : {}),
           });
         }
         return existing._id;

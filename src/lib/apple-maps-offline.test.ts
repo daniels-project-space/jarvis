@@ -13,6 +13,7 @@ describe("Apple Maps offline preflight", () => {
         id: "gmail-flight-1",
         marker: "jarvis-gmail-booking:gmail-flight-1",
         kind: "flight",
+        tripVerified: true,
         title: "Iberia 123 · confirmed",
         start: Date.parse("2030-09-03T09:15:00+02:00"),
         timeZone: "Europe/Madrid",
@@ -35,8 +36,25 @@ describe("Apple Maps offline preflight", () => {
     expect(buildAppleMapsOfflinePreflight({
       city: "Lisbon",
       now: Date.parse("2030-09-02T09:30:00+01:00"),
-      flights: [{ id: "f", kind: "flight", start: Date.parse("2030-09-03T09:00:00+01:00"), timeZone: "Europe/London" }],
+      flights: [{ id: "f", kind: "flight", tripVerified: true, start: Date.parse("2030-09-03T09:00:00+01:00"), timeZone: "Europe/London" }],
     })).toMatchObject({ status: "too_late" });
+  });
+
+  it("requires exactly one trip-verified flight with an explicit IANA zone", () => {
+    const now = Date.parse("2030-09-01T08:00:00Z");
+    expect(buildAppleMapsOfflinePreflight({
+      city: "Lisbon",
+      now,
+      flights: [{ id: "missing-zone", kind: "flight", tripVerified: true, start: Date.parse("2030-09-03T09:00:00Z") }],
+    })).toMatchObject({ status: "needs_flight_confirmation", reason: expect.stringMatching(/IANA time zone/i) });
+    expect(buildAppleMapsOfflinePreflight({
+      city: "Lisbon",
+      now,
+      flights: [
+        { id: "one", kind: "flight", tripVerified: true, start: Date.parse("2030-09-03T09:00:00+01:00"), timeZone: "Europe/Lisbon" },
+        { id: "two", kind: "flight", tripVerified: true, start: Date.parse("2030-09-04T09:00:00+01:00"), timeZone: "Europe/Lisbon" },
+      ],
+    })).toMatchObject({ status: "needs_flight_confirmation", reason: expect.stringMatching(/choose one/i) });
   });
 
   it("makes a current HTTPS Apple Maps search handoff", () => {

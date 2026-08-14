@@ -307,7 +307,7 @@ export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPr
     // from reopening; the server uses a validated zone when creating it.
   }
   const calendar = preflight?.calendarStatus === "approval_required"
-    ? "Calendar approval awaits your protected click in Jarvis chat."
+    ? "Prepare a fresh protected Calendar approval in Jarvis chat when you are ready to add it."
     : preflight?.calendarStatus === "needs_reconnect"
       ? "Reconnect Google with Calendar access to prepare the calendar reminder."
       : "Connect Google Calendar to prepare the calendar reminder.";

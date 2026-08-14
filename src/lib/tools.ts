@@ -629,6 +629,7 @@ export const TOOL_DEFS = [
         draft_id: { type: "string", description: "Exact live conversation trip id" },
         creation_id: { type: "string", description: "Exact saved trip id" },
         trip_id: { type: "string", description: "Legacy exact saved trip id only" },
+        flight_id: { type: "string", description: "Opaque Gmail flight choice returned by a prior Apple Maps preflight prompt; required only when several confirmed flights match the trip window" },
         days: { type: "number", description: "Gmail confirmation lookback, 7-730 days; default 365" },
       },
     },
@@ -2487,6 +2488,94 @@ async function offlineMapCalendarStatus(): Promise<OfflineMapCalendarStatus> {
  * deleting offline map regions inside the Maps app, so the URL/card is a
  * truthful handoff rather than a claimed device action.
  */
+function appleMapsOfflineTodoTag(sourceKey: string): string {
+  return `source:${sourceKey}`;
+}
+
+function appleMapsOfflineTodoTags(sourceKey: string): string[] {
+  return ["jarvis", "travel", "apple-maps", appleMapsOfflineTodoTag(sourceKey)];
+}
+
+function appleMapsOfflineCityKey(value: unknown): string {
+  return String(value ?? "")
+    .split(",")[0]
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("en-GB")
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 120);
+}
+
+/**
+ * A date-window Gmail flight is not enough to attach an Apple Maps action to a
+ * trip: another journey can fall on the same day. Require the existing
+ * independently geocoded, time-valid Gmail stay proof for this exact city.
+ */
+function hasFreshDestinationBookingReference(doc: any, now = Date.now()): boolean {
+  const city = appleMapsOfflineCityKey(doc?.destination);
+  if (!city) return false;
+  const references = [
+    ...(Array.isArray(doc?.bookingReferences) ? doc.bookingReferences : []),
+    ...(Array.isArray(doc?.cityContexts)
+      ? doc.cityContexts.map((context: any) => context?.bookingReference && {
+        ...context.bookingReference,
+        city: context.bookingReference.city ?? context.city,
+      }).filter(Boolean)
+      : []),
+  ];
+  return references.some((reference: any) => {
+    const verifiedAt = Number(reference?.verifiedAt);
+    const end = Number(reference?.end ?? reference?.start);
+    return appleMapsOfflineCityKey(reference?.city) === city
+      && Number.isFinite(end)
+      && end >= now
+      && Number.isFinite(verifiedAt)
+      && verifiedAt <= now
+      && now - verifiedAt <= 24 * 60 * 60_000;
+  });
+}
+
+async function upsertAppleMapsOfflineTodo(preflight: {
+  sourceKey: string;
+  todoText: string;
+  at: number;
+}): Promise<"created" | "existing" | "needs_retry"> {
+  const tags = appleMapsOfflineTodoTags(preflight.sourceKey);
+  const findExisting = (todos: unknown): any | undefined => Array.isArray(todos)
+    ? todos.find((todo: any) => !todo?.done && Array.isArray(todo?.tags) && todo.tags.includes(tags[3]))
+    : undefined;
+  const reflectsPreflight = (todo: any): boolean => Boolean(todo)
+    && String(todo.text ?? "") === preflight.todoText
+    && Number(todo.dueDate) === preflight.at
+    && Array.isArray(todo.tags)
+    && todo.tags.includes(tags[3]);
+  try {
+    const existing = findExisting(await q_hub("todos:list"));
+    if (existing?._id) {
+      await m_hub("todos:update", {
+        id: existing._id,
+        text: preflight.todoText,
+        dueDate: preflight.at,
+        tags,
+      });
+      return "existing";
+    }
+    await m_hub("todos:add", { text: preflight.todoText, dueDate: preflight.at, tags });
+    return "created";
+  } catch {
+    // A network error after the Hub accepted todos:add is ambiguous. Re-list by
+    // the stable source tag before exposing a retry state, so a retry cannot
+    // create a duplicate travel task.
+    try {
+      const existing = findExisting(await q_hub("todos:list"));
+      if (reflectsPreflight(existing)) return "existing";
+    } catch {
+      // The durable Jarvis reminder remains available; surface an honest retry.
+    }
+    return "needs_retry";
+  }
+}
+
 async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
   const workspaceResult = exactTravelWorkspace(args);
   if (workspaceResult.error) return workspaceResult.error;
@@ -2507,7 +2596,37 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     return "Apple Maps preflight is waiting for a readable Gmail connection. No reminder, to-do, or Calendar proposal was created.";
   }
   const matching = bookingsForTripWindow(bookings, trip.doc.departDate, trip.doc.returnDate);
-  const result = buildAppleMapsOfflinePreflight({ city: trip.doc.destination, flights: matching });
+  const flightCandidates = matching.filter((booking) => booking.kind === "flight" && Number.isFinite(Number(booking.start)));
+  const requestedFlightId = String(args.flight_id ?? "").trim().slice(0, 80);
+  const selectedFlight = requestedFlightId
+    ? flightCandidates.find((booking) => bookingCalendarSelectionId(booking) === requestedFlightId)
+    : undefined;
+  if (requestedFlightId && !selectedFlight) {
+    return "That Apple Maps flight choice no longer matches a confirmed Gmail flight for this exact trip. Refresh the trip's bookings and choose again; no reminder, to-do, or Calendar proposal was created.";
+  }
+  const hasDestinationProof = hasFreshDestinationBookingReference(trip.doc);
+  if (!hasDestinationProof) {
+    return "Apple Maps preflight is waiting for a fresh, city-verified Gmail stay reference for this exact trip. Refresh confirmed bookings for this trip first; no reminder, to-do, or Calendar proposal was created.";
+  }
+  if (!selectedFlight && flightCandidates.length !== 1) {
+    if (!flightCandidates.length) {
+      return "Apple Maps preflight is waiting for an upcoming confirmed Gmail flight for this exact trip. No reminder, to-do, or Calendar proposal was created.";
+    }
+    const choices = flightCandidates
+      .filter((booking) => Number(booking.start) > Date.now())
+      .slice(0, 6)
+      .map((booking) => `${bookingCalendarSelectionId(booking)} · ${bookingDisplayWhen(booking)} · ${booking.title.slice(0, 100)}`)
+      .join("\n");
+    return `Choose the exact confirmed Gmail flight for this Apple Maps preflight, then use its opaque flight_id. No reminder, to-do, or Calendar proposal was created.\n${choices || "No upcoming flight choice is available."}`;
+  }
+  const selected = selectedFlight ?? flightCandidates[0];
+  if (!selected) {
+    return "Apple Maps preflight is waiting for an upcoming confirmed Gmail flight for this exact trip. No reminder, to-do, or Calendar proposal was created.";
+  }
+  const result = buildAppleMapsOfflinePreflight({
+    city: trip.doc.destination,
+    flights: [{ ...selected, tripVerified: true }],
+  });
   if (result.status === "needs_flight_confirmation") {
     return `Apple Maps preflight is waiting: ${result.reason}. No reminder, to-do, or Calendar proposal was created.`;
   }
@@ -2516,26 +2635,8 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   }
   const preflight = result.preflight;
 
-  let todoStatus: "created" | "existing" | "needs_retry" = "needs_retry";
-  try {
-    const todos = await q_hub("todos:list");
-    const existing = Array.isArray(todos) && todos.some((todo: any) => !todo?.done && String(todo?.text ?? "") === preflight.todoText);
-    if (existing) {
-      todoStatus = "existing";
-    } else {
-      await m_hub("todos:add", {
-        text: preflight.todoText,
-        dueDate: preflight.at,
-        tags: ["jarvis", "travel", "apple-maps"],
-      });
-      todoStatus = "created";
-    }
-  } catch {
-    // Keep the rest of the preflight safe and durable; the trip card exposes
-    // this retry state instead of saying that Hub storage succeeded.
-    todoStatus = "needs_retry";
-  }
-
+  // Persist Jarvis's own timed action first. Hub is a separate service, so a
+  // failure there must never leave a to-do that claims a reminder exists.
   try {
     await convexMutation("reminders:add", {
       text: preflight.reminderText,
@@ -2546,6 +2647,7 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   } catch {
     return "Apple Maps preflight could not persist Jarvis's timed reminder. No Calendar proposal was created; retry this exact trip.";
   }
+  const todoStatus = await upsertAppleMapsOfflineTodo(preflight);
 
   let calendarStatus = await offlineMapCalendarStatus();
   let calendarApprovalMarker = "";
@@ -2598,8 +2700,8 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   const calendarNote = calendarStatus === "approval_required"
     ? "Google Calendar is ready for your protected one-click approval below; nothing has been written yet."
     : calendarStatus === "needs_reconnect"
-      ? "Google Calendar needs a reconnect with Calendar access; its pending action is saved on the trip."
-      : "Google Calendar is not connected yet; its pending action is saved on the trip for a later retry.";
+      ? "Google Calendar needs a reconnect with Calendar access; ask Jarvis to prepare this exact trip again after reconnecting."
+      : "Google Calendar is not connected yet; ask Jarvis to prepare this exact trip again after connecting it.";
   return `Apple Maps preflight is scheduled for ${preflight.city} one local calendar day before the confirmed flight: Jarvis push/spoken reminder is durable. ${todoNote} ${calendarNote} The Apple Maps card is a handoff only—on iPhone, choose Download, then remove the old unused map in Maps > Offline Maps.${calendarApprovalMarker ? `\n${calendarApprovalMarker}` : ""}`;
 }
 

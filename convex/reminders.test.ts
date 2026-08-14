@@ -52,4 +52,44 @@ describe("retry-safe timed reminders", () => {
       workerToken: WORKER,
     })).rejects.toThrow(/source key/i);
   });
+
+  it("re-arms one completed automated reminder only when a reschedule is still in the future", async () => {
+    const t = convexTest(schema, modules);
+    const initial = await t.mutation(api.reminders.add, {
+      text: "Download Seville map",
+      at: Date.now() + 60_000,
+      sourceKey: SOURCE_KEY,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.reminders.complete, { id: initial, workerToken: WORKER });
+
+    const rescheduled = await t.mutation(api.reminders.add, {
+      text: "Download Seville map after flight moved",
+      at: Date.now() + 120_000,
+      sourceKey: SOURCE_KEY,
+      workerToken: WORKER,
+    });
+    expect(rescheduled).toEqual(initial);
+    await expect(t.query(api.reminders.upcoming, { workerToken: WORKER })).resolves.toEqual([
+      expect.objectContaining({ _id: initial, text: "Download Seville map after flight moved" }),
+    ]);
+  });
+
+  it("never revives an automated reminder the owner cancelled", async () => {
+    const t = convexTest(schema, modules);
+    const initial = await t.mutation(api.reminders.add, {
+      text: "Download Seville map",
+      at: Date.now() + 60_000,
+      sourceKey: SOURCE_KEY,
+      workerToken: WORKER,
+    });
+    await expect(t.mutation(api.reminders.cancel, { match: "Seville", workerToken: WORKER })).resolves.toBe("Download Seville map");
+    await expect(t.mutation(api.reminders.add, {
+      text: "Download Seville map after flight moved",
+      at: Date.now() + 120_000,
+      sourceKey: SOURCE_KEY,
+      workerToken: WORKER,
+    })).resolves.toEqual(initial);
+    await expect(t.query(api.reminders.upcoming, { workerToken: WORKER })).resolves.toEqual([]);
+  });
 });

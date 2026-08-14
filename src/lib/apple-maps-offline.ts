@@ -3,13 +3,16 @@ import "server-only";
 import { createHash } from "node:crypto";
 
 const DAY_MS = 24 * 60 * 60_000;
-const DEFAULT_TIME_ZONE = "Europe/London";
 
 export type AppleMapsOfflineFlight = {
   id: string;
   marker?: string;
   kind: string;
+  /** Set only after the exact trip has supplied verified destination evidence or an opaque Gmail selection. */
+  tripVerified?: boolean;
   title?: string;
+  bookingName?: string;
+  location?: string;
   start?: number;
   allDay?: boolean;
   timeZone?: string;
@@ -37,14 +40,16 @@ function cleanCity(value: unknown): string {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
 }
 
-function validTimeZone(value: unknown): string {
+function validTimeZone(value: unknown): string | undefined {
   const candidate = String(value ?? "").trim();
-  if (!candidate || candidate.length > 80) return DEFAULT_TIME_ZONE;
+  // `Intl` also accepts aliases such as UTC. For a one-local-calendar-day
+  // travel action we require an explicit IANA region instead of guessing.
+  if (!/^[A-Za-z_+-]+\/[A-Za-z0-9_+\-/]+$/.test(candidate) || candidate.length > 80) return undefined;
   try {
     new Intl.DateTimeFormat("en-GB", { timeZone: candidate }).format(0);
     return candidate;
   } catch {
-    return DEFAULT_TIME_ZONE;
+    return undefined;
   }
 }
 
@@ -109,14 +114,19 @@ export function buildAppleMapsOfflinePreflight(input: {
   if (!city) return { status: "needs_flight_confirmation", reason: "the trip has no verified destination city" };
   const now = input.now ?? Date.now();
   const flights = input.flights
-    .filter((flight) => flight.kind === "flight" && Number.isFinite(flight.start) && Number(flight.start) > now)
+    .filter((flight) => flight.tripVerified === true && flight.kind === "flight" && Number.isFinite(flight.start) && Number(flight.start) > now)
     .sort((left, right) => Number(left.start) - Number(right.start));
-  const flight = flights[0];
-  if (!flight || !Number.isFinite(flight.start)) {
-    return { status: "needs_flight_confirmation", reason: "no upcoming confirmed Gmail flight is attached to this exact trip" };
+  if (flights.length !== 1) {
+    return { status: "needs_flight_confirmation", reason: flights.length
+      ? "choose one exact verified Gmail flight for this trip"
+      : "no upcoming confirmed Gmail flight is verified for this exact trip" };
   }
+  const flight = flights[0]!;
 
   const timeZone = validTimeZone(flight.timeZone);
+  if (!timeZone) {
+    return { status: "needs_flight_confirmation", reason: "the verified Gmail flight needs an explicit valid IANA time zone before a local-day reminder can be scheduled" };
+  }
   const departure = dateParts(Number(flight.start), timeZone);
   const date = previousDate(departure);
   const time = flight.allDay ? { hour: 9, minute: 0 } : { hour: departure.hour, minute: departure.minute };

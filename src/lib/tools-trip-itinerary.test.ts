@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
@@ -73,6 +74,16 @@ const doc = {
   ],
   locked: { activities: [], stay: { name: "Hotel Tejo", lat: 38.714, lng: -9.142 } },
 };
+
+function opaqueBookingChoiceId(booking: { id: string; marker: string }): string {
+  const digest = createHash("sha256")
+    .update("jarvis-gmail-booking-v1\0")
+    .update(booking.id)
+    .update("\0")
+    .update(booking.marker)
+    .digest("hex");
+  return `booking-${digest.slice(0, 16)}`;
+}
 
 const routed = {
   ...doc,
@@ -282,6 +293,26 @@ describe("trip itinerary tool actions", () => {
       destination: "Seville",
       departDate: "2030-09-10",
       returnDate: "2030-09-14",
+      cityContexts: [{
+        id: "city:seville",
+        city: "Seville",
+        source: "destination",
+        center: { lat: 37.389, lng: -5.984 },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        bookingReference: {
+          city: "Seville",
+          title: "Hotel Seville · confirmed",
+          location: "Seville, Spain",
+          start: Date.parse("2030-09-10T12:00:00+02:00"),
+          end: Date.parse("2030-09-14T12:00:00+02:00"),
+          lat: 37.389,
+          lng: -5.984,
+          distanceKm: 0.2,
+          state: "upcoming",
+          verifiedAt: Date.now(),
+        },
+      }],
     };
     mock.getTrip.mockResolvedValueOnce({ id: "draft-apple", doc: automationTrip, storage: "draft" });
     mock.scanGmailBookingConfirmations.mockResolvedValueOnce([flight]);
@@ -292,7 +323,7 @@ describe("trip itinerary tool actions", () => {
       return null;
     });
     mock.convexMutation.mockResolvedValue(undefined);
-    const hubFetch = vi.fn(async (input: string | URL) => {
+    const hubFetch = vi.fn(async (input: string | URL, _init?: RequestInit) => {
       const url = new URL(String(input));
       if (url.pathname === "/api/query") return new Response(JSON.stringify({ value: [] }), { headers: { "content-type": "application/json" } });
       if (url.pathname === "/api/mutation") return new Response(JSON.stringify({ value: "todo-apple" }), { headers: { "content-type": "application/json" } });
@@ -314,6 +345,12 @@ describe("trip itinerary tool actions", () => {
       value: "https://maps.apple.com/search?query=Seville",
     }));
     expect(hubFetch).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(hubFetch.mock.calls[1]?.[1]?.body))).toMatchObject({
+      path: "todos:add",
+      args: expect.objectContaining({
+        tags: expect.arrayContaining([expect.stringMatching(/^source:[a-f0-9]{64}$/)]),
+      }),
+    });
     expect(mock.saveTrip).toHaveBeenCalledWith("draft-apple", expect.objectContaining({
       offlineMapPreflight: expect.objectContaining({
         city: "Seville",
@@ -329,7 +366,32 @@ describe("trip itinerary tool actions", () => {
       id: "gmail-flight-2", marker: "jarvis-gmail-booking:gmail-flight-2", kind: "flight" as const,
       title: "✈ Iberia 456 · confirmed", provider: "Iberia", start: Date.parse("2030-09-12T09:15:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
     };
-    const automationTrip = { ...doc, destination: "Seville", departDate: "2030-09-12", returnDate: "2030-09-14" };
+    const automationTrip = {
+      ...doc,
+      destination: "Seville",
+      departDate: "2030-09-12",
+      returnDate: "2030-09-14",
+      cityContexts: [{
+        id: "city:seville",
+        city: "Seville",
+        source: "destination",
+        center: { lat: 37.389, lng: -5.984 },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        bookingReference: {
+          city: "Seville",
+          title: "Hotel Seville · confirmed",
+          location: "Seville, Spain",
+          start: Date.parse("2030-09-12T12:00:00+02:00"),
+          end: Date.parse("2030-09-14T12:00:00+02:00"),
+          lat: 37.389,
+          lng: -5.984,
+          distanceKm: 0.2,
+          state: "upcoming",
+          verifiedAt: Date.now(),
+        },
+      }],
+    };
     mock.getTrip.mockResolvedValueOnce({ id: "draft-no-google", doc: automationTrip, storage: "draft" });
     mock.scanGmailBookingConfirmations.mockResolvedValueOnce([flight]);
     mock.bookingsForTripWindow.mockReturnValueOnce([flight]);
@@ -344,5 +406,115 @@ describe("trip itinerary tool actions", () => {
     expect(mock.saveTrip).toHaveBeenCalledWith("draft-no-google", expect.objectContaining({
       offlineMapPreflight: expect.objectContaining({ calendarStatus: "needs_connection" }),
     }), true, expect.objectContaining({ storage: "draft" }));
+  });
+
+  it("never attaches a date-only Gmail flight to a trip without a fresh city-verified booking", async () => {
+    const flight = {
+      id: "gmail-unrelated-flight", marker: "jarvis-gmail-booking:gmail-unrelated-flight", kind: "flight" as const,
+      title: "✈ A flight that merely shares the date", provider: "Example Air", start: Date.parse("2030-09-15T09:15:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
+    };
+    const tripWithoutDestinationProof = { ...doc, destination: "Seville", departDate: "2030-09-15", returnDate: "2030-09-18" };
+    mock.getTrip.mockResolvedValueOnce({ id: "draft-no-city-proof", doc: tripWithoutDestinationProof, storage: "draft" });
+    mock.scanGmailBookingConfirmations.mockResolvedValueOnce([flight]);
+    mock.bookingsForTripWindow.mockReturnValueOnce([flight]);
+
+    await expect(executeTool("travel_offline_maps_prepare", {
+      draft_id: "draft-no-city-proof",
+      flight_id: opaqueBookingChoiceId(flight),
+    }))
+      .resolves.toContain("fresh, city-verified Gmail stay reference");
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+  });
+
+  it("requires and accepts an opaque Gmail flight choice when outbound and return flights both match", async () => {
+    const outbound = {
+      id: "gmail-outbound", marker: "jarvis-gmail-booking:gmail-outbound", kind: "flight" as const,
+      title: "✈ Outbound · confirmed", provider: "Example Air", start: Date.parse("2030-09-15T09:15:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
+    };
+    const returning = {
+      id: "gmail-return", marker: "jarvis-gmail-booking:gmail-return", kind: "flight" as const,
+      title: "✈ Return · confirmed", provider: "Example Air", start: Date.parse("2030-09-18T18:15:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
+    };
+    const trip = {
+      ...doc,
+      destination: "Seville",
+      departDate: "2030-09-15",
+      returnDate: "2030-09-18",
+      bookingReferences: [{
+        city: "Seville", title: "Hotel Seville · confirmed", location: "Seville, Spain",
+        start: Date.parse("2030-09-15T12:00:00+02:00"), end: Date.parse("2030-09-18T12:00:00+02:00"),
+        lat: 37.389, lng: -5.984, distanceKm: 0.2, state: "upcoming", verifiedAt: Date.now(),
+      }],
+    };
+    mock.getTrip.mockResolvedValue({ id: "draft-flight-choice", doc: trip, storage: "draft" });
+    mock.scanGmailBookingConfirmations.mockResolvedValue([outbound, returning]);
+    mock.bookingsForTripWindow.mockReturnValue([outbound, returning]);
+
+    const prompt = await executeTool("travel_offline_maps_prepare", { draft_id: "draft-flight-choice" });
+    expect(prompt).toContain("Choose the exact confirmed Gmail flight");
+    expect(prompt).toContain(opaqueBookingChoiceId(outbound));
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+
+    mock.convexQuery.mockImplementation(async (path: string) => path === "ui:getActiveThread" ? "thread-choice" : { connected: false });
+    mock.convexMutation.mockResolvedValue(undefined);
+    const hubFetch = vi.fn(async (input: string | URL, _init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/query") return new Response(JSON.stringify({ value: [] }), { headers: { "content-type": "application/json" } });
+      if (url.pathname === "/api/mutation") return new Response(JSON.stringify({ value: "todo-choice" }), { headers: { "content-type": "application/json" } });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", hubFetch);
+
+    await expect(executeTool("travel_offline_maps_prepare", {
+      draft_id: "draft-flight-choice",
+      flight_id: opaqueBookingChoiceId(outbound),
+    })).resolves.toContain("Apple Maps preflight is scheduled for Seville");
+    expect(mock.convexMutation).toHaveBeenCalledWith("reminders:add", expect.objectContaining({
+      text: expect.stringContaining("before flight 2030-09-15"),
+    }));
+  });
+
+  it("updates the one source-tagged Hub to-do when a verified trip is refreshed", async () => {
+    const flight = {
+      id: "gmail-flight-update", marker: "jarvis-gmail-booking:gmail-flight-update", kind: "flight" as const,
+      title: "✈ Iberia 789 · confirmed", provider: "Iberia", start: Date.parse("2030-09-18T10:15:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
+    };
+    const sourceKey = createHash("sha256")
+      .update("jarvis-apple-maps-offline-preflight-v1\0")
+      .update(flight.marker)
+      .update("\0")
+      .update("seville")
+      .digest("hex");
+    const automationTrip = {
+      ...doc,
+      destination: "Seville",
+      departDate: "2030-09-18",
+      returnDate: "2030-09-21",
+      bookingReferences: [{
+        city: "Seville", title: "Hotel Seville · confirmed", location: "Seville, Spain",
+        start: Date.parse("2030-09-18T12:00:00+02:00"), end: Date.parse("2030-09-21T12:00:00+02:00"),
+        lat: 37.389, lng: -5.984, distanceKm: 0.2, state: "upcoming", verifiedAt: Date.now(),
+      }],
+    };
+    mock.getTrip.mockResolvedValueOnce({ id: "draft-update-todo", doc: automationTrip, storage: "draft" });
+    mock.scanGmailBookingConfirmations.mockResolvedValueOnce([flight]);
+    mock.bookingsForTripWindow.mockReturnValueOnce([flight]);
+    mock.convexQuery.mockImplementation(async (path: string) => path === "ui:getActiveThread" ? "thread-apple" : { connected: false });
+    mock.convexMutation.mockResolvedValue(undefined);
+    const hubFetch = vi.fn(async (input: string | URL, _init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/query") {
+        return new Response(JSON.stringify({ value: [{ _id: "todo-existing", done: false, tags: [`source:${sourceKey}`] }] }), { headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname === "/api/mutation") return new Response(JSON.stringify({ value: "todo-existing" }), { headers: { "content-type": "application/json" } });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", hubFetch);
+
+    await expect(executeTool("travel_offline_maps_prepare", { draft_id: "draft-update-todo" })).resolves.toContain("matching Hub to-do already exists");
+    expect(JSON.parse(String(hubFetch.mock.calls[1]?.[1]?.body))).toMatchObject({
+      path: "todos:update",
+      args: expect.objectContaining({ id: "todo-existing", dueDate: flight.start - 86_400_000, tags: expect.arrayContaining([`source:${sourceKey}`]) }),
+    });
   });
 });
