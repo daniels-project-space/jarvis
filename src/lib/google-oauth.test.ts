@@ -27,6 +27,18 @@ afterEach(() => {
 });
 
 describe("Google OAuth access-token cache", () => {
+  it("requires every connect setting, including a valid AES-256 key, before consent can start", async () => {
+    const { isGoogleOAuthConfigurationReady } = await import("./google-oauth");
+
+    expect(isGoogleOAuthConfigurationReady()).toBe(false);
+    process.env.GOOGLE_CLIENT_ID = "client";
+    process.env.GOOGLE_CLIENT_SECRET = "secret";
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = "invalid";
+    expect(isGoogleOAuthConfigurationReady()).toBe(false);
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    expect(isGoogleOAuthConfigurationReady()).toBe(true);
+  });
+
   it("does not reuse a warm bearer token after the connected credentials change", async () => {
     process.env.GMAIL_BOOKINGS_CLIENT_ID = "client";
     process.env.GMAIL_BOOKINGS_CLIENT_SECRET = "secret";

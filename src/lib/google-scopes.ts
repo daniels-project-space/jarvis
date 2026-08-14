@@ -2,7 +2,7 @@
 // Next.js server and Convex. This module intentionally has no Node or React
 // dependencies so capability status can be computed at the Convex boundary.
 
-export const GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
+export const GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 export const GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose";
 
 // `calendar.events.owned` is enough for the authenticated account's primary
@@ -10,7 +10,7 @@ export const GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail
 export const GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE = "https://www.googleapis.com/auth/calendar.events.owned";
 
 export const GOOGLE_OAUTH_SCOPES = [
-  GOOGLE_GMAIL_MODIFY_SCOPE,
+  GOOGLE_GMAIL_READONLY_SCOPE,
   GOOGLE_GMAIL_COMPOSE_SCOPE,
   GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE,
 ].join(" ");
@@ -26,7 +26,7 @@ export function hasGoogleScopes(scope: string, required: readonly string[]): boo
 
 export function googleCapabilities(scope: string) {
   return {
-    gmail: hasGoogleScopes(scope, [GOOGLE_GMAIL_MODIFY_SCOPE, GOOGLE_GMAIL_COMPOSE_SCOPE]),
+    gmail: hasGoogleScopes(scope, [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_COMPOSE_SCOPE]),
     calendar: hasGoogleScopes(scope, [GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE]),
   };
 }

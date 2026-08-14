@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { randomBytes } from "node:crypto";
 import { adminSessionHash, validateAdminSession } from "@/lib/control-session";
+import { isGoogleOAuthConfigurationReady } from "@/lib/google-oauth";
 import { GOOGLE_OAUTH_SCOPES } from "@/lib/google-scopes";
 
 // Feature 4a: begins the Google OAuth connect flow. Owner/admin-gated the
@@ -25,12 +26,12 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL("/", req.url));
   }
 
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  if (!clientId) {
-    return Response.json(
-      { ok: false, error: "GOOGLE_CLIENT_ID is not configured." },
-      { status: 500, headers: { "cache-control": "no-store" } },
-    );
+  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  if (!clientId || !isGoogleOAuthConfigurationReady()) {
+    const url = new URL("/", req.url);
+    url.searchParams.set("google_oauth", "error");
+    url.searchParams.set("google_oauth_detail", "not_configured");
+    return NextResponse.redirect(url);
   }
 
   const state = randomBytes(32).toString("base64url");
@@ -45,9 +46,9 @@ export async function GET(req: NextRequest) {
   // consent before — without this, a reconnect can silently return no
   // refresh_token and the callback would have nothing to store.
   authorizeUrl.searchParams.set("prompt", "consent");
-  // Preserve earlier grants while requesting the one additional, narrowly
-  // scoped Calendar capability on reconnect.
-  authorizeUrl.searchParams.set("include_granted_scopes", "true");
+  // Always request the complete least-privilege set. We deliberately do not
+  // ask Google to retain earlier grants, which could keep the legacy broader
+  // Gmail modify capability on a reconnect.
   authorizeUrl.searchParams.set("scope", GOOGLE_OAUTH_SCOPES);
   authorizeUrl.searchParams.set("state", state);
 

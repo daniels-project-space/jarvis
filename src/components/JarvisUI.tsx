@@ -77,6 +77,7 @@ import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
+import { googleOAuthReturnNotice, type GoogleOAuthReturnNotice } from "@/lib/google-oauth-return";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
 import {
   authoritativeCancellationReceipt,
@@ -541,7 +542,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup,
+  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -559,6 +560,7 @@ function OptionsPanel({
   onOpenTravel: () => void;
   onOpenGoals: () => void;
   onMacSetup: () => void;
+  googleOAuthNotice: GoogleOAuthReturnNotice | null;
 }) {
   const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
     <div className="flex items-center justify-between gap-4 py-2.5">
@@ -637,6 +639,15 @@ function OptionsPanel({
               </a>
             )}
           </Row>
+          {googleOAuthNotice && (
+            <div
+              aria-live="polite"
+              role="status"
+              className={`rounded-lg px-2.5 py-2 text-[11px] ${googleOAuthNotice.tone === "success" ? "bg-emerald-400/10 text-emerald-200" : "bg-amber-300/10 text-amber-100"}`}
+            >
+              {googleOAuthNotice.message}
+            </div>
+          )}
           <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
             <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
               {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
@@ -2007,6 +2018,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Speech deliberately has no engine or voice switch: every device uses the
   // same neural Jarvis identity.
   const [optionsOpen, setOptionsOpen] = useState(false);
+  const [googleOAuthNotice, setGoogleOAuthNotice] = useState<GoogleOAuthReturnNotice | null>(null);
   const setMoodMut = (args: Record<string, unknown>) => privateMutation("ui:setMood", args);
   const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: true });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
@@ -2017,6 +2029,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const liveManuallyStopped = useRef(false);
   const resumeLiveWhenVisible = useRef(false);
   const sttFailureStreak = useRef(0);
+  useEffect(() => {
+    if (guest) return;
+    const notice = googleOAuthReturnNotice(window.location.search);
+    if (!notice) return;
+    setGoogleOAuthNotice(notice);
+    setOptionsOpen(true);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("google_oauth");
+    url.searchParams.delete("google_oauth_detail");
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [guest]);
   useEffect(() => {
     // Settings left by the superseded speech engines made different browsers
     // silently select different Jarvis voices.
@@ -5547,6 +5570,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             setPanelMin(false);
             void setPanel({ type: "widget", value: JSON.stringify({ kind: "mac_setup" }), title: "Mac shortcut setup" });
           }}
+          googleOAuthNotice={googleOAuthNotice}
         />
       )}
 

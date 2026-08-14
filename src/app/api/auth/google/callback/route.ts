@@ -1,7 +1,7 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { adminSessionHash, controlMutation, validateAdminSession } from "@/lib/control-session";
-import { encryptGoogleRefreshToken, GoogleOAuthError } from "@/lib/google-oauth";
+import { encryptGoogleRefreshToken, GoogleOAuthError, isGoogleOAuthConfigurationReady } from "@/lib/google-oauth";
 
 // Feature 4a: completes the Google OAuth connect flow started by
 // src/app/api/auth/google/start/route.ts. Validates the CSRF `state`
@@ -54,9 +54,11 @@ export async function GET(req: NextRequest) {
   const code = params.get("code");
   if (!code) return redirectWithStatus(req, "error", "missing_code");
 
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return redirectWithStatus(req, "error", "not_configured");
+  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
+  if (!clientId || !clientSecret || !isGoogleOAuthConfigurationReady()) {
+    return redirectWithStatus(req, "error", "not_configured");
+  }
 
   const redirectUri = new URL("/api/auth/google/callback", req.url).toString();
 

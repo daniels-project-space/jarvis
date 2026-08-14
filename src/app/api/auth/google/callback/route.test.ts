@@ -6,6 +6,7 @@ const mock = vi.hoisted(() => ({
   validateAdminSession: vi.fn(async () => true),
   controlMutation: vi.fn(async () => undefined),
   encrypt: vi.fn(() => "encrypted-refresh-token"),
+  configured: vi.fn(() => true),
 }));
 
 vi.mock("@/lib/control-session", () => ({
@@ -15,6 +16,7 @@ vi.mock("@/lib/control-session", () => ({
 }));
 vi.mock("@/lib/google-oauth", () => ({
   encryptGoogleRefreshToken: mock.encrypt,
+  isGoogleOAuthConfigurationReady: mock.configured,
   GoogleOAuthError: class GoogleOAuthError extends Error {},
 }));
 
@@ -33,7 +35,7 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
     const url = String(input);
     if (url.includes("oauth2.googleapis.com/token")) {
-      return Response.json({ refresh_token: "refresh", access_token: "access", scope: "https://www.googleapis.com/auth/gmail.modify" });
+      return Response.json({ refresh_token: "refresh", access_token: "access", scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose" });
     }
     if (url.includes("oauth2/v2/userinfo")) return Response.json({ email: "daniel@example.com" });
     throw new Error(`unexpected fetch ${url}`);
@@ -48,7 +50,7 @@ afterEach(() => {
 
 describe("Google OAuth callback scope persistence", () => {
   it.each([
-    "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/calendar.events.owned",
+    "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/calendar.events.owned",
     "https://www.googleapis.com/auth/gmail.modify",
   ])("persists exactly Google's returned scope rather than assuming requested grants", async (scope) => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => Response.json({
@@ -76,5 +78,15 @@ describe("Google OAuth callback scope persistence", () => {
     expect(response.headers.get("location")).toContain("google_oauth_detail=missing_scope");
     expect(mock.controlMutation).not.toHaveBeenCalled();
     expect(mock.encrypt).not.toHaveBeenCalled();
+  });
+
+  it("does not exchange an authorization code unless all secure OAuth settings are ready", async () => {
+    mock.configured.mockReturnValue(false);
+
+    const response = await GET(callbackRequest());
+
+    expect(response.headers.get("location")).toContain("google_oauth_detail=not_configured");
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(mock.controlMutation).not.toHaveBeenCalled();
   });
 });

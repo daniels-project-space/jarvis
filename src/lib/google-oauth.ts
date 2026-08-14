@@ -47,6 +47,21 @@ function encryptionKey(): Buffer {
 }
 
 /**
+ * Checks the complete server-only configuration before the browser is sent
+ * to Google. Starting consent with only a client ID used to strand a user at
+ * callback time when the client secret or encryption key was absent.
+ */
+export function isGoogleOAuthConfigurationReady(): boolean {
+  if (!process.env.GOOGLE_CLIENT_ID?.trim() || !process.env.GOOGLE_CLIENT_SECRET?.trim()) return false;
+  try {
+    encryptionKey();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Encrypts a Google refresh token for storage in the `googleAccounts` Convex
  * table. Called by src/app/api/auth/google/callback/route.ts immediately
  * after the authorization-code exchange, before the plaintext token is
