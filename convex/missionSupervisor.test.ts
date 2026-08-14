@@ -2083,6 +2083,80 @@ describe("dormant mission supervisor authority", () => {
     });
   });
 
+  it("quarantines a supervisor dispatch with a missing receipt without launching a replacement", async () => {
+    const t = convexTest(schema, modules);
+    const fixture = await pauseAndResumeFleet(
+      t,
+      "fleet-invalid-dispatch-quarantine",
+      [delegatedWorkstream({
+        task: "Keep unprovable worker reservations out of capacity.",
+        label: "invalid receipt quarantine",
+      })],
+    );
+    const offered = await reserveSupervisorFleet(
+      t,
+      fixture.resumed.controlReceiptId,
+    );
+    const reservation = offered.reservations[0] as DispatchReservation;
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(fixture.jobIds[0]);
+      if (!job?.dispatchReceiptId) throw new Error("supervisor dispatch receipt was not persisted");
+      await ctx.db.delete(job.dispatchReceiptId);
+    });
+
+    vi.advanceTimersByTime(2 * 60_000 + 1);
+    expect(await t.mutation(jobsApi.reapStale, { workerToken: WORKER }))
+      .toMatchObject({
+        quarantinedDispatches: ["Keep unprovable worker reservations out of capacity."],
+      });
+    const first = await t.run(async (ctx) => ({
+      job: await ctx.db.get(fixture.jobIds[0]),
+      runtime: await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", fixture.jobIds[0])).first(),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", fixture.jobIds[0]).eq("attempt", 1)).first(),
+      receipts: await ctx.db.query("workReceipts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", fixture.jobIds[0]).eq("attempt", 1)).collect(),
+      events: await ctx.db.query("workEvents")
+        .withIndex("by_job", (q) => q.eq("jobId", String(fixture.jobIds[0]))).collect(),
+      attention: (await ctx.db.query("attentionItems").collect())
+        .filter((item) => item.jobId === String(fixture.jobIds[0])),
+    }));
+    expect(first.job).toMatchObject({ status: "needs_input", providerRunState: "quarantined" });
+    expect(first.job?.dispatchId).toBeUndefined();
+    expect(first.runtime?.status).toBe("needs_input");
+    expect(first.attempt).toMatchObject({ status: "needs_input" });
+    expect(first.receipts).toMatchObject([{
+      protocolVersion: 2,
+      status: "needs_input",
+      terminalCode: "dispatch_authority_invalid",
+      recoveryDisposition: "needs_input",
+    }]);
+    expect(first.events.filter((event) => event.type === "dispatch_quarantined")).toHaveLength(1);
+    expect(first.attention).toHaveLength(1);
+    expect(await t.mutation(jobsApi.claimDispatched, {
+      jobId: reservation.jobId,
+      dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation),
+      workerRunId: "must-not-launch-after-quarantine",
+      workerToken: WORKER,
+    })).toMatchObject({ executable: false, held: true });
+
+    expect(await t.mutation(jobsApi.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ quarantinedDispatches: [] });
+    const second = await t.run(async (ctx) => ({
+      receipts: await ctx.db.query("workReceipts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", fixture.jobIds[0]).eq("attempt", 1)).collect(),
+      events: await ctx.db.query("workEvents")
+        .withIndex("by_job", (q) => q.eq("jobId", String(fixture.jobIds[0]))).collect(),
+      attention: (await ctx.db.query("attentionItems").collect())
+        .filter((item) => item.jobId === String(fixture.jobIds[0])),
+    }));
+    expect(second.receipts).toHaveLength(1);
+    expect(second.events.filter((event) => event.type === "dispatch_quarantined")).toHaveLength(1);
+    expect(second.attention).toHaveLength(1);
+  });
+
   it("skips an expired source offer until the minute fallback reoffers its exact bytes", async () => {
     const t = convexTest(schema, modules);
     const fixture = await pauseAndResumeFleet(

@@ -442,6 +442,209 @@ describe("project-group fair reservation authority", () => {
     expect(state.activeRuntimes).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
   });
 
+  it("preserves a valid expired V2 reservation for its byte-identical reoffer", async () => {
+    const t = convexTest(schema, modules);
+    const jobId = await enqueue(t, { missionId: "mission-valid-expired-reoffer" });
+    const first = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "valid-expired-reoffer",
+      workerToken: WORKER,
+    });
+    const reservation = first.reservations[0]!;
+
+    vi.advanceTimersByTime(2 * 60_000 + 1);
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({
+        releasedDispatches: ["Inspect the isolated scheduler fixture and report bounded evidence."],
+        quarantinedDispatches: [],
+      });
+    const reoffered = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "exact-expired-reoffer",
+      workerToken: WORKER,
+    });
+    expect(reoffered.reservations).toEqual([reservation]);
+    const state = await t.run(async (ctx) => {
+      const job = await ctx.db.get(jobId);
+      return {
+        job,
+        receipt: job?.dispatchReceiptId ? await ctx.db.get(job.dispatchReceiptId) : null,
+      };
+    });
+    expect(state.job).toMatchObject({ status: "dispatching", dispatchId: reservation.dispatchId });
+    expect(state.receipt).toMatchObject({
+      status: "reserved",
+      receiptDigest: reservation.dispatchReceiptDigest,
+      payloadDigest: reservation.dispatchPayloadDigest,
+    });
+  });
+
+  it("quarantines an expired V2 dispatch with a missing receipt exactly once", async () => {
+    const t = convexTest(schema, modules);
+    const jobId = await enqueue(t, { missionId: "mission-missing-receipt" });
+    const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "missing-receipt-fixture",
+      workerToken: WORKER,
+    });
+    const reservation = batch.reservations[0]!;
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(jobId);
+      if (!job?.dispatchReceiptId) throw new Error("dispatch receipt fixture was not persisted");
+      await ctx.db.delete(job.dispatchReceiptId);
+    });
+
+    vi.advanceTimersByTime(2 * 60_000 + 1);
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({
+        quarantinedDispatches: ["Inspect the isolated scheduler fixture and report bounded evidence."],
+      });
+    const first = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      runtime: await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first(),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first(),
+      events: await ctx.db.query("workEvents")
+        .withIndex("by_job", (q) => q.eq("jobId", String(jobId))).collect(),
+      attention: (await ctx.db.query("attentionItems").collect())
+        .filter((item) => item.jobId === String(jobId)),
+    }));
+    expect(first.job).toMatchObject({
+      status: "needs_input",
+      stage: "needs dispatch review",
+      providerRunState: "quarantined",
+    });
+    expect(first.job?.dispatchId).toBeUndefined();
+    expect(first.job?.dispatchReceiptId).toBeUndefined();
+    expect(first.job?.workerRunId).toBeUndefined();
+    expect(first.runtime).toMatchObject({ status: "needs_input", stage: "needs dispatch review" });
+    expect(first.attempt).toMatchObject({ status: "needs_input" });
+    expect(first.events.filter((event) => event.type === "dispatch_quarantined")).toHaveLength(1);
+    expect(first.attention).toMatchObject([{
+      status: "open",
+      title: "Worker reservation needs review",
+      actionClass: "ask",
+    }]);
+
+    expect(await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "must-not-relaunch-missing-receipt",
+      workerToken: WORKER,
+    })).toMatchObject({ reservations: [] });
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ quarantinedDispatches: [] });
+    const second = await t.run(async (ctx) => ({
+      events: await ctx.db.query("workEvents")
+        .withIndex("by_job", (q) => q.eq("jobId", String(jobId))).collect(),
+      attention: (await ctx.db.query("attentionItems").collect())
+        .filter((item) => item.jobId === String(jobId)),
+    }));
+    expect(second.events.filter((event) => event.type === "dispatch_quarantined")).toHaveLength(1);
+    expect(second.attention).toHaveLength(1);
+    expect(reservation.dispatchId).toBeTruthy();
+  });
+
+  it("releases capacity held by expired receipt-invalid dispatches", async () => {
+    const t = convexTest(schema, modules);
+    const invalidIds: Id<"jobs">[] = [];
+    for (let index = 0; index < BACKGROUND_CONCURRENCY_LIMIT; index += 1) {
+      invalidIds.push(await enqueue(t, { missionId: `mission-invalid-dispatch-${index}` }));
+    }
+    const active = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: BACKGROUND_CONCURRENCY_LIMIT,
+      reason: "fill-invalid-dispatch-capacity",
+      workerToken: WORKER,
+    });
+    expect(active.reservations).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
+    const waiting = await enqueue(t, { missionId: "mission-waits-for-quarantine", priority: 100 });
+    expect(await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "still-capacity-blocked",
+      workerToken: WORKER,
+    })).toMatchObject({ reservations: [] });
+    await t.run(async (ctx) => {
+      for (const jobId of invalidIds) {
+        const job = await ctx.db.get(jobId);
+        if (!job?.dispatchReceiptId) throw new Error("invalid dispatch fixture has no receipt");
+        await ctx.db.delete(job.dispatchReceiptId);
+      }
+    });
+
+    vi.advanceTimersByTime(2 * 60_000 + 1);
+    const reaped = await t.mutation(api.jobs.reapStale, { workerToken: WORKER });
+    expect(reaped.quarantinedDispatches).toHaveLength(BACKGROUND_CONCURRENCY_LIMIT);
+    const resumed = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "capacity-released-after-quarantine",
+      workerToken: WORKER,
+    });
+    expect(resumed.reservations.map((reservation) => reservation.jobId)).toEqual([String(waiting)]);
+  });
+
+  it("quarantines a legacy expired dispatch without fabricating a worker launch", async () => {
+    const t = convexTest(schema, modules);
+    const jobId = await t.run(async (ctx) => {
+      const now = Date.now();
+      const id = await ctx.db.insert("jobs", {
+        task: "Legacy dispatch must stop for human review.",
+        status: "dispatching",
+        stage: "dispatching",
+        priority: 50,
+        percent: 1,
+        attempt: 1,
+        maxAttempts: 3,
+        dispatchId: "legacy-unprovable-dispatch",
+        dispatchLeaseUntil: now - 1,
+        heartbeatAt: now - 1,
+        providerRunState: "reconciling",
+        createdAt: now,
+      });
+      await ctx.db.insert("jobRuntime", {
+        jobId: id,
+        task: "Legacy dispatch must stop for human review.",
+        status: "dispatching",
+        stage: "dispatching",
+        priority: 50,
+        percent: 1,
+        attempt: 1,
+        maxAttempts: 3,
+        heartbeatAt: now - 1,
+        dispatchId: "legacy-unprovable-dispatch",
+        dispatchLeaseUntil: now - 1,
+        createdAt: now,
+        updatedAt: now,
+      });
+      return id;
+    });
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ quarantinedDispatches: ["Legacy dispatch must stop for human review."] });
+    const first = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      runtime: await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", jobId)).first(),
+      events: await ctx.db.query("workEvents")
+        .withIndex("by_job", (q) => q.eq("jobId", String(jobId))).collect(),
+      attention: (await ctx.db.query("attentionItems").collect())
+        .filter((item) => item.jobId === String(jobId)),
+    }));
+    expect(first.job).toMatchObject({ status: "needs_input", providerRunState: "quarantined" });
+    expect(first.job?.dispatchId).toBeUndefined();
+    expect(first.job?.workerRunId).toBeUndefined();
+    expect(first.runtime?.status).toBe("needs_input");
+    expect(first.events.filter((event) => event.type === "dispatch_quarantined")).toHaveLength(1);
+    expect(first.attention).toHaveLength(1);
+
+    expect(await t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ quarantinedDispatches: [] });
+    const second = await t.run(async (ctx) => ({
+      events: await ctx.db.query("workEvents")
+        .withIndex("by_job", (q) => q.eq("jobId", String(jobId))).collect(),
+      attention: (await ctx.db.query("attentionItems").collect())
+        .filter((item) => item.jobId === String(jobId)),
+    }));
+    expect(second.events.filter((event) => event.type === "dispatch_quarantined")).toHaveLength(1);
+    expect(second.attention).toHaveLength(1);
+  });
+
   it("keeps historical unbound rows non-executable without admitting them in a poll", async () => {
     const t = convexTest(schema, modules);
     await t.run(async (ctx) => {

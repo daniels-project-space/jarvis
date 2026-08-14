@@ -424,6 +424,116 @@ async function openStaleReviewAttention(ctx: any, row: any, now: number) {
   });
 }
 
+// A dispatch is executable only while its durable projection and immutable
+// receipt describe the same launch. When that proof disappears after the
+// reservation lease expires, preserving `dispatching` would indefinitely
+// consume a worker slot. This is intentionally a human-review state, never a
+// retry: an unknown launch must not be replaced with a competing Trigger run.
+async function openDispatchAuthorityAttention(
+  ctx: any,
+  row: any,
+  dispatchId: string,
+  now: number,
+) {
+  const attempt = row.attempt ?? 1;
+  const fingerprint = `dispatch-authority-invalid:${String(row._id)}:${attempt}:${dispatchId}`;
+  const existing = await ctx.db.query("attentionItems")
+    .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", fingerprint)).first();
+  const item = {
+    fingerprint,
+    project: row.repo,
+    title: "Worker reservation needs review",
+    detail: "The expired worker reservation no longer has one exact immutable launch receipt. JARVIS stopped it before another worker could be launched; review it and submit a fresh job if needed.",
+    evidence: [
+      `Job ${String(row._id)}`,
+      `Specialist attempt ${attempt}`,
+      `Dispatch ${dispatchId}`,
+    ],
+    severity: "decision",
+    impact: 80,
+    urgency: 75,
+    confidence: 1,
+    actionClass: "ask",
+    status: "open",
+    jobId: String(row._id),
+    updatedAt: now,
+  };
+  if (existing) await ctx.db.patch(existing._id, item);
+  else await ctx.db.insert("attentionItems", { ...item, createdAt: now });
+}
+
+async function quarantineUnprovableDispatch(
+  ctx: any,
+  row: any,
+  dispatchId: string,
+  now: number,
+) {
+  const attemptNumber = row.attempt ?? 1;
+  const explanation = "The expired worker reservation no longer has one exact immutable launch receipt. No replacement worker was started; review this work before submitting a fresh job.";
+  const attempt = await attemptFor(ctx, row._id, attemptNumber);
+  // Supervisor-owned work is append-only. Record a matching terminal receipt
+  // only when the execution authority is still exact; a corrupt authority is
+  // itself evidence to preserve, not a reason to fabricate a receipt.
+  if (isSupervisorOwnedJob(row) && await readAttemptExecutionAuthority(ctx, row, attemptNumber)) {
+    const existingReceipts = await ctx.db
+      .query("workReceipts")
+      .withIndex("by_job_attempt", (q: any) => q.eq("jobId", row._id).eq("attempt", attemptNumber))
+      .take(2);
+    if (!existingReceipts.length) {
+      await insertFreshTerminalWorkReceipt(ctx, row, attemptNumber, {
+        status: "needs_input",
+        terminalCode: "dispatch_authority_invalid",
+        recoveryDisposition: "needs_input",
+        acceptanceEvidence: [],
+        artifacts: [
+          `convex://jobs/${String(row._id)}/attempt/${attemptNumber}/dispatch`,
+        ],
+        verification: "needs_input",
+        terminalEventKey: `dispatch-authority-invalid:${attemptNumber}:${dispatchId}`,
+        result: explanation,
+        evidence: row.progress ?? row.checkpoint,
+      }, now);
+    }
+  }
+  if (attempt && !attempt.completedAt) {
+    await ctx.db.patch(attempt._id, {
+      status: "needs_input",
+      completedAt: now,
+      lastEventAt: now,
+    });
+  }
+  await patchJobWithRuntime(ctx, row, {
+    ...invalidateDeliveryLease(row),
+    status: "needs_input",
+    stage: "needs dispatch review",
+    progress: "worker reservation authority cannot be proven — review required",
+    heartbeatAt: now,
+    nextRunAt: undefined,
+    dispatchId: undefined,
+    dispatchGeneration: undefined,
+    dispatchPhase: undefined,
+    dispatchReceiptId: undefined,
+    dispatchReceiptDigest: undefined,
+    dispatchPayloadDigest: undefined,
+    dispatchLeaseUntil: undefined,
+    dispatchReason: undefined,
+    workerRunId: undefined,
+    workerRuntime: undefined,
+    deliveryRunId: undefined,
+    activeDeliveryAttemptId: undefined,
+    providerRunState: "quarantined",
+    providerObservedAt: now,
+  });
+  await appendAttemptEvidence(ctx, row, "dispatch_quarantined", explanation, {
+    stage: "needs dispatch review",
+    percent: row.percent,
+    evidenceKind: "watchdog",
+    eventKey: `dispatch-authority-invalid:${attemptNumber}:${dispatchId}`,
+    attempt: attemptNumber,
+  });
+  await openDispatchAuthorityAttention(ctx, row, dispatchId, now);
+}
+
 function deliveryClaimMatches(row: any, attempt: any, a: any) {
   return Boolean(attempt
     && attempt.authorityDigest === a.authorityDigest
@@ -3300,6 +3410,7 @@ export const reapStale = mutation({
       .withIndex("by_status_dispatch_lease", (q: any) => q.eq("status", "dispatching").lte("dispatchLeaseUntil", now))
       .take(100);
     const releasedDispatches: string[] = [];
+    const quarantinedDispatches: string[] = [];
     for (const activity of dispatching) {
       const j = await ctx.db.get(activity.jobId);
       if (!j || j.status !== "dispatching" || j.dispatchId !== activity.dispatchId) {
@@ -3312,15 +3423,16 @@ export const reapStale = mutation({
         || receipt.receiptDigest !== j.dispatchReceiptDigest
         || receipt.payloadDigest !== j.dispatchPayloadDigest
         || !["reserved", "reconciling"].includes(receipt.status)) {
-        // An active v2 projection without its immutable launch receipt cannot
-        // be made executable by timeout recovery. Leave it held for explicit
-        // repair instead of manufacturing a competing Trigger identity.
-        await patchJobWithRuntime(ctx, j, {
-          progress: "worker reservation receipt missing or stale — held",
-          providerRunState: "reconciling",
-          providerObservedAt: now,
-          heartbeatAt: now,
-        });
+        // An active projection without its exact immutable launch receipt
+        // cannot be re-offered safely. Quarantine it outside the active index
+        // rather than silently refreshing a zombie reservation forever.
+        await quarantineUnprovableDispatch(
+          ctx,
+          j,
+          String(activity.dispatchId ?? j.dispatchId ?? "missing-dispatch-id"),
+          now,
+        );
+        quarantinedDispatches.push(j.task.slice(0, 80));
         continue;
       }
       await patchJobWithRuntime(ctx, j, {
@@ -3701,6 +3813,7 @@ export const reapStale = mutation({
       abandoned,
       stalled,
       releasedDispatches,
+      quarantinedDispatches,
       expiredControllers,
       reconciledPausedClaims,
       expiredCloudWorkspaceHolds,

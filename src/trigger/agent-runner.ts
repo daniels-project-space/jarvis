@@ -810,6 +810,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
   let repairs = 0;
   let cloudWorkspaceResumed = 0;
   let expiredCloudWorkspaceHolds = 0;
+  let quarantinedDispatches = 0;
   if (runtimeAttestation) {
     try {
       // Construction validates the exact deployment-bound probe receipt but
@@ -828,10 +829,16 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     recovered = Number(reaped?.requeued?.length ?? 0) + Number(reaped?.releasedDispatches?.length ?? 0);
     abandoned = Number(reaped?.abandoned?.length ?? 0);
     expiredCloudWorkspaceHolds = Number(reaped?.expiredCloudWorkspaceHolds?.length ?? 0);
+    quarantinedDispatches = Number(reaped?.quarantinedDispatches?.length ?? 0);
     for (const title of reaped?.abandoned ?? [])
       await convexMutation("chatQueue:postAssistant", {
         threadId: await chatThread(),
         text: `I have to be honest, sir — the background job "${title}" kept dying on me and I've stopped retrying it.`,
+      }).catch(() => {});
+    for (const title of reaped?.quarantinedDispatches ?? [])
+      await convexMutation("chatQueue:postAssistant", {
+        threadId: await chatThread(),
+        text: `I've stopped the background job "${title}" because its worker reservation could not be verified. It is waiting for review; I have not started a replacement.`,
       }).catch(() => {});
     const healer: any = await convexMutation("incidents:claimForRepair", { limit: 2, maxAttempts: 2 });
     repairs = Number(healer?.claims?.length ?? 0);
@@ -936,7 +943,15 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     /* reminders must never block fleet dispatch */
   }
   await runWatchSweep().catch(() => {});
-  return { recovered, abandoned, repairs, cloudWorkspaceResumed, expiredCloudWorkspaceHolds, migration };
+  return {
+    recovered,
+    abandoned,
+    repairs,
+    cloudWorkspaceResumed,
+    expiredCloudWorkspaceHolds,
+    quarantinedDispatches,
+    migration,
+  };
 }
 
 // One Trigger run owns one exact durable job and one isolated Codex process.
