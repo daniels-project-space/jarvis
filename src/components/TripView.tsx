@@ -282,6 +282,9 @@ type OfflineMapPreflightValue = {
   todoStatus?: unknown;
   reminderStatus?: unknown;
   calendarStatus?: unknown;
+  refreshState?: unknown;
+  refreshError?: unknown;
+  calendarRefreshRequired?: unknown;
 };
 
 function safeAppleMapsHandoff(value: unknown): string | null {
@@ -306,7 +309,9 @@ export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPr
     // A corrupted historic time zone must never prevent the saved travel plan
     // from reopening; the server uses a validated zone when creating it.
   }
-  const calendar = preflight?.calendarStatus === "approval_required"
+  const calendar = preflight?.calendarRefreshRequired === true
+    ? "The itinerary changed, so prepare a fresh protected Calendar approval before adding or changing it."
+    : preflight?.calendarStatus === "approval_required"
     ? "Prepare a fresh protected Calendar approval in Jarvis chat when you are ready to add it."
     : preflight?.calendarStatus === "needs_reconnect"
       ? "Reconnect Google with Calendar access to prepare the calendar reminder."
@@ -316,12 +321,27 @@ export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPr
     : preflight?.todoStatus === "existing"
       ? "Matching Hub to-do is already saved."
       : "Hub to-do is saved.";
+  const refresh = preflight?.refreshState === "scheduled"
+    ? "Gmail itinerary refresh is active for this exact saved trip."
+    : preflight?.refreshState === "pending_google"
+      ? "Gmail refresh is waiting for Jarvis's Google connection; the existing reminder stays unchanged."
+      : preflight?.refreshState === "needs_flight_confirmation"
+        ? "The selected Gmail flight changed or disappeared; Jarvis needs an exact confirmation before changing this reminder."
+        : preflight?.refreshState === "needs_city_confirmation"
+          ? "The booked stay changed; Jarvis needs an exact city confirmation before changing this reminder."
+          : preflight?.refreshState === "pending_refresh"
+            ? "Jarvis will retry the saved-trip refresh; the existing reminder stays unchanged."
+            : preflight?.refreshState === "draft_manual_only"
+              ? "Save this trip to turn on exact Gmail itinerary refresh."
+              : preflight?.refreshState === "pending_city_identity" || preflight?.refreshState === "pending_registry"
+                ? "Jarvis needs one exact Gmail booked-stay identity before automatic refresh can begin."
+                : "This preflight is manual-only.";
   return (
     <section aria-label="Apple Maps offline preflight" className={`${GLASS} mt-2 flex flex-wrap items-center justify-between gap-2 border-cyan/25 bg-cyan/[0.045] px-2.5 py-2`}>
       <div className="min-w-0">
         <div className="hud-label !text-cyan">Apple Maps · offline preflight</div>
         <div className="mt-0.5 text-[11px] font-medium text-ice">{city} · {when}</div>
-        <p className="mt-0.5 max-w-xl text-[9px] leading-snug text-slate">Jarvis reminder is scheduled. {todo} {calendar} Download and deletion remain in Maps: download {city}, then remove an old unused map in Offline Maps (or use Optimize Storage).</p>
+        <p className="mt-0.5 max-w-xl text-[9px] leading-snug text-slate">Jarvis reminder is scheduled. {todo} {calendar} {refresh} Download and deletion remain in Maps: download {city}, then remove an old unused map in Offline Maps (or use Optimize Storage).</p>
       </div>
       <a href={mapUrl} target="_blank" rel="noreferrer" className="shrink-0 rounded-lg bg-cyan/15 px-2.5 py-1.5 text-[10px] font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25" aria-label={`Open Apple Maps for ${city}`}>
         Open Apple Maps ↗

@@ -25,6 +25,13 @@ import { googleCalendarApprovalMarker, issueGoogleCalendarApproval, issueGoogleC
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
 import { buildAppleMapsOfflinePreflight } from "./apple-maps-offline";
 import {
+  appleMapsOfflineGmailIdentity,
+  appleMapsOfflinePreflightSourceKey,
+  currentAppleMapsOfflineCityProof,
+  matchesAppleMapsOfflineCityProof,
+  type AppleMapsOfflineCityProof,
+} from "./apple-maps-offline-refresh";
+import {
   gmailSearch,
   gmailReadMessage,
   gmailCreateDraft,
@@ -2511,9 +2518,9 @@ function appleMapsOfflineCityKey(value: unknown): string {
  * trip: another journey can fall on the same day. Require the existing
  * independently geocoded, time-valid Gmail stay proof for this exact city.
  */
-function hasFreshDestinationBookingReference(doc: any, now = Date.now()): boolean {
+function freshDestinationBookingReference(doc: any, now = Date.now()): AppleMapsOfflineCityProof | undefined {
   const city = appleMapsOfflineCityKey(doc?.destination);
-  if (!city) return false;
+  if (!city) return undefined;
   const references = [
     ...(Array.isArray(doc?.bookingReferences) ? doc.bookingReferences : []),
     ...(Array.isArray(doc?.cityContexts)
@@ -2523,7 +2530,7 @@ function hasFreshDestinationBookingReference(doc: any, now = Date.now()): boolea
       }).filter(Boolean)
       : []),
   ];
-  return references.some((reference: any) => {
+  const reference = references.find((reference: any) => {
     const verifiedAt = Number(reference?.verifiedAt);
     const end = Number(reference?.end ?? reference?.start);
     return appleMapsOfflineCityKey(reference?.city) === city
@@ -2533,6 +2540,26 @@ function hasFreshDestinationBookingReference(doc: any, now = Date.now()): boolea
       && verifiedAt <= now
       && now - verifiedAt <= 24 * 60 * 60_000;
   });
+  if (!reference) return undefined;
+  const proof: AppleMapsOfflineCityProof = {
+    city: String(reference.city).slice(0, 120),
+    title: String(reference.title ?? "Booked stay").slice(0, 180),
+    ...(reference.bookingName ? { bookingName: String(reference.bookingName).slice(0, 180) } : {}),
+    location: String(reference.location).slice(0, 300),
+    start: Number(reference.start),
+    end: Number(reference.end ?? reference.start),
+    ...(reference.timeZone ? { timeZone: String(reference.timeZone).slice(0, 80) } : {}),
+    lat: Number(reference.lat),
+    lng: Number(reference.lng),
+    distanceKm: Number(reference.distanceKm),
+    verifiedAt: Number(reference.verifiedAt),
+  };
+  return currentAppleMapsOfflineCityProof(proof, now);
+}
+
+function exactCityProofBooking(bookings: ConfirmedBooking[], proof: AppleMapsOfflineCityProof): ConfirmedBooking | undefined {
+  const matches = bookings.filter((booking) => matchesAppleMapsOfflineCityProof(booking, proof));
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 async function upsertAppleMapsOfflineTodo(preflight: {
@@ -2604,8 +2631,8 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   if (requestedFlightId && !selectedFlight) {
     return "That Apple Maps flight choice no longer matches a confirmed Gmail flight for this exact trip. Refresh the trip's bookings and choose again; no reminder, to-do, or Calendar proposal was created.";
   }
-  const hasDestinationProof = hasFreshDestinationBookingReference(trip.doc);
-  if (!hasDestinationProof) {
+  const cityProof = freshDestinationBookingReference(trip.doc);
+  if (!cityProof) {
     return "Apple Maps preflight is waiting for a fresh, city-verified Gmail stay reference for this exact trip. Refresh confirmed bookings for this trip first; no reminder, to-do, or Calendar proposal was created.";
   }
   if (!selectedFlight && flightCandidates.length !== 1) {
@@ -2623,9 +2650,19 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   if (!selected) {
     return "Apple Maps preflight is waiting for an upcoming confirmed Gmail flight for this exact trip. No reminder, to-do, or Calendar proposal was created.";
   }
+  const existingSavedSourceKey = String(trip.doc.offlineMapPreflight?.sourceKey ?? "");
+  // Adopt the source key of a preflight made by the previous release. A saved
+  // trip that is re-prepared after this upgrade must update that reminder and
+  // Hub to-do instead of leaving an old one behind.
+  const savedTripSourceKey = workspace.storage === "creation"
+    ? (/^[a-f0-9]{64}$/.test(existingSavedSourceKey)
+      ? existingSavedSourceKey
+      : appleMapsOfflinePreflightSourceKey(workspace.id))
+    : undefined;
   const result = buildAppleMapsOfflinePreflight({
     city: trip.doc.destination,
     flights: [{ ...selected, tripVerified: true }],
+    sourceKey: savedTripSourceKey,
   });
   if (result.status === "needs_flight_confirmation") {
     return `Apple Maps preflight is waiting: ${result.reason}. No reminder, to-do, or Calendar proposal was created.`;
@@ -2670,6 +2707,35 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     }
   }
 
+  // Background maintenance is opt-in and saved-trip only. It never lists the
+  // travel library: each registry row contains the exact Gmail flight and stay
+  // identities Daniel selected here, so a later refresh cannot drift to a
+  // different trip sharing the same date or city.
+  const now = Date.now();
+  const nextRefreshAt = Math.max(now + 60_000, Math.min(preflight.at - 5 * 60_000, now + 6 * 60 * 60_000));
+  let automaticRefresh: "scheduled" | "draft_manual_only" | "pending_city_identity" | "pending_registry" = workspace.storage === "creation"
+    ? "pending_city_identity"
+    : "draft_manual_only";
+  if (workspace.storage === "creation") {
+    const proofBooking = exactCityProofBooking(matching, cityProof);
+    if (proofBooking) {
+      try {
+        const registered = await convexMutation("appleMapsOfflinePreflights:upsert", {
+          creationId: trip.id,
+          sourceKey: preflight.sourceKey,
+          preflight,
+          flightIdentity: appleMapsOfflineGmailIdentity(selected, bookingCalendarSelectionId(selected)),
+          cityProofIdentity: appleMapsOfflineGmailIdentity(proofBooking, bookingCalendarSelectionId(proofBooking)),
+          cityProof,
+          nextRefreshAt,
+        });
+        automaticRefresh = registered?.ok ? "scheduled" : "pending_registry";
+      } catch {
+        automaticRefresh = "pending_registry";
+      }
+    }
+  }
+
   trip.doc.offlineMapPreflight = {
     city: preflight.city,
     flightMarker: preflight.flightMarker,
@@ -2682,7 +2748,9 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     todoStatus,
     reminderStatus: "scheduled",
     calendarStatus,
-    updatedAt: Date.now(),
+    refreshState: automaticRefresh,
+    ...(automaticRefresh === "scheduled" ? { lastCheckedAt: now, nextRefreshAt, calendarRefreshRequired: false } : {}),
+    updatedAt: now,
   };
   await saveTrip(trip.id, trip.doc, true, tripContext);
   await convexMutation("chatQueue:postCard", {
@@ -2702,7 +2770,12 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     : calendarStatus === "needs_reconnect"
       ? "Google Calendar needs a reconnect with Calendar access; ask Jarvis to prepare this exact trip again after reconnecting."
       : "Google Calendar is not connected yet; ask Jarvis to prepare this exact trip again after connecting it.";
-  return `Apple Maps preflight is scheduled for ${preflight.city} one local calendar day before the confirmed flight: Jarvis push/spoken reminder is durable. ${todoNote} ${calendarNote} The Apple Maps card is a handoff only—on iPhone, choose Download, then remove the old unused map in Maps > Offline Maps.${calendarApprovalMarker ? `\n${calendarApprovalMarker}` : ""}`;
+  const refreshNote = automaticRefresh === "scheduled"
+    ? "Jarvis will now refresh only this saved trip's exact Gmail flight and booked-stay sources, and update its existing reminder/to-do if that itinerary changes."
+    : workspace.storage === "draft"
+      ? "This is still a live draft, so its reminder is manual-only until you save the trip."
+      : "The reminder is scheduled, but automatic refresh is waiting for one exact Gmail booked-stay identity; Jarvis will not guess one.";
+  return `Apple Maps preflight is scheduled for ${preflight.city} one local calendar day before the confirmed flight: Jarvis push/spoken reminder is durable. ${todoNote} ${calendarNote} ${refreshNote} The Apple Maps card is a handoff only—on iPhone, choose Download, then remove the old unused map in Maps > Offline Maps.${calendarApprovalMarker ? `\n${calendarApprovalMarker}` : ""}`;
 }
 
 async function publishHostAction(action: JarvisHostAction): Promise<void> {

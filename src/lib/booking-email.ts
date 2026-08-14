@@ -2,6 +2,7 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 import { getGoogleAccessToken } from "./google-oauth";
+import { matchesAppleMapsOfflineGmailIdentity, type AppleMapsOfflineGmailIdentity } from "./apple-maps-offline-refresh";
 
 export type BookingKind = "flight" | "stay" | "activity" | "transport" | "dining" | "reservation";
 
@@ -338,6 +339,19 @@ async function gmail<T = JsonObject>(path: string): Promise<T> {
   return await response.json() as T;
 }
 
+/** The exact-message variant preserves a missing original message as a normal
+ * itinerary replacement case while still rejecting every other Gmail error. */
+async function gmailMaybe<T = JsonObject>(path: string): Promise<T | null> {
+  const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${path}`, {
+    headers: { Authorization: `Bearer ${await accessToken()}` },
+    cache: "no-store",
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new GmailBookingsError(`Gmail booking sync returned HTTP ${response.status}.`);
+  return await response.json() as T;
+}
+
 export async function scanGmailBookingConfirmations(options: { days?: number; maxResults?: number; search?: string } = {}): Promise<ConfirmedBooking[]> {
   const days = Math.max(7, Math.min(730, Math.round(options.days ?? 365)));
   const maxResults = Math.max(1, Math.min(80, Math.round(options.maxResults ?? 40)));
@@ -359,6 +373,62 @@ export async function scanGmailBookingConfirmations(options: { days?: number; ma
     seen.add(key);
     return true;
   }).sort((left, right) => (left.start ?? Number.MAX_SAFE_INTEGER) - (right.start ?? Number.MAX_SAFE_INTEGER));
+}
+
+function parsedBooking(message: GmailMessage): { booking: ConfirmedBooking; receivedAt: number } | null {
+  const booking = parseBookingEmail({
+    id: String(message.id), threadId: message.threadId, subject: header(message, "subject"), from: header(message, "from"),
+    body: messageBody(message.payload) || String(message.snippet ?? ""), sentAt: Number(message.internalDate ?? Date.now()),
+  });
+  return booking ? { booking, receivedAt: Number(message.internalDate ?? 0) } : null;
+}
+
+function exactIdentityConfirmation(identity: AppleMapsOfflineGmailIdentity): string {
+  return clean(identity.confirmationCode ?? "", 80).replace(/["{}()]/g, " ").trim();
+}
+
+/**
+ * Reads only a preflight's selected Gmail message, its exact Gmail thread, or
+ * a narrow confirmation-code query. This is deliberately separate from the
+ * generic booking scanner: background refreshes must not trawl unrelated trips.
+ */
+export async function lookupGmailBookingForAppleMapsPreflight(
+  identity: AppleMapsOfflineGmailIdentity,
+): Promise<ConfirmedBooking | null> {
+  const messages = new Map<string, GmailMessage>();
+  const direct = await gmailMaybe<GmailMessage>(`messages/${encodeURIComponent(identity.messageId)}?format=full`);
+  if (direct?.id) messages.set(String(direct.id), direct);
+
+  if (identity.threadId) {
+    const thread = await gmailMaybe<{ messages?: GmailMessage[] }>(`threads/${encodeURIComponent(identity.threadId)}?format=full`);
+    for (const message of thread?.messages ?? []) if (message?.id) messages.set(String(message.id), message);
+  }
+
+  // A provider can send a replacement in a new thread. Confirmation codes are
+  // exact booking evidence, unlike a date/city search; cap the follow-up read.
+  const confirmation = exactIdentityConfirmation(identity);
+  if (confirmation) {
+    const listed = await gmail<{ messages?: { id?: string }[] }>(`messages?q=${encodeURIComponent(`"${confirmation}"`)}&maxResults=8`);
+    const ids = (listed.messages ?? []).flatMap((row) => row.id && !messages.has(String(row.id)) ? [String(row.id)] : []);
+    const fetched = await Promise.all(ids.map(async (id) => await gmailMaybe<GmailMessage>(`messages/${encodeURIComponent(id)}?format=full`)));
+    for (const message of fetched) if (message?.id) messages.set(String(message.id), message);
+  }
+
+  const matches = [...messages.values()]
+    .map(parsedBooking)
+    .filter((value): value is { booking: ConfirmedBooking; receivedAt: number } => Boolean(value))
+    .filter(({ booking }) => matchesAppleMapsOfflineGmailIdentity(booking, identity));
+  if (!matches.length) return null;
+
+  // An exact selected message wins if no confirmation-backed replacement is
+  // present. If the provider supplied a shared confirmation reference, choose
+  // its newest matching confirmation in that exact identity set.
+  const confirmationMatches = matches.filter(({ booking }) => Boolean(identity.confirmationCode)
+    && String(booking.confirmationCode ?? "").trim().toLocaleUpperCase("en-GB")
+      === String(identity.confirmationCode ?? "").trim().toLocaleUpperCase("en-GB"));
+  const candidates = confirmationMatches.length ? confirmationMatches : matches;
+  candidates.sort((left, right) => right.receivedAt - left.receivedAt || String(left.booking.id).localeCompare(String(right.booking.id)));
+  return candidates[0]!.booking;
 }
 
 /** Explicit read-only entry point for proactive travel lookup. It performs no calendar or trip writes. */

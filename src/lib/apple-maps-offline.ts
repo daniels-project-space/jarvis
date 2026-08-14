@@ -108,6 +108,8 @@ export function appleMapsCitySearchUrl(city: string): string {
 export function buildAppleMapsOfflinePreflight(input: {
   city: string;
   flights: readonly AppleMapsOfflineFlight[];
+  /** A saved TripDoc may supply one stable registry key across Gmail updates. */
+  sourceKey?: string;
   now?: number;
 }): AppleMapsOfflinePreflightResult {
   const city = cleanCity(input.city);
@@ -136,12 +138,15 @@ export function buildAppleMapsOfflinePreflight(input: {
   }
 
   const flightMarker = String(flight.marker || flight.id).slice(0, 240);
-  const sourceKey = createHash("sha256")
+  const derivedSourceKey = createHash("sha256")
     .update("jarvis-apple-maps-offline-preflight-v1\0")
     .update(flightMarker)
     .update("\0")
     .update(city.toLocaleLowerCase("en-GB"))
     .digest("hex");
+  const sourceKey = typeof input.sourceKey === "string" && /^[a-f0-9]{64}$/.test(input.sourceKey)
+    ? input.sourceKey
+    : derivedSourceKey;
   const flightDate = localDateText(Number(flight.start), timeZone);
   const title = String(flight.title || "confirmed flight").replace(/\s+/g, " ").trim().slice(0, 120);
   const task = `Apple Maps offline · ${city} · before flight ${flightDate}`;

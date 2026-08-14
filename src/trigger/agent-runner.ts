@@ -26,6 +26,7 @@ import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { canonicalizeRepository } from "../lib/workflow-contract";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
 import { runWatchSweep } from "./watch-runtime";
+import { refreshAppleMapsOfflinePreflights } from "./apple-maps-offline-refresh";
 import {
   cleanupSubscriptionHome,
   missingSubscriptionTools,
@@ -1100,6 +1101,13 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
       }).catch(() => false);
     }
   }));
+  // Only owner-scheduled saved-trip rows are eligible. The refresher reads the
+  // exact Gmail flight/stay identities recorded on those rows; a missing OAuth
+  // runtime turns into a visible pending state rather than an inbox-wide scan.
+  const appleMapsOfflinePreflights = await refreshAppleMapsOfflinePreflights({
+    query: async (path, args) => await convexQuery(path, args),
+    mutation: async (path, args) => await convexMutation(path, args),
+  }).catch(() => ({ due: 0, refreshed: 0, pending: 0, skipped: 0 }));
   try {
     const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
     for (const reminder of due) {
@@ -1132,6 +1140,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     expiredCloudWorkspaceHolds,
     quarantinedDispatches,
     controllerSession,
+    appleMapsOfflinePreflights,
     migration,
   };
 }

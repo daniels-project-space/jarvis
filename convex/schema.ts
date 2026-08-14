@@ -553,6 +553,72 @@ export default defineSchema({
     .index("by_status", ["status", "at"])
     .index("by_sourceKey", ["sourceKey"]),
 
+  // Explicit owner-created saved-trip preflights. This is intentionally not a
+  // trip-library index: the worker may refresh only rows Daniel has opted into,
+  // never every itinerary or every Gmail booking.
+  appleMapsOfflinePreflights: defineTable({
+    creationId: v.id("creations"),
+    sourceKey: v.string(),
+    preflight: v.object({
+      city: v.string(),
+      flightMarker: v.string(),
+      flightTitle: v.string(),
+      flightStart: v.number(),
+      at: v.number(),
+      timeZone: v.string(),
+      mapUrl: v.string(),
+      todoText: v.string(),
+      reminderText: v.string(),
+    }),
+    flightIdentity: v.object({
+      selectionId: v.string(),
+      messageId: v.string(),
+      marker: v.string(),
+      threadId: v.optional(v.string()),
+      kind: v.string(),
+      provider: v.string(),
+      confirmationCode: v.optional(v.string()),
+    }),
+    cityProofIdentity: v.object({
+      selectionId: v.string(),
+      messageId: v.string(),
+      marker: v.string(),
+      threadId: v.optional(v.string()),
+      kind: v.string(),
+      provider: v.string(),
+      confirmationCode: v.optional(v.string()),
+    }),
+    cityProof: v.object({
+      city: v.string(),
+      title: v.string(),
+      bookingName: v.optional(v.string()),
+      location: v.string(),
+      start: v.number(),
+      end: v.number(),
+      timeZone: v.optional(v.string()),
+      lat: v.number(),
+      lng: v.number(),
+      distanceKm: v.number(),
+      verifiedAt: v.number(),
+    }),
+    refreshState: v.union(
+      v.literal("scheduled"),
+      v.literal("pending_refresh"),
+      v.literal("pending_google"),
+      v.literal("needs_flight_confirmation"),
+      v.literal("needs_city_confirmation"),
+      v.literal("too_late"),
+      v.literal("trip_missing"),
+    ),
+    lastError: v.optional(v.string()),
+    lastCheckedAt: v.optional(v.number()),
+    nextRefreshAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_creationId", ["creationId"])
+    .index("by_nextRefreshAt", ["nextRefreshAt"]),
+
   jobs: defineTable({
     admissionProtocolVersion: v.optional(v.number()),
     protocolHoldReason: v.optional(v.string()),

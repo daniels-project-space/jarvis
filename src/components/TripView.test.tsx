@@ -213,6 +213,7 @@ describe("TripTimeline", () => {
         todoStatus: "existing",
         reminderStatus: "scheduled",
         calendarStatus: "needs_connection",
+        refreshState: "scheduled",
       }} />,
     );
 
@@ -220,6 +221,7 @@ describe("TripTimeline", () => {
     expect(markup).toContain('href="https://maps.apple.com/search?query=Seville"');
     expect(markup).toContain("Matching Hub to-do is already saved.");
     expect(markup).toContain("Connect Google Calendar");
+    expect(markup).toContain("Gmail itinerary refresh is active for this exact saved trip.");
     expect(markup).toContain("Download and deletion remain in Maps");
   });
 });

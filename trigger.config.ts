@@ -35,6 +35,10 @@ export default defineConfig({
             // codex-session vault service and persisted encrypted in its
             // private R2 bucket. Never fan auth.json into Trigger containers.
             "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN",
+            // Trigger refreshes only explicit saved-trip Gmail identities. It
+            // needs the same server-side OAuth envelope inputs as Vercel; no
+            // OAuth bearer is ever synced or written into a task payload.
+            "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_TOKEN_ENCRYPTION_KEY",
             // Dedicated, read-only Hub context capability. It stays in the
             // trusted worker/controller environment and is stripped from any
             // Codex child process before spawn.
