@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractCurrentStateFacts, shouldCaptureDurableMemory } from "./current-state";
+import { CURRENT_LOCATION_TTL_MS, extractCurrentStateFacts, shouldCaptureDurableMemory } from "./current-state";
 
 describe("current state extraction", () => {
   it.each([
@@ -9,7 +9,7 @@ describe("current state extraction", () => {
     ["I am in London.", "London"],
   ])("extracts a high-confidence current location from %s", (text, place) => {
     expect(extractCurrentStateFacts(text)).toEqual([
-      expect.objectContaining({ key: "profile.current_location", value: place }),
+      expect.objectContaining({ key: "profile.current_location", value: place, validForMs: CURRENT_LOCATION_TTL_MS }),
     ]);
   });
 
@@ -22,6 +22,10 @@ describe("current state extraction", () => {
   ])("does not turn questions, negations, or idioms into state: %s", (text) => {
     expect(extractCurrentStateFacts(text)).toEqual([]);
   });
+});
+
+it("keeps conversational current-place context time-bounded", () => {
+  expect(CURRENT_LOCATION_TTL_MS).toBe(12 * 60 * 60 * 1000);
 });
 
 describe("durable memory admission", () => {

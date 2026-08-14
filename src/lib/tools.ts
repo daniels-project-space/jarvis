@@ -52,6 +52,7 @@ import {
   searchOpenStreetMapPlaces,
   type OpenStreetMapPlace,
 } from "./openstreetmap";
+import { deviceLocationFreshness, freshCurrentLocation, freshDeviceLocation } from "./live-location";
 
 // JARVIS's tool belt — one portable JSON-schema definition list executed by
 // the foreground Codex supervisor and the realtime client bridge.
@@ -3036,7 +3037,12 @@ async function travelMap(args: any): Promise<string> {
         .then((bookings) => ({ bookings, unavailable: false }))
         .catch(() => ({ bookings: [] as ConfirmedBooking[], unavailable: true }))
       : Promise.resolve({ bookings: [] as ConfirmedBooking[], unavailable: false });
-    let center: (TravelMapPoint & { label: string; detail?: string; source: "saved_location" | "current_state" | "gmail_current_stay" | TravelProvider }) | null = null;
+    let center: (TravelMapPoint & {
+      label: string;
+      detail?: string;
+      source: "saved_location" | "current_state" | "gmail_current_stay" | TravelProvider;
+      capturedAt?: number;
+    }) | null = null;
     let bookingLookup: { bookings: ConfirmedBooking[]; unavailable: boolean } | undefined;
     let currentStay: ConfirmedBooking | undefined;
     if (request.location) {
@@ -3052,25 +3058,37 @@ async function travelMap(args: any): Promise<string> {
       };
     } else {
       const [currentState, saved] = await Promise.all([
-        convexQuery("currentState:getActive", { key: "profile.current_location" }).catch(() => null) as Promise<{ value?: string } | null>,
+        convexQuery("currentState:getActive", { key: "profile.current_location" }).catch(() => null) as Promise<{ value?: string; observedAt?: number } | null>,
         convexQuery("ui:getLocation", {}).catch(() => null) as Promise<any>,
       ]);
-      const currentPlace = currentState?.value?.trim();
-      if (currentPlace) {
-        const locationMatch = (await searchTravelPlaces(currentPlace, { maxResults: 1 })).places[0];
+      const currentPlace = freshCurrentLocation(currentState, now);
+      const liveDeviceLocation = freshDeviceLocation(saved, now);
+      // A direct conversational correction may intentionally supersede a GPS
+      // point, but a later live device update wins as Daniel moves around.
+      const useCurrentPlace = currentPlace && (!liveDeviceLocation || currentPlace.observedAt >= liveDeviceLocation.updatedAt)
+        ? currentPlace
+        : undefined;
+      if (useCurrentPlace) {
+        const locationMatch = (await searchTravelPlaces(useCurrentPlace.value, { maxResults: 1 })).places[0];
         if (locationMatch) {
           center = {
             lat: locationMatch.lat,
             lng: locationMatch.lng,
-            label: currentPlace,
+            label: useCurrentPlace.value,
             detail: locationMatch.address || locationMatch.name,
             source: "current_state",
+            capturedAt: useCurrentPlace.observedAt,
           };
         }
       }
-      const [lat, lng] = String(saved?.value ?? "").split(",").map(Number);
-      if (!center && Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
-        center = { lat, lng, label: "Saved current location", source: "saved_location" };
+      if (!center && liveDeviceLocation) {
+        center = {
+          lat: liveDeviceLocation.lat,
+          lng: liveDeviceLocation.lng,
+          label: liveDeviceLocation.label ?? "Live device location",
+          source: "saved_location",
+          capturedAt: liveDeviceLocation.updatedAt,
+        };
       }
       // Only an active, address-bearing confirmed stay may establish location.
       // This is a fallback after explicit profile/browser location, never a
@@ -3239,9 +3257,16 @@ async function placesNear(args: any): Promise<string> {
   const query = String(args.query ?? "").trim();
   if (!query) return "What am I looking for?";
   const loc: any = await convexQuery("ui:getLocation", {}).catch(() => null);
-  if (!loc?.value) return "I don't have your location yet, sir — tap the location toggle in the options panel (⚙) once and it stays on.";
-  const [lat, lng] = String(loc.value).split(",").map(Number);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "Your saved location is invalid. Update it in options and try again.";
+  const liveDeviceLocation = freshDeviceLocation(loc);
+  if (!liveDeviceLocation) {
+    const freshness = deviceLocationFreshness(loc);
+    if (freshness === "stale") {
+      return "Your live location is out of date. Refresh Location in options (⚙) or keep this Jarvis tab open, then try again.";
+    }
+    if (freshness === "invalid") return "Your saved location is invalid. Refresh it in options and try again.";
+    return "I don't have your location yet, sir — enable Location in the options panel (⚙), then try again.";
+  }
+  const { lat, lng } = liveDeviceLocation;
   try {
     const lookup = await searchTravelPlaces(query, {
       center: { lat, lng },
@@ -3254,7 +3279,7 @@ async function placesNear(args: any): Promise<string> {
       kind: "places",
       query,
       provider: lookup.provider,
-      center: { lat, lng, source: "saved_location" },
+      center: { lat, lng, source: "saved_location", capturedAt: liveDeviceLocation.updatedAt },
       items: places.slice(0, 10),
     }, `near you · ${query.slice(0, 24)}`);
     const nearest = places[0];

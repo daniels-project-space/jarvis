@@ -478,6 +478,9 @@ export const setLocation = mutation({
   args: { lat: v.number(), lng: v.number(), label: v.optional(v.string()), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    if (!Number.isFinite(a.lat) || !Number.isFinite(a.lng) || Math.abs(a.lat) > 90 || Math.abs(a.lng) > 180) {
+      throw new Error("Location coordinates are out of range");
+    }
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first();
     const doc = { key: "location", type: "location", value: `${a.lat},${a.lng}`, title: a.label, updatedAt: Date.now() };
     if (ex) await ctx.db.patch(ex._id, doc);

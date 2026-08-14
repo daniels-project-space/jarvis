@@ -38,11 +38,11 @@ function osmPlace(name: string, address: string, lat: number, lng: number) {
 describe("travel_map tool", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    const now = Date.now();
     mock.convexQuery.mockImplementation(async (path: string) =>
-      path === "currentState:getActive" ? { value: "Sevilla" } : "thread-1",
+      path === "currentState:getActive" ? { value: "Sevilla", observedAt: now } : "thread-1",
     );
     mock.convexMutation.mockResolvedValue(undefined);
-    const now = Date.now();
     mock.lookupBookings.mockResolvedValue([{
       id: "gmail-booking-1",
       kind: "stay",
@@ -264,10 +264,16 @@ describe("travel_map tool", () => {
   });
 
   it("keeps the exact niche follow-up on Sevilla without requiring the model to repeat the city", async () => {
+    const observedAt = Date.now() - 1_000;
+    mock.convexQuery.mockImplementation(async (path: string) =>
+      path === "currentState:getActive" ? { value: "Sevilla", observedAt } : "thread-1",
+    );
     const result = await executeTool("travel_map", {
       query: "attractions in the city",
       preferences: "I'm not looking for touristy stuff; give me something more niche",
+      include_bookings: false,
     });
+    console.log("LOCATION DEBUG", vi.mocked(fetch).mock.calls.map(([input]) => String(input)));
 
     expect(result).toContain("Interactive OpenStreetMap opened for Sevilla");
     expect(mock.convexQuery).toHaveBeenCalledWith("currentState:getActive", {
@@ -279,9 +285,47 @@ describe("travel_map tool", () => {
       kind: "places",
       activeTool: "travel_map",
       locationLabel: "Sevilla",
-      center: { label: "Sevilla", source: "current_state" },
+      center: { label: "Sevilla", source: "current_state", capturedAt: observedAt },
       preferences: "I'm not looking for touristy stuff; give me something more niche",
     });
+  });
+
+  it("uses a newer live device location instead of an older conversational city", async () => {
+    const now = Date.now();
+    mock.convexQuery.mockImplementation(async (path: string) => {
+      if (path === "currentState:getActive") return { value: "Sevilla", observedAt: now - 10 * 60_000 };
+      if (path === "ui:getLocation") return { value: "51.5074,-0.1278", updatedAt: now - 60_000 };
+      return "thread-1";
+    });
+
+    const result = await executeTool("travel_map", { query: "quiet bookshops", include_bookings: false });
+
+    expect(result).toContain("Interactive OpenStreetMap opened for Live device location");
+    expect(mock.lookupBookings).not.toHaveBeenCalled();
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel.center).toMatchObject({
+      lat: 51.5074,
+      lng: -0.1278,
+      label: "Live device location",
+      source: "saved_location",
+      capturedAt: now - 60_000,
+    });
+  });
+
+  it("fails closed for stale device coordinates in literal near-me searches", async () => {
+    mock.convexQuery.mockImplementation(async (path: string) =>
+      path === "ui:getLocation"
+        ? { value: "51.5074,-0.1278", updatedAt: Date.now() - 16 * 60_000 }
+        : "thread-1",
+    );
+
+    const result = await executeTool("places_near", { query: "pizza" });
+
+    expect(result).toContain("live location is out of date");
+    expect(mock.lookupBookings).not.toHaveBeenCalled();
+    expect(mock.convexMutation).not.toHaveBeenCalledWith("ui:setPanel", expect.anything());
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
   it("derives a map centre and scoped POI search only from a confirmed active Gmail stay", async () => {

@@ -39,4 +39,32 @@ describe("guest client-state boundary", () => {
     expect(response.status).toBe(403);
     expect(controlMutation).not.toHaveBeenCalled();
   });
+
+  it("accepts bounded owner live-location updates", async () => {
+    vi.mocked(controlActor).mockResolvedValue({ kind: "owner" } as any);
+    vi.mocked(controlMutation).mockResolvedValue(undefined as never);
+
+    const response = await POST(request({ action: "set_location", lat: 51.5074, lng: -0.1278, label: "London" }));
+
+    expect(response.status).toBe(200);
+    expect(controlMutation).toHaveBeenCalledWith("ui:setLocation", {
+      lat: 51.5074, lng: -0.1278, label: "London", authTokenHash: "owner-hash",
+    });
+  });
+
+  it.each([
+    { lat: 91, lng: 0 },
+    { lat: -91, lng: 0 },
+    { lat: 0, lng: 181 },
+    { lat: 0, lng: -181 },
+    { lat: "NaN", lng: 0 },
+    { lat: 0, lng: "Infinity" },
+  ])("rejects invalid location coordinates: %o", async ({ lat, lng }) => {
+    vi.mocked(controlActor).mockResolvedValue({ kind: "owner" } as any);
+
+    const response = await POST(request({ action: "set_location", lat, lng }));
+
+    expect(response.status).toBe(400);
+    expect(controlMutation).not.toHaveBeenCalled();
+  });
 });

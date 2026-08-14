@@ -5,7 +5,9 @@ export type CurrentStateFact = {
   validForMs: number;
 };
 
-const LOCATION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// A conversational "I'm in …" is useful current context, not durable location.
+// Browser GPS has an even shorter freshness window in live-location.ts.
+export const CURRENT_LOCATION_TTL_MS = 12 * 60 * 60 * 1000;
 const NON_PLACES = /^(?:a |an |the )?(?:bed|home|here|there|trouble|love|pain|a rush|no hurry|the kitchen|the office|the city|the car)$/i;
 
 /** Extract only high-confidence, first-person current state. This deliberately
@@ -29,7 +31,7 @@ export function extractCurrentStateFacts(input: string): CurrentStateFact[] {
     key: "profile.current_location",
     value,
     confidence: explicitCurrent || explicitLocation ? 0.99 : 0.94,
-    validForMs: LOCATION_TTL_MS,
+    validForMs: CURRENT_LOCATION_TTL_MS,
   }];
 }
 

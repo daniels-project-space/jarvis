@@ -55,7 +55,9 @@ export async function POST(req: NextRequest) {
   if (action === "set_location") {
     const lat = Number(body?.lat);
     const lng = Number(body?.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return Response.json({ ok: false }, { status: 400 });
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      return Response.json({ ok: false }, { status: 400 });
+    }
     await controlMutation("ui:setLocation", {
       lat,
       lng,

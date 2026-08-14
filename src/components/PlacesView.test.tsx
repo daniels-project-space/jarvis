@@ -111,7 +111,7 @@ describe("PlacesView travel presentation", () => {
       query: "historic places",
       provider: "openstreetmap",
       locationLabel: "Sevilla",
-      center: { lat: 37.3891, lng: -5.9845, label: "Saved current location", source: "saved_location" },
+      center: { lat: 37.3891, lng: -5.9845, label: "Live device location", source: "saved_location", capturedAt: Date.now() },
       items: [{
         name: "Real Alcázar de Sevilla",
         address: "Plaza del Triunfo, Sevilla",
@@ -136,6 +136,7 @@ describe("PlacesView travel presentation", () => {
     })} />);
 
     expect(html).toContain("Place data © OpenStreetMap contributors");
+    expect(html).toContain("live device location · expires automatically when stale");
     expect(html).toContain("Hours (OpenStreetMap): Oct-Mar: 09:30-17:00");
     expect(html).toContain("site (OSM) ↗");
     expect(html).toContain("Wikipedia ↗");

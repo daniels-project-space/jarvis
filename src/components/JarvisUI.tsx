@@ -61,6 +61,7 @@ import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostCont
 import { parseEmbeddedHostIntent, type JarvisHostAction } from "@/lib/host-actions";
 import { JARVIS_MAC_ENTRY_URL, macShortcutUrl } from "@/lib/mac-shortcut";
 import { viewerFetch, viewerFetchWithTimeout } from "@/lib/viewer-request";
+import { shouldPersistLiveLocation, type ReportedLiveLocation } from "@/lib/live-location";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
@@ -681,9 +682,9 @@ function OptionsPanel({
               <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.liveDefault ? "translate-x-4" : ""}`} />
             </button>
           </Row>
-          <Row label="Location" hint={locOn ? "on — 'near me' works everywhere" : "for 'pizza near me', local hours"}>
+          <Row label="Location" hint={locOn ? "live updates on this device · pause stops updates; the last point expires shortly" : "for 'pizza near me', local hours and moving-city maps"}>
             <button onClick={onLocation} className={`rounded-lg px-3 py-1 text-[11px] transition ${locOn ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
-              {locOn ? "on" : "enable"}
+              {locOn ? "pause" : "enable"}
             </button>
           </Row>
           <Row label="Reduce motion" hint="calmer orb + fewer animations">
@@ -2078,40 +2079,74 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     return () => document.documentElement.classList.remove("jarvis-reduce-motion");
   }, [prefs.reduceMotion]);
 
-  // Location: granted once, then permanent (browser remembers the permission,
-  // and we refresh the stored coords on load so "near me" works in both lanes).
-  const setLocationMut = (args: { lat: number; lng: number; label?: string }) =>
+  // Location is opt-in and only retains the current point. The browser watch
+  // sends a bounded live heartbeat rather than a movement history.
+  const setLocationMut = useCallback((args: { lat: number; lng: number; label?: string }) =>
     viewerFetch("/api/client-state", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "set_location", ...args }),
-    });
+    }), []);
   const [locOn, setLocOn] = useState(false);
-  const captureLocation = (announce = false): Promise<boolean> =>
+  const lastReportedLocation = useRef<ReportedLiveLocation | null>(null);
+  const reportLiveLocation = useCallback((position: GeolocationPosition) => {
+    const next = {
+      lat: position.coords.latitude,
+      lng: position.coords.longitude,
+      capturedAt: Date.now(),
+    };
+    if (!shouldPersistLiveLocation(lastReportedLocation.current, next)) return false;
+    const report = { lat: next.lat, lng: next.lng, sentAt: next.capturedAt };
+    lastReportedLocation.current = report;
+    void setLocationMut({ lat: report.lat, lng: report.lng }).catch(() => {
+      if (lastReportedLocation.current?.sentAt === report.sentAt) lastReportedLocation.current = null;
+    });
+    return true;
+  }, [setLocationMut]);
+  const captureLocation = useCallback((announce = false): Promise<boolean> =>
     new Promise((resolve) => {
-      if (!navigator.geolocation) {
+      if (typeof navigator === "undefined" || !navigator.geolocation) {
         if (announce) alert("This device can't share location.");
         return resolve(false);
       }
       navigator.geolocation.getCurrentPosition(
         (pos) => {
-          void setLocationMut({ lat: pos.coords.latitude, lng: pos.coords.longitude });
           localStorage.setItem("jarvis_location", "1");
           setLocOn(true);
+          reportLiveLocation(pos);
           resolve(true);
         },
         () => {
           if (announce) alert("Location blocked — allow it in your browser's site settings, then toggle again.");
           resolve(false);
         },
-        { enableHighAccuracy: false, timeout: 8000, maximumAge: 5 * 60_000 },
+        { enableHighAccuracy: true, timeout: 12_000, maximumAge: 60_000 },
       );
-    });
+    }), [reportLiveLocation]);
   useEffect(() => {
-    // silently refresh coords on load if he's already granted it once
-    if (localStorage.getItem("jarvis_location") === "1") void captureLocation(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (localStorage.getItem("jarvis_location") === "1") setLocOn(true);
   }, []);
+  useEffect(() => {
+    if (!locOn || typeof navigator === "undefined" || !navigator.geolocation) return;
+    const watchId = navigator.geolocation.watchPosition(
+      reportLiveLocation,
+      () => {
+        // Keep the explicit opt-in. Browser permission errors remain visible in
+        // browser controls and should not erase a recently valid point.
+      },
+      { enableHighAccuracy: true, timeout: 12_000, maximumAge: 60_000 },
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [locOn, reportLiveLocation]);
+  const toggleLocation = useCallback(() => {
+    if (locOn) {
+      localStorage.removeItem("jarvis_location");
+      lastReportedLocation.current = null;
+      setLocOn(false);
+      return;
+    }
+    void captureLocation(true);
+  }, [captureLocation, locOn]);
 
   // Chat history drawer + intelligent video handling (16:9 stage / PiP corner)
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -5198,7 +5233,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           onEnableMicrophone={() => void enableMicrophone()}
           live={live}
           locOn={locOn}
-          onLocation={() => void captureLocation(true)}
+          onLocation={toggleLocation}
           onClose={() => setOptionsOpen(false)}
           onToggleLive={() => void toggleLive()}
           onMood={(m) => void setMoodMut({ mood: m, manual: true })}

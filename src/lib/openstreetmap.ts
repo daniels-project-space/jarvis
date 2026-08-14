@@ -380,11 +380,15 @@ export async function searchOpenStreetMapPlaces(
   }).filter((place: OpenStreetMapPlace) => Number.isFinite(place.lat) && Number.isFinite(place.lng) && Boolean(place.name))
     .sort((left: OpenStreetMapPlace, right: OpenStreetMapPlace) => (left.dist ?? Infinity) - (right.dist ?? Infinity));
 
-  if (placeCache.size >= MAX_CACHE_ENTRIES) {
-    const oldest = placeCache.keys().next().value;
-    if (oldest) placeCache.delete(oldest);
+  // Empty Nominatim responses can be transient (or a newly mapped place), so
+  // never make a zero-result lookup sticky for five minutes.
+  if (places.length) {
+    if (placeCache.size >= MAX_CACHE_ENTRIES) {
+      const oldest = placeCache.keys().next().value;
+      if (oldest) placeCache.delete(oldest);
+    }
+    placeCache.set(cacheKey, { expiresAt: Date.now() + CACHE_TTL_MS, places });
   }
-  placeCache.set(cacheKey, { expiresAt: Date.now() + CACHE_TTL_MS, places });
   return places;
 }
 

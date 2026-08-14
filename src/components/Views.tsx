@@ -751,7 +751,14 @@ type PlacesWidget = {
   preferences?: string;
   locationLabel?: string;
   provider?: "openstreetmap";
-  center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "current_state" | "gmail_current_stay" | "openstreetmap" };
+  center: {
+    lat: number;
+    lng: number;
+    label?: string;
+    detail?: string;
+    source?: "saved_location" | "current_state" | "gmail_current_stay" | "openstreetmap";
+    capturedAt?: number;
+  };
   base?: {
     lat?: number; lng?: number; label: string; address?: string; source?: string;
     stayStatus?: "active" | "upcoming"; start?: number; end?: number; timeZone?: string; checkedAt?: number;
@@ -923,6 +930,8 @@ export function PlacesView({ value }: { value: string }) {
           <div className="text-[10px] uppercase tracking-[.14em] text-cyan/75">map centre</div>
           <div className="truncate text-xs font-medium text-ice">{center.label ?? w.locationLabel ?? "Selected area"}</div>
           {center.detail && <div className="truncate text-[10px] text-slate">{center.detail}</div>}
+          {center.source === "saved_location" && <div className="mt-0.5 text-[9px] text-emerald-300/80">live device location · expires automatically when stale</div>}
+          {center.source === "current_state" && <div className="mt-0.5 text-[9px] text-cyan/70">recent conversation location · superseded by newer live movement</div>}
         </div>
       </div>
       <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3 @min-[760px]:w-[min(380px,38%)] @min-[760px]:flex-none">
