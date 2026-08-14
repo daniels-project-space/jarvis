@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  createStandbyListenerClientId,
   createStandbyListenerLeaseFence,
+  nextStandbyListenerLease,
   renewStandbyListenerLease,
   STANDBY_LISTENER_LOCAL_LEASE_MS,
   STANDBY_LISTENER_RENEWAL_DEADLINE_MS,
@@ -18,8 +20,31 @@ function deferred<T>() {
 
 describe("standby listener lease fence", () => {
   it("keeps the browser fence safely inside the server lease", () => {
-    expect(STANDBY_LISTENER_LOCAL_LEASE_MS).toBeLessThan(STANDBY_LISTENER_SERVER_LEASE_MS);
+    expect(
+      STANDBY_LISTENER_LOCAL_LEASE_MS + STANDBY_LISTENER_RENEWAL_DEADLINE_MS,
+    ).toBeLessThanOrEqual(STANDBY_LISTENER_SERVER_LEASE_MS - 5_000);
     expect(STANDBY_LISTENER_RENEWAL_DEADLINE_MS).toBeLessThan(STANDBY_LISTENER_RENEWAL_INTERVAL_MS);
+  });
+
+  it("creates a per-document cryptographic identity and fails closed without entropy", () => {
+    const first = createStandbyListenerClientId({
+      randomUUID: () => "first-document",
+    });
+    const second = createStandbyListenerClientId({
+      randomUUID: () => "second-document",
+    });
+    expect(first).toBe("standby:first-document");
+    expect(second).toBe("standby:second-document");
+    expect(first).not.toBe(second);
+    expect(createStandbyListenerClientId(undefined)).toMatch(/^standby:/);
+    expect(createStandbyListenerClientId({})).toBeNull();
+  });
+
+  it("monotonically fences each lease minted by a document", () => {
+    const first = nextStandbyListenerLease("standby:document", 0);
+    const second = nextStandbyListenerLease("standby:document", first.sequence);
+    expect(first).toEqual({ id: "standby:document:1", sequence: 1 });
+    expect(second).toEqual({ id: "standby:document:2", sequence: 2 });
   });
 
   it("expires exactly once unless a completed renewal extends it", () => {

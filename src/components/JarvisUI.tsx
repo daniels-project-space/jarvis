@@ -89,8 +89,12 @@ import {
 } from "@/lib/final-delivery";
 import { withClientDeadline } from "@/lib/client-deadline";
 import {
+  createStandbyListenerClientId,
   createStandbyListenerLeaseFence,
+  nextStandbyListenerLease,
   renewStandbyListenerLease,
+  type StandbyListenerLease,
+  STANDBY_LISTENER_RENEWAL_DEADLINE_MS,
   STANDBY_LISTENER_RENEWAL_INTERVAL_MS,
 } from "@/lib/standby-listener-lease";
 import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
@@ -1646,7 +1650,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const voiceRow = useJarvisQuery(api.ui.getVoice, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
   const liveOnRow = useJarvisQuery(api.ui.getLiveOn, guest ? "skip" : {}) as { value: string; updatedAt: number } | null | undefined;
   const standbyListenerRow = useJarvisQuery(api.ui.getStandbyListener, guest ? "skip" : {}) as
-    | { value: string; updatedAt: number }
+    | {
+      value: string;
+      updatedAt: number;
+      standbyLeaseId?: string;
+      standbyLeaseSequence?: number;
+    }
     | null
     | undefined;
   const hostActionRow = useJarvisQuery(api.ui.getHostAction, embedded && !guest ? {} : "skip") as
@@ -1950,6 +1959,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const lastVoiceInput = useRef<{ text: string; at: number } | null>(null);
   const liveRef = useRef(false);
   const me = useRef("");
+  const [standbyClient] = useState(() => createStandbyListenerClientId());
+  const standbyLeaseRef = useRef<StandbyListenerLease | null>(null);
+  const standbyLeaseSequenceRef = useRef(0);
   const standbyLeaseOwnedRef = useRef(false);
   const standbyClaimingRef = useRef(false);
   const standbyEpochRef = useRef(0);
@@ -2299,30 +2311,52 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     setWake(false);
   };
+  const isCurrentStandbyLease = (lease: StandbyListenerLease) => {
+    const current = standbyLeaseRef.current;
+    return current?.id === lease.id && current.sequence === lease.sequence;
+  };
+  const revokeStandbyLease = (lease: StandbyListenerLease | null) => {
+    if (guest || !standbyClient || !lease) return;
+    void setStandbyListener({
+      client: standbyClient,
+      on: false,
+      standbyLeaseId: lease.id,
+      standbyLeaseSequence: lease.sequence,
+    }).catch(() => {});
+  };
   const releaseStandbyListener = () => {
     standbyEpochRef.current += 1;
     clearStandbyHeartbeat();
     standbyLeaseFence.clear();
-    const owned = standbyLeaseOwnedRef.current;
+    const lease = standbyLeaseRef.current;
+    standbyLeaseRef.current = null;
     standbyLeaseOwnedRef.current = false;
     stopStandbyRecognition();
-    if (!guest && owned && me.current) {
-      void setStandbyListener({ client: me.current, on: false }).catch(() => {});
-    }
+    // Revoke a pending claim as well as an acknowledged one. withClientDeadline
+    // cannot cancel an in-flight Convex mutation, so this is the compensation
+    // path that leaves a matching server tombstone when it arrives late.
+    revokeStandbyLease(lease);
   };
   const maintainStandbyHeartbeat = () => {
-    if (guest || standbyHeartbeatRef.current) return;
+    if (guest || !standbyClient || standbyHeartbeatRef.current) return;
     standbyHeartbeatRef.current = setInterval(() => {
-      if (!standbyLeaseOwnedRef.current || document.hidden || !standbyIsEligible()) {
+      const lease = standbyLeaseRef.current;
+      if (!standbyLeaseOwnedRef.current || !lease || document.hidden || !standbyIsEligible()) {
         releaseStandbyListener();
         return;
       }
       const renewalEpoch = standbyEpochRef.current;
       void renewStandbyListenerLease({
-        renewRemote: () => setStandbyListener({ client: me.current, on: true }),
+        renewRemote: () => setStandbyListener({
+          client: standbyClient,
+          on: true,
+          standbyLeaseId: lease.id,
+          standbyLeaseSequence: lease.sequence,
+        }),
         stillOwnsLease: () => (
           renewalEpoch === standbyEpochRef.current
           && standbyLeaseOwnedRef.current
+          && isCurrentStandbyLease(lease)
         ),
         onRenewed: () => {
           if (document.hidden || !standbyIsEligible()) {
@@ -2376,7 +2410,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // the authenticated Jarvis iframe owns the fenced logical listener lease.
     // That single lease keeps main Jarvis and every installed overlay from
     // hearing the same wake phrase at the same time.
-    if (guest || !standbyIsEligible() || document.hidden) {
+    if (guest || !standbyClient || !standbyIsEligible() || document.hidden) {
       releaseStandbyListener();
       return;
     }
@@ -2386,28 +2420,47 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     standbyClaimingRef.current = true;
     void (async () => {
       let claimed = standbyLeaseOwnedRef.current;
-      if (!claimed) {
-        try {
-          claimed = await withClientDeadline(
-            setStandbyListener({ client: me.current || (me.current = clientId()), on: true }),
-            4_000,
-            "standby listener ownership",
-          );
-        } catch {
+      let lease = standbyLeaseRef.current;
+      try {
+        if (claimed && !lease) {
+          // A logical owner without a generation is unsafe to renew.
           claimed = false;
         }
+        if (!claimed) {
+          lease = nextStandbyListenerLease(standbyClient, standbyLeaseSequenceRef.current);
+          standbyLeaseSequenceRef.current = lease.sequence;
+          standbyLeaseRef.current = lease;
+          claimed = await withClientDeadline(
+            setStandbyListener({
+              client: standbyClient,
+              on: true,
+              standbyLeaseId: lease.id,
+              standbyLeaseSequence: lease.sequence,
+            }),
+            STANDBY_LISTENER_RENEWAL_DEADLINE_MS,
+            "standby listener ownership",
+          );
+        }
+      } catch {
+        claimed = false;
+      } finally {
+        standbyClaimingRef.current = false;
       }
-      standbyClaimingRef.current = false;
+      const leaseIsCurrent = !!lease && isCurrentStandbyLease(lease);
       if (
         claimed !== true
+        || !lease
+        || !leaseIsCurrent
         || epoch !== standbyEpochRef.current
         || document.hidden
         || !standbyIsEligible()
       ) {
-        if (claimed === true && epoch !== standbyEpochRef.current && !guest && me.current) {
-          void setStandbyListener({ client: me.current, on: false }).catch(() => {});
+        // Never stop the global recognizer from a stale async branch. If a
+        // newer local lease owns it, only revoke this branch's remote token.
+        if (lease) {
+          if (leaseIsCurrent) releaseStandbyListener();
+          else revokeStandbyLease(lease);
         }
-        stopStandbyRecognition();
         return;
       }
       standbyLeaseOwnedRef.current = true;
@@ -2419,10 +2472,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         if (
           epoch !== standbyEpochRef.current
           || !standbyLeaseOwnedRef.current
+          || !isCurrentStandbyLease(lease)
           || document.hidden
           || !standbyIsEligible()
         ) {
-          m.stopWake();
+          if (isCurrentStandbyLease(lease)) releaseStandbyListener();
           return;
         }
         if (!m.wakeSupported()) {
@@ -2474,13 +2528,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       standbyEpochRef.current += 1;
       clearStandbyHeartbeat();
       standbyLeaseFence.clear();
-      const standbyOwned = standbyLeaseOwnedRef.current;
+      const standbyLease = standbyLeaseRef.current;
+      standbyLeaseRef.current = null;
       standbyLeaseOwnedRef.current = false;
       stopStandbyRecognition();
-      if (!guest && standbyOwned && me.current) {
+      if (!guest && standbyClient && standbyLease) {
         const standbyBody = JSON.stringify({
           path: "ui:setStandbyListener",
-          args: { client: me.current, on: false },
+          args: {
+            client: standbyClient,
+            on: false,
+            standbyLeaseId: standbyLease.id,
+            standbyLeaseSequence: standbyLease.sequence,
+          },
         });
         void viewerFetch("/api/client-mutation", {
           method: "POST",
@@ -2636,7 +2696,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (
       standbyLeaseOwnedRef.current
       && standbyListenerRow
-      && standbyListenerRow.value !== me.current
+      && (
+        standbyListenerRow.value !== standbyClient
+        || standbyListenerRow.standbyLeaseId !== standbyLeaseRef.current?.id
+        || standbyListenerRow.standbyLeaseSequence !== standbyLeaseRef.current?.sequence
+      )
     ) releaseStandbyListener();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [standbyListenerRow]);

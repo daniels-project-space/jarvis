@@ -1,19 +1,22 @@
 import { tryAcquireBrowserVoiceLease, type BrowserVoiceLease } from "../../src/lib/browser-voice-lease";
+import { createStandbyListenerClientId } from "../../src/lib/standby-listener-lease";
 
 const frame = new URL(window.location.href).searchParams.get("frame") ?? "unknown";
+const standbyListenerClient = createStandbyListenerClientId();
 let lease: BrowserVoiceLease | null = null;
 let stream: MediaStream | null = null;
 
 document.body.innerHTML = `
   <main aria-label="${frame} voice fixture">
     <h1>${frame} Jarvis</h1>
+    <output aria-label="Standby listener client">${standbyListenerClient ?? "unavailable"}</output>
     <output aria-label="Live microphone status">idle</output>
     <button type="button" aria-label="Start live listening">Start live listening</button>
     <button type="button" aria-label="Stop live listening" disabled>Stop live listening</button>
   </main>
 `;
 
-const statusElement = document.querySelector<HTMLOutputElement>("output");
+const statusElement = document.querySelector<HTMLOutputElement>("output[aria-label='Live microphone status']");
 const startButtonElement = document.querySelector<HTMLButtonElement>("button[aria-label='Start live listening']");
 const stopButtonElement = document.querySelector<HTMLButtonElement>("button[aria-label='Stop live listening']");
 if (!statusElement || !startButtonElement || !stopButtonElement) throw new Error("voice fixture controls are missing");

@@ -12,6 +12,28 @@ function isSafeFixtureRequest(method: string, url: string) {
 }
 
 test.describe("Browser live microphone lease fixture", () => {
+  test("gives copied-session Jarvis documents distinct standby listener identities", async ({ page }) => {
+    await page.addInitScript(() => {
+      sessionStorage.setItem("jarvis_client", "copied");
+    });
+    await page.goto("/voice", { waitUntil: "networkidle" });
+
+    const main = page.frameLocator("iframe[title='Main Jarvis']");
+    const overlay = page.frameLocator("iframe[title='Overlay Jarvis']");
+    const [mainClient, overlayClient] = await Promise.all([
+      main.getByLabel("Standby listener client").textContent(),
+      overlay.getByLabel("Standby listener client").textContent(),
+    ]);
+
+    expect(mainClient).toBeTruthy();
+    expect(overlayClient).toBeTruthy();
+    expect(mainClient).not.toBe("copied");
+    expect(overlayClient).not.toBe("copied");
+    expect(mainClient).not.toBe("unavailable");
+    expect(overlayClient).not.toBe("unavailable");
+    expect(mainClient).not.toBe(overlayClient);
+  });
+
   test("allows one same-origin Jarvis document to capture, then hands off after stop", async ({ page }) => {
     const unsafeRequests: string[] = [];
     await page.addInitScript(() => {

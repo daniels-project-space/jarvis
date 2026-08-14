@@ -2094,8 +2094,23 @@ export default defineSchema({
     // superseded browser start. Other UI rows intentionally leave them empty.
     liveLeaseId: v.optional(v.string()),
     liveLeaseSequence: v.optional(v.number()),
+    // Standby wake recognition has an independent lease. Its generation token
+    // turns a local timeout/release into a durable tombstone, so a delayed
+    // network mutation cannot restart a recognizer after it has stopped.
+    standbyLeaseId: v.optional(v.string()),
+    standbyLeaseSequence: v.optional(v.number()),
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
+
+  // Immutable revocations for individual standby wake leases. This remains
+  // separate from the singleton active-lease row because an older network
+  // request must stay blocked after later tabs claim and release that row.
+  standbyListenerRevocations: defineTable({
+    leaseId: v.string(),
+    client: v.string(),
+    sequence: v.number(),
+    releasedAt: v.number(),
+  }).index("by_leaseId", ["leaseId"]),
 
   // Web-push subscriptions (per device) — JARVIS pings the phone even when closed.
   pushSubs: defineTable({

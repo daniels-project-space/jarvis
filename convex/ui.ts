@@ -424,29 +424,87 @@ export const getLiveOn = query({
 // commands before the live-mode lock has a chance to engage.
 const STANDBY_LISTENER_KEY = "standbyListener";
 const STANDBY_LISTENER_LEASE_MS = 25_000;
+const STANDBY_LISTENER_RELEASED_TYPE = "voice-standby-released";
 
 export const setStandbyListener = mutation({
-  args: { client: v.string(), on: v.boolean(), ...actorAuthArgs },
+  args: {
+    client: v.string(),
+    on: v.boolean(),
+    standbyLeaseId: v.optional(v.string()),
+    standbyLeaseSequence: v.optional(v.number()),
+    ...actorAuthArgs,
+  },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const standbyLeaseId = a.standbyLeaseId;
+    const standbyLeaseSequence = a.standbyLeaseSequence;
+    if (
+      !standbyLeaseId
+      || typeof standbyLeaseSequence !== "number"
+      || !Number.isSafeInteger(standbyLeaseSequence)
+      || standbyLeaseSequence <= 0
+    ) return false;
     const ex = await ctx.db.query("ui")
       .withIndex("by_key", (q: any) => q.eq("key", STANDBY_LISTENER_KEY))
       .first();
+    const revoked = await ctx.db.query("standbyListenerRevocations")
+      .withIndex("by_leaseId", (q) => q.eq("leaseId", standbyLeaseId))
+      .first();
+    const sameLease = !!ex
+      && ex.value === a.client
+      && ex.standbyLeaseId === standbyLeaseId
+      && ex.standbyLeaseSequence === standbyLeaseSequence;
+    const now = Date.now();
     if (!a.on) {
-      // Never let one tab release another tab's fenced listener lease.
-      if (ex && ex.value === a.client) await ctx.db.delete(ex._id);
+      // A client-side timeout cannot cancel its already-issued mutation. Keep
+      // an immutable per-lease revocation, in addition to the singleton row,
+      // so a delayed claim stays blocked even after other tabs have claimed
+      // and released the active listener row.
+      if (!revoked) await ctx.db.insert("standbyListenerRevocations", {
+        leaseId: standbyLeaseId,
+        client: a.client,
+        sequence: standbyLeaseSequence,
+        releasedAt: now,
+      });
+      if (!ex || sameLease) {
+        const tombstone = {
+          key: STANDBY_LISTENER_KEY,
+          type: STANDBY_LISTENER_RELEASED_TYPE,
+          value: a.client,
+          standbyLeaseId,
+          standbyLeaseSequence,
+          updatedAt: now,
+        };
+        if (ex) await ctx.db.patch(ex._id, tombstone);
+        else await ctx.db.insert("ui", tombstone);
+      }
       return true;
     }
-    // A caller can renew only its own lease while it is fresh. Another active
-    // listener wins until it hides, unloads, or stops heartbeating.
-    if (ex && ex.value !== a.client && Date.now() - ex.updatedAt < STANDBY_LISTENER_LEASE_MS) {
-      return false;
+    if (revoked) return false;
+    const activeLease = ex?.type === "voice-standby"
+      && now - ex.updatedAt < STANDBY_LISTENER_LEASE_MS;
+    // A caller may renew only the exact lease token that is currently active.
+    // This keeps duplicate tabs from sharing a copied session identity.
+    if (activeLease) {
+      if (!sameLease) return false;
+      await ctx.db.patch(ex!._id, { updatedAt: now });
+      return true;
     }
+    // Preserve the newest released/expired generation for this document. It
+    // fences reordered "on" mutations from an earlier local lease.
+    if (
+      ex
+      && ex.value === a.client
+      && Number.isSafeInteger(ex.standbyLeaseSequence)
+      && ex.standbyLeaseSequence! >= standbyLeaseSequence
+    ) return false;
     const doc = {
       key: STANDBY_LISTENER_KEY,
       type: "voice-standby",
       value: a.client,
-      updatedAt: Date.now(),
+      standbyLeaseId,
+      standbyLeaseSequence,
+      updatedAt: now,
     };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
@@ -461,7 +519,11 @@ export const getStandbyListener = query({
     const row = await ctx.db.query("ui")
       .withIndex("by_key", (q: any) => q.eq("key", STANDBY_LISTENER_KEY))
       .first();
-    if (!row || Date.now() - row.updatedAt >= STANDBY_LISTENER_LEASE_MS) return null;
+    if (
+      !row
+      || row.type !== "voice-standby"
+      || Date.now() - row.updatedAt >= STANDBY_LISTENER_LEASE_MS
+    ) return null;
     return row;
   },
 });
