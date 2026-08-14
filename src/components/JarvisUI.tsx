@@ -336,17 +336,22 @@ export function safeEmbeddedMessageText(args: {
   return summary;
 }
 
-function MessageFileBadges({ files, align = "left" }: { files?: ChatFileManifest[]; align?: "left" | "right" }) {
+export function MessageFileBadges({ files, align = "left" }: { files?: ChatFileManifest[]; align?: "left" | "right" }) {
   if (!files?.length) return null;
   return (
     <div className={`mt-1 flex flex-wrap gap-1 ${align === "right" ? "justify-end" : "justify-start"}`} aria-label="Files used by this message">
       {files.map((file) => {
         const ready = file.status === "ready" || file.status === "stored_only";
-        const label = <><span aria-hidden="true">{file.mimeType.startsWith("image/") ? "▧" : "▤"}</span> <span className="max-w-40 truncate">{file.name}</span>{!ready && <span className="text-amber-300"> · {file.status}</span>}</>;
+        const storedOnly = file.status === "stored_only";
+        const status = storedOnly ? "saved only" : !ready ? file.status : "";
+        const title = storedOnly
+          ? `${file.relativePath || file.name} — saved only; Jarvis could not inspect this file's contents.`
+          : file.relativePath || file.name;
+        const label = <><span aria-hidden="true">{file.mimeType.startsWith("image/") ? "▧" : "▤"}</span> <span className="max-w-40 truncate">{file.name}</span>{status && <span className={storedOnly ? "text-slate-400" : "text-amber-300"}> · {status}</span>}</>;
         return ready ? (
-          <a key={file.fileId} href={`/api/files/${encodeURIComponent(file.fileId)}`} target="_blank" rel="noreferrer" className="inline-flex max-w-52 items-center gap-1 rounded-full border border-cyan/20 bg-cyan/[0.05] px-2 py-1 text-[10px] text-cyan/80 hover:border-cyan/45 hover:text-cyan" title={file.relativePath || file.name}>{label}</a>
+          <a key={file.fileId} href={`/api/files/${encodeURIComponent(file.fileId)}`} target="_blank" rel="noreferrer" className="inline-flex max-w-52 items-center gap-1 rounded-full border border-cyan/20 bg-cyan/[0.05] px-2 py-1 text-[10px] text-cyan/80 hover:border-cyan/45 hover:text-cyan" title={title}>{label}</a>
         ) : (
-          <span key={file.fileId} className="inline-flex max-w-52 items-center gap-1 rounded-full border border-white/10 bg-white/[0.025] px-2 py-1 text-[10px] text-slate-400" title={file.relativePath || file.name}>{label}</span>
+          <span key={file.fileId} className="inline-flex max-w-52 items-center gap-1 rounded-full border border-white/10 bg-white/[0.025] px-2 py-1 text-[10px] text-slate-400" title={title}>{label}</span>
         );
       })}
     </div>

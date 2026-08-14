@@ -15,7 +15,7 @@ vi.mock("@/lib/secure-convex", () => ({
     args === "skip" || !tripViewFixture.doc ? undefined : { data: JSON.stringify(tripViewFixture.doc) },
 }));
 
-import TripView, { isFreshTripBookedStayReference, TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
+import TripView, { bookedStayMapMarker, isFreshTripBookedStayReference, TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
 
 describe("TripTimeline", () => {
   it("keeps a time-valid Gmail stay visibly distinct from a hotel candidate", () => {
@@ -72,6 +72,30 @@ describe("TripTimeline", () => {
     expect(isFreshTripBookedStayReference(booking, "Amsterdam", now)).toBe(true);
     expect(isFreshTripBookedStayReference(booking, "Rotterdam", now)).toBe(false);
     expect(isFreshTripBookedStayReference({ ...booking, verifiedAt: now - 24 * 60 * 60_000 - 1 }, "Amsterdam", now)).toBe(false);
+  });
+
+  it("pins a canonical city booking even when the legacy booking projection is absent", () => {
+    const now = Date.UTC(2026, 8, 12, 12, 0);
+    const context = { id: "amsterdam", city: "Amsterdam" };
+    const booking = {
+      bookingName: "Canal House",
+      location: "42 Water Street, Amsterdam, Netherlands",
+      start: now - 3_600_000,
+      end: now + 86_400_000,
+      lat: 52.369,
+      lng: 4.9,
+      verifiedAt: now - 60_000,
+    };
+
+    expect(bookedStayMapMarker(booking, context, now)).toMatchObject({
+      key: `booking:amsterdam:${booking.start}`,
+      name: "Booked location · Amsterdam",
+      kind: "stay",
+      lat: 52.369,
+      lng: 4.9,
+      locked: true,
+    });
+    expect(bookedStayMapMarker({ ...booking, cityContextId: "berlin" }, context, now)).toBeNull();
   });
 
   it("renders persisted stop and transfer timing without drawing a made-up connection", () => {

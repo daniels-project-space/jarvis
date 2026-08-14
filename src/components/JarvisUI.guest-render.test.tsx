@@ -51,7 +51,7 @@ vi.mock("next/dynamic", () => ({
 }));
 
 import Home from "../app/page";
-import JarvisUI, { safeEmbeddedMessageText } from "./JarvisUI";
+import JarvisUI, { MessageFileBadges, safeEmbeddedMessageText } from "./JarvisUI";
 
 describe("guest Home application render", () => {
   it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {
@@ -100,5 +100,23 @@ describe("guest Home application render", () => {
       status: "done",
       text: "I saved the useful result.\nstderr: noisy implementation detail",
     })).toBe("I saved the useful result.");
+  });
+
+  it("does not present stored-only media as ready for Jarvis to inspect in the real message badge", () => {
+    const markup = renderToStaticMarkup(
+      <MessageFileBadges files={[{
+        fileId: "private-video",
+        name: "walkthrough.mp4",
+        relativePath: "travel/walkthrough.mp4",
+        mimeType: "video/mp4",
+        sizeBytes: 2_048,
+        status: "stored_only",
+      }]} />,
+    );
+
+    expect(markup).toContain("walkthrough.mp4");
+    expect(markup).toContain("saved only");
+    expect(markup).toContain("Jarvis could not inspect this file&#x27;s contents.");
+    expect(markup).toContain('href="/api/files/private-video"');
   });
 });

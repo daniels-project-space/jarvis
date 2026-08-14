@@ -3239,6 +3239,28 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         await sendPush("JARVIS", spoken.slice(0, 140), "/");
       } catch (e: any) {
         const message = redactSensitiveText(String(e?.message ?? e), env);
+        // The session controller intentionally emits this exact, secret-free
+        // operator signal when its ChatGPT session cannot be used safely
+        // (notably after an uncertain refresh-token rotation). Retrying that
+        // same job only rents more Trigger runs while the required repair is
+        // external. Convert it into the existing fenced input/attention hold
+        // instead; the exact dispatch closes and no automatic retry is queued.
+        if (/^JARVIS_CODEX_SESSION_UNAVAILABLE\[[a-z_]+\]:/.test(message)) {
+          const heldForSessionRepair = await convexMutation("jobs:requestInput", {
+            jobId: job.jobId,
+            expectedAttempt,
+            authorityDigest,
+            workerRunId: String(job.workerRunId),
+            question: `Jarvis needs the controller-managed Codex session repaired before this background task can continue. ${message.slice(0, 900)}`,
+            checkpoint: `Background work paused before Codex could start. ${message.slice(0, 1_200)}`,
+          }).catch(() => false);
+          if (job.incidentId)
+            await convexMutation("incidents:setStatus", { id: job.incidentId, status: "open" }).catch(() => {});
+          // `requestInput` is an intentional terminal hold for this worker.
+          // Do not synthesize a mission or post an exhausted-worker message.
+          // A fenced manual recovery must create the next eligible attempt.
+          if (heldForSessionRepair) return;
+        }
         const recovered = await checkpointMutation({
           jobId: job.jobId,
           expectedAttempt,

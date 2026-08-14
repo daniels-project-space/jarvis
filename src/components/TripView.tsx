@@ -64,7 +64,8 @@ type TripDoc = {
   activeCityContextId?: string;
   [key: string]: any;
 };
-type Marker = { key: string; lat: number; lng: number; kind: "stay" | "activity" | "airport"; name: string; locked?: boolean; discoveryId?: string };
+export type TripMapMarker = { key: string; lat: number; lng: number; kind: "stay" | "activity" | "airport"; name: string; locked?: boolean; discoveryId?: string };
+type Marker = TripMapMarker;
 
 const KIND_COLOR: Record<string, string> = { stay: "#00ff88", activity: "#5cc8ff", airport: "#ffb454" };
 const GLASS = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
@@ -156,6 +157,7 @@ const distanceText = (meters: unknown) => {
 };
 
 export type TripBookedStayReferenceValue = {
+  cityContextId?: string;
   city?: string;
   title?: string;
   bookingName?: string;
@@ -163,6 +165,8 @@ export type TripBookedStayReferenceValue = {
   start?: number;
   end?: number;
   timeZone?: string;
+  lat?: number;
+  lng?: number;
   distanceKm?: number;
   verifiedAt?: number;
 };
@@ -186,6 +190,34 @@ export function isFreshTripBookedStayReference(
     && Number.isFinite(verifiedAt)
     && verifiedAt <= now
     && now - verifiedAt <= BOOKING_REFERENCE_MAX_AGE_MS;
+}
+
+/**
+ * A fresh Gmail reference belongs to the selected city context, not merely to
+ * the legacy top-level booking projection. This keeps its pin present when a
+ * saved plan only carries the canonical city-context reference.
+ */
+export function bookedStayMapMarker(
+  booking: TripBookedStayReferenceValue,
+  activeCityContext: Pick<CityContext, "id" | "city"> | null,
+  now = Date.now(),
+): TripMapMarker | null {
+  if (!activeCityContext) return null;
+  if (booking.cityContextId && booking.cityContextId !== activeCityContext.id) return null;
+  const city = cityName(booking.city) || activeCityContext.city;
+  const scopedBooking = { ...booking, city, cityContextId: booking.cityContextId ?? activeCityContext.id };
+  if (!isFreshTripBookedStayReference(scopedBooking, activeCityContext.city, now)) return null;
+  const lat = Number(scopedBooking.lat);
+  const lng = Number(scopedBooking.lng);
+  if (!validLatLng(lat, lng)) return null;
+  return {
+    key: `booking:${scopedBooking.cityContextId}:${scopedBooking.start}`,
+    lat,
+    lng,
+    kind: "stay",
+    name: `Booked location · ${city}`,
+    locked: true,
+  };
 }
 
 const bookingDateText = (value: number | undefined, timeZone?: string) => {
@@ -976,10 +1008,12 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
     };
     for (const s of doc.stays ?? [])
       if (belongsToCityContext(s, activeCityContext, cityContexts) && validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.id ?? `${s.name}:${s.city ?? activeCityContext?.city ?? doc.destination}`}`, lat: s.lat, lng: s.lng, kind: "stay", name: `${s.name}${s.city ? ` · ${s.city}` : ""}`, locked: doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name });
-    for (const booking of doc.bookingReferences ?? []) {
-      const bookingForCity = activeCityContext ? { ...booking, city: cityName(booking.city) || activeCityContext.city } : booking;
-      if (belongsToCityContext(booking, activeCityContext, cityContexts) && activeCityContext && validLatLng(booking.lat, booking.lng) && isFreshTripBookedStayReference(bookingForCity, activeCityContext.city, bookingNow))
-        addMarker({ key: `booking:${bookingForCity.city}:${booking.start}`, lat: booking.lat, lng: booking.lng, kind: "stay", name: `Booked location · ${bookingForCity.city}`, locked: true });
+    // The city context is canonical. The top-level list is retained for older
+    // saved plans, but must not be the only way a booked location reaches the
+    // active city's map.
+    for (const booking of [activeCityContext?.bookingReference, ...(doc.bookingReferences ?? [])]) {
+      const marker = bookedStayMapMarker(booking ?? {}, activeCityContext, bookingNow);
+      if (marker) addMarker(marker);
     }
     for (const discovery of discoveries)
       for (const item of discovery.items ?? [])

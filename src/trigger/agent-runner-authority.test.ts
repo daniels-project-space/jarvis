@@ -1171,6 +1171,39 @@ describe("production Trigger worker authority harness", () => {
     expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
   });
 
+  it("holds an unavailable controller session for operator repair without queuing another paid worker", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-session-repair-hold");
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+    const operatorSignal =
+      "JARVIS_CODEX_SESSION_UNAVAILABLE[rotation_uncertain]: re-enrol the controller-managed ChatGPT session; do not add an API key";
+    (dependencies.prepareSubscriptionEnv as any).mockResolvedValue({
+      env: { PATH: process.env.PATH, CODEX_HOME: "/tmp/jarvis-session-repair-hold" },
+      error: operatorSignal,
+    });
+
+    expect(await invokeHarness(reservation, "session-repair-hold-run", dependencies)).toEqual({ processed: 1 });
+    expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    expect(bridge.trace.map((call) => call.path)).toContain("jobs:requestInput");
+    expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:checkpointAndRequeue");
+
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first(),
+      attention: await ctx.db.query("attentionItems")
+        .withIndex("by_jobId", (q) => q.eq("jobId", String(jobId))).first(),
+      retry: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 2)).first(),
+    }));
+    expect(state.job).toMatchObject({ status: "needs_input", attempt: 1 });
+    expect(state.attempt).toMatchObject({ status: "needs_input" });
+    expect(state.retry).toBeNull();
+    expect(state.attention?.detail).toContain("rotation_uncertain");
+  });
+
   it.each(["prepare", "preflight"] as const)(
     "does not emit a local subscription acquisition when supervisor %s fails before Codex",
     async (failurePoint) => {
