@@ -9,6 +9,7 @@ import {
   storePrivateCreationAssetFromUrl,
 } from "./creation-assets";
 import { privateR2Get } from "./private-r2";
+import { readyPrivateFilePanel } from "./private-file-panel";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
@@ -1246,6 +1247,19 @@ export const TOOL_DEFS = [
       type: "object",
       properties: {
         file_id: { type: "string", description: "the exact id of the ready uploaded image" },
+        title: { type: "string", description: "optional short label for the panel and download card" },
+      },
+      required: ["file_id"],
+    },
+  },
+  {
+    name: "show_uploaded_file",
+    description:
+      "Open one exact already-uploaded ready image, MP4/MOV/WebM video, or PDF on Jarvis's native private panel and attach an owner-authenticated download card. Use only when Daniel explicitly asks to show, play, preview, or open a particular uploaded visual file; pass its exact file_id from the current attachment or private-file catalog. It accepts only a ready safely detected image/video/PDF, uses only Jarvis's same-origin protected file route, and refuses stored-only, processing, deleted, audio, and arbitrary document files.",
+    parameters: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "the exact id of the ready uploaded image, video, or PDF" },
         title: { type: "string", description: "optional short label for the panel and download card" },
       },
       required: ["file_id"],
@@ -4693,6 +4707,66 @@ async function showUploadedImage(args: any): Promise<string> {
   return "Opened the selected ready image on screen and attached an owner-authenticated download card.";
 }
 
+type PrivateUploadedFilePanelRecord = {
+  _id?: string;
+  originalName?: string;
+  relativePath?: string;
+  status?: string;
+  detectedMimeType?: string;
+};
+
+async function showUploadedFile(args: Record<string, unknown>): Promise<string> {
+  const fileId = String(args.file_id ?? "").trim();
+  if (!fileId) return "TOOL DID NOTHING: no file_id passed.";
+  const file = await convexQuery("files:getForOwner", { fileId }).catch(() => null) as PrivateUploadedFilePanelRecord | null;
+  if (!file || file.status === "deleted") return "TOOL DID NOTHING: the selected file is not available.";
+  const panel = readyPrivateFilePanel({
+    fileId: String(file._id ?? fileId),
+    name: String(file.originalName ?? ""),
+    relativePath: String(file.relativePath ?? ""),
+    // This must be the server-side detected MIME, never the declared upload
+    // type: a client cannot turn arbitrary bytes into browser-rendered content.
+    mimeType: String(file.detectedMimeType ?? ""),
+    status: String(file.status ?? ""),
+  });
+  if (!panel) {
+    if (file.status === "stored_only") {
+      return "TOOL DID NOTHING: the selected file is stored-only, so it cannot be safely opened in Jarvis yet. It remains private and can be retried from Library.";
+    }
+    if (file.status !== "ready") {
+      return `TOOL DID NOTHING: the selected file is not ready for private display yet (status: ${String(file.status ?? "unknown").slice(0, 40)}).`;
+    }
+    return "TOOL DID NOTHING: the selected ready file is not a safely detected image, video, or PDF that Jarvis can open privately.";
+  }
+
+  const requestedTitle = String(args.title ?? "").trim().replace(/\s+/g, " ").slice(0, 120);
+  const title = requestedTitle || panel.title;
+  const downloadUrl = `${panel.value}?download=1`;
+  const threadId = await activeThread();
+  let panelShown = true;
+  try {
+    await convexMutation("ui:setPanel", { type: panel.type, value: panel.value, title });
+  } catch {
+    panelShown = false;
+  }
+  let cardPosted = true;
+  try {
+    await convexMutation("chatQueue:postCard", {
+      threadId,
+      type: panel.type,
+      value: panel.value,
+      title,
+      downloadUrl,
+    });
+  } catch {
+    cardPosted = false;
+  }
+  if (!panelShown || !cardPosted) {
+    return `The selected ready ${panel.kind} stayed private${panelShown ? "" : ", but could not be shown on screen"}${cardPosted ? "" : ", and its authenticated download card could not be posted"}.`;
+  }
+  return `Opened the selected ready ${panel.kind} on screen and attached an owner-authenticated download card.`;
+}
+
 const FILE_REVIEW_STATES = new Set(["unreviewed", "favorite", "review_remove"] as const);
 type FileReviewState = typeof FILE_REVIEW_STATES extends Set<infer State> ? State : never;
 
@@ -5604,6 +5678,8 @@ export async function executeTool(
       return await openFileAsDoc(args);
     case "show_uploaded_image":
       return await showUploadedImage(args);
+    case "show_uploaded_file":
+      return await showUploadedFile(args);
     case "review_uploaded_file":
       return await reviewUploadedFile(args, invocationContext);
     case "gmail_search": {

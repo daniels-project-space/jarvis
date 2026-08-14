@@ -101,7 +101,7 @@ export function novitaPatchProposalFailureClass(
   if (/^(?:attestation_mismatch|runtime_config_digest_mismatch|invalid_endpoint_url|api_key_unavailable|missing_api_key)$/.test(String(reason ?? ""))) {
     return "configuration";
   }
-  if (/^(?:non_json_response|response_out_of_bounds|completion_out_of_bounds|malformed_proposal|proposal_out_of_bounds)$/.test(String(reason ?? ""))) {
+  if (/^(?:non_json_response|response_out_of_bounds|completion_out_of_bounds|response_model_mismatch|malformed_proposal|proposal_out_of_bounds)$/.test(String(reason ?? ""))) {
     return "response";
   }
   return "transport";

@@ -5,6 +5,7 @@ import { usePaginatedQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api";
 import { CHAT_FILE_LIMITS, type ChatFileManifest } from "@/lib/chat-files";
 import { clientMutation } from "@/lib/client-mutation";
+import { readyPrivateFilePanel } from "@/lib/private-file-panel";
 import { useViewerSession } from "@/lib/viewer-session";
 import { viewerFetchWithTimeout } from "@/lib/viewer-request";
 
@@ -12,9 +13,6 @@ type LibraryFile = ChatFileManifest & { pinned?: boolean; updatedAt?: number };
 type FileIdSetter = (update: string[] | ((current: string[]) => string[])) => void;
 type FileReviewState = NonNullable<ChatFileManifest["reviewState"]>;
 type ReviewFilter = "all" | Exclude<FileReviewState, "unreviewed">;
-const READY_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
-const READY_VIDEO_MIME_TYPES = new Set(["video/mp4", "video/quicktime", "video/webm"]);
-const READY_PDF_MIME_TYPES = new Set(["application/pdf"]);
 
 function reviewStateFor(file: Pick<ChatFileManifest, "reviewState">): FileReviewState {
   return file.reviewState === "favorite" || file.reviewState === "review_remove"
@@ -27,33 +25,18 @@ export function filterFilesByReviewState(files: LibraryFile[], filter: ReviewFil
 }
 
 export function readyPrivateImagePanel(file: Pick<ChatFileManifest, "fileId" | "name" | "relativePath" | "mimeType" | "status">) {
-  const mimeType = String(file.mimeType ?? "").trim().toLowerCase();
-  if (file.status !== "ready" || !READY_IMAGE_MIME_TYPES.has(mimeType)) return null;
-  return {
-    type: "image" as const,
-    value: `/api/files/${encodeURIComponent(file.fileId)}`,
-    title: (file.relativePath || file.name).slice(0, 120),
-  };
+  const panel = readyPrivateFilePanel(file);
+  return panel?.type === "image" ? { type: panel.type, value: panel.value, title: panel.title } : null;
 }
 
 export function readyPrivateVideoPanel(file: Pick<ChatFileManifest, "fileId" | "name" | "relativePath" | "mimeType" | "status">) {
-  const mimeType = String(file.mimeType ?? "").trim().toLowerCase();
-  if (file.status !== "ready" || !READY_VIDEO_MIME_TYPES.has(mimeType)) return null;
-  return {
-    type: "private_video" as const,
-    value: `/api/files/${encodeURIComponent(file.fileId)}`,
-    title: (file.relativePath || file.name).slice(0, 120),
-  };
+  const panel = readyPrivateFilePanel(file);
+  return panel?.type === "private_video" ? { type: panel.type, value: panel.value, title: panel.title } : null;
 }
 
 export function readyPrivatePdfPanel(file: Pick<ChatFileManifest, "fileId" | "name" | "relativePath" | "mimeType" | "status">) {
-  const mimeType = String(file.mimeType ?? "").trim().toLowerCase();
-  if (file.status !== "ready" || !READY_PDF_MIME_TYPES.has(mimeType)) return null;
-  return {
-    type: "private_pdf" as const,
-    value: `/api/files/${encodeURIComponent(file.fileId)}`,
-    title: (file.relativePath || file.name).slice(0, 120),
-  };
+  const panel = readyPrivateFilePanel(file);
+  return panel?.type === "private_pdf" ? { type: panel.type, value: panel.value, title: panel.title } : null;
 }
 
 function fileSize(bytes: number): string {
