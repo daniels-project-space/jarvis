@@ -105,6 +105,27 @@ export type TripBookedStayReferenceValue = {
   verifiedAt?: number;
 };
 
+export const BOOKING_REFERENCE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+
+export function isFreshTripBookedStayReference(
+  booking: TripBookedStayReferenceValue,
+  city: string,
+  now = Date.now(),
+) {
+  const bookingCity = typeof booking.city === "string" ? booking.city.trim().toLocaleLowerCase("en-GB") : "";
+  const selectedCity = city.trim().toLocaleLowerCase("en-GB");
+  const start = Number(booking.start);
+  const end = Number(booking.end ?? booking.start);
+  const verifiedAt = Number(booking.verifiedAt);
+  return Boolean(bookingCity && bookingCity === selectedCity && booking.location)
+    && Number.isFinite(start)
+    && Number.isFinite(end)
+    && end >= now
+    && Number.isFinite(verifiedAt)
+    && verifiedAt <= now
+    && now - verifiedAt <= BOOKING_REFERENCE_MAX_AGE_MS;
+}
+
 const bookingDateText = (value: number | undefined, timeZone?: string) => {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
   try {
@@ -641,8 +662,6 @@ export function TripDayControls({
   );
 }
 
-const BOOKING_REFERENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-
 export default function TripView({ value }: { value: string }) {
   let draftId = "";
   let creationId = "";
@@ -723,14 +742,9 @@ export default function TripView({ value }: { value: string }) {
   const mapRoute: ItineraryRoute | undefined = tab === "explore" ? activeDiscovery?.route : activePlanDay?.route;
   const bookedStay = useMemo((): TripBookedStayReferenceValue | null => {
     if (!bookingNow || !Array.isArray(doc?.bookingReferences)) return null;
-    const city = String(activeDiscovery?.city ?? doc?.destination ?? "").trim().toLocaleLowerCase("en-GB");
+    const city = String(activeDiscovery?.city ?? doc?.destination ?? "").trim();
     return (doc.bookingReferences as any[])
-      .filter((booking) => {
-        const start = Number(booking?.start);
-        const end = Number(booking?.end ?? booking?.start);
-        const verifiedAt = Number(booking?.verifiedAt);
-        return Boolean(booking?.city && booking?.location) && booking.city.trim().toLocaleLowerCase("en-GB") === city && Number.isFinite(start) && Number.isFinite(end) && end >= bookingNow && Number.isFinite(verifiedAt) && bookingNow - verifiedAt <= BOOKING_REFERENCE_MAX_AGE_MS;
-      })
+      .filter((booking) => isFreshTripBookedStayReference(booking, city, bookingNow))
       .sort((left, right) => Number(left.start) - Number(right.start))
       .map((booking) => ({
         city: String(booking.city),
@@ -744,6 +758,12 @@ export default function TripView({ value }: { value: string }) {
         verifiedAt: Number(booking.verifiedAt),
       }))[0] ?? null;
   }, [activeDiscovery?.city, bookingNow, doc?.bookingReferences, doc?.destination]);
+  const activeDiscoveryBookingReference = useMemo(() => {
+    const booking = activeDiscovery?.bookingReference as TripBookedStayReferenceValue | undefined;
+    return booking && bookingNow && isFreshTripBookedStayReference(booking, String(activeDiscovery?.city ?? ""), bookingNow)
+      ? booking
+      : null;
+  }, [activeDiscovery?.bookingReference, activeDiscovery?.city, bookingNow]);
 
   const markers: Marker[] = useMemo(() => {
     if (!doc) return [];
@@ -754,7 +774,7 @@ export default function TripView({ value }: { value: string }) {
     for (const s of doc.stays ?? [])
       if (validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.id ?? `${s.name}:${s.city ?? doc.destination}`}`, lat: s.lat, lng: s.lng, kind: "stay", name: `${s.name}${s.city ? ` · ${s.city}` : ""}`, locked: doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name });
     for (const booking of doc.bookingReferences ?? [])
-      if (validLatLng(booking.lat, booking.lng) && Number(booking.end) >= bookingNow && Number(booking.verifiedAt) + BOOKING_REFERENCE_MAX_AGE_MS >= bookingNow)
+      if (validLatLng(booking.lat, booking.lng) && isFreshTripBookedStayReference(booking, String(booking.city ?? ""), bookingNow))
         addMarker({ key: `booking:${booking.city}:${booking.start}`, lat: booking.lat, lng: booking.lng, kind: "stay", name: `Booked location · ${booking.city}`, locked: true });
     for (const discovery of discoveries)
       for (const item of discovery.items ?? [])
@@ -1282,7 +1302,7 @@ export default function TripView({ value }: { value: string }) {
                     <div className="text-right text-[10px] text-cyan">
                       {activeDiscovery.route?.status === "ready" ? `${routeModeLabel(activeDiscovery.route.mode)} · ${durationSecondsText(activeDiscovery.route.durationSeconds) ?? "timing"}` : activeDiscovery.route?.mode === "transit" ? "transit timing unavailable" : "markers only"}
                     </div>
-                    {activeDiscovery.bookingReference && <div className="w-full rounded-lg border border-emerald-300/15 bg-emerald-300/5 px-2 py-1.5 text-[10px] text-emerald-100">Read-only Gmail stay verified near {activeDiscovery.city}: {activeDiscovery.bookingReference.bookingName || activeDiscovery.bookingReference.title} · {activeDiscovery.bookingReference.distanceKm} km from centre.</div>}
+                    {activeDiscoveryBookingReference && <div className="w-full rounded-lg border border-emerald-300/15 bg-emerald-300/5 px-2 py-1.5 text-[10px] text-emerald-100">Read-only Gmail stay verified near {activeDiscovery.city}: {activeDiscoveryBookingReference.bookingName || activeDiscoveryBookingReference.title} · {activeDiscoveryBookingReference.distanceKm} km from centre.</div>}
                   </section>
                   {(activeDiscovery.items ?? []).map((item: any) => {
                     const markerKey = `disc:${activeDiscovery.id}:${item.id}`;

@@ -2,6 +2,137 @@ import { query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireViewer, viewerAuthArgs } from "./controlAuth";
 
+const ACTIVE_TRAVEL_BOOKING_REFERENCE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+
+const travelText = (value: unknown, max: number) =>
+  typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, max) : "";
+
+const travelNumber = (value: unknown) => {
+  const number = typeof value === "number" ? value : Number.NaN;
+  return Number.isFinite(number) ? number : undefined;
+};
+
+const travelRow = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+
+/**
+ * The visible panel is a trusted owner-controlled UI row. Still treat its
+ * payload as untrusted input here: a malformed/stale panel must not make an
+ * arbitrary draft part of the model context.
+ */
+function activePanelDraftId(panel: unknown) {
+  const row = travelRow(panel);
+  if (row.type !== "trip" || typeof row.value !== "string") return "";
+  try {
+    return travelText(travelRow(JSON.parse(row.value)).draftId, 128);
+  } catch {
+    return "";
+  }
+}
+
+function activeTravelSummary(draft: any, activeThreadId: string, now: number) {
+  if (!draft || draft.state !== "draft" || draft.threadId !== activeThreadId || draft.expiresAt <= now) return null;
+  let data: Record<string, unknown>;
+  try {
+    data = travelRow(JSON.parse(String(draft.data ?? "")));
+  } catch {
+    return null;
+  }
+  if (data.kind !== "trip") return null;
+  const destination = travelText(data.destination, 160) || travelText(draft.destination, 160);
+  if (!destination) return null;
+
+  const itinerary = Array.isArray(data.itinerary)
+    ? data.itinerary.slice(0, 14).flatMap((rawDay) => {
+        const day = travelRow(rawDay);
+        const date = travelText(day.date, 24);
+        if (!date) return [];
+        const route = travelRow(day.route);
+        const items = Array.isArray(day.items)
+          ? day.items.slice(0, 12).flatMap((rawItem) => {
+              const item = travelRow(rawItem);
+              const title = travelText(item.title, 120);
+              return title ? [{
+                title,
+                time: travelText(item.time, 16),
+                kind: travelText(item.kind, 32),
+                durationMinutes: travelNumber(item.durationMinutes),
+              }] : [];
+            })
+          : [];
+        return [{
+          date,
+          label: travelText(day.label, 80),
+          items,
+          route: {
+            mode: travelText(route.mode, 32),
+            status: travelText(route.status, 32),
+            durationSeconds: travelNumber(route.durationSeconds),
+            distanceMeters: travelNumber(route.distanceMeters),
+          },
+        }];
+      })
+    : [];
+
+  const discoveries = Array.isArray(data.discoveries)
+    ? data.discoveries.slice(0, 8).flatMap((rawDiscovery) => {
+        const discovery = travelRow(rawDiscovery);
+        const city = travelText(discovery.city, 120);
+        if (!city) return [];
+        const route = travelRow(discovery.route);
+        return [{
+          city,
+          query: travelText(discovery.query, 160),
+          itemCount: Array.isArray(discovery.items) ? discovery.items.length : 0,
+          route: {
+            mode: travelText(route.mode, 32),
+            status: travelText(route.status, 32),
+            durationSeconds: travelNumber(route.durationSeconds),
+            distanceMeters: travelNumber(route.distanceMeters),
+          },
+        }];
+      })
+    : [];
+
+  const bookingReferences = Array.isArray(data.bookingReferences)
+    ? data.bookingReferences.slice(0, 8).flatMap((rawBooking) => {
+        const booking = travelRow(rawBooking);
+        const city = travelText(booking.city, 120);
+        const location = travelText(booking.location, 260);
+        const start = travelNumber(booking.start);
+        const end = travelNumber(booking.end ?? booking.start);
+        const verifiedAt = travelNumber(booking.verifiedAt);
+        if (!city || !location || start === undefined || end === undefined || end < now || verifiedAt === undefined || verifiedAt > now || now - verifiedAt > ACTIVE_TRAVEL_BOOKING_REFERENCE_MAX_AGE_MS) return [];
+        return [{
+          city,
+          title: travelText(booking.title, 160),
+          bookingName: travelText(booking.bookingName, 160),
+          location,
+          start,
+          end,
+          state: start <= now ? "active" : "upcoming",
+          timeZone: travelText(booking.timeZone, 80),
+          distanceKm: travelNumber(booking.distanceKm),
+          verifiedAt,
+        }];
+      })
+    : [];
+
+  return {
+    draftId: String(draft._id),
+    title: travelText(data.title, 180) || travelText(draft.title, 180),
+    destination,
+    departDate: travelText(data.departDate, 24),
+    returnDate: travelText(data.returnDate, 24),
+    status: travelText(data.status, 32),
+    planRevision: travelNumber(data.planRevision) ?? travelNumber(draft.planRevision) ?? 0,
+    updatedAt: travelNumber(draft.updatedAt) ?? now,
+    itinerary,
+    discoveries,
+    bookingReferences,
+  };
+}
+
 // A single bounded snapshot replaces the former 10-call Convex fan-out used
 // by every chat and Realtime session. Keep payloads concise: this is model
 // context, while full artifacts remain addressable by id.
@@ -11,7 +142,7 @@ export const snapshot = query({
     await requireViewer(ctx, a);
     const text = a.userText?.trim().slice(0, 240);
     const activeStatuses = ["running", "pending", "awaiting_approval", "paused", "needs_input"];
-    const [memHit, memRecent, currentState, business, projects, activeGroups, findings, trip, draft, location, panel, creations, agents, attentionGroups, approvals, goalGroups, missionGoals] =
+    const [memHit, memRecent, currentState, business, projects, activeGroups, findings, trip, draft, location, panel, activeThread, creations, agents, attentionGroups, approvals, goalGroups, missionGoals] =
       await Promise.all([
         text
           ? ctx.db
@@ -48,6 +179,7 @@ export const snapshot = query({
           .first(),
         ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "location")).first(),
         ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "panel")).first(),
+        ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "activeThread")).first(),
         ctx.db.query("creations").withIndex("by_updatedAt").order("desc").take(12),
         ctx.db.query("agentProfiles").collect(),
         Promise.all(
@@ -94,6 +226,17 @@ export const snapshot = query({
         (row.expiresAt === undefined || row.expiresAt > now)
         && all.findIndex((candidate: any) => candidate._id === row._id) === index,
     );
+    const activeThreadId = travelText(activeThread?.value, 128) || "main";
+    const panelDraftId = activePanelDraftId(panel);
+    let activeTravel = null;
+    if (panelDraftId) {
+      try {
+        activeTravel = activeTravelSummary(await ctx.db.get(panelDraftId as any), activeThreadId, now);
+      } catch {
+        // The panel may refer to a legacy creation or malformed id. It is not
+        // a reason to fail an otherwise useful foreground context snapshot.
+      }
+    }
     return {
       currentState: currentState.filter((row) => row.expiresAt > Date.now()),
       memory: usableMemory.slice(0, 10),
@@ -121,6 +264,7 @@ export const snapshot = query({
       draft,
       location,
       panel,
+      activeTravel,
       creations: creations.map((creation: any) => ({
         id: String(creation._id),
         kind: creation.kind,

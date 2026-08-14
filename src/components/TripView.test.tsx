@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
+import { isFreshTripBookedStayReference, TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
 
 describe("TripTimeline", () => {
   it("keeps a time-valid Gmail stay visibly distinct from a hotel candidate", () => {
@@ -42,6 +42,21 @@ describe("TripTimeline", () => {
     );
 
     expect(markup).toBe("");
+  });
+
+  it("keeps discovery and map references scoped to a fresh matching city", () => {
+    const now = Date.UTC(2026, 8, 12, 12, 0);
+    const booking = {
+      city: "Amsterdam",
+      location: "42 Water Street, Amsterdam, Netherlands",
+      start: now - 3_600_000,
+      end: now + 86_400_000,
+      verifiedAt: now - 60_000,
+    };
+
+    expect(isFreshTripBookedStayReference(booking, "Amsterdam", now)).toBe(true);
+    expect(isFreshTripBookedStayReference(booking, "Rotterdam", now)).toBe(false);
+    expect(isFreshTripBookedStayReference({ ...booking, verifiedAt: now - 24 * 60 * 60_000 - 1 }, "Amsterdam", now)).toBe(false);
   });
 
   it("renders persisted stop and transfer timing without drawing a made-up connection", () => {

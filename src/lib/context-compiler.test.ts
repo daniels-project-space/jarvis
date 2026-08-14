@@ -5,6 +5,8 @@ import {
   CONTEXT_COMPILER_MAX_CHARS,
 } from "./context-compiler";
 
+const now = Date.now();
+
 const input = {
   northStar: "Build a connected portfolio that compounds Daniel's time and judgement.",
   projectRegistry: [
@@ -12,7 +14,7 @@ const input = {
     { slug: "finance-engine-v2", name: "Finance Engine", vision: "A research-first trading lab." },
   ],
   brain: {
-    currentState: [{ key: "profile.current_location", value: "Sevilla", observedAt: Date.now(), confidence: 0.99 }],
+    currentState: [{ key: "profile.current_location", value: "Sevilla", observedAt: now, confidence: 0.99 }],
     memory: [
       { kind: "preference", title: "Reply style", body: "Keep spoken replies concise.", source: "chat", confidence: 1 },
       { kind: "decision", title: "Safety", body: "External actions need approval.", source: "obsidian", confidence: 0.95 },
@@ -39,10 +41,10 @@ const input = {
       _id: "trip-1",
       title: "London",
       data: JSON.stringify({ status: "planning", locked: { flight: "BA" } }),
-      updatedAt: Date.now(),
+      updatedAt: now,
     },
-    draft: { title: "Launch note", data: "The complete current draft.", updatedAt: Date.now() },
-    location: { title: "Home", value: "London" },
+    draft: { title: "Launch note", data: "The complete current draft.", updatedAt: now },
+    location: { title: "London", value: "51.50740,-0.12780", updatedAt: now - 1_000 },
     findings: [{ spoken: "The focused context path is bounded." }],
   },
   hub: {
@@ -109,7 +111,7 @@ describe("context compiler", () => {
     expect(compileContext({ ...input, userText: "Make the draft warmer" }))
       .toContain("The complete current draft");
     expect(compileContext({ ...input, userText: "What's the weather near me?" }))
-      .toContain("LIVE LOCATION");
+      .toContain("CURRENT SITUATION");
     expect(compileContext({ ...input, userText: "Explain the Jarvis architecture" }))
       .not.toContain("TRIP IN PROGRESS");
   });
@@ -122,6 +124,94 @@ describe("context compiler", () => {
     expect(result).toContain("CURRENT SITUATION");
     expect(result).toContain("current location is Sevilla");
     expect(result).toContain("default map, weather, route, and nearby-search origin");
+  });
+
+  it("uses the newest fresh device location and never carries a stale one forward", () => {
+    const freshDevice = compileContext({
+      ...input,
+      userText: "Show nearby places on a map",
+      brain: {
+        ...input.brain,
+        currentState: [{ key: "profile.current_location", value: "Sevilla", observedAt: now - 10_000 }],
+        location: { title: "Camden", value: "51.53900,-0.14200", updatedAt: now },
+      },
+    });
+    expect(freshDevice).toContain("LIVE LOCATION");
+    expect(freshDevice).toContain("Camden");
+    expect(freshDevice).not.toContain("current location is Sevilla");
+
+    const stale = compileContext({
+      ...input,
+      userText: "Show nearby places on a map",
+      brain: {
+        ...input.brain,
+        currentState: [{ key: "profile.current_location", value: "Old Sevilla", observedAt: now - 13 * 60 * 60_000 }],
+        location: { title: "Old London", value: "51.50740,-0.12780", updatedAt: now - 16 * 60_000 },
+      },
+    });
+    expect(stale).not.toContain("CURRENT SITUATION");
+    expect(stale).not.toContain("LIVE LOCATION");
+  });
+
+  it("grounds a city turn in the exact live workspace and its fresh booked stay", () => {
+    const result = compileContext({
+      ...input,
+      userText: "Show attractions in Sevilla and add them to day one",
+      brain: {
+        ...input.brain,
+        activeTravel: {
+          draftId: "draft-sevilla-1",
+          destination: "Sevilla",
+          departDate: "2026-09-12",
+          returnDate: "2026-09-16",
+          planRevision: 3,
+          itinerary: [{
+            date: "2026-09-12",
+            items: [{ title: "Alcázar", time: "10:00", durationMinutes: 90, kind: "activity" }],
+            route: { mode: "walking", status: "ready", durationSeconds: 720, distanceMeters: 700 },
+          }],
+          discoveries: [{ city: "Sevilla", query: "attractions", itemCount: 5, route: { mode: "walking", status: "ready", durationSeconds: 900 } }],
+          bookingReferences: [{
+            city: "Sevilla",
+            title: "Riverside Apartments",
+            bookingName: "Riverside Apartments",
+            location: "42 Calle del Agua, Sevilla",
+            start: now - 3_600_000,
+            end: now + 86_400_000,
+            verifiedAt: now - 60_000,
+            timeZone: "Europe/Madrid",
+            distanceKm: 0.8,
+          }],
+        },
+      },
+    });
+    expect(result).toContain("LIVE TRAVEL WORKSPACE");
+    expect(result).toContain("draft_id=draft-sevilla-1");
+    expect(result).toContain("Alcázar");
+    expect(result).toContain("BOOKED STAY REFERENCE");
+    expect(result).toContain("Riverside Apartments");
+
+    const staleBooking = compileContext({
+      ...input,
+      userText: "Show attractions in Sevilla",
+      brain: {
+        ...input.brain,
+        activeTravel: {
+          draftId: "draft-sevilla-1",
+          destination: "Sevilla",
+          bookingReferences: [{
+            city: "Sevilla",
+            bookingName: "Expired verification",
+            location: "42 Calle del Agua, Sevilla",
+            start: now - 3_600_000,
+            end: now + 86_400_000,
+            verifiedAt: now - 24 * 60 * 60_000 - 1,
+          }],
+        },
+      },
+    });
+    expect(staleBooking).not.toContain("BOOKED STAY REFERENCE");
+    expect(staleBooking).not.toContain("Expired verification");
   });
 
   it("preserves ranking identities for on-screen number follow-ups", () => {

@@ -1,3 +1,5 @@
+import { freshCurrentLocation, freshDeviceLocation } from "./live-location";
+
 export type ContextProfile = "reflex" | "focused" | "operational" | "strategic";
 
 type ContextRow = Record<string, unknown>;
@@ -16,6 +18,7 @@ type BrainContext = {
   creations?: ContextRow[];
   findings?: ContextRow[];
   trip?: ContextRow | null;
+  activeTravel?: ContextRow | null;
   draft?: ContextRow | null;
   location?: ContextRow | null;
   panel?: ContextRow | null;
@@ -52,12 +55,110 @@ const TRAVEL = /\b(?:trip|travel|flight|hotel|stay|airport|transfer|destination|
 const DRAFT_EDIT = /\b(?:draft|document|write|writing|rewrite|edit|longer|shorter|warmer|tone|wording)\b/i;
 const LOCATION = /\b(?:near me|nearby|local|location|directions?|routes?|maps?|places?|attractions?|city|restaurant|weather)\b/i;
 const TEAM = /\b(?:agent|team|delegate|mission|goal|working|progress|status)\b/i;
+const TRAVEL_BOOKING_REFERENCE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 
 const text = (value: unknown, max: number) =>
   String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
 
 const asRow = (value: unknown): ContextRow =>
   value !== null && typeof value === "object" ? value as ContextRow : {};
+
+const finiteNumber = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+const placeKey = (value: unknown) =>
+  text(value, 180)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("en-GB")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+function routeContext(routeValue: unknown) {
+  const route = asRow(routeValue);
+  if (text(route.status, 32) !== "ready") return "";
+  const mode = text(route.mode, 32) || "route";
+  const minutes = finiteNumber(route.durationSeconds);
+  const distance = finiteNumber(route.distanceMeters);
+  return `${mode}${minutes === undefined ? "" : ` ${Math.max(1, Math.round(minutes / 60))} min`}${distance === undefined ? "" : ` · ${Math.round(distance / 100) / 10} km`}`;
+}
+
+/** Compact, trusted travel workspace evidence for later conversational turns. */
+function activeTravelContext(value: unknown) {
+  const workspace = asRow(value);
+  const draftId = text(workspace.draftId, 100);
+  const destination = text(workspace.destination, 160);
+  if (!draftId || !destination) return "";
+  const dates = [text(workspace.departDate, 24), text(workspace.returnDate, 24)].filter(Boolean).join(" → ");
+  const itinerary = Array.isArray(workspace.itinerary)
+    ? workspace.itinerary.slice(0, 6).flatMap((rawDay) => {
+        const day = asRow(rawDay);
+        const date = text(day.date, 24) || text(day.label, 80);
+        if (!date) return [];
+        const items = Array.isArray(day.items)
+          ? day.items.slice(0, 6).flatMap((rawItem) => {
+              const item = asRow(rawItem);
+              const title = text(item.title, 100);
+              if (!title) return [];
+              const time = text(item.time, 16);
+              const duration = finiteNumber(item.durationMinutes);
+              return [`${time ? `${time} ` : ""}${title}${duration === undefined ? "" : ` (${Math.max(1, Math.round(duration))} min)`}`];
+            })
+          : [];
+        const route = routeContext(day.route);
+        return [`${date}: ${items.length ? items.join(" → ") : "no stops yet"}${route ? ` · ${route}` : ""}`];
+      })
+    : [];
+  const discoveries = Array.isArray(workspace.discoveries)
+    ? workspace.discoveries.slice(0, 6).flatMap((rawDiscovery) => {
+        const discovery = asRow(rawDiscovery);
+        const city = text(discovery.city, 100);
+        if (!city) return [];
+        const query = text(discovery.query, 100) || "places";
+        const itemCount = finiteNumber(discovery.itemCount);
+        const route = routeContext(discovery.route);
+        return [`${city}: ${query}${itemCount === undefined ? "" : ` (${Math.max(0, Math.round(itemCount))} places)`}${route ? ` · ${route}` : ""}`];
+      })
+    : [];
+  return `draft_id=${draftId}; destination=${destination}${dates ? `; dates=${dates}` : ""}; plan revision ${Math.max(0, Math.round(finiteNumber(workspace.planRevision) ?? 0))}. Continue this exact live globe workspace for every itinerary, place, route, or stay change; never open a duplicate. ${itinerary.length ? `Itinerary: ${itinerary.join(" | ")}.` : ""}${discoveries.length ? ` Saved city explorations: ${discoveries.join(" | ")}.` : ""}`;
+}
+
+function matchingTravelBookingReference(value: unknown, userText: string, now = Date.now()) {
+  const workspace = asRow(value);
+  const references = Array.isArray(workspace.bookingReferences) ? workspace.bookingReferences : [];
+  const destinationKey = placeKey(workspace.destination);
+  const valid = references.flatMap((rawReference) => {
+    const reference = asRow(rawReference);
+    const city = text(reference.city, 120);
+    const location = text(reference.location, 260);
+    const start = finiteNumber(reference.start);
+    const end = finiteNumber(reference.end);
+    const verifiedAt = finiteNumber(reference.verifiedAt);
+    if (!city || !location || start === undefined || end === undefined || end < now || verifiedAt === undefined || verifiedAt > now || now - verifiedAt > TRAVEL_BOOKING_REFERENCE_MAX_AGE_MS) return [];
+    return [{
+      city,
+      location,
+      start,
+      end,
+      verifiedAt,
+      title: text(reference.title, 160),
+      bookingName: text(reference.bookingName, 160),
+      state: start <= now ? "active" : "upcoming",
+      timeZone: text(reference.timeZone, 80),
+      distanceKm: finiteNumber(reference.distanceKm),
+    }];
+  });
+  if (!valid.length) return undefined;
+  const userPlace = placeKey(userText);
+  const requestedCity = valid.find((reference) => {
+    const city = placeKey(reference.city);
+    return city.length >= 3 && userPlace.includes(city);
+  });
+  if (requestedCity) return requestedCity;
+  const destinationReference = valid.find((reference) => placeKey(reference.city) === destinationKey);
+  return destinationReference && (destinationKey.length >= 3 && userPlace.includes(destinationKey) || FOLLOW_UP.test(userText))
+    ? destinationReference
+    : undefined;
+}
 
 const rowLine = (row: ContextRow, max = 520) => {
   const source = row?.source ? ` · ${text(row.source, 24)}` : "";
@@ -185,6 +286,22 @@ export function compileContext(input: ContextCompilerInput): string {
     if (panel) add("DISPLAY CONTEXT", panel, true);
   }
 
+  const travelTurn = TRAVEL.test(userText) || LOCATION.test(userText) || FOLLOW_UP.test(userText);
+  const activeTravel = asRow(brain.activeTravel);
+  const activeTravelWorkspace = travelTurn ? activeTravelContext(activeTravel) : "";
+  if (activeTravelWorkspace) {
+    add("LIVE TRAVEL WORKSPACE", activeTravelWorkspace, true);
+    const booking = matchingTravelBookingReference(activeTravel, userText);
+    if (booking) {
+      const dates = [new Date(booking.start).toISOString(), new Date(booking.end).toISOString()].join(" → ");
+      add(
+        "BOOKED STAY REFERENCE",
+        `${booking.bookingName || booking.title || "Confirmed stay"} in ${booking.city}: ${booking.location}. ${booking.state}; ${dates}${booking.timeZone ? ` (${booking.timeZone})` : ""}${booking.distanceKm === undefined ? "" : ` · verified ${booking.distanceKm} km from city centre`}. Keep this read-only Gmail stay as the map/reference base for ${booking.city} only; do not treat it as a hotel option or apply it to another city.`,
+        true,
+      );
+    }
+  }
+
   const memories = Array.isArray(brain.memory) ? brain.memory : [];
   const memoryLimit = profile === "reflex" ? 1 : profile === "focused" ? 3 : profile === "strategic" ? 8 : 5;
   if (memories.length && memoryLimit) {
@@ -196,10 +313,26 @@ export function compileContext(input: ContextCompilerInput): string {
 
   const currentState = Array.isArray(brain.currentState) ? brain.currentState : [];
   const currentLocation = currentState.find((row) => row.key === "profile.current_location");
-  if (currentLocation?.value && (LOCATION.test(userText) || TRAVEL.test(userText) || FOLLOW_UP.test(userText))) {
+  const currentPlace = freshCurrentLocation(currentLocation);
+  const liveDeviceLocation = freshDeviceLocation(asRow(brain.location));
+  // A direct statement can deliberately supersede a GPS sample, but a later
+  // device update is authoritative as Daniel moves. Match travel_map's order
+  // so voice/text and the visible map never disagree about "near me".
+  const useCurrentPlace = currentPlace && (!liveDeviceLocation || currentPlace.observedAt >= liveDeviceLocation.updatedAt)
+    ? currentPlace
+    : undefined;
+  if (useCurrentPlace && travelTurn) {
     add(
       "CURRENT SITUATION",
-      `Daniel's current location is ${text(currentLocation.value, 120)} (observed ${new Date(Number(currentLocation.observedAt ?? 0)).toISOString()}). Use it as the default map, weather, route, and nearby-search origin until superseded.`,
+      `Daniel's current location is ${text(useCurrentPlace.value, 120)} (observed ${new Date(useCurrentPlace.observedAt).toISOString()}). Use it as the default map, weather, route, and nearby-search origin until superseded.`,
+      true,
+    );
+  }
+  if (liveDeviceLocation && (!currentPlace || liveDeviceLocation.updatedAt > currentPlace.observedAt) && travelTurn) {
+    const label = liveDeviceLocation.label || "Live device location";
+    add(
+      "LIVE LOCATION",
+      `${label} at ${liveDeviceLocation.lat.toFixed(5)}, ${liveDeviceLocation.lng.toFixed(5)} (reported ${new Date(liveDeviceLocation.updatedAt).toISOString()}). Use this freshest device position as the default map, weather, route, and nearby-search origin until superseded.`,
       true,
     );
   }
@@ -315,7 +448,7 @@ export function compileContext(input: ContextCompilerInput): string {
 
   const trip = asRow(brain.trip);
   const tripIsRecent = Number(trip.updatedAt ?? 0) > Date.now() - 14 * 86_400_000;
-  if (TRAVEL.test(userText) && trip.data && tripIsRecent) {
+  if (TRAVEL.test(userText) && !activeTravelWorkspace && trip.data && tripIsRecent) {
     add(
       "TRIP IN PROGRESS",
       `id=${text(trip._id, 80)}. Continue this trip; do not start a duplicate. ${text(trip.data, 1_350)}`,
@@ -331,11 +464,6 @@ export function compileContext(input: ContextCompilerInput): string {
       `“${text(draft.title, 140)}”. Edit requests refer to this exact text; revise the complete draft rather than creating another. ${text(draft.data, 1_350)}`,
       true,
     );
-  }
-
-  const location = asRow(brain.location);
-  if (LOCATION.test(userText) && location.value) {
-    add("LIVE LOCATION", `${text(location.value, 240)}${location.title ? ` (${text(location.title, 100)})` : ""}`);
   }
 
   const creations = Array.isArray(brain.creations) ? brain.creations : [];
