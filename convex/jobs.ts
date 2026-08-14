@@ -4323,6 +4323,7 @@ export const authorizeExecutionBoundary = mutation({
       v.literal("provider_create"),
       v.literal("codex_start"),
       v.literal("codex_resume"),
+      v.literal("novita_delegate"),
       v.literal("checkpoint"),
       v.literal("review_receipt"),
       v.literal("integration"),

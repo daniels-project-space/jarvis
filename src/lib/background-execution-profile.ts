@@ -1,4 +1,9 @@
 import { parseWorkModelTier, type WorkModelTier } from "./work-models";
+import {
+  canonicalNovitaPatchProposerAttestation,
+  resolveNovitaPatchProposerAttestation,
+  type NovitaPatchProposerAttestation,
+} from "./novita-patch-proposer-attestation";
 
 /**
  * The only model transport admitted to the current background executor.
@@ -9,6 +14,7 @@ import { parseWorkModelTier, type WorkModelTier } from "./work-models";
  */
 export const BACKGROUND_EXECUTION_PROVIDER = "codex-subscription" as const;
 export const BACKGROUND_EXECUTION_PROFILE_VERSION = 1 as const;
+export const BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION = 2 as const;
 
 export const BACKGROUND_REPOSITORY_CAPABILITIES = Object.freeze([
   "repository_exec",
@@ -36,7 +42,7 @@ export type BackgroundExecutionAuthority = Readonly<{
  * A complete, serializable execution admission. Its authority shape is
  * derived by this module and cannot be widened by a caller-provided profile.
  */
-export type BackgroundExecutionProfile = Readonly<{
+type CodexBackgroundExecutionProfile = Readonly<{
   version: typeof BACKGROUND_EXECUTION_PROFILE_VERSION;
   provider: BackgroundExecutionProvider;
   modelTier: WorkModelTier;
@@ -44,6 +50,25 @@ export type BackgroundExecutionProfile = Readonly<{
   authority: BackgroundExecutionAuthority;
   repositoryCapabilities: readonly BackgroundRepositoryCapability[];
 }>;
+
+/**
+ * Codex remains the sole workspace executor. Version 2 adds a bounded,
+ * no-tool Novita draft stage whose non-secret identity is SHA-bound beside the
+ * Codex authority; it cannot become an arbitrary provider switch.
+ */
+type DelegatedCodexBackgroundExecutionProfile = Readonly<{
+  version: typeof BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION;
+  provider: BackgroundExecutionProvider;
+  modelTier: WorkModelTier;
+  readonly: boolean;
+  authority: BackgroundExecutionAuthority;
+  repositoryCapabilities: readonly BackgroundRepositoryCapability[];
+  novitaPatchProposer: NovitaPatchProposerAttestation;
+}>;
+
+export type BackgroundExecutionProfile =
+  | CodexBackgroundExecutionProfile
+  | DelegatedCodexBackgroundExecutionProfile;
 
 export type BackgroundExecutionProfileRejectionCode =
   | "invalid_profile"
@@ -70,6 +95,7 @@ const PROFILE_KEYS = new Set([
   "authority",
   "repositoryCapabilities",
 ]);
+const DELEGATED_PROFILE_KEYS = new Set([...PROFILE_KEYS, "novitaPatchProposer"]);
 
 const AUTHORITY_KEYS = new Set(["external", "apps", "secrets", "network"]);
 
@@ -146,11 +172,13 @@ export function resolveBackgroundExecutionProfile(
   value: unknown = {},
 ): BackgroundExecutionProfileResolution {
   if (!isRecord(value)) return rejected("invalid_profile", "Background execution profile must be an object");
-  if (Object.keys(value).some((key) => !PROFILE_KEYS.has(key))) {
-    return rejected("invalid_profile", "Background execution profile contains an untrusted field");
-  }
-  if (value.version !== undefined && value.version !== BACKGROUND_EXECUTION_PROFILE_VERSION) {
+  const version = value.version === undefined ? BACKGROUND_EXECUTION_PROFILE_VERSION : value.version;
+  if (version !== BACKGROUND_EXECUTION_PROFILE_VERSION && version !== BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION) {
     return rejected("invalid_profile", "Background execution profile version is unsupported");
+  }
+  const keys = version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION ? DELEGATED_PROFILE_KEYS : PROFILE_KEYS;
+  if (Object.keys(value).some((key) => !keys.has(key))) {
+    return rejected("invalid_profile", "Background execution profile contains an untrusted field");
   }
 
   const provider = profileProvider(value.provider);
@@ -186,6 +214,28 @@ export function resolveBackgroundExecutionProfile(
       capabilities,
       "Background execution repository capabilities exceed the admitted Codex scope",
     );
+  }
+
+  const novitaPatchProposer = version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION
+    ? resolveNovitaPatchProposerAttestation(value.novitaPatchProposer)
+    : undefined;
+  if (version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION && !novitaPatchProposer) {
+    return rejected("invalid_profile", "Novita patch-proposer attestation is invalid");
+  }
+
+  if (version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION && novitaPatchProposer) {
+    return Object.freeze({
+      accepted: true as const,
+      profile: Object.freeze({
+        version: BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION,
+        provider,
+        modelTier,
+        readonly,
+        authority: DENIED_AUTHORITY,
+        repositoryCapabilities: capabilities,
+        novitaPatchProposer,
+      }),
+    });
   }
 
   return Object.freeze({
@@ -230,8 +280,18 @@ export function backgroundExecutionProfileForWorkOrder(input: Readonly<{
   modelTier: WorkModelTier;
   readonly: boolean;
   repositoryCapabilities: readonly string[];
+  novitaPatchProposer?: NovitaPatchProposerAttestation;
 }>): BackgroundExecutionProfile {
-  const resolved = resolveBackgroundExecutionProfileForWorkOrder(input);
+  const resolved = resolveBackgroundExecutionProfile({
+    version: input.novitaPatchProposer
+      ? BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION
+      : BACKGROUND_EXECUTION_PROFILE_VERSION,
+    provider: BACKGROUND_EXECUTION_PROVIDER,
+    modelTier: input.modelTier,
+    readonly: input.readonly,
+    repositoryCapabilities: [...input.repositoryCapabilities],
+    ...(input.novitaPatchProposer ? { novitaPatchProposer: input.novitaPatchProposer } : {}),
+  });
   if (!resolved.accepted) throw new Error(`Derived background execution profile is invalid: ${resolved.code}`);
   return resolved.profile;
 }
@@ -245,6 +305,9 @@ export function canonicalBackgroundExecutionProfile(profile: BackgroundExecution
     readonly: profile.readonly,
     authority: profile.authority,
     repositoryCapabilities: profile.repositoryCapabilities,
+    ...(profile.version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION
+      ? { novitaPatchProposer: canonicalNovitaPatchProposerAttestation(profile.novitaPatchProposer) }
+      : {}),
   });
 }
 

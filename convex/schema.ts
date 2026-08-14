@@ -41,19 +41,47 @@ const missionSupervisorModelTierValidator = v.union(
 // This is intentionally an explicit false-only capability snapshot. The
 // provider/model transport belongs to the immutable work order, never to a
 // mutable job update or environment toggle.
-const backgroundExecutionProfileValidator = v.object({
-  version: v.literal(1),
-  provider: v.literal("codex-subscription"),
-  modelTier: missionSupervisorModelTierValidator,
-  readonly: v.boolean(),
-  authority: v.object({
-    external: v.literal(false),
-    apps: v.literal(false),
-    secrets: v.literal(false),
-    network: v.literal(false),
-  }),
-  repositoryCapabilities: v.array(v.string()),
+const backgroundExecutionAuthorityValidator = v.object({
+  external: v.literal(false),
+  apps: v.literal(false),
+  secrets: v.literal(false),
+  network: v.literal(false),
 });
+
+const backgroundExecutionProfileValidator = v.union(
+  v.object({
+    version: v.literal(1),
+    provider: v.literal("codex-subscription"),
+    modelTier: missionSupervisorModelTierValidator,
+    readonly: v.boolean(),
+    authority: backgroundExecutionAuthorityValidator,
+    repositoryCapabilities: v.array(v.string()),
+  }),
+  v.object({
+    version: v.literal(2),
+    provider: v.literal("codex-subscription"),
+    modelTier: missionSupervisorModelTierValidator,
+    readonly: v.boolean(),
+    authority: backgroundExecutionAuthorityValidator,
+    repositoryCapabilities: v.array(v.string()),
+    novitaPatchProposer: v.object({
+      adapterId: v.literal("novita-qwen-patch-proposer-v1"),
+      configDigest: v.string(),
+      endpointId: v.string(),
+      modelId: v.string(),
+      modelRevision: v.string(),
+      imageDigest: v.string(),
+      quantization: v.literal("gptq-int4"),
+      api: v.literal("openai-chat-completions"),
+      requestLimits: v.object({
+        maxInputBytes: v.number(),
+        maxOutputTokens: v.number(),
+        maxTurns: v.literal(1),
+        timeoutMs: v.number(),
+      }),
+    }),
+  }),
+);
 
 const missionSupervisorDecisionOriginValidator = v.union(
   v.literal("model"),

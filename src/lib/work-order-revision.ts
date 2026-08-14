@@ -6,6 +6,7 @@ import {
   resolveBackgroundExecutionProfileForWorkOrder,
   type BackgroundExecutionProfile,
 } from "./background-execution-profile";
+import { novitaPatchProposerForWorkOrder } from "./novita-patch-proposer-attestation";
 import { SCOPED_TEAM_MANIFEST } from "./workflow-contract";
 import {
   admittedTriggerMachine,
@@ -173,10 +174,23 @@ export function workOrderRevisionForJob(
     ? sourceProvider !== "github" || !sourceBranch || !sourceRef || !sourceHeadSha
     : sourceProvider !== "none" || sourceBranch || sourceRef || sourceHeadSha) return null;
   const minimumReasoningEffort = normalizeMinimumReasoningEffort(job.reasoningEffort, minimumModel);
+  const risk = String(job.risk ?? "low");
+  const approvalRequired = job.approvalRequired === true;
+  const novitaPatchProposer = novitaPatchProposerForWorkOrder({
+    task: policyTask,
+    modelTier: minimumModel,
+    readonly,
+    repository,
+    sourceProvider,
+    risk,
+    approvalRequired,
+    mcpScope,
+  });
   const backgroundExecutionProfile = backgroundExecutionProfileForWorkOrder({
     modelTier: minimumModel,
     readonly,
     repositoryCapabilities: toolScope,
+    ...(novitaPatchProposer ? { novitaPatchProposer } : {}),
   });
   const triggerMachine = admittedTriggerMachine({ readonly, minimumModel, minimumReasoningEffort });
   return {
@@ -202,10 +216,10 @@ export function workOrderRevisionForJob(
     toolScope,
     mcpScope,
     deliveryPolicy: String(job.deliveryMode ?? (readonly ? "read_only" : "manual")),
-    risk: String(job.risk ?? "low"),
-    approvalRequired: job.approvalRequired === true,
+    risk,
+    approvalRequired,
     approvalReason: typeof job.approvalReason === "string" && job.approvalReason ? job.approvalReason : undefined,
-    approvalResult: job.approvalRequired === true ? "human_gate_required" : "autonomous",
+    approvalResult: approvalRequired ? "human_gate_required" : "autonomous",
     agentId: agent.agentId,
     agentRole: typeof job.agentRole === "string" && job.agentRole ? job.agentRole : agent.agentRole,
     minimumModel,

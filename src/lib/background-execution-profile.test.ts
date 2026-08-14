@@ -54,6 +54,34 @@ describe("background execution profile", () => {
     expect(resolveBackgroundExecutionProfile(profile)).toMatchObject({ accepted: true, profile });
   });
 
+  it("binds a strict no-tool Novita draft attestation without changing the Codex executor", () => {
+    const novitaPatchProposer = {
+      adapterId: "novita-qwen-patch-proposer-v1",
+      configDigest: "a".repeat(64),
+      endpointId: "endpoint_123456",
+      modelId: "Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4",
+      modelRevision: "16e3d0e4df2aa0a4d819c2d6846df4a452e42d83",
+      imageDigest: "sha256:c2f3b1b964e47809b722b5e75b61b1e7b39a50f70388cf2bf2418f16a9f31da2",
+      quantization: "gptq-int4",
+      api: "openai-chat-completions",
+      requestLimits: { maxInputBytes: 12_000, maxOutputTokens: 800, maxTurns: 1, timeoutMs: 30_000 },
+    } as const;
+    const profile = accepted({
+      version: 2,
+      provider: "codex-subscription",
+      modelTier: "luna",
+      readonly: false,
+      authority: { external: false, apps: false, secrets: false, network: false },
+      repositoryCapabilities: ["repository_read_file", "repository_list_files", "repository_write_file"],
+      novitaPatchProposer,
+    });
+    expect(profile).toMatchObject({ version: 2, provider: BACKGROUND_EXECUTION_PROVIDER, novitaPatchProposer });
+    expect(resolveBackgroundExecutionProfile({ ...profile, endpointUrl: "https://untrusted.example" })).toMatchObject({
+      accepted: false,
+      code: "invalid_profile",
+    });
+  });
+
   it("derives a work-order profile instead of accepting a caller provider", () => {
     expect(backgroundExecutionProfileForWorkOrder({
       modelTier: "terra",
