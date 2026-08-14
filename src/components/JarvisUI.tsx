@@ -78,6 +78,11 @@ import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { googleOAuthReturnNotice, type GoogleOAuthReturnNotice } from "@/lib/google-oauth-return";
+import {
+  googleOAuthStatusPresentation,
+  type GoogleOAuthConnectionStatus,
+  type GoogleOAuthServerStatus,
+} from "@/lib/google-oauth-status";
 import { hubContextStatusPresentation, type HubContextStatus } from "@/lib/hub-context-status";
 import {
   controllerSessionStatusPresentation,
@@ -588,11 +593,29 @@ function OptionsPanel({
   // gate as the rest of the options panel; the encrypted credential itself is
   // only ever available to trusted server/worker code.
   const googleStatus = useJarvisQuery(api.googleAuth.getConnectionStatus, {});
-  const googleConnected = googleStatus && googleStatus.connected === true;
-  const googleEmail = googleStatus && googleStatus.connected ? googleStatus.email : undefined;
-  const googleCalendarConnected = googleStatus && googleStatus.connected ? googleStatus.capabilities?.calendar === true : false;
-  const googleGmailConnected = googleStatus && googleStatus.connected ? googleStatus.capabilities?.gmail === true : false;
-  const googleNeedsReconnect = googleConnected && (!googleCalendarConnected || !googleGmailConnected);
+  const [googleServerStatus, setGoogleServerStatus] = useState<GoogleOAuthServerStatus>("checking");
+  useEffect(() => {
+    const controller = new AbortController();
+    void viewerFetch("/api/google/status", { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        const body = await response.json().catch(() => null) as { configured?: unknown } | null;
+        if (!response.ok || typeof body?.configured !== "boolean") throw new Error("Google OAuth status unavailable");
+        setGoogleServerStatus(body.configured ? "configured" : "needs_setup");
+      })
+      .catch((error) => {
+        if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
+        setGoogleServerStatus("unavailable");
+      });
+    return () => controller.abort();
+  }, []);
+  const googleConnectionStatus: GoogleOAuthConnectionStatus = !googleStatus
+    ? "checking"
+    : !googleStatus.connected
+      ? "disconnected"
+      : googleStatus.capabilities?.calendar === true && googleStatus.capabilities?.gmail === true
+        ? "connected"
+        : "needs_reconnect";
+  const googleConnection = googleOAuthStatusPresentation(googleServerStatus, googleConnectionStatus);
   const [hubContextStatus, setHubContextStatus] = useState<HubContextStatus>("checking");
   useEffect(() => {
     const controller = new AbortController();
@@ -690,13 +713,15 @@ function OptionsPanel({
               set up
             </button>
           </Row>
-          <Row label="Google account" hint={googleConnected ? `connected${googleEmail ? ` · ${googleEmail}` : ""}${googleNeedsReconnect ? " · reconnect to enable Gmail + Google Calendar" : " · Gmail + Google Calendar ready"}` : "Gmail read/draft and opt-in Google Calendar — connect to enable"}>
-            {googleConnected && !googleNeedsReconnect ? (
-              <span className="rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-[11px] text-emerald-300">connected ✓</span>
-            ) : (
+          <Row label="Google account" hint={googleConnection.hint}>
+            {googleConnection.action === "connect" || googleConnection.action === "reconnect" ? (
               <a href="/api/auth/google/start" className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
-                {googleConnected ? "reconnect" : "connect"}
+                {googleConnection.action}
               </a>
+            ) : (
+              <span className={`rounded-lg border px-3 py-1 text-[11px] ${googleConnection.tone === "ready" ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : googleConnection.tone === "attention" ? "border-amber-300/30 bg-amber-300/10 text-amber-100" : "border-white/10 bg-black/20 text-slate"}`}>
+                {googleConnection.label}
+              </span>
             )}
           </Row>
           {googleOAuthNotice && (
