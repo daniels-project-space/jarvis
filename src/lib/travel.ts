@@ -324,8 +324,11 @@ export async function openTrip(a: {
     destination: a.destination,
     destIata,
     origin: "LHR",
-    departDate: "",
-    returnDate: "",
+    // The globe opens before provider work starts. Keep dates that were
+    // already spoken in that first durable draft rather than briefly showing
+    // an undated trip until the scout's later provider patch arrives.
+    departDate: a.departDate?.trim() ?? "",
+    returnDate: a.returnDate?.trim() ?? "",
     adults: 2,
     budgetGbp: 0,
     status: "scouting",

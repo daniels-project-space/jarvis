@@ -1,19 +1,33 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
 const mock = vi.hoisted(() => ({
   searchOpenStreetMapPlaces: vi.fn(),
+  findAirport: vi.fn(),
+  convexMutation: vi.fn(),
+  convexQuery: vi.fn(),
 }));
 
-vi.mock("./context", () => ({ convexMutation: vi.fn(), convexQuery: vi.fn() }));
-vi.mock("./openstreetmap", () => ({ searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces }));
+vi.mock("./context", () => ({
+  convexMutation: mock.convexMutation,
+  convexQuery: mock.convexQuery,
+}));
+vi.mock("./openstreetmap", () => ({
+  searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces,
+  findAirport: mock.findAirport,
+}));
 
-import { placesActivities } from "./travel";
+import { openTrip, placesActivities } from "./travel";
 
 describe("trip activity discovery", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      json: async () => ({ results: [] }),
+    }));
+    mock.convexQuery.mockResolvedValue("main");
+    mock.findAirport.mockResolvedValue(undefined);
     mock.searchOpenStreetMapPlaces.mockResolvedValue([
       {
         name: "Jarvis Test Museum",
@@ -24,6 +38,39 @@ describe("trip activity discovery", () => {
         mapsUri: "https://www.openstreetmap.org/?mlat=38.72&mlon=-9.14",
       },
     ]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps already-known dates in the first durable trip draft", async () => {
+    mock.convexMutation.mockResolvedValueOnce({
+      ok: true,
+      id: "draft-dated-trip",
+      planRevision: 4,
+    });
+
+    const opened = await openTrip({
+      destination: "Seville",
+      destIata: "SVQ",
+      departDate: " 2026-10-14 ",
+      returnDate: " 2026-10-19 ",
+      sourceMessageId: "message-dated-trip",
+    });
+
+    expect(opened.doc).toMatchObject({
+      destination: "Seville",
+      departDate: "2026-10-14",
+      returnDate: "2026-10-19",
+      planRevision: 4,
+    });
+    const createDraft = mock.convexMutation.mock.calls.find(([name]) => name === "travelDrafts:createDraft");
+    expect(createDraft).toBeDefined();
+    expect(JSON.parse(createDraft![1].data)).toMatchObject({
+      departDate: "2026-10-14",
+      returnDate: "2026-10-19",
+    });
   });
 
   it("uses keyless OpenStreetMap activity results without inventing ratings or photos", async () => {
