@@ -231,6 +231,25 @@ describe("live voice bootstrap policy", () => {
     expect(releaseSecondLease).not.toHaveBeenCalled();
   });
 
+  it("releases the current tokenized live lease when the UI unmounts without pagehide", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    const releaseLive = source.slice(
+      source.indexOf("function releaseLive()"),
+      source.indexOf("function endFreeVoiceSession"),
+    );
+    const unmountStart = source.indexOf("useEffect(() => () => {", source.indexOf("async function toggleLive"));
+    const unmount = source.slice(unmountStart, source.indexOf("  }, []);", unmountStart));
+
+    expect(source).toContain("const releaseLiveOnUnmountRef = useRef<() => void>(() => {});");
+    expect(source).toContain("releaseLiveOnUnmountRef.current = releaseLive;");
+    expect(unmount).toContain("freeLoop.current = false;");
+    expect(unmount).toContain("releaseLiveOnUnmountRef.current();");
+    expect(releaseLive).toContain("if (liveBeat.current) clearInterval(liveBeat.current);");
+    expect(releaseLive).toContain("liveRemoteLeaseRef.current = null;");
+    expect(releaseLive).toContain("liveLeaseId: remoteLease.id");
+    expect(releaseLive).toContain("liveLeaseSequence: remoteLease.sequence");
+  });
+
   it("fails closed when passive narration cannot obtain the shared voice lease", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
     const ensureVoice = source.slice(

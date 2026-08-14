@@ -1996,6 +1996,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const browserLiveLeaseRef = useRef<BrowserVoiceLease | null>(null);
   const browserLiveLeaseReleaseRef = useRef<Promise<void> | null>(null);
   const liveRemoteLeaseRef = useRef<{ id: string; sequence: number } | null>(null);
+  // The final unmount effect is installed only once, so it needs the current
+  // release closure after auth/session state has settled.
+  const releaseLiveOnUnmountRef = useRef<() => void>(() => {});
   const liveSessionEpoch = useRef(0);
   const liveInterruptionEpoch = useRef(0);
   const voiceInterruptionPendingRef = useRef(false);
@@ -4129,6 +4132,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }).catch(() => {});
     }
   }
+  releaseLiveOnUnmountRef.current = releaseLive;
 
   function endFreeVoiceSession() {
     liveSessionEpoch.current += 1;
@@ -4325,9 +4329,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => () => {
     liveSessionEpoch.current += 1;
     liveRef.current = false;
-    cancelFreeRearm();
-    closePersistentLiveMic();
-    void releaseBrowserLiveLease();
+    freeLoop.current = false;
+    releaseLiveOnUnmountRef.current();
   }, []);
 
   useEffect(() => {
