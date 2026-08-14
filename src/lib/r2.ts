@@ -2,9 +2,9 @@ import "server-only";
 import { AwsClient } from "aws4fetch";
 import { getServiceSecrets } from "./vault";
 
-// Durable artifact storage: the `jarvis` R2 bucket with its public r2.dev
-// domain — everything JARVIS creates (images, PDFs) gets a permanent URL here
-// instead of an expiring provider link.
+// Deprecated legacy public artifact storage. Existing creations can still
+// reference this bucket, but all new images, PDFs, exports, and captures must
+// use the private R2 helpers in `private-r2.ts` / `creation-assets.ts`.
 
 const BUCKET = "jarvis";
 const PUBLIC_BASE = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev";

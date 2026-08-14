@@ -1,8 +1,9 @@
 import { CHAT_FILE_LIMITS } from "./chat-files";
 
 const TRUSTED_CAPTURE_BASE = "https://pub-901f8094a6f04b32a784dc06cf3ebbc3.r2.dev";
-const JARVIS_IMAGE_MARKER = /\[JARVIS_IMAGE_URL:([^\]]+)\]/;
-const JARVIS_IMAGE_MARKERS = /\s*\[JARVIS_IMAGE_URL:[^\]]+\]\s*/g;
+const JARVIS_IMAGE_URL_MARKER = /\[JARVIS_IMAGE_URL:([^\]]+)\]/;
+const JARVIS_IMAGE_CAPTURE_MARKER = /\[JARVIS_IMAGE_CAPTURE:([^\]]+)\]/;
+const JARVIS_IMAGE_MARKERS = /\s*\[JARVIS_IMAGE_(?:URL|CAPTURE):[^\]]+\]\s*/g;
 
 export const CODEX_IMAGE_LIMITS = Object.freeze({
   maxSourceBytes: 12 * 1024 * 1024,
@@ -62,8 +63,17 @@ export function stripJarvisImageMarkers(text: string): string {
   return text.replace(JARVIS_IMAGE_MARKERS, " ").trim();
 }
 
+// New captures are private R2 objects. The opaque id is not a storage key or
+// URL; the Trigger worker reconstructs a tightly validated private key from
+// it. The old URL marker remains readable only so in-flight historic turns do
+// not silently lose their image input after this migration.
+export function trustedCaptureId(text: string): string | null {
+  const id = text.match(JARVIS_IMAGE_CAPTURE_MARKER)?.[1]?.trim();
+  return id && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id) ? id : null;
+}
+
 export function trustedCaptureUrl(text: string): URL | null {
-  const raw = text.match(JARVIS_IMAGE_MARKER)?.[1]?.trim();
+  const raw = text.match(JARVIS_IMAGE_URL_MARKER)?.[1]?.trim();
   if (!raw || raw.length > 2_048) return null;
   try {
     const url = new URL(raw);

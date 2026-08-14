@@ -5,6 +5,13 @@ import { vaultFailureStage, type VaultFailureStage } from "./vault-client";
 import { CHAT_FILE_LIMITS, normalizeUploadMime, normalizeUploadSha256 } from "./chat-files";
 
 const REQUIRED_PRIVATE_BUCKET = "jarvis-private-files";
+const FILE_OBJECT_KEY = /^owners\/daniel\/files\/[a-zA-Z0-9_-]+\/v[1-9][0-9]*\/(?:original|extracted\.txt|preview\.webp)$/;
+const OPAQUE_OBJECT_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const OPAQUE_OBJECT_ID = new RegExp(`^${OPAQUE_OBJECT_ID_SOURCE}$`, "i");
+const CREATION_OBJECT_KEY = new RegExp(`^owners/daniel/creations/${OPAQUE_OBJECT_ID_SOURCE}/(?:asset|thumb)$`, "i");
+const CAPTURE_OBJECT_KEY = new RegExp(`^owners/daniel/captures/${OPAQUE_OBJECT_ID_SOURCE}/image$`, "i");
+
+export type PrivateCreationObjectPurpose = "asset" | "thumb";
 
 export type PrivateR2ConfigurationCode =
   | "bucket_missing"
@@ -56,10 +63,16 @@ export function assertPrivateBucketName(value: string | undefined): string {
 
 function validateObjectKey(value: string): string {
   const key = value.trim();
-  if (!/^owners\/daniel\/files\/[a-zA-Z0-9_-]+\/v[1-9][0-9]*\/(?:original|extracted\.txt|preview\.webp)$/.test(key)) {
+  if (!FILE_OBJECT_KEY.test(key) && !CREATION_OBJECT_KEY.test(key) && !CAPTURE_OBJECT_KEY.test(key)) {
     throw new Error("invalid private R2 object key");
   }
   return key;
+}
+
+function opaqueObjectId(value: string, label: string): string {
+  const id = String(value).trim().toLowerCase();
+  if (!OPAQUE_OBJECT_ID.test(id)) throw new Error(`invalid private ${label} object identity`);
+  return id;
 }
 
 export function privateFileObjectKey(
@@ -72,6 +85,24 @@ export function privateFileObjectKey(
     throw new Error("invalid private file object identity");
   }
   return validateObjectKey(`owners/daniel/files/${id}/v${version}/${purpose}`);
+}
+
+// Generated artifacts and transient camera/screen captures get their own
+// deliberately narrow namespaces. Their opaque UUIDs are minted server-side;
+// accepting no arbitrary prefix here keeps the generic private R2 operations
+// from becoming a bucket-read/write primitive.
+export function privateCreationObjectKey(
+  assetId: string,
+  purpose: PrivateCreationObjectPurpose = "asset",
+): string {
+  if (purpose !== "asset" && purpose !== "thumb") throw new Error("invalid private creation object purpose");
+  const id = opaqueObjectId(assetId, "creation");
+  return validateObjectKey(`owners/daniel/creations/${id}/${purpose}`);
+}
+
+export function privateCaptureObjectKey(captureId: string): string {
+  const id = opaqueObjectId(captureId, "capture");
+  return validateObjectKey(`owners/daniel/captures/${id}/image`);
 }
 
 function encodedKey(value: string): string {

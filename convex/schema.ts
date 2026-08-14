@@ -2106,14 +2106,17 @@ export default defineSchema({
     .index("by_signature", ["signature"]),
 
   // Everything JARVIS creates (mind maps, charts, images, PDFs, docs) lives
-  // here — his atelier. `data` is the editable source (JSON/markdown); `url`
-  // points at the stored artifact in R2 when there is one.
+  // here — his atelier. `data` is the editable source (JSON/markdown). New
+  // binary assets live under a private opaque R2 key; `url`/`thumb` remain for
+  // legacy public objects and first-party display routes only.
   creations: defineTable({
     kind: v.string(), // "canvas" | "chart" | "image" | "pdf" | "doc"
     title: v.string(),
     data: v.optional(v.string()), // JSON (canvas/chart) or markdown (doc)
-    url: v.optional(v.string()), // R2 public url (image/pdf)
-    thumb: v.optional(v.string()), // small preview url if any
+    url: v.optional(v.string()), // legacy public URL or first-party media route
+    thumb: v.optional(v.string()), // legacy preview URL or first-party media route
+    assetR2Key: v.optional(v.string()), // private `owners/daniel/creations/.../asset`
+    assetContentType: v.optional(v.string()), // media type verified again at read time
     category: v.optional(v.string()), // emails, notes, boards, mind maps, etc.
     folder: v.optional(v.string()), // human-readable hierarchy: Projects / X, Visuals / Boards…
     project: v.optional(v.string()),

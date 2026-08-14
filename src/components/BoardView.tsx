@@ -206,7 +206,8 @@ export default function BoardView({ value }: { value: string }) {
 
   // Render the live scene to a PNG/SVG client-side (Excalidraw's export
   // utilities need a real canvas), then hand the bytes to creation-export so
-  // they get a permanent R2 url and become the library thumbnail (`thumb`).
+  // they get a private artifact, an authenticated display URL, and the
+  // library thumbnail (`thumb`).
   const exportImage = async (format: "png" | "svg") => {
     const ex = apiRef.current;
     if (!ex || !creationId || exporting) return;
@@ -226,7 +227,7 @@ export default function BoardView({ value }: { value: string }) {
               mimeType: "image/png",
               quality: 0.9,
               // Cap raster size — an unbounded export can blow well past what's
-              // sane to store, and r2Put() itself has no size ceiling.
+              // sane to store before it reaches the private export route.
               maxWidthOrHeight: 1600,
               exportPadding: 16,
             })

@@ -6,8 +6,9 @@ const mock = vi.hoisted(() => ({
   validateAdminSession: vi.fn(),
   controlQuery: vi.fn(),
   controlMutation: vi.fn(),
-  r2Put: vi.fn(),
-  r2DeleteFreshCreation: vi.fn(),
+  putPrivateCreationAsset: vi.fn(),
+  deletePrivateCreationAsset: vi.fn(),
+  creationMediaUrl: vi.fn(),
 }));
 
 vi.mock("@/lib/control-session", () => ({
@@ -16,9 +17,10 @@ vi.mock("@/lib/control-session", () => ({
   controlQuery: mock.controlQuery,
   controlMutation: mock.controlMutation,
 }));
-vi.mock("@/lib/r2", () => ({
-  r2Put: mock.r2Put,
-  r2DeleteFreshCreation: mock.r2DeleteFreshCreation,
+vi.mock("@/lib/creation-assets", () => ({
+  putPrivateCreationAsset: mock.putPrivateCreationAsset,
+  deletePrivateCreationAsset: mock.deletePrivateCreationAsset,
+  creationMediaUrl: mock.creationMediaUrl,
 }));
 
 import { POST } from "./route";
@@ -48,8 +50,12 @@ describe("creation export persistence", () => {
     mock.adminSessionHash.mockResolvedValue(OWNER);
     mock.validateAdminSession.mockResolvedValue(true);
     mock.controlQuery.mockResolvedValue(board);
-    mock.r2Put.mockResolvedValue("https://pub.example/creations/2026-08/launch-board.png");
-    mock.r2DeleteFreshCreation.mockResolvedValue(undefined);
+    mock.putPrivateCreationAsset.mockImplementation(async (_bytes: unknown, contentType: string) => ({
+      key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
+      contentType,
+    }));
+    mock.deletePrivateCreationAsset.mockResolvedValue(undefined);
+    mock.creationMediaUrl.mockImplementation((id: string) => `/api/creation-media?id=${encodeURIComponent(id)}&variant=asset`);
     mock.controlMutation.mockImplementation(async (path: string) => {
       if (path === "creations:create") return "export-1";
       return undefined;
@@ -62,15 +68,19 @@ describe("creation export persistence", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       creationId: "export-1",
+      url: "/api/creation-media?id=export-1&variant=asset",
       downloadUrl: "/api/creation-download?id=export-1",
       chatPosted: true,
     });
-    expect(mock.r2Put).toHaveBeenCalledWith("Launch board-svg", expect.any(Buffer), "image/svg+xml");
+    expect(mock.putPrivateCreationAsset).toHaveBeenCalledWith(expect.any(Buffer), "image/svg+xml");
     expect(mock.controlMutation).toHaveBeenCalledWith("creations:create", expect.objectContaining({
       kind: "export",
-      url: "https://pub.example/creations/2026-08/launch-board.png",
+      assetR2Key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
+      assetContentType: "image/svg+xml",
       data: expect.stringContaining('"sourceCreationId":"board-1"'),
     }));
+    const creationCall = mock.controlMutation.mock.calls.find(([path]) => path === "creations:create")?.[1];
+    expect(creationCall).not.toHaveProperty("url");
     expect(mock.controlMutation).toHaveBeenCalledWith("chatQueue:postCard", expect.objectContaining({
       type: "image",
       downloadUrl: "/api/creation-download?id=export-1",
@@ -83,7 +93,7 @@ describe("creation export persistence", () => {
     const response = await POST(request());
 
     expect(response.status).toBe(400);
-    expect(mock.r2Put).not.toHaveBeenCalled();
+    expect(mock.putPrivateCreationAsset).not.toHaveBeenCalled();
     expect(mock.controlMutation).not.toHaveBeenCalled();
   });
 
@@ -93,6 +103,9 @@ describe("creation export persistence", () => {
     const response = await POST(request());
 
     expect(response.status).toBe(502);
-    expect(mock.r2DeleteFreshCreation).toHaveBeenCalledWith("https://pub.example/creations/2026-08/launch-board.png");
+    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith({
+      key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
+      contentType: "image/png",
+    });
   });
 });

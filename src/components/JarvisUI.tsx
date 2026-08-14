@@ -4057,11 +4057,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ image, question: q, mode: "camera" }),
       });
-      const { imageUrl } = await r.json();
-      if (imageUrl) {
+      const { captureId } = await r.json();
+      if (captureId) {
         setInput("");
         void submit(
-          `${q || "Tell me what this is and anything useful about it. Read all relevant visible text."} [JARVIS_IMAGE_URL:${imageUrl}]`,
+          `${q || "Tell me what this is and anything useful about it. Read all relevant visible text."} [JARVIS_IMAGE_CAPTURE:${captureId}]`,
         );
       }
     } catch {
@@ -4095,10 +4095,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ image, question: q }),
       });
-      const { imageUrl } = await r.json();
-      if (imageUrl) {
+      const { captureId } = await r.json();
+      if (captureId) {
         void submit(
-          `${q || "Tell me what is on my screen and help with what looks important."} [JARVIS_IMAGE_URL:${imageUrl}]`,
+          `${q || "Tell me what is on my screen and help with what looks important."} [JARVIS_IMAGE_CAPTURE:${captureId}]`,
         );
       }
     } catch {

@@ -16,6 +16,28 @@ type TripCanvasWrite = {
   data: string;
 };
 
+function privateCreationMediaUrl(id: Id<"creations">): string {
+  return `/api/creation-media?id=${encodeURIComponent(String(id))}&variant=asset`;
+}
+
+function isPrivateCreationAssetKey(value: string | undefined): value is string {
+  return Boolean(value && /^owners\/daniel\/creations\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/asset$/i.test(value));
+}
+
+function viewerCreation(row: any) {
+  const { assetR2Key: _assetR2Key, assetContentType: _assetContentType, ...publicRow } = row;
+  const filing = inferCreationFiling(row);
+  if (!isPrivateCreationAssetKey(row.assetR2Key)) return { ...publicRow, ...filing, hasPrivateAsset: false };
+  const mediaUrl = privateCreationMediaUrl(row._id);
+  return {
+    ...publicRow,
+    ...filing,
+    url: mediaUrl,
+    thumb: mediaUrl,
+    hasPrivateAsset: true,
+  };
+}
+
 function isRecord(value: unknown): value is TripCanvasRecord {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -125,7 +147,7 @@ export const list = query({
           .withIndex("by_updatedAt")
           .order("desc")
           .take(limit);
-    return rows.map((row) => ({ ...row, ...inferCreationFiling(row) }));
+    return rows.map(viewerCreation);
   },
 });
 
@@ -134,7 +156,24 @@ export const get = query({
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
     const row = await ctx.db.get(a.id);
-    return row ? { ...row, ...inferCreationFiling(row) } : null;
+    return row ? viewerCreation(row) : null;
+  },
+});
+
+// A deliberately narrow server-side lookup for the authenticated media and
+// download routes. Viewer-facing reads above never disclose private R2 keys.
+export const getForMedia = query({
+  args: { id: v.id("creations"), ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const row = await ctx.db.get(a.id);
+    if (!row || !isPrivateCreationAssetKey(row.assetR2Key)) return null;
+    return {
+      assetR2Key: row.assetR2Key,
+      assetContentType: typeof row.assetContentType === "string" ? row.assetContentType.slice(0, 160) : undefined,
+      title: row.title,
+      kind: row.kind,
+    };
   },
 });
 
@@ -151,7 +190,7 @@ export const latest = query({
         (r: any) => (!a.kind || r.kind === a.kind) && (!t || r.title.toLowerCase().includes(t)),
       ) ?? null
     );
-    return row ? { ...row, ...inferCreationFiling(row) } : null;
+    return row ? viewerCreation(row) : null;
   },
 });
 
@@ -162,6 +201,8 @@ export const create = mutation({
     data: v.optional(v.string()),
     url: v.optional(v.string()),
     thumb: v.optional(v.string()),
+    assetR2Key: v.optional(v.string()),
+    assetContentType: v.optional(v.string()),
     category: v.optional(v.string()),
     folder: v.optional(v.string()),
     project: v.optional(v.string()),
@@ -173,6 +214,12 @@ export const create = mutation({
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    if (a.assetR2Key !== undefined && !isPrivateCreationAssetKey(a.assetR2Key)) {
+      throw new Error("invalid private creation asset key");
+    }
+    if (a.assetContentType !== undefined && !a.assetR2Key) {
+      throw new Error("private creation asset content type requires an asset key");
+    }
     const filing = inferCreationFiling(a);
     const creationId = await ctx.db.insert("creations", {
       kind: a.kind,
@@ -180,6 +227,8 @@ export const create = mutation({
       data: a.data,
       url: a.url,
       thumb: a.thumb,
+      assetR2Key: a.assetR2Key,
+      assetContentType: a.assetContentType?.slice(0, 160),
       ...filing,
       threadId: a.threadId?.slice(0, 120),
       sourceFiles: a.sourceFiles,

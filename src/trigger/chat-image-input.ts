@@ -8,10 +8,11 @@ import { readBoundedResponseBytes } from "../lib/bounded-json";
 import {
   CODEX_IMAGE_LIMITS,
   boundedCodexImageInputs,
+  trustedCaptureId,
   trustedCaptureUrl,
   type CodexImageInput,
 } from "../lib/codex-image-data";
-import { privateR2Get } from "../lib/private-r2";
+import { privateCaptureObjectKey, privateR2Get } from "../lib/private-r2";
 
 type ImageAttachment = ChatFileManifest & { r2Key: string };
 type ImageInputDependencies = {
@@ -126,13 +127,22 @@ export async function materializeCodexChatImages(
   const { signal, ...dependencyOverrides } = options;
   const deps = { ...defaultDependencies, ...dependencyOverrides };
   const sources: ImageSource[] = [];
-  const capture = trustedCaptureUrl(userText);
-  if (capture) {
+  const captureId = trustedCaptureId(userText);
+  if (captureId) {
     sources.push({
       label: "camera or screen capture submitted with this message",
       maximumBytes: CODEX_IMAGE_LIMITS.maxSourceBytes,
-      read: async (readSignal) => await deps.fetchCapture(capture, readSignal),
+      read: async (readSignal) => await deps.getPrivate(privateCaptureObjectKey(captureId), readSignal),
     });
+  } else {
+    const legacyCapture = trustedCaptureUrl(userText);
+    if (legacyCapture) {
+      sources.push({
+        label: "camera or screen capture submitted with this message",
+        maximumBytes: CODEX_IMAGE_LIMITS.maxSourceBytes,
+        read: async (readSignal) => await deps.fetchCapture(legacyCapture, readSignal),
+      });
+    }
   }
   const remaining = CODEX_IMAGE_LIMITS.maxInputs - sources.length;
   for (const file of attachments.filter((item) => isImageMime(item.mimeType)).slice(0, remaining)) {

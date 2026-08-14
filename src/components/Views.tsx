@@ -1915,11 +1915,12 @@ export function LaunchView({ value }: { value: string }) {
 /* ---------------------------------- pdf ---------------------------------- */
 
 export function PdfView({ url, title }: { url: string; title?: string }) {
+  const downloadUrl = url.startsWith("/api/creation-media?") ? `${url}&download=1` : url;
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center justify-between border-b border-white/5 px-3 py-1.5">
         <span className="truncate text-xs text-ice">{title ?? "document.pdf"}</span>
-        <a href={url} target="_blank" rel="noreferrer" className="hud-label shrink-0 rounded px-2 py-0.5 !text-cyan hover:bg-cyan/10">
+        <a href={downloadUrl} target="_blank" rel="noreferrer" className="hud-label shrink-0 rounded px-2 py-0.5 !text-cyan hover:bg-cyan/10">
           ⬇ download
         </a>
       </div>
@@ -2171,7 +2172,7 @@ export function CreationsView({ value }: { value: string }) {
                             <a href={`/api/creation-download?id=${encodeURIComponent(r._id)}`} className="text-slate hover:text-cyan" title="Editable .excalidraw source">file ↓</a>
                             <span className="text-white/15">·</span>
                             {r.thumb ? (
-                              <a href={r.thumb} download className="text-slate hover:text-cyan">image ↓</a>
+                              <a href={r.thumb.startsWith("/api/creation-media?") ? `${r.thumb}&download=1` : r.thumb} download className="text-slate hover:text-cyan">image ↓</a>
                             ) : (
                               <span className="text-slate/40" title="Open the board and use “export image” first">image ↓</span>
                             )}

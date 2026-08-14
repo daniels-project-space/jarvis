@@ -12,7 +12,7 @@ const mock = vi.hoisted(() => ({
   trigger: vi.fn(),
   getSecret: vi.fn(),
   executeTool: vi.fn(),
-  r2Put: vi.fn(),
+  privateR2Put: vi.fn(),
 }));
 
 vi.mock("@/lib/request-auth", () => ({
@@ -38,7 +38,10 @@ vi.mock("@/lib/transcript", () => ({
 vi.mock("@/lib/control-session", () => ({ isSameOriginRequest: vi.fn(() => true) }));
 vi.mock("@/lib/tools", () => ({ TOOL_DEFS: [{ name: "dispatch_agent" }], executeTool: mock.executeTool }));
 vi.mock("@/lib/tool-belts", () => ({ TOOL_BELTS: { core: new Set(["dispatch_agent"]) }, slimToolDefinition: (value: unknown) => value }));
-vi.mock("@/lib/r2", () => ({ r2Put: mock.r2Put }));
+vi.mock("@/lib/private-r2", () => ({
+  privateR2Put: mock.privateR2Put,
+  privateCaptureObjectKey: (captureId: string) => `owners/daniel/captures/${captureId}/image`,
+}));
 
 import { POST as chatPost } from "./chat/route";
 import { POST as cancelChatPost } from "./chat/cancel/route";
@@ -277,6 +280,6 @@ describe("guest foreground boundary", () => {
     expect(tool.status).toBe(403);
     expect(visual.status).toBe(403);
     expect(mock.executeTool).not.toHaveBeenCalled();
-    expect(mock.r2Put).not.toHaveBeenCalled();
+    expect(mock.privateR2Put).not.toHaveBeenCalled();
   });
 });

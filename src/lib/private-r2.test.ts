@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { assertPrivateBucketName, privateR2ConfigurationCode } from "./private-r2";
+import {
+  assertPrivateBucketName,
+  privateCaptureObjectKey,
+  privateCreationObjectKey,
+  privateR2ConfigurationCode,
+} from "./private-r2";
 
 describe("private R2 configuration diagnostics", () => {
   it("accepts only the dedicated private bucket", () => {
@@ -25,5 +30,17 @@ describe("private R2 configuration diagnostics", () => {
     } catch (error) {
       expect(privateR2ConfigurationCode(error)).toBe("bucket_mismatch");
     }
+  });
+
+  it("builds only opaque creation and capture object keys", () => {
+    const id = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    expect(privateCreationObjectKey(id)).toBe(`owners/daniel/creations/${id}/asset`);
+    expect(privateCreationObjectKey(id, "thumb")).toBe(`owners/daniel/creations/${id}/thumb`);
+    expect(privateCaptureObjectKey(id)).toBe(`owners/daniel/captures/${id}/image`);
+  });
+
+  it("rejects broad or non-opaque creation and capture paths", () => {
+    expect(() => privateCreationObjectKey("owners/daniel/files/anything/v1/original")).toThrow("invalid private creation object identity");
+    expect(() => privateCaptureObjectKey("capture-1")).toThrow("invalid private capture object identity");
   });
 });

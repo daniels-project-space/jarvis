@@ -2,7 +2,12 @@ import "server-only";
 import { createHash } from "node:crypto";
 import { convexMutation, convexQuery } from "./context";
 import { getSecret, getServiceSecrets } from "./vault";
-import { r2DeleteFreshCreation, r2Put, r2StoreFromUrl } from "./r2";
+import {
+  creationMediaUrl,
+  deletePrivateCreationAsset,
+  putPrivateCreationAsset,
+  storePrivateCreationAssetFromUrl,
+} from "./creation-assets";
 import { privateR2Get } from "./private-r2";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
@@ -2556,16 +2561,16 @@ async function createImage(args: any): Promise<string> {
   }
   if (!imageUrl) return "Image generation timed out after 30s — try again.";
   const title = String(args.title ?? prompt.slice(0, 60));
-  let finalUrl: string;
+  let asset: Awaited<ReturnType<typeof storePrivateCreationAssetFromUrl>>;
   try {
-    finalUrl = (await r2StoreFromUrl(title, imageUrl)).url;
+    asset = await storePrivateCreationAssetFromUrl(imageUrl);
   } catch (e: any) {
     // A provider URL is short-lived and must never be passed off as a saved
     // Jarvis creation. Keep the incident signal, but fail the durable flow.
     await convexMutation("incidents:report", {
       source: "tools",
-      signature: "r2:create-image-store",
-      message: `R2 re-home of generated image failed: ${String(e?.message ?? e).slice(0, 200)}`,
+      signature: "private-r2:create-image-store",
+      message: `Private R2 re-home of generated image failed: ${String(e?.message ?? e).slice(0, 200)}`,
     }).catch(() => {});
     return "Image generation completed, but durable storage failed. It was not saved to the creations library and no download card was posted.";
   }
@@ -2573,26 +2578,27 @@ async function createImage(args: any): Promise<string> {
   let creationId: unknown;
   try {
     creationId = await convexMutation("creations:create", {
-      kind: "image", title, url: finalUrl, thumb: finalUrl, data: prompt, ...filing,
+      kind: "image", title, assetR2Key: asset.key, assetContentType: asset.contentType, data: prompt, ...filing,
     });
     if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
   } catch {
-    // Only delete the fresh R2 object we just created. Without a library row,
-    // it is undiscoverable and must not become a false "saved" artifact.
-    await r2DeleteFreshCreation(finalUrl).catch(() => undefined);
+    // Only delete the fresh private object we just created. Without a library
+    // row it is undiscoverable and must not become a false "saved" artifact.
+    await deletePrivateCreationAsset(asset).catch(() => undefined);
     return "Image generated, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
   }
+  const mediaUrl = creationMediaUrl(creationId);
   const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
   let panelShown = true;
   try {
-    await convexMutation("ui:setPanel", { type: "image", value: finalUrl, title });
+    await convexMutation("ui:setPanel", { type: "image", value: mediaUrl, title });
   } catch {
     panelShown = false;
   }
   let cardPosted = true;
   try {
     await convexMutation("chatQueue:postCard", {
-      threadId: filing.threadId, type: "image", value: finalUrl, title, downloadUrl,
+      threadId: filing.threadId, type: "image", value: mediaUrl, title, downloadUrl,
     });
   } catch {
     cardPosted = false;
@@ -2600,7 +2606,7 @@ async function createImage(args: any): Promise<string> {
   if (!panelShown || !cardPosted) {
     return `Image saved to the creations library${panelShown ? "" : ", but it could not be shown on screen"}${cardPosted ? "" : ", and its download card could not be posted"}.`;
   }
-  return `Image generated, shown on screen, saved to the creations library, and attached with a secure download card. URL: ${finalUrl}`;
+  return "Image generated, shown on screen, saved to the creations library, and attached with a secure download card.";
 }
 
 async function storeImage(args: any): Promise<string> {
@@ -2608,29 +2614,30 @@ async function storeImage(args: any): Promise<string> {
   if (!/^https?:\/\//.test(url)) return "Give me a valid image URL.";
   const title = String(args.title ?? "stored image").slice(0, 80);
   try {
-    const { url: stored } = await r2StoreFromUrl(title, url);
+    const asset = await storePrivateCreationAssetFromUrl(url);
     const filing = await creationFiling(args);
     let creationId: unknown;
     try {
       creationId = await convexMutation("creations:create", {
-        kind: "image", title, url: stored, thumb: stored, ...filing,
+        kind: "image", title, assetR2Key: asset.key, assetContentType: asset.contentType, ...filing,
       });
       if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
     } catch {
-      // The R2 object is fresh and undiscoverable without a library record;
+      // The private object is fresh and undiscoverable without a library row;
       // never leave it behind while claiming that this image was saved.
-      await r2DeleteFreshCreation(stored).catch(() => undefined);
+      await deletePrivateCreationAsset(asset).catch(() => undefined);
       return "The image was copied, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
     }
+    const mediaUrl = creationMediaUrl(creationId);
     const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
     try {
       await convexMutation("chatQueue:postCard", {
-        threadId: filing.threadId, type: "image", value: stored, title, downloadUrl,
+        threadId: filing.threadId, type: "image", value: mediaUrl, title, downloadUrl,
       });
     } catch {
       return "Image saved to the creations library, but its download card could not be posted.";
     }
-    return `Stored permanently in the creations library and attached with a secure download card. URL: ${stored}`;
+    return "Stored privately in the creations library and attached with a secure download card.";
   } catch (e: any) {
     return `Couldn't store that image: ${e?.message ?? e}`;
   }
@@ -2643,29 +2650,30 @@ async function createPdf(args: any): Promise<string> {
   try {
     const { markdownToPdf } = await import("./pdf");
     const bytes = await markdownToPdf(title, md.slice(0, 30_000));
-    const url = await r2Put(title, bytes, "application/pdf");
+    const asset = await putPrivateCreationAsset(bytes, "application/pdf");
     const filing = await creationFiling(args);
     let creationId: unknown;
     try {
       creationId = await convexMutation("creations:create", {
-        kind: "pdf", title, url, data: md.slice(0, 20_000), ...filing,
+        kind: "pdf", title, assetR2Key: asset.key, assetContentType: asset.contentType, data: md.slice(0, 20_000), ...filing,
       });
       if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
     } catch {
-      await r2DeleteFreshCreation(url).catch(() => undefined);
+      await deletePrivateCreationAsset(asset).catch(() => undefined);
       return "PDF was rendered, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
     }
+    const mediaUrl = creationMediaUrl(creationId);
     const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
     let panelShown = true;
     try {
-      await convexMutation("ui:setPanel", { type: "pdf", value: url, title });
+      await convexMutation("ui:setPanel", { type: "pdf", value: mediaUrl, title });
     } catch {
       panelShown = false;
     }
     let cardPosted = true;
     try {
       await convexMutation("chatQueue:postCard", {
-        threadId: filing.threadId, type: "pdf", value: url, title: `${title}.pdf`, downloadUrl,
+        threadId: filing.threadId, type: "pdf", value: mediaUrl, title: `${title}.pdf`, downloadUrl,
       });
     } catch {
       cardPosted = false;
@@ -2673,7 +2681,7 @@ async function createPdf(args: any): Promise<string> {
     if (!panelShown || !cardPosted) {
       return `PDF saved to the creations library${panelShown ? "" : ", but it could not be shown on screen"}${cardPosted ? "" : ", and its download card could not be posted"}.`;
     }
-    return `PDF is shown on screen, saved to the creations library, and attached with a secure download card. URL: ${url}`;
+    return "PDF is shown on screen, saved to the creations library, and attached with a secure download card.";
   } catch (e: any) {
     return `PDF creation failed: ${e?.message ?? e}`;
   }

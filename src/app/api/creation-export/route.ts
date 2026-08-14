@@ -1,11 +1,11 @@
 import type { NextRequest } from "next/server";
 import { adminSessionHash, controlMutation, controlQuery, validateAdminSession } from "@/lib/control-session";
-import { r2DeleteFreshCreation, r2Put } from "@/lib/r2";
+import { creationMediaUrl, deletePrivateCreationAsset, putPrivateCreationAsset } from "@/lib/creation-assets";
 
 // Client-rendered board exports (PNG/SVG) land here: Excalidraw can only
 // rasterize its scene in the browser, so BoardView renders the bytes and
-// posts them up to get a permanent R2 object, an owned library artifact, and
-// a chat card with a first-party download route.
+// posts them up to get a private R2 object, an owned library artifact, and a
+// chat card with a first-party authenticated media/download route.
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
@@ -44,11 +44,11 @@ export async function POST(req: NextRequest) {
   if (bytes.byteLength > MAX_BYTES) return Response.json({ error: "export too large" }, { status: 413 });
 
   const contentType = format === "png" ? "image/png" : "image/svg+xml";
-  let url: string;
+  let asset: Awaited<ReturnType<typeof putPrivateCreationAsset>>;
   try {
-    url = await r2Put(`${row.title || "board"}-${format}`, bytes, contentType);
+    asset = await putPrivateCreationAsset(bytes, contentType);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "R2 upload failed";
+    const message = error instanceof Error ? error.message : "private R2 upload failed";
     return Response.json({ error: message.slice(0, 180) }, { status: 502 });
   }
 
@@ -57,8 +57,8 @@ export async function POST(req: NextRequest) {
     const created = await controlMutation("creations:create", {
       kind: "export",
       title: `${row.title || "Board"} · ${format.toUpperCase()} export`,
-      url,
-      thumb: url,
+      assetR2Key: asset.key,
+      assetContentType: asset.contentType,
       data: JSON.stringify({ sourceCreationId: row._id, format, contentType }),
       category: "exports",
       folder: row.folder ? `${row.folder} / Exports` : "Exports",
@@ -70,16 +70,19 @@ export async function POST(req: NextRequest) {
     if (typeof created !== "string" || !created) throw new Error("creation persistence returned no id");
     exportCreationId = created;
   } catch (error) {
-    // No durable record means no user can discover the upload. Delete only
-    // this freshly created object; failures remain visible in server logs but
-    // never convert a failed export into a false success response.
-    await r2DeleteFreshCreation(url).catch(() => undefined);
+    // No durable record means no user can discover the private upload. Delete
+    // only this freshly created object; never convert a failed export into a
+    // false success response.
+    await deletePrivateCreationAsset(asset).catch(() => undefined);
     const message = error instanceof Error ? error.message : "export persistence failed";
     return Response.json({ error: message.slice(0, 180) }, { status: 502 });
   }
 
+  const url = creationMediaUrl(exportCreationId);
   // A PNG is a useful current board thumbnail, while each PNG/SVG remains an
   // independent immutable library item rather than overwriting prior exports.
+  // The parent only stores the authenticated first-party display route, never
+  // a private key or public bucket URL.
   if (format === "png") {
     await controlMutation("creations:update", { id, thumb: url, authTokenHash }).catch(() => undefined);
   }

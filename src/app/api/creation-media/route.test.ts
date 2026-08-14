@@ -1,0 +1,89 @@
+import { NextRequest } from "next/server";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mock = vi.hoisted(() => ({
+  adminSessionHash: vi.fn(),
+  validateAdminSession: vi.fn(),
+  controlQuery: vi.fn(),
+  privateR2Get: vi.fn(),
+}));
+
+vi.mock("@/lib/control-session", () => ({
+  adminSessionHash: mock.adminSessionHash,
+  validateAdminSession: mock.validateAdminSession,
+  controlQuery: mock.controlQuery,
+}));
+vi.mock("@/lib/private-r2", () => ({ privateR2Get: mock.privateR2Get }));
+
+import { GET } from "./route";
+
+const OWNER = "a".repeat(64);
+const media = {
+  assetR2Key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
+  assetContentType: "image/png",
+  title: "Launch image",
+  kind: "image",
+};
+
+function request(query = "id=creation-1", headers: HeadersInit = {}) {
+  return new NextRequest(`https://jarvis.example/api/creation-media?${query}`, { headers });
+}
+
+describe("private creation media", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mock.adminSessionHash.mockResolvedValue(OWNER);
+    mock.validateAdminSession.mockResolvedValue(true);
+    mock.controlQuery.mockResolvedValue(media);
+    mock.privateR2Get.mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), {
+      status: 200,
+      headers: { "content-type": "image/svg+xml", "content-length": "3", "accept-ranges": "bytes" },
+    }));
+  });
+
+  it("streams a private object only after owner authentication and media lookup", async () => {
+    const response = await GET(request());
+
+    expect(response.status).toBe(200);
+    expect(mock.controlQuery).toHaveBeenCalledWith("creations:getForMedia", { id: "creation-1", authTokenHash: OWNER });
+    expect(mock.privateR2Get).toHaveBeenCalledWith(media.assetR2Key, undefined);
+    expect(response.headers.get("content-type")).toBe("image/svg+xml");
+    expect(response.headers.get("content-disposition")).toContain("inline");
+    expect(response.headers.get("cache-control")).toContain("private");
+    expect(response.headers.get("content-security-policy")).toContain("sandbox");
+    await expect(response.arrayBuffer()).resolves.toEqual(new Uint8Array([1, 2, 3]).buffer);
+  });
+
+  it("honours a valid range and only changes disposition when an explicit download is requested", async () => {
+    mock.privateR2Get.mockResolvedValue(new Response(new Uint8Array([2]), {
+      status: 206,
+      headers: { "content-type": "image/png", "content-range": "bytes 1-1/3", "content-length": "1" },
+    }));
+
+    const response = await GET(request("id=creation-1&download=1", { range: "bytes=1-1" }));
+
+    expect(response.status).toBe(206);
+    expect(mock.privateR2Get).toHaveBeenCalledWith(media.assetR2Key, "bytes=1-1");
+    expect(response.headers.get("content-range")).toBe("bytes 1-1/3");
+    expect(response.headers.get("content-disposition")).toContain("attachment");
+  });
+
+  it("fails closed without a media row and never asks storage for an arbitrary key", async () => {
+    mock.controlQuery.mockResolvedValue(null);
+
+    const response = await GET(request());
+
+    expect(response.status).toBe(404);
+    expect(mock.privateR2Get).not.toHaveBeenCalled();
+  });
+
+  it("rejects unauthenticated media reads before querying Convex or R2", async () => {
+    mock.adminSessionHash.mockResolvedValue(null);
+
+    const response = await GET(request());
+
+    expect(response.status).toBe(401);
+    expect(mock.controlQuery).not.toHaveBeenCalled();
+    expect(mock.privateR2Get).not.toHaveBeenCalled();
+  });
+});
