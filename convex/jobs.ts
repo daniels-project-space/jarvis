@@ -63,6 +63,10 @@ import {
 import { admissionForRepository } from "./sourceAdmission";
 import { WORK_ORDER_MACHINE_RUNTIME, WORK_ORDER_MACHINE_TEMPLATE } from "../src/lib/work-order-revision";
 import {
+  resolveBackgroundExecutionProfile,
+  resolveBackgroundExecutionProfileForWorkOrder,
+} from "../src/lib/background-execution-profile";
+import {
   exactTerminalWorkReceipt,
   insertFreshTerminalWorkReceipt,
   type RecoveryDisposition,
@@ -1370,6 +1374,14 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
   const attemptAuthority = await readAttemptExecutionAuthority(ctx, j, j.attempt ?? 1);
   if (!attemptAuthority) return null;
   const order = attemptAuthority.workOrder;
+  const executionProfile = order.backgroundExecutionProfile === undefined
+    ? resolveBackgroundExecutionProfileForWorkOrder({
+      modelTier: order.minimumModel,
+      readonly: order.readonly,
+      repositoryCapabilities: order.toolScope,
+    })
+    : resolveBackgroundExecutionProfile(order.backgroundExecutionProfile);
+  if (!executionProfile.accepted) return null;
   const delivery: any = j.activeDeliveryAttemptId ? await ctx.db.get(j.activeDeliveryAttemptId) : null;
   return {
     jobId: j._id,
@@ -1379,6 +1391,7 @@ async function claimedJob(ctx: any, j: any, upstreamEvidence: readonly any[] = [
     readonly: order.readonly,
     model: order.minimumModel,
     reasoningEffort: order.minimumReasoningEffort,
+    backgroundExecutionProfile: executionProfile.profile,
     mcp: [...order.mcpScope],
     toolScope: [...order.toolScope],
     agentRole: order.agentRole,
@@ -4341,6 +4354,14 @@ export const authorizeExecutionBoundary = mutation({
       })) return null;
     const authority = await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest);
     if (!authority) return null;
+    const executionProfile = authority.workOrder.backgroundExecutionProfile === undefined
+      ? resolveBackgroundExecutionProfileForWorkOrder({
+        modelTier: authority.workOrder.minimumModel,
+        readonly: authority.workOrder.readonly,
+        repositoryCapabilities: authority.workOrder.toolScope,
+      })
+      : resolveBackgroundExecutionProfile(authority.workOrder.backgroundExecutionProfile);
+    if (!executionProfile.accepted) return null;
     return {
       phase: a.phase,
       authorityDigest: authority.authorityDigest,
@@ -4366,6 +4387,7 @@ export const authorizeExecutionBoundary = mutation({
       dispatchPayloadDigest: receipt.payloadDigest,
       minimumModel: authority.workOrder.minimumModel,
       minimumReasoningEffort: authority.workOrder.minimumReasoningEffort,
+      backgroundExecutionProfile: executionProfile.profile,
       toolScope: authority.workOrder.toolScope,
       mcpScope: authority.workOrder.mcpScope,
     };

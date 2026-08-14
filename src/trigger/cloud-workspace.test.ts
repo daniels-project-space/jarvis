@@ -17,7 +17,7 @@ import {
   type PatchManifest,
 } from "./cloud-workspace";
 import { FakeCloudWorkspaceProvider } from "./cloud-workspace-fake";
-import { CloudWorkspaceToolBridge } from "./cloud-workspace-tools";
+import { CloudWorkspaceToolBridge, cloudRepositoryToolsForScope } from "./cloud-workspace-tools";
 import { persistPortableCheckpoint, prepareCloudWorkspaceExecution, replayCloudWorkspaceExecution, terminateOrphanedCloudWorkspaces } from "./cloud-workspace-controller";
 import {
   CLOUD_WORKSPACE_CAPABILITY_MATRIX,
@@ -202,10 +202,30 @@ describe("fail-closed cloud workspace boundary", () => {
   it("never projects controller secrets or caller env into sandbox execution", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
-    const bridge = new CloudWorkspaceToolBridge(provider, workspace);
+    const bridge = new CloudWorkspaceToolBridge(provider, workspace, {
+      allowedToolScope: ["repository_exec", "repository_read_file", "repository_list_files", "repository_write_file"],
+    });
     await bridge.invoke({ threadId: "t", turnId: "r", callId: "c", namespace: null, tool: "repository_exec", arguments: { command: "printf clean" } });
     expect(provider.observedExecEnvironments).toEqual([{}]);
     expect(JSON.stringify(provider.observedExecEnvironments)).not.toMatch(/OPENAI|CODEX|GITHUB|CONVEX|TRIGGER|VAULT|TOKEN|SECRET/);
+  });
+
+  it("does not advertise or execute write tools for a read-only work order", async () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const workspace = await provider.createWorkspace({
+      attemptKey: "readonly:1", template: "node", runtime: "node-22", lockfileDigest: "c".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+    });
+    const bridge = new CloudWorkspaceToolBridge(provider, workspace, {
+      allowedToolScope: ["repository_read_file", "repository_list_files"],
+    });
+    const outcome = await bridge.invoke({
+      threadId: "t", turnId: "r", callId: "c", namespace: null,
+      tool: "repository_write_file", arguments: { path: "blocked.txt", content: "nope" },
+    });
+    expect(outcome.success).toBe(false);
+    expect(provider.calls).not.toContain("writeFile");
+    expect(cloudRepositoryToolsForScope(["repository_read_file", "repository_list_files"])
+      .map((tool) => tool.name)).toEqual(["repository_read_file", "repository_list_files"]);
   });
 
   it.each([

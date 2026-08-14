@@ -1,4 +1,11 @@
 import { normalizeWorkModelTier, type WorkModelTier } from "./work-models";
+import {
+  backgroundExecutionProfileForWorkOrder,
+  backgroundExecutionProfilesEqual,
+  resolveBackgroundExecutionProfile,
+  resolveBackgroundExecutionProfileForWorkOrder,
+  type BackgroundExecutionProfile,
+} from "./background-execution-profile";
 import { SCOPED_TEAM_MANIFEST } from "./workflow-contract";
 import {
   admittedTriggerMachine,
@@ -15,11 +22,11 @@ export const WORK_ORDER_MACHINE_CLASS = `${WORK_ORDER_MACHINE_RUNTIME}/${WORK_OR
 
 export const WORK_ORDER_MCP_ALLOWLIST = Object.freeze(["browserbase", "context7", "playwright"] as const);
 export const WORK_ORDER_READ_TOOLS = Object.freeze([
-  "repository_exec",
   "repository_read_file",
   "repository_list_files",
 ] as const);
 export const WORK_ORDER_WRITE_TOOLS = Object.freeze([
+  "repository_exec",
   ...WORK_ORDER_READ_TOOLS,
   "repository_write_file",
 ] as const);
@@ -55,6 +62,9 @@ export type WorkOrderRevisionBinding = Readonly<{
   agentRole: string;
   minimumModel: WorkModelTier;
   minimumReasoningEffort: "low" | "medium" | "high" | "max";
+  // Optional only while protocol-v2 rows already in production are drained.
+  // New work orders always carry this profile and bind it into the digest.
+  backgroundExecutionProfile?: BackgroundExecutionProfile;
   machineClass: typeof WORK_ORDER_MACHINE_CLASS;
   triggerMachinePreset: TriggerAgentMachinePreset;
   triggerMachineReason: TriggerAgentMachineReason;
@@ -163,6 +173,11 @@ export function workOrderRevisionForJob(
     ? sourceProvider !== "github" || !sourceBranch || !sourceRef || !sourceHeadSha
     : sourceProvider !== "none" || sourceBranch || sourceRef || sourceHeadSha) return null;
   const minimumReasoningEffort = normalizeMinimumReasoningEffort(job.reasoningEffort, minimumModel);
+  const backgroundExecutionProfile = backgroundExecutionProfileForWorkOrder({
+    modelTier: minimumModel,
+    readonly,
+    repositoryCapabilities: toolScope,
+  });
   const triggerMachine = admittedTriggerMachine({ readonly, minimumModel, minimumReasoningEffort });
   return {
     protocolVersion: WORK_ORDER_REVISION_PROTOCOL_VERSION,
@@ -195,6 +210,7 @@ export function workOrderRevisionForJob(
     agentRole: typeof job.agentRole === "string" && job.agentRole ? job.agentRole : agent.agentRole,
     minimumModel,
     minimumReasoningEffort,
+    backgroundExecutionProfile,
     machineClass: WORK_ORDER_MACHINE_CLASS,
     triggerMachinePreset: triggerMachine.preset,
     triggerMachineReason: triggerMachine.reason,
@@ -233,6 +249,7 @@ export function canonicalWorkOrderRevision(binding: WorkOrderRevisionBinding): s
     agentRole: binding.agentRole,
     minimumModel: binding.minimumModel,
     minimumReasoningEffort: binding.minimumReasoningEffort,
+    ...(binding.backgroundExecutionProfile ? { backgroundExecutionProfile: binding.backgroundExecutionProfile } : {}),
     machineClass: binding.machineClass,
     triggerMachinePreset: binding.triggerMachinePreset,
     triggerMachineReason: binding.triggerMachineReason,
@@ -241,6 +258,10 @@ export function canonicalWorkOrderRevision(binding: WorkOrderRevisionBinding): s
 
 export function workOrderRevisionRowBinding(row: Record<string, unknown>): WorkOrderRevisionBinding | null {
   if (Number(row.protocolVersion) !== WORK_ORDER_REVISION_PROTOCOL_VERSION) return null;
+  const profile = row.backgroundExecutionProfile === undefined
+    ? undefined
+    : resolveBackgroundExecutionProfile(row.backgroundExecutionProfile);
+  if (profile && !profile.accepted) return null;
   const binding = {
     protocolVersion: WORK_ORDER_REVISION_PROTOCOL_VERSION,
     jobId: String(row.jobId ?? ""),
@@ -272,14 +293,31 @@ export function workOrderRevisionRowBinding(row: Record<string, unknown>): WorkO
     agentRole: row.agentRole,
     minimumModel: row.minimumModel,
     minimumReasoningEffort: row.minimumReasoningEffort,
+    backgroundExecutionProfile: profile?.accepted ? profile.profile : undefined,
     machineClass: row.machineClass,
     triggerMachinePreset: row.triggerMachinePreset,
     triggerMachineReason: row.triggerMachineReason,
   } as WorkOrderRevisionBinding;
+  // Protocol-v2 rows from before this profile existed may retain the old
+  // read-only `repository_exec` scope. It is write-capable in practice, so
+  // those rows must remain visible but cannot be re-admitted for execution.
+  const legacyProfile = binding.backgroundExecutionProfile === undefined && Array.isArray(binding.toolScope)
+    ? resolveBackgroundExecutionProfileForWorkOrder({
+      modelTier: binding.minimumModel,
+      readonly: binding.readonly,
+      repositoryCapabilities: binding.toolScope,
+    })
+    : binding.backgroundExecutionProfile === undefined ? undefined : null;
   if (!Number.isSafeInteger(binding.revision) || binding.revision < 1
     || typeof binding.executableTask !== "string" || typeof binding.policyTask !== "string"
     || !Array.isArray(binding.acceptanceCriteria) || !Array.isArray(binding.toolScope) || !Array.isArray(binding.mcpScope)
     || !workOrderAgent(binding.agentId)
+    || (binding.backgroundExecutionProfile === undefined && (!legacyProfile || !legacyProfile.accepted))
+    || (binding.backgroundExecutionProfile !== undefined && (
+      binding.backgroundExecutionProfile.modelTier !== binding.minimumModel
+      || binding.backgroundExecutionProfile.readonly !== binding.readonly
+      || !exactArray(binding.backgroundExecutionProfile.repositoryCapabilities, binding.toolScope)
+    ))
     || !["human_gate_required", "autonomous"].includes(binding.approvalResult)
     || binding.machineClass !== WORK_ORDER_MACHINE_CLASS
     || !(TRIGGER_AGENT_MACHINE_PRESETS as readonly unknown[]).includes(binding.triggerMachinePreset)
@@ -317,6 +355,8 @@ export function workOrderProjectionMatches(job: Record<string, unknown>, binding
     && job.agentRole === binding.agentRole
     && job.model === binding.minimumModel
     && job.reasoningEffort === binding.minimumReasoningEffort
+    && (binding.backgroundExecutionProfile === undefined
+      || backgroundExecutionProfilesEqual(job.backgroundExecutionProfile, binding.backgroundExecutionProfile))
     && job.machineClass === binding.machineClass
     && job.triggerMachinePreset === binding.triggerMachinePreset
     && job.triggerMachineReason === binding.triggerMachineReason;

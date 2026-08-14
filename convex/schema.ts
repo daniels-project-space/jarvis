@@ -38,6 +38,23 @@ const missionSupervisorModelTierValidator = v.union(
   v.literal("sol"),
 );
 
+// This is intentionally an explicit false-only capability snapshot. The
+// provider/model transport belongs to the immutable work order, never to a
+// mutable job update or environment toggle.
+const backgroundExecutionProfileValidator = v.object({
+  version: v.literal(1),
+  provider: v.literal("codex-subscription"),
+  modelTier: missionSupervisorModelTierValidator,
+  readonly: v.boolean(),
+  authority: v.object({
+    external: v.literal(false),
+    apps: v.literal(false),
+    secrets: v.literal(false),
+    network: v.literal(false),
+  }),
+  repositoryCapabilities: v.array(v.string()),
+});
+
 const missionSupervisorDecisionOriginValidator = v.union(
   v.literal("model"),
   v.literal("policy"),
@@ -512,6 +529,7 @@ export default defineSchema({
     readonly: v.optional(v.boolean()), // if true, runner never commits/pushes
     model: v.optional(v.string()), // optional Codex tier override (luna|terra|sol)
     reasoningEffort: v.optional(v.string()), // optional per-job override (low|medium|high|max)
+    backgroundExecutionProfile: v.optional(backgroundExecutionProfileValidator),
     mcp: v.optional(v.array(v.string())), // MCP servers to attach (playwright, context7)
     toolScope: v.optional(v.array(v.string())),
     agentRole: v.optional(v.string()),
@@ -927,6 +945,9 @@ export default defineSchema({
     agentRole: v.string(),
     minimumModel: v.string(),
     minimumReasoningEffort: v.string(),
+    // Optional only for active protocol-v2 rows created before the execution
+    // profile existed. New work orders must carry the hashed snapshot.
+    backgroundExecutionProfile: v.optional(backgroundExecutionProfileValidator),
     machineClass: v.string(),
     // Optional only for Convex-first rollout compatibility. Protocol-v2
     // readers reject historical rows that do not carry both exact bindings.

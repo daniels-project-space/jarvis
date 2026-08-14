@@ -59,6 +59,11 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
     jobId, authorityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
     workOrderRevisionDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
     deliveryMode: policy,
+    backgroundExecutionProfile: {
+      version: 1,
+      provider: "codex-subscription",
+      authority: { external: false, apps: false, secrets: false, network: false },
+    },
   });
   const result = "specialist executed once";
   const note = "supervisor pass";

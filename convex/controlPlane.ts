@@ -359,7 +359,7 @@ const IMMUTABLE_JOB_BINDING_FIELDS = [
 
 const ACTIVE_WORK_ORDER_FIELDS = [
   "task", "policyTask", "steer", "acceptanceCriteria", "repo", "readonly",
-  "model", "reasoningEffort", "mcp", "toolScope", "deliveryMode", "risk",
+  "model", "reasoningEffort", "backgroundExecutionProfile", "mcp", "toolScope", "deliveryMode", "risk",
   "approvalRequired", "approvalReason", "agentId", "agentRole", "machineClass",
   "triggerMachinePreset", "triggerMachineReason",
   "workOrderProtocolVersion", "workOrderRevision", "workOrderRevisionId", "workOrderRevisionDigest",
@@ -644,7 +644,14 @@ export function runtimeMatchesSchedulingAuthority(runtime: any, authority: {
 export async function insertJobWithRuntime(ctx: any, value: any) {
   const projectAdmission = value.projectAdmission as ProjectSourceAdmission | undefined;
   const requireFreshSourceAdmission = value.requireFreshSourceAdmission === true;
-  const { projectAdmission: _projectAdmission, requireFreshSourceAdmission: _fresh, ...persistedValue } = value;
+  const {
+    projectAdmission: _projectAdmission,
+    requireFreshSourceAdmission: _fresh,
+    // Provider authority is derived only after the scheduling binding exists;
+    // callers can never smuggle a profile into a job.
+    backgroundExecutionProfile: _requestedBackgroundExecutionProfile,
+    ...persistedValue
+  } = value;
   if (!persistedValue.missionId) throw new Error("Executable work requires an immutable mission group id");
   if (!projectAdmission || !await projectSourceAdmissionIsValid(projectAdmission, {
     expectedRepository: persistedValue.repo,
@@ -769,6 +776,7 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
     workOrderRevision: 1,
     workOrderRevisionId: initialWorkOrderRevisionId,
     workOrderRevisionDigest: initialWorkOrderDigest,
+    backgroundExecutionProfile: initialWorkOrderBinding.backgroundExecutionProfile,
   };
   const admittedPatch = { ...admitted };
   delete admittedPatch._id;
@@ -883,6 +891,7 @@ function activeWorkOrderPatch(
     readonly: binding.readonly,
     model: binding.minimumModel,
     reasoningEffort: binding.minimumReasoningEffort,
+    backgroundExecutionProfile: binding.backgroundExecutionProfile,
     mcp: [...binding.mcpScope],
     toolScope: [...binding.toolScope],
     deliveryMode: binding.deliveryPolicy,

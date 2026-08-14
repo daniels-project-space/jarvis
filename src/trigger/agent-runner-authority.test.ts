@@ -752,6 +752,34 @@ describe("production Trigger worker authority harness", () => {
     expect(state.attempt?.workerRunId).toBeUndefined();
   });
 
+  it("fails a forged background execution profile before subscription, provider, clone, or tools", async () => {
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-forged-background-profile");
+    await t.run(async (ctx) => {
+      const job = await ctx.db.get(jobId);
+      const profile = job?.backgroundExecutionProfile;
+      if (!profile) throw new Error("fixture is missing its derived execution profile");
+      await ctx.db.patch(jobId, {
+        backgroundExecutionProfile: {
+          ...profile,
+          modelTier: profile.modelTier === "sol" ? "terra" : "sol",
+        },
+      });
+    });
+    const bridge = bridgeProductionRunnerToConvex(t);
+
+    const result = await invokeProductionWorker(workerPayload(reservation), "trigger-forged-background-profile");
+
+    expect(result).toMatchObject({ processed: 0, stale: true, continued: false, runtime: "trigger" });
+    expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:claimDispatched",
+      "jobs:reserveDispatchBatch",
+    ]);
+    expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
+    expect(boundaries.configuredCloudWorkspaceProvider).not.toHaveBeenCalled();
+    expect(trigger.batchTrigger).not.toHaveBeenCalled();
+  });
+
   it("ignores forged payload authority and binds the actual Trigger run to the immutable claim", async () => {
     const t = convexTest(schema, modules);
     const { jobId, reservation } = await reservedWritableJob(t, "runner-payload-forgery");

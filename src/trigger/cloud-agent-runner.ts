@@ -7,7 +7,7 @@ import {
   CodexRequestRejectedError,
 } from "./codex-app-server";
 import { buildCloudCodexPermissionProfile } from "./cloud-codex-permissions";
-import { CloudWorkspaceToolBridge, CLOUD_REPOSITORY_TOOLS } from "./cloud-workspace-tools";
+import { CloudWorkspaceToolBridge, cloudRepositoryToolsForScope } from "./cloud-workspace-tools";
 import { CloudWorkspaceError, type CloudWorkspace, type CloudWorkspaceProvider } from "./cloud-workspace";
 import { consumeSubscriptionAuth, isCodexUnauthorizedError } from "./subscription-runtime";
 
@@ -54,6 +54,8 @@ export async function runCloudWorkspaceAgent(input: {
   workspace: CloudWorkspace;
   prompt: string;
   model: string;
+  /** Immutable cloud repository capability snapshot from the work order. */
+  toolScope: readonly string[];
   reasoningEffort?: unknown;
   timeoutMs: number;
   executionState?: () => Promise<string>;
@@ -93,8 +95,10 @@ export async function runCloudWorkspaceAgent(input: {
   let accepted = false;
   let effect = false;
   let rejected = false;
+  const dynamicTools = cloudRepositoryToolsForScope(input.toolScope);
   const bridge = new CloudWorkspaceToolBridge(input.provider, input.workspace, {
     signal: abort.signal,
+    allowedToolScope: input.toolScope,
     beforeTool: async () => {
       const state = await input.executionState?.() ?? "running";
       if (state !== "running") {
@@ -106,7 +110,7 @@ export async function runCloudWorkspaceAgent(input: {
     },
   });
   const server = new CodexAppServer(input.bin, input.controllerEnv, input.timeoutMs, {
-    dynamicTools: CLOUD_REPOSITORY_TOOLS,
+    dynamicTools,
     onDynamicToolCall: (call) => bridge.invoke(call),
     controllerCwd: input.controllerScratch,
     permissionProfile,
@@ -114,7 +118,7 @@ export async function runCloudWorkspaceAgent(input: {
     onAuthConsumed: () => consumeSubscriptionAuth(input.controllerEnv),
     developerInstructions:
       "You are a background repository specialist. The controller scratch is empty and read-only. " +
-      "All repository reads, writes, listings, and commands MUST use the repository_* dynamic tools. " +
+      "Use only the repository_* dynamic tools exposed for this work order; unavailable tools are forbidden. " +
       "Never use a built-in host shell or filesystem tool for repository work. The sandbox has no credentials and no network by default.",
   });
   const control = input.executionState

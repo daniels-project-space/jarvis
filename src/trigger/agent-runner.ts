@@ -16,6 +16,12 @@ import {
 } from "./model-policy";
 import { reviewPrompt } from "./codex-review";
 import { normalizeWorkModelTier } from "../lib/work-models";
+import {
+  backgroundExecutionProfilesEqual,
+  resolveBackgroundExecutionProfile,
+  resolveBackgroundExecutionProfileForWorkOrder,
+  type BackgroundExecutionProfile,
+} from "../lib/background-execution-profile";
 import { githubGitEnv, githubRepoUrl } from "./git-transport";
 import { canonicalizeRepository } from "../lib/workflow-contract";
 import { buildContinuationCheckpoint, segmentTimeoutMs } from "./continuation";
@@ -710,6 +716,7 @@ export type AgentRunnerBoundaryObservation = Readonly<{
   workOrderRevisionId: string;
   workOrderRevision: number;
   workOrderRevisionDigest: string;
+  backgroundExecutionProfile?: BackgroundExecutionProfile;
   schedulingBindingDigest: string;
   repository: string | null;
   sourceBranch: string | null;
@@ -1067,6 +1074,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         || boundary.workOrderRevisionId !== job.workOrderRevisionId
         || Number(boundary.workOrderRevision) !== Number(job.workOrderRevision)
         || boundary.workOrderRevisionDigest !== job.workOrderRevisionDigest
+        || (job.backgroundExecutionProfile !== undefined
+          && !backgroundExecutionProfilesEqual(boundary.backgroundExecutionProfile, job.backgroundExecutionProfile))
         || boundary.repository !== (job.repo ?? null)
         || boundary.sourceBranch !== (job.sourceBranch ?? null)
         || boundary.sourceHeadSha !== (job.sourceHeadSha ?? null)
@@ -1093,6 +1102,28 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       }).catch(() => false);
       return { processed: 1, error };
     };
+    // New claims carry the SHA-bound profile. The legacy fallback is derived
+    // from the already immutable model/readonly/tool scope and can only admit
+    // Codex, so an unprovisioned Novita transport cannot be selected during
+    // this rollout.
+    const executionProfile = job.backgroundExecutionProfile === undefined
+      ? resolveBackgroundExecutionProfileForWorkOrder({
+        modelTier: normalizeWorkModelTier(job.model),
+        readonly: job.readonly === true,
+        repositoryCapabilities: Array.isArray(job.toolScope) ? job.toolScope : [],
+      })
+      : resolveBackgroundExecutionProfile(job.backgroundExecutionProfile);
+    if (!executionProfile.accepted) {
+      return failClaimed(`background execution is held: ${executionProfile.code}`);
+    }
+    if (executionProfile.profile.modelTier !== normalizeWorkModelTier(job.model)
+      || executionProfile.profile.readonly !== (job.readonly === true)
+      || !backgroundExecutionProfilesEqual(executionProfile.profile, {
+        ...executionProfile.profile,
+        repositoryCapabilities: Array.isArray(job.toolScope) ? job.toolScope : [],
+      })) {
+      return failClaimed("background execution profile does not match the immutable claimed work order");
+    }
     const provider: AgentProvider = "codex";
     const bin = resolveSubscriptionAgentBin(provider);
     if (!bin) return failClaimed(`no ${provider} binary`);
@@ -2331,6 +2362,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             workspace: providerWorkspace!,
             prompt,
             model,
+            toolScope: job.toolScope,
             reasoningEffort,
             onProgress: reportProgress,
             executionState: async () => {

@@ -41,8 +41,31 @@ export const CLOUD_REPOSITORY_TOOLS: CodexDynamicToolSpec[] = [
   },
 ];
 
+export type CloudRepositoryToolName = "repository_exec" | "repository_read_file" | "repository_write_file" | "repository_list_files";
+
+const CLOUD_REPOSITORY_TOOL_NAMES = new Set<CloudRepositoryToolName>([
+  "repository_exec",
+  "repository_read_file",
+  "repository_write_file",
+  "repository_list_files",
+]);
+
+function isCloudRepositoryToolName(value: string): value is CloudRepositoryToolName {
+  return CLOUD_REPOSITORY_TOOL_NAMES.has(value as CloudRepositoryToolName);
+}
+
+/**
+ * The durable work order is the capability authority.  Dynamic-tool discovery
+ * must expose no broader set than that authority, even for a read-only job.
+ */
+export function cloudRepositoryToolsForScope(scope: readonly string[]): CodexDynamicToolSpec[] {
+  const allowed = new Set(scope.filter(isCloudRepositoryToolName));
+  return CLOUD_REPOSITORY_TOOLS.filter((tool) => allowed.has(tool.name as CloudRepositoryToolName));
+}
+
 type ToolBridgeOptions = {
   signal?: AbortSignal;
+  allowedToolScope: readonly string[];
   beforeTool?: (call: CodexDynamicToolCall) => Promise<"running" | "stale" | "cancelled" | "steered">;
 };
 
@@ -59,11 +82,12 @@ export class CloudWorkspaceToolBridge {
   constructor(
     private readonly provider: CloudWorkspaceProvider,
     private readonly workspace: CloudWorkspace,
-    private readonly options: ToolBridgeOptions = {},
+    private readonly options: ToolBridgeOptions,
   ) {}
 
   async invoke(call: CodexDynamicToolCall): Promise<CodexDynamicToolResult> {
-    if (call.namespace !== null || !CLOUD_REPOSITORY_TOOLS.some((tool) => tool.name === call.tool)) {
+    const allowed = cloudRepositoryToolsForScope(this.options.allowedToolScope);
+    if (call.namespace !== null || !allowed.some((tool) => tool.name === call.tool)) {
       return result("Unknown cloud repository tool.", false);
     }
     try {
