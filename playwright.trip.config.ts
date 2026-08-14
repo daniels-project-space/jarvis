@@ -22,7 +22,7 @@ export default defineConfig({
   reporter: "list",
   retries: 0,
   testDir: "./e2e",
-  testMatch: ["trip-timeline.fixture.spec.ts", "spoken-caption-layout.fixture.spec.ts"],
+  testMatch: ["trip-timeline.fixture.spec.ts", "trip-location-follow.fixture.spec.ts", "spoken-caption-layout.fixture.spec.ts"],
   timeout: 30_000,
   use: {
     baseURL: `http://127.0.0.1:${port}`,

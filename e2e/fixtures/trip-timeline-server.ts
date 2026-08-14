@@ -20,6 +20,8 @@ const contentTypes: Record<string, string> = {
   "/caption": "text/html; charset=utf-8",
   "/caption.js": "text/javascript; charset=utf-8",
   "/caption.css": "text/css; charset=utf-8",
+  "/location": "text/html; charset=utf-8",
+  "/location.js": "text/javascript; charset=utf-8",
 };
 
 const csp = [
@@ -91,6 +93,19 @@ const captionFixtureHtml = [
   "</html>",
 ].join("\n");
 
+const locationFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trip location follow fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/location.js" defer></script>
+  </body>
+</html>`;
+
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
 
@@ -103,6 +118,7 @@ async function main() {
     fixture: join(projectRoot, "e2e/fixtures/trip-timeline.browser.tsx"),
     voice: join(projectRoot, "e2e/fixtures/browser-voice-lease.browser.ts"),
     caption: join(projectRoot, "e2e/fixtures/spoken-caption-layout.browser.tsx"),
+    location: join(projectRoot, "e2e/fixtures/trip-location-follow.browser.tsx"),
   },
   format: "iife",
   jsx: "automatic",
@@ -121,12 +137,14 @@ async function main() {
   const voiceJsPath = join(outputDir, "voice.js");
   const captionJsPath = join(outputDir, "caption.js");
   const captionCssPath = join(outputDir, "caption.css");
+  const locationJsPath = join(outputDir, "location.js");
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
     access(voiceJsPath),
     access(captionJsPath),
     access(captionCssPath),
+    access(locationJsPath),
   ]);
 
   const server = createServer(async (request, response) => {
@@ -174,6 +192,11 @@ async function main() {
     response.end(captionFixtureHtml);
     return;
   }
+  if (pathname === "/location") {
+    response.writeHead(200);
+    response.end(locationFixtureHtml);
+    return;
+  }
 
   response.writeHead(200);
   response.end(await readFile(
@@ -185,6 +208,8 @@ async function main() {
           ? captionJsPath
           : pathname === "/caption.css"
             ? captionCssPath
+            : pathname === "/location.js"
+              ? locationJsPath
             : voiceJsPath,
   ));
   });

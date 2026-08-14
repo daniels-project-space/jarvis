@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useJarvisQuery } from "@/lib/secure-convex";
+import { followTripCityContext } from "@/lib/trip-location-follow";
 import { viewerFetch } from "@/lib/viewer-request";
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -404,6 +405,121 @@ async function tripTool(workspace: TripWorkspace, action: string, extra: Record<
   const result = String(body.result ?? "");
   if (!response.ok || /^Tool failed:/i.test(result)) throw new Error(result || "Travel action failed");
   return result;
+}
+
+/** Browser-only city following. Coordinates are never rendered, persisted, or sent to a service. */
+export function TripLocationFollowControl({
+  contexts,
+  activeCityContextId,
+  disabled,
+  onSelect,
+}: {
+  contexts: CityContext[];
+  activeCityContextId?: string;
+  disabled?: boolean;
+  onSelect: (cityContextId: string) => Promise<boolean>;
+}) {
+  const [following, setFollowing] = useState(false);
+  const [status, setStatus] = useState<"off" | "requesting" | "following" | "unavailable" | "denied">("off");
+  const contextsRef = useRef(contexts);
+  const activeCityContextIdRef = useRef<string | undefined>(activeCityContextId);
+  const lastActiveCityContextIdPropRef = useRef<string | undefined>(activeCityContextId);
+  const pendingCityRef = useRef<string | undefined>(undefined);
+  const selectRef = useRef(onSelect);
+
+  useEffect(() => {
+    contextsRef.current = contexts;
+    selectRef.current = onSelect;
+  }, [contexts, onSelect]);
+
+  useEffect(() => {
+    // A parent re-render caused by the selection itself still has the old
+    // Convex value. Only replace an optimistic local selection when the
+    // received selection actually changes.
+    if (activeCityContextId !== lastActiveCityContextIdPropRef.current) {
+      lastActiveCityContextIdPropRef.current = activeCityContextId;
+      activeCityContextIdRef.current = activeCityContextId;
+    }
+  }, [activeCityContextId]);
+
+  useEffect(() => {
+    if (!disabled) return;
+    setFollowing(false);
+    setStatus("off");
+  }, [disabled]);
+
+  useEffect(() => {
+    if (!following || disabled) return;
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      setStatus("unavailable");
+      setFollowing(false);
+      return;
+    }
+    setStatus("requesting");
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const context = followTripCityContext({
+          contexts: contextsRef.current,
+          currentContextId: activeCityContextIdRef.current,
+          position: {
+            lat: position.coords.latitude,
+            lng: position.coords.longitude,
+            accuracyMeters: position.coords.accuracy,
+          },
+        });
+        setStatus("following");
+        if (!context || context.id === activeCityContextIdRef.current || pendingCityRef.current) return;
+        pendingCityRef.current = context.id;
+        void selectRef.current(context.id)
+          .then((selected) => {
+            // Convex will replace this optimistic value with the durable selection.
+            // It prevents duplicate posts while that subscription update arrives.
+            if (selected) activeCityContextIdRef.current = context!.id;
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            pendingCityRef.current = undefined;
+          });
+      },
+      (error) => {
+        setStatus(error.code === error.PERMISSION_DENIED ? "denied" : "unavailable");
+        setFollowing(false);
+      },
+      { enableHighAccuracy: false, maximumAge: 60_000, timeout: 15_000 },
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [disabled, following]);
+
+  return (
+    <div className="grid justify-items-end gap-1">
+      <button
+        type="button"
+        aria-label={following ? "Stop following my location" : "Follow my location"}
+        aria-pressed={following}
+        disabled={disabled}
+        onClick={() => {
+          if (following) {
+            setFollowing(false);
+            setStatus("off");
+          } else {
+            setStatus("requesting");
+            setFollowing(true);
+          }
+        }}
+        className="rounded-md border border-cyan/25 bg-cyan/10 px-2 py-1 text-[9px] uppercase tracking-wider text-cyan hover:bg-cyan/20 disabled:opacity-40"
+      >
+        {following ? "following" : "follow location"}
+      </button>
+      {status !== "off" && (
+        <div className="max-w-52 text-[9px] text-slate" aria-live="polite">
+          {status === "following" && "Following your device locally; only a saved city selection is synced."}
+          {status === "requesting" && "Requesting device location locally…"}
+          {status === "denied" && "Location permission was denied; city selection remains manual."}
+          {status === "unavailable" && "Live location is unavailable; city selection remains manual."}
+        </div>
+      )}
+    </div>
+  );
 }
 
 async function retryTrip(workspace: TripWorkspace, doc: any) {
@@ -891,28 +1007,30 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
     return ms;
   }, [activeCityContext, bookingNow, cityContexts, discoveries, doc, itineraryDays]);
 
+  const act = async (label: string, action: string, extra: Record<string, unknown> = {}) => {
+    if (!workspace || draftLocked) {
+      setActionError(draftLocked ? "This draft has just been saved. Opening the permanent plan…" : "This trip workspace is unavailable.");
+      return false;
+    }
+    setBusy(label);
+    setActionError("");
+    try {
+      await tripTool(workspace, action, extra);
+      return true;
+    } catch (error: any) {
+      setActionError(String(error?.message ?? error));
+      return false;
+    } finally {
+      setBusy("");
+    }
+  };
+
   if (!doc)
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-slate">
         <span className="mr-2 h-2 w-2 animate-ping rounded-full bg-cyan" /> loading trip…
       </div>
     );
-
-  const act = async (label: string, action: string, extra: Record<string, unknown> = {}) => {
-    if (!workspace || draftLocked) {
-      setActionError(draftLocked ? "This draft has just been saved. Opening the permanent plan…" : "This trip workspace is unavailable.");
-      return;
-    }
-    setBusy(label);
-    setActionError("");
-    try {
-      await tripTool(workspace, action, extra);
-    } catch (error: any) {
-      setActionError(String(error?.message ?? error));
-    } finally {
-      setBusy("");
-    }
-  };
 
   const refreshBookings = async () => {
     if (!workspace || draftLocked) {
@@ -1088,9 +1206,21 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
                 {cityContexts.map((context) => <option key={context.id} value={context.id}>{context.city}</option>)}
               </select>
             </label>
-            <div className="text-right">
-              <div className="text-[11px] font-medium text-ice">{activeCityContext.city}</div>
-              <div className="text-[9px] text-slate">centre {activeCityContext.center.lat.toFixed(3)}, {activeCityContext.center.lng.toFixed(3)}{activeCityContext.source ? ` · ${activeCityContext.source}` : ""}</div>
+            <div className="flex items-center gap-2 text-right">
+              <TripLocationFollowControl
+                contexts={cityContexts}
+                activeCityContextId={doc.activeCityContextId ?? activeCityContext.id}
+                disabled={!workspace || draftLocked || cityContexts.length < 2}
+                onSelect={async (cityContextId) => {
+                  if (busy) return false;
+                  setActionError("");
+                  return act("following location", "select_city_context", { city_context_id: cityContextId });
+                }}
+              />
+              <div>
+                <div className="text-[11px] font-medium text-ice">{activeCityContext.city}</div>
+                <div className="text-[9px] text-slate">centre {activeCityContext.center.lat.toFixed(3)}, {activeCityContext.center.lng.toFixed(3)}{activeCityContext.source ? ` · ${activeCityContext.source}` : ""}</div>
+              </div>
             </div>
           </div>
         )}

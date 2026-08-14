@@ -223,6 +223,8 @@ describe("TripView city contexts", () => {
     const markup = renderTrip();
 
     expect(markup).toContain('aria-label="Active city"');
+    expect(markup).toContain('aria-label="Follow my location"');
+    expect(markup).toContain("follow location");
     expect(markup).toMatch(/<option value="berlin" selected="">Berlin<\/option>/);
     expect(markup).toContain("centre 52.520, 13.405");
     expect(markup).toContain("Berlin Courtyard Stay");
