@@ -29,6 +29,8 @@ export type OpenStreetMapPlace = OpenStreetMapPoint & {
   mapsUri: string;
   /** Raw OSM tags are deliberately narrowed to these source-backed fields. */
   openingHours?: string;
+  /** Exact OSM `charge` tag; it may be stale and must be verified with the venue. */
+  charge?: string;
   websiteUrl?: string;
   wikipedia?: OpenStreetMapWikipediaSource;
   wikipediaArticle?: WikimediaPlaceArticle;
@@ -38,6 +40,22 @@ export type OpenStreetMapSearchOptions = {
   center?: OpenStreetMapPoint;
   radiusMetres?: number;
   maxResults?: number;
+};
+
+export type OpenStreetMapTravelMode = "walking" | "driving" | "bicycling" | "transit";
+
+export type OpenStreetMapRouteLeg = {
+  distanceMeters: number;
+  durationSeconds: number;
+};
+
+export type OpenStreetMapRoute = {
+  /** Longitude/latitude GeoJSON coordinates returned by the routing provider. */
+  coordinates: [number, number][];
+  distanceMeters: number;
+  durationSeconds: number;
+  legs: OpenStreetMapRouteLeg[];
+  attribution: string;
 };
 
 type NominatimPlace = {
@@ -58,6 +76,23 @@ type WikimediaPage = {
   thumbnail?: { source?: unknown };
 };
 
+type OsrmRoutePayload = {
+  code?: unknown;
+  routes?: unknown;
+};
+
+type OsrmRoute = {
+  distance?: unknown;
+  duration?: unknown;
+  geometry?: { coordinates?: unknown };
+  legs?: unknown;
+};
+
+type OsrmRouteLeg = {
+  distance?: unknown;
+  duration?: unknown;
+};
+
 const NOMINATIM_BASE_URL = process.env.NOMINATIM_BASE_URL?.trim() || "https://nominatim.openstreetmap.org";
 const NOMINATIM_MIN_INTERVAL_MS = process.env.NODE_ENV === "test" ? 0 : 1_100;
 const CACHE_TTL_MS = 5 * 60_000;
@@ -68,7 +103,23 @@ const WIKIMEDIA_TIMEOUT_MS = 4_500;
 const MAX_WIKIMEDIA_ENRICHMENTS = 4;
 const MAX_WIKIMEDIA_CACHE_ENTRIES = 120;
 const wikipediaArticleCache = new Map<string, { expiresAt: number; article: WikimediaPlaceArticle | null }>();
+// FOSSGIS hosts free public OSRM instances for foot, bike and car routing.
+// Their policy is one request/second, so this owner-scale adapter serialises
+// requests and caches each short itinerary. Do not use it for bulk routing.
+const FOSSGIS_ROUTER_BY_MODE: Record<Exclude<OpenStreetMapTravelMode, "transit">, string> = {
+  walking: "https://routing.openstreetmap.de/routed-foot",
+  bicycling: "https://routing.openstreetmap.de/routed-bike",
+  driving: "https://routing.openstreetmap.de/routed-car",
+};
+const ROUTING_MIN_INTERVAL_MS = process.env.NODE_ENV === "test" ? 0 : 1_100;
+const ROUTING_TIMEOUT_MS = 8_000;
+const ROUTING_CACHE_TTL_MS = 5 * 60_000;
+const MAX_ROUTING_CACHE_ENTRIES = 64;
+const MAX_ROUTE_POINTS = 9;
+const MAX_ROUTE_GEOMETRY_POINTS = 20_000;
+const routeCache = new Map<string, { expiresAt: number; route: OpenStreetMapRoute }>();
 let nextNominatimRequestAt = 0;
+let nextRoutingRequestAt = 0;
 
 function bounded(value: unknown, fallback: number, min: number, max: number): number {
   const number = Number(value);
@@ -147,12 +198,15 @@ function wikipediaSource(value: unknown): OpenStreetMapWikipediaSource | undefin
   };
 }
 
-function sourceTags(place: NominatimPlace): Pick<OpenStreetMapPlace, "openingHours" | "websiteUrl" | "wikipedia"> {
+function sourceTags(place: NominatimPlace): Pick<OpenStreetMapPlace, "openingHours" | "charge" | "websiteUrl" | "wikipedia"> {
   const tags = place.extratags && typeof place.extratags === "object" && !Array.isArray(place.extratags)
     ? place.extratags
     : {};
   return {
     openingHours: sourceText(tags.opening_hours, 180),
+    // Preserve the exact source tag rather than guessing a currency, whether
+    // it applies to every visitor, or whether it remains current.
+    charge: sourceText(tags.charge, 100),
     websiteUrl: safeHttpUrl(tags.website),
     wikipedia: wikipediaSource(tags.wikipedia),
   };
@@ -334,17 +388,139 @@ export async function searchOpenStreetMapPlaces(
   return places;
 }
 
+function isRoutePoint(point: unknown): point is OpenStreetMapPoint {
+  return Boolean(point) && typeof point === "object"
+    && Number.isFinite((point as OpenStreetMapPoint).lat)
+    && Number.isFinite((point as OpenStreetMapPoint).lng)
+    && Math.abs((point as OpenStreetMapPoint).lat) <= 90
+    && Math.abs((point as OpenStreetMapPoint).lng) <= 180;
+}
+
+function routePointKey(point: OpenStreetMapPoint): string {
+  return `${point.lng.toFixed(6)},${point.lat.toFixed(6)}`;
+}
+
+function boundedRoutePoints(points: OpenStreetMapPoint[]): OpenStreetMapPoint[] | undefined {
+  if (points.length < 2 || points.length > MAX_ROUTE_POINTS || !points.every(isRoutePoint)) return undefined;
+  const cleaned = points.filter((point, index) => index === 0 || routePointKey(point) !== routePointKey(points[index - 1]!));
+  return cleaned.length >= 2 ? cleaned : undefined;
+}
+
+async function respectRoutingRateLimit(): Promise<void> {
+  const now = Date.now();
+  const scheduledAt = Math.max(now, nextRoutingRequestAt);
+  nextRoutingRequestAt = scheduledAt + ROUTING_MIN_INTERVAL_MS;
+  if (scheduledAt > now) await new Promise<void>((resolve) => setTimeout(resolve, scheduledAt - now));
+}
+
+function validMetric(value: unknown): number | undefined {
+  const metric = Number(value);
+  return Number.isFinite(metric) && metric >= 0 ? metric : undefined;
+}
+
+function parseRouteCoordinates(value: unknown): [number, number][] | undefined {
+  if (!Array.isArray(value) || value.length < 2 || value.length > MAX_ROUTE_GEOMETRY_POINTS) return undefined;
+  const coordinates: [number, number][] = [];
+  for (const coordinate of value) {
+    if (!Array.isArray(coordinate) || coordinate.length !== 2) return undefined;
+    const [lng, lat] = coordinate;
+    if (!Number.isFinite(lng) || !Number.isFinite(lat) || Math.abs(Number(lng)) > 180 || Math.abs(Number(lat)) > 90) return undefined;
+    coordinates.push([Number(lng), Number(lat)]);
+  }
+  return coordinates;
+}
+
+function parseRoute(payload: OsrmRoutePayload, expectedLegs: number): OpenStreetMapRoute | undefined {
+  if (payload.code !== "Ok" || !Array.isArray(payload.routes)) return undefined;
+  const first = payload.routes[0] as OsrmRoute | undefined;
+  const distanceMeters = validMetric(first?.distance);
+  const durationSeconds = validMetric(first?.duration);
+  const coordinates = parseRouteCoordinates(first?.geometry?.coordinates);
+  if (distanceMeters == null || durationSeconds == null || !coordinates || !Array.isArray(first?.legs) || first.legs.length !== expectedLegs) return undefined;
+  const legs: OpenStreetMapRouteLeg[] = [];
+  for (const rawLeg of first.legs) {
+    const leg = rawLeg as OsrmRouteLeg;
+    const distance = validMetric(leg?.distance);
+    const duration = validMetric(leg?.duration);
+    if (distance == null || duration == null) return undefined;
+    legs.push({ distanceMeters: distance, durationSeconds: duration });
+  }
+  return {
+    coordinates,
+    distanceMeters,
+    durationSeconds,
+    legs,
+    attribution: "Route data © OpenStreetMap contributors · FOSSGIS OSRM",
+  };
+}
+
+/**
+ * Gets actual street geometry and per-leg estimates for a short ordered route.
+ * Transit deliberately returns undefined: this keyless OSRM service has no
+ * real transit profile, and a driving or walking estimate must never be
+ * presented as public-transit timing.
+ */
+export async function routeOpenStreetMapItinerary(args: {
+  points: OpenStreetMapPoint[];
+  mode: OpenStreetMapTravelMode;
+}): Promise<OpenStreetMapRoute | undefined> {
+  if (args.mode === "transit") return undefined;
+  const points = boundedRoutePoints(args.points);
+  if (!points) return undefined;
+  const key = `${args.mode}:${points.map(routePointKey).join(";")}`;
+  const cached = routeCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.route;
+  if (cached) routeCache.delete(key);
+
+  const coordinates = points.map(routePointKey).join(";");
+  const endpoint = new URL(`${FOSSGIS_ROUTER_BY_MODE[args.mode]}/route/v1/driving/${coordinates}`);
+  endpoint.search = new URLSearchParams({
+    alternatives: "false",
+    steps: "false",
+    geometries: "geojson",
+    overview: "full",
+    continue_straight: "false",
+  }).toString();
+
+  try {
+    await respectRoutingRateLimit();
+    const response = await fetch(endpoint, {
+      headers: {
+        accept: "application/json",
+        "user-agent": "Jarvis owner-operated assistant/1.0 (https://jarvis-orcin-six.vercel.app)",
+      },
+      signal: AbortSignal.timeout(ROUTING_TIMEOUT_MS),
+    });
+    if (!response.ok) return undefined;
+    const route = parseRoute(await response.json() as OsrmRoutePayload, points.length - 1);
+    if (!route) return undefined;
+    if (routeCache.size >= MAX_ROUTING_CACHE_ENTRIES) {
+      const oldest = routeCache.keys().next().value;
+      if (oldest) routeCache.delete(oldest);
+    }
+    routeCache.set(key, { expiresAt: Date.now() + ROUTING_CACHE_TTL_MS, route });
+    return route;
+  } catch {
+    // Routing is optional: the map must show markers, not invented lines or timing.
+    return undefined;
+  }
+}
+
 /** Opens an OSM/OSRM route. Public transit has no equivalent free global router. */
 export function openStreetMapDirectionsUrl(args: {
   origin: OpenStreetMapPoint;
   destination: OpenStreetMapPoint;
-  mode: "walking" | "driving" | "bicycling" | "transit";
-}): string {
+  /** Ordered intermediate stops, if any. */
+  waypoints?: OpenStreetMapPoint[];
+  mode: OpenStreetMapTravelMode;
+}): string | undefined {
+  if (args.mode === "transit") return undefined;
   const engine = args.mode === "walking"
     ? "fossgis_osrm_foot"
     : args.mode === "bicycling"
       ? "fossgis_osrm_bike"
       : "fossgis_osrm_car";
-  const route = `${args.origin.lat},${args.origin.lng};${args.destination.lat},${args.destination.lng}`;
+  const points = [args.origin, ...(args.waypoints ?? []), args.destination].filter(isRoutePoint);
+  const route = points.map((point) => `${point.lat},${point.lng}`).join(";");
   return `https://www.openstreetmap.org/directions?engine=${encodeURIComponent(engine)}&route=${encodeURIComponent(route)}`;
 }

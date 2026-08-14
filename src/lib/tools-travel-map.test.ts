@@ -42,6 +42,7 @@ describe("travel_map tool", () => {
       path === "currentState:getActive" ? { value: "Sevilla" } : "thread-1",
     );
     mock.convexMutation.mockResolvedValue(undefined);
+    const now = Date.now();
     mock.lookupBookings.mockResolvedValue([{
       id: "gmail-booking-1",
       kind: "stay",
@@ -49,11 +50,30 @@ describe("travel_map tool", () => {
       provider: "Booking",
       bookingName: "Hotel Casa 1800 Sevilla",
       location: "Rodrigo Caro, 6, 41004 Sevilla, Spain",
+      start: now + 24 * 60 * 60_000,
+      end: now + 4 * 24 * 60 * 60_000,
+      timeZone: "Europe/Madrid",
       allDay: false,
       marker: "jarvis-gmail-booking:gmail-booking-1",
     }]);
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const query = new URL(String(url)).searchParams.get("q") ?? "";
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.hostname === "routing.openstreetmap.de") {
+        return new Response(JSON.stringify({
+          code: "Ok",
+          routes: [{
+            distance: 2150,
+            duration: 1430,
+            geometry: { coordinates: [[-5.9902, 37.386], [-5.997, 37.387], [-6.006, 37.3855], [-5.993, 37.394], [-5.997, 37.401]] },
+            legs: [
+              { distance: 600, duration: 400 },
+              { distance: 820, duration: 530 },
+              { distance: 730, duration: 500 },
+            ],
+          }],
+        }), { status: 200 });
+      }
+      const query = url.searchParams.get("q") ?? "";
       if (query === "Sevilla") {
         return new Response(JSON.stringify([osmPlace("Sevilla", "Sevilla, Spain", 37.3891, -5.9845)]), { status: 200 });
       }
@@ -75,17 +95,17 @@ describe("travel_map tool", () => {
       query: "attractions in the city",
       preferences: "not touristy; give me something more niche",
       route: true,
-      include_bookings: true,
       travel_mode: "walking",
     });
 
     expect(result).toContain("Interactive OpenStreetMap opened for Sevilla");
-    expect(result).toContain("Opening hours are shown only when OpenStreetMap tags them");
-    expect(result).toContain("admission prices are not claimed");
-    expect(result).toContain("read-only Gmail booking base");
+    expect(result).toContain("Opening hours and entry prices are shown only when OpenStreetMap tags them");
+    expect(result).toContain("about 24 minutes across 3 legs");
+    expect(result).toContain("read-only booked-location reference");
     expect(mock.lookupBookings).toHaveBeenCalledWith({ days: 730, maxResults: 24 });
     const requests = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)));
-    expect(requests.every((url) => url.hostname === "nominatim.openstreetmap.org")).toBe(true);
+    expect(requests.some((url) => url.hostname === "nominatim.openstreetmap.org")).toBe(true);
+    expect(requests.some((url) => url.hostname === "routing.openstreetmap.de")).toBe(true);
 
     const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
     expect(panelCall).toBeTruthy();
@@ -96,12 +116,76 @@ describe("travel_map tool", () => {
       provider: "openstreetmap",
       center: { label: "Sevilla", source: "openstreetmap" },
       base: { label: "Hotel Casa 1800 Sevilla", source: "Read-only Gmail booking" },
-      booking: { requested: true, status: "matched" },
+      booking: { requested: true, status: "matched", stayStatus: "upcoming" },
       route: { mode: "walking" },
     });
     expect(panel.items).toHaveLength(3);
-    expect(panel.route.coordinates).toHaveLength(4);
+    expect(panel.route.coordinates).toHaveLength(5);
+    expect(panel.route.durationSeconds).toBe(1430);
+    expect(panel.route.legs).toHaveLength(3);
     expect(panel.route.directionsUrl).toContain("openstreetmap.org/directions");
+  });
+
+  it("refreshes a time-valid booked stay as a city reference even without a route", async () => {
+    const result = await executeTool("travel_map", {
+      location: "Sevilla",
+      query: "quiet galleries",
+    });
+
+    expect(result).toContain("booked-location reference");
+    expect(mock.lookupBookings).toHaveBeenCalledWith({ days: 730, maxResults: 24 });
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panel = JSON.parse(String(panelCall?.[1]?.value));
+    expect(panel).toMatchObject({
+      base: {
+        label: "Hotel Casa 1800 Sevilla",
+        source: "Read-only Gmail booking",
+        stayStatus: "upcoming",
+        timeZone: "Europe/Madrid",
+      },
+      booking: { requested: true, status: "matched", stayStatus: "upcoming" },
+    });
+    expect(panel.base.start).toEqual(expect.any(Number));
+    expect(panel.base.checkedAt).toEqual(expect.any(Number));
+    expect(panel.route).toBeUndefined();
+  });
+
+  it("tries a small ranked set and shows only the time-valid stay verified in this city", async () => {
+    const now = Date.now();
+    mock.lookupBookings.mockResolvedValue([
+      {
+        id: "gmail-active-other-city", kind: "stay", title: "🏨 Elsewhere · confirmed", provider: "Booking",
+        bookingName: "Outside Hotel", location: "Outside Road 1, London, England",
+        start: now - 60 * 60_000, end: now + 60 * 60_000, allDay: false,
+        marker: "jarvis-gmail-booking:gmail-active-other-city",
+      },
+      {
+        id: "gmail-local-alias", kind: "stay", title: "🏨 City stay · confirmed", provider: "Booking",
+        bookingName: "Calle Local Hotel", location: "Calle Local 7, Sevilla, Spain",
+        start: now + 24 * 60 * 60_000, end: now + 3 * 24 * 60 * 60_000, allDay: false,
+        marker: "jarvis-gmail-booking:gmail-local-alias",
+      },
+    ]);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      const query = url.searchParams.get("q") ?? "";
+      if (query === "Seville") return new Response(JSON.stringify([osmPlace("Sevilla", "Sevilla, Spain", 37.3891, -5.9845)]), { status: 200 });
+      if (query.includes("Outside Road")) return new Response(JSON.stringify([osmPlace("Outside Hotel", "London, England", 51.5072, -0.1276)]), { status: 200 });
+      if (query.includes("Calle Local")) return new Response(JSON.stringify([osmPlace("Calle Local Hotel", "Calle Local 7, Sevilla", 37.386, -5.9902)]), { status: 200 });
+      return new Response(JSON.stringify([osmPlace("Local Gallery", "Sevilla, Spain", 37.3855, -6.006)]), { status: 200 });
+    }));
+
+    await executeTool("travel_map", { location: "Seville", query: "galleries" });
+
+    const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    const panelText = String(panelCall?.[1]?.value);
+    const panel = JSON.parse(panelText);
+    expect(panel.base).toMatchObject({ label: "Calle Local Hotel", stayStatus: "upcoming" });
+    expect(panelText).not.toContain("Outside Hotel");
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)).searchParams.get("q"))).toEqual(expect.arrayContaining([
+      "Outside Road 1, London, England",
+      "Calle Local 7, Sevilla, Spain",
+    ]));
   });
 
   it("carries only exact OpenStreetMap-backed attraction sources into the map card", async () => {
@@ -145,9 +229,10 @@ describe("travel_map tool", () => {
     const result = await executeTool("travel_map", {
       location: city,
       query: "historic attractions",
+      include_bookings: false,
     });
 
-    expect(result).toContain("admission prices are not claimed");
+    expect(result).toContain("entry prices are shown only when OpenStreetMap tags them");
     const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
     const panel = JSON.parse(String(panelCall?.[1]?.value));
     expect(panel.items[0]).toMatchObject({
@@ -165,8 +250,8 @@ describe("travel_map tool", () => {
         attribution: "Wikipedia (es) · image via Wikimedia",
       },
     });
-    expect(panel.items[0]).not.toHaveProperty("charge");
-    expect(JSON.stringify(panel)).not.toContain("18 EUR");
+    expect(panel.items[0].charge).toBe("18 EUR");
+    expect(JSON.stringify(panel)).toContain("18 EUR");
     const sources = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)).hostname);
     expect(sources.filter((hostname) => hostname === "es.wikipedia.org")).toHaveLength(1);
   });

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   enrichOpenStreetMapPlacesWithWikimedia,
   openStreetMapDirectionsUrl,
+  routeOpenStreetMapItinerary,
   searchOpenStreetMapPlaces,
   type OpenStreetMapPlace,
 } from "./openstreetmap";
@@ -38,14 +39,64 @@ describe("OpenStreetMap provider", () => {
     expect(new Headers(init?.headers).get("user-agent")).toContain("Jarvis owner-operated assistant");
   });
 
-  it("creates a free walking route link", () => {
+  it("creates a free multi-stop walking route link and declines fake transit", () => {
     const url = openStreetMapDirectionsUrl({
       origin: { lat: 51.5, lng: -0.14 },
+      waypoints: [{ lat: 51.5005, lng: -0.1405 }],
       destination: { lat: 51.501, lng: -0.141 },
       mode: "walking",
     });
     expect(url).toContain("openstreetmap.org/directions");
     expect(url).toContain("fossgis_osrm_foot");
+    expect(url).toContain("51.5005");
+    expect(openStreetMapDirectionsUrl({
+      origin: { lat: 51.5, lng: -0.14 },
+      destination: { lat: 51.501, lng: -0.141 },
+      mode: "transit",
+    })).toBeUndefined();
+  });
+
+  it("returns bounded street geometry and per-leg timing from the public router", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      expect(url.hostname).toBe("routing.openstreetmap.de");
+      expect(url.pathname).toContain("/routed-foot/route/v1/driving/");
+      expect(url.searchParams.get("geometries")).toBe("geojson");
+      expect(url.searchParams.get("overview")).toBe("full");
+      return new Response(JSON.stringify({
+        code: "Ok",
+        routes: [{
+          distance: 1240,
+          duration: 860,
+          geometry: { coordinates: [[-0.14, 51.5], [-0.1405, 51.5005], [-0.141, 51.501]] },
+          legs: [
+            { distance: 500, duration: 360 },
+            { distance: 740, duration: 500 },
+          ],
+        }],
+      }), { status: 200 });
+    }));
+
+    const route = await routeOpenStreetMapItinerary({
+      mode: "walking",
+      points: [
+        { lat: 51.5, lng: -0.14 },
+        { lat: 51.5005, lng: -0.1405 },
+        { lat: 51.501, lng: -0.141 },
+      ],
+    });
+
+    expect(route).toMatchObject({
+      distanceMeters: 1240,
+      durationSeconds: 860,
+      coordinates: [[-0.14, 51.5], [-0.1405, 51.5005], [-0.141, 51.501]],
+      legs: [{ distanceMeters: 500, durationSeconds: 360 }, { distanceMeters: 740, durationSeconds: 500 }],
+      attribution: expect.stringContaining("FOSSGIS OSRM"),
+    });
+    expect(await routeOpenStreetMapItinerary({
+      mode: "transit",
+      points: [{ lat: 51.5, lng: -0.14 }, { lat: 51.501, lng: -0.141 }],
+    })).toBeUndefined();
   });
 
   it("retains only bounded source-backed OSM tags", async () => {
@@ -78,7 +129,7 @@ describe("OpenStreetMap provider", () => {
       },
     });
     expect(place).not.toHaveProperty("extratags");
-    expect(place).not.toHaveProperty("charge");
+    expect(place.charge).toBe("18 EUR");
     expect(place).not.toHaveProperty("phone");
   });
 

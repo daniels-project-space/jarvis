@@ -734,9 +734,16 @@ export function DocView({ value }: { value: string }) {
 
 type Place = {
   name: string; address: string; rating?: number; reviews?: number; openNow?: boolean;
-  hoursToday?: string; openingHours?: string; websiteUrl?: string; type?: string; lat: number; lng: number; dist: number | null; mapsUri: string;
+  hoursToday?: string; openingHours?: string; charge?: string; websiteUrl?: string; type?: string; lat: number; lng: number; dist: number | null; mapsUri: string;
   wikipedia?: { language: string; title: string; articleUrl: string };
   wikipediaArticle?: { title: string; articleUrl: string; thumbnailUrl?: string; attribution: string };
+};
+
+type TravelImagePreview = {
+  title: string;
+  thumbnailUrl: string;
+  articleUrl: string;
+  attribution: string;
 };
 
 type PlacesWidget = {
@@ -745,15 +752,20 @@ type PlacesWidget = {
   locationLabel?: string;
   provider?: "openstreetmap";
   center: { lat: number; lng: number; label?: string; detail?: string; source?: "saved_location" | "current_state" | "gmail_current_stay" | "openstreetmap" };
-  base?: { lat?: number; lng?: number; label: string; address?: string; source?: string };
+  base?: {
+    lat?: number; lng?: number; label: string; address?: string; source?: string;
+    stayStatus?: "active" | "upcoming"; start?: number; end?: number; timeZone?: string; checkedAt?: number;
+  };
   booking?: {
     requested: boolean;
     status: "not_requested" | "current_stay" | "matched" | "unavailable" | "no_local_match" | "not_found";
-    message?: string;
+    message?: string; stayStatus?: "active" | "upcoming"; start?: number; end?: number; timeZone?: string; checkedAt?: number;
   };
   route?: {
     label?: string; note?: string; mode?: string; coordinates?: [number, number][];
-    directionsUrl?: string; order?: string[];
+    directionsUrl?: string; order?: string[]; distanceMeters?: number; durationSeconds?: number;
+    legs?: { to: string; distanceMeters: number; durationSeconds: number }[];
+    attribution?: string;
   };
   items: Place[];
 };
@@ -771,6 +783,7 @@ export function PlacesView({ value }: { value: string }) {
   const mapObj = useRef<any>(null);
   const [sel, setSel] = useState(0);
   const [mapError, setMapError] = useState("");
+  const [imagePreview, setImagePreview] = useState<TravelImagePreview | null>(null);
   const items = w?.items ?? [];
   const center = w?.center;
   const base = w?.base;
@@ -854,19 +867,55 @@ export function PlacesView({ value }: { value: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
+  useEffect(() => {
+    if (!imagePreview) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setImagePreview(null);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [imagePreview]);
+
   if (!w || !center || !items.length) return <div className="flex flex-1 items-center justify-center text-sm text-slate">No mapped places matched this request.</div>;
   const origin = Number.isFinite(base?.lat) && Number.isFinite(base?.lng)
     ? { lat: base!.lat!, lng: base!.lng! }
     : center;
   const dir = (p: Place, mode: string) => {
-    const engine = mode === "walking" || mode === "transit"
+    const engine = mode === "walking"
       ? "fossgis_osrm_foot"
+      : mode === "bicycling"
+        ? "fossgis_osrm_bike"
       : "fossgis_osrm_car";
     return `https://www.openstreetmap.org/directions?engine=${engine}&route=${origin.lat}%2C${origin.lng}%3B${p.lat}%2C${p.lng}`;
   };
   const routeUrl = route?.directionsUrl;
+  const routeDistance = route?.distanceMeters != null
+    ? `${Math.round(route.distanceMeters / 100) / 10} km`
+    : undefined;
+  const formatRouteDuration = (seconds: number) => {
+    const minutes = Math.max(1, Math.round(seconds / 60));
+    return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60 ? `${minutes % 60}m` : ""}`.trim() : `${minutes} min`;
+  };
+  const formatStayWindow = (start?: number, end?: number, timeZone?: string) => {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return undefined;
+    const format = (zone?: string) => new Intl.DateTimeFormat("en-GB", {
+      day: "numeric", month: "short", year: "numeric", timeZone: zone,
+    });
+    try {
+      const dateFormat = format(timeZone);
+      const startText = dateFormat.format(new Date(start!));
+      const endText = dateFormat.format(new Date(end!));
+      return startText === endText ? startText : `${startText} – ${endText}`;
+    } catch {
+      const dateFormat = format("UTC");
+      const startText = dateFormat.format(new Date(start!));
+      const endText = dateFormat.format(new Date(end!));
+      return startText === endText ? startText : `${startText} – ${endText}`;
+    }
+  };
   return (
-    <div className="flex min-h-0 flex-1 flex-col @min-[760px]:flex-row">
+    <>
+      <div className="flex min-h-0 flex-1 flex-col @min-[760px]:flex-row">
       <div className="relative h-56 w-full shrink-0 overflow-hidden bg-[#071018] @min-[760px]:h-auto @min-[760px]:flex-1">
         <div ref={mapEl} className="absolute inset-0" />
         {mapError && <div className="absolute inset-x-3 bottom-3 rounded-lg border border-amber/25 bg-[#071018]/90 p-2 text-[11px] text-amber backdrop-blur">{mapError}</div>}
@@ -882,9 +931,16 @@ export function PlacesView({ value }: { value: string }) {
         {w.preferences && <div className="mb-2 mt-1 text-[11px] leading-relaxed text-slate">Taste: {w.preferences}</div>}
         {base && (
           <div className="mb-2.5 rounded-xl border border-amber/25 bg-amber/[0.07] p-2.5">
-            <div className="text-[9px] uppercase tracking-[.14em] text-amber/75">starting base · {base.source ?? "booking"}</div>
+            <div className="text-[9px] uppercase tracking-[.14em] text-amber/75">{route ? "starting base" : "booked stay · reference"} · {base.source ?? "booking"}</div>
             <div className="mt-0.5 text-sm font-medium text-ice">{base.label}</div>
             {base.address && <div className="text-[10px] leading-relaxed text-slate">{base.address}</div>}
+            {base.stayStatus && (
+              <div className="mt-1 text-[10px] font-medium text-amber">
+                {base.stayStatus === "active" ? "active now" : "upcoming"}
+                {formatStayWindow(base.start, base.end, base.timeZone) ? ` · ${formatStayWindow(base.start, base.end, base.timeZone)}` : ""}
+              </div>
+            )}
+            {base.checkedAt && <div className="mt-0.5 text-[9px] text-slate">Refreshed from connected Gmail for this map</div>}
           </div>
         )}
         {w.booking?.requested && w.booking.status !== "matched" && w.booking.message && (
@@ -896,9 +952,25 @@ export function PlacesView({ value }: { value: string }) {
           <div className="mb-2.5 rounded-xl border border-amber/20 bg-white/[0.035] p-2.5">
             <div className="text-[11px] font-medium text-amber">{route.label ?? "Suggested stop order"}</div>
             {route.note && <div className="mt-0.5 text-[10px] leading-relaxed text-slate">{route.note}</div>}
+            {route.durationSeconds != null && (
+              <div className="mt-1.5 text-[11px] font-medium text-ice">
+                {formatRouteDuration(route.durationSeconds)}{routeDistance ? ` · ${routeDistance}` : ""}
+              </div>
+            )}
+            {route.legs?.length ? (
+              <ol className="mt-1.5 space-y-0.5 border-l border-amber/20 pl-2 text-[10px] leading-relaxed text-slate">
+                {route.legs.map((leg, index) => (
+                  <li key={`${leg.to}-${index}`}>
+                    <span className="text-amber/85">{index + 1}. {leg.to}</span>
+                    {` · ${formatRouteDuration(leg.durationSeconds)}${leg.distanceMeters != null ? ` · ${Math.round(leg.distanceMeters / 10) / 100} km` : ""}`}
+                  </li>
+                ))}
+              </ol>
+            ) : null}
+            {route.attribution && <div className="mt-1 text-[9px] text-slate">{route.attribution}</div>}
             {routeUrl && (
               <a href={routeUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-flex rounded-lg border border-amber/25 bg-amber/10 px-2 py-1 text-[10px] text-amber transition hover:bg-amber/15">
-                open navigable route ↗
+                open multi-stop route ↗
               </a>
             )}
           </div>
@@ -916,15 +988,22 @@ export function PlacesView({ value }: { value: string }) {
               <div className="flex items-start gap-2">
                 <span className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full bg-cyan/15 font-mono text-[11px] text-cyan ring-1 ring-cyan/40">{i + 1}</span>
                 {p.wikipediaArticle?.thumbnailUrl && (
-                  <a
-                    href={p.wikipediaArticle.articleUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                    title={`Open ${p.wikipediaArticle.title} on Wikipedia`}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setImagePreview({
+                        title: p.wikipediaArticle!.title,
+                        thumbnailUrl: p.wikipediaArticle!.thumbnailUrl!,
+                        articleUrl: p.wikipediaArticle!.articleUrl,
+                        attribution: p.wikipediaArticle!.attribution,
+                      });
+                    }}
+                    title={`Expand ${p.wikipediaArticle.title}`}
+                    aria-label={`Expand image for ${p.wikipediaArticle.title}`}
                     className="mt-0.5 h-14 w-16 shrink-0 overflow-hidden rounded-md bg-white/5 ring-1 ring-white/10 transition hover:ring-cyan/45"
                   >
-                    {/* External, source-attributed Wikimedia thumbnail: do not proxy it through paid image optimisation. */}
+                    {/* Source-attributed Wikimedia thumbnail: never proxy it through paid image optimisation. */}
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={p.wikipediaArticle.thumbnailUrl}
@@ -933,7 +1012,7 @@ export function PlacesView({ value }: { value: string }) {
                       referrerPolicy="no-referrer"
                       className="h-full w-full object-cover"
                     />
-                  </a>
+                  </button>
                 )}
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[14px] font-medium text-ice">{p.name}</div>
@@ -944,6 +1023,7 @@ export function PlacesView({ value }: { value: string }) {
                   </div>
                   {p.hoursToday && <div className="mt-0.5 text-[11px] text-slate">Today: {p.hoursToday}</div>}
                   {p.openingHours && <div className="mt-0.5 text-[11px] text-slate">Hours (OpenStreetMap): {p.openingHours}</div>}
+                  {p.charge && <div className="mt-0.5 text-[11px] text-amber/85">Entry (OpenStreetMap; verify): {p.charge}</div>}
                   <div className="truncate text-[10px] text-slate">{p.address}</div>
                   {(p.websiteUrl || p.wikipedia?.articleUrl || p.wikipediaArticle?.articleUrl) && (
                     <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px]">
@@ -961,7 +1041,7 @@ export function PlacesView({ value }: { value: string }) {
                   )}
                   {p.wikipediaArticle?.thumbnailUrl && <div className="mt-0.5 text-[9px] text-slate">{p.wikipediaArticle.attribution}</div>}
                   <div className="mt-2 flex gap-1.5">
-                    {[["walking", "🚶"], ["driving", "🚗"], ["transit", "🚆"]].map(([m, ic]) => (
+                    {[["walking", "🚶"], ["bicycling", "🚲"], ["driving", "🚗"]].map(([m, ic]) => (
                       <a key={m} href={dir(p, m)} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} title={m} className="rounded-lg bg-white/5 px-2 py-1 text-xs ring-1 ring-white/10 transition hover:bg-cyan/15 hover:ring-cyan/40">
                         {ic}
                       </a>
@@ -978,7 +1058,28 @@ export function PlacesView({ value }: { value: string }) {
           ))}
         </div>
       </div>
-    </div>
+      </div>
+      {imagePreview && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Image preview: ${imagePreview.title}`}
+          onClick={() => setImagePreview(null)}
+          className="fixed inset-0 z-[100] grid place-items-center bg-black/80 p-4 backdrop-blur-sm"
+        >
+          <div onClick={(event) => event.stopPropagation()} className="relative max-h-[92dvh] w-full max-w-4xl overflow-auto rounded-2xl border border-white/15 bg-[#071018] p-3 shadow-2xl">
+            <button type="button" onClick={() => setImagePreview(null)} aria-label="Close image preview" className="absolute right-5 top-5 z-10 grid size-10 place-items-center rounded-full bg-black/65 text-lg text-white ring-1 ring-white/20 hover:bg-black/85">×</button>
+            {/* The URL was allowed only from an exact OSM-linked Wikipedia article. */}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={imagePreview.thumbnailUrl} alt={imagePreview.title} referrerPolicy="no-referrer" className="max-h-[78dvh] w-full rounded-xl object-contain" />
+            <div className="flex flex-wrap items-center justify-between gap-2 px-1 pt-2 text-[11px] text-slate">
+              <span>{imagePreview.attribution}</span>
+              <a href={imagePreview.articleUrl} target="_blank" rel="noopener noreferrer" className="text-cyan hover:text-cyan/80">Open source article ↗</a>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

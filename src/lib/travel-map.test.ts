@@ -31,6 +31,17 @@ describe("travel map requests", () => {
     );
   });
 
+  it("refreshes matching booked-city references by default but supports an explicit opt-out", () => {
+    expect(normalizeTravelMapRequest({ location: "Sevilla", query: "galleries" })).toMatchObject({
+      includeBookings: true,
+      route: false,
+    });
+    expect(normalizeTravelMapRequest({ location: "Sevilla", query: "galleries", include_bookings: false })).toMatchObject({
+      includeBookings: false,
+      route: false,
+    });
+  });
+
   it("keeps worldwide keyless multi-stop navigation", () => {
     const origin = { lat: 37.39, lng: -5.99 };
     const points = [

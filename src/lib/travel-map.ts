@@ -31,9 +31,10 @@ export function normalizeTravelMapRequest(args: Record<string, unknown>): Travel
     location,
     query,
     preferences,
-    // Booking lookup stays opt-in for a simple map, but route/itinerary requests
-    // use the connected booking as a base unless the caller explicitly declines.
-    includeBookings: args.include_bookings === true || (route && args.include_bookings !== false),
+    // Every travel map re-checks for a time-valid stay near the city unless
+    // Daniel explicitly declines. This keeps the booked location visible as a
+    // reference while he moves between cities, instead of only on route maps.
+    includeBookings: args.include_bookings !== false,
     route,
     travelMode,
   };

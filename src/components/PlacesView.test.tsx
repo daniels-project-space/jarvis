@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { Briefing2View, CandlesView, PlacesView, WeatherView, WebResultsView } from "./Views";
 
 describe("PlacesView travel presentation", () => {
-  it("labels the city centre, Gmail base, suggested connector and real route link honestly", () => {
+  it("labels the city centre, Gmail base, timed street route and source-backed entry price", () => {
     const value = JSON.stringify({
       kind: "places",
       query: "niche attractions",
@@ -20,10 +20,14 @@ describe("PlacesView travel presentation", () => {
         source: "Read-only Gmail booking",
       },
       route: {
-        label: "Suggested walking order · straight map connector",
-        note: "The line shows stop order, not street geometry; use the route link for navigation.",
+        label: "Suggested walking route · street geometry",
+        note: "Timed route follows public OpenStreetMap road/path data through the numbered stops in order.",
         mode: "walking",
-        coordinates: [[-5.9902, 37.386], [-6.006, 37.3855]],
+        coordinates: [[-5.9902, 37.386], [-5.998, 37.3858], [-6.006, 37.3855]],
+        distanceMeters: 1500,
+        durationSeconds: 900,
+        legs: [{ to: "Centro Cerámica Triana", distanceMeters: 1500, durationSeconds: 900 }],
+        attribution: "Route data © OpenStreetMap contributors · FOSSGIS OSRM",
         directionsUrl: "https://www.openstreetmap.org/directions?engine=fossgis_osrm_foot&route=37.386%2C-5.9902%3B37.3855%2C-6.006",
       },
       items: [{
@@ -32,6 +36,7 @@ describe("PlacesView travel presentation", () => {
         lat: 37.3855,
         lng: -6.006,
         dist: 1.5,
+        charge: "6 EUR",
         mapsUri: "https://www.openstreetmap.org/?mlat=37.3855&mlon=-6.006",
       }],
     });
@@ -42,9 +47,12 @@ describe("PlacesView travel presentation", () => {
     expect(html).toContain("OpenStreetMap contributors");
     expect(html).toContain("Read-only Gmail booking");
     expect(html).toContain("Hotel Casa 1800 Sevilla");
-    expect(html).toContain("straight map connector");
-    expect(html).toContain("not street geometry");
-    expect(html).toContain("open navigable route");
+    expect(html).toContain("street geometry");
+    expect(html).toContain("15 min");
+    expect(html).toContain("1.5 km");
+    expect(html).toContain("FOSSGIS OSRM");
+    expect(html).toContain("Entry (OpenStreetMap; verify): 6 EUR");
+    expect(html).toContain("open multi-stop route");
     expect(html).toContain("Centro Cerámica Triana");
   });
 
@@ -65,6 +73,35 @@ describe("PlacesView travel presentation", () => {
 
     expect(html).toContain("Gmail booking lookup is currently unavailable");
     expect(html).toContain("route starts from the map centre");
+    expect(html).not.toContain("starting base");
+  });
+
+  it("renders a time-sensitive booked-city reference even when no route is requested", () => {
+    const html = renderToStaticMarkup(<PlacesView value={JSON.stringify({
+      kind: "places",
+      query: "galleries",
+      locationLabel: "Sevilla",
+      center: { lat: 37.3891, lng: -5.9845, label: "Sevilla", source: "openstreetmap" },
+      base: {
+        lat: 37.386,
+        lng: -5.9902,
+        label: "Hotel Casa 1800 Sevilla",
+        address: "Rodrigo Caro, 6, 41004 Sevilla, Spain",
+        source: "Read-only Gmail booking",
+        stayStatus: "upcoming",
+        start: Date.UTC(2026, 7, 9, 13),
+        end: Date.UTC(2026, 7, 12, 9),
+        timeZone: "Europe/Madrid",
+        checkedAt: Date.UTC(2026, 7, 1),
+      },
+      booking: { requested: true, status: "matched", stayStatus: "upcoming" },
+      items: [{ name: "Casa de Pilatos", address: "Sevilla", lat: 37.39, lng: -5.988, dist: 0.7, mapsUri: "https://www.openstreetmap.org/" }],
+    })} />);
+
+    expect(html).toContain("booked stay · reference");
+    expect(html).toContain("upcoming");
+    expect(html).toContain("9 Aug 2026 – 12 Aug 2026");
+    expect(html).toContain("Refreshed from connected Gmail for this map");
     expect(html).not.toContain("starting base");
   });
 
@@ -105,6 +142,7 @@ describe("PlacesView travel presentation", () => {
     expect(html).toContain("Wikipedia (es) · image via Wikimedia");
     expect(html).toContain("https://upload.wikimedia.org/example/alcazar.jpg");
     expect(html).toContain("https://es.wikipedia.org/wiki/Real_Alc%C3%A1zar_de_Sevilla");
+    expect(html).toContain("Expand image for Real Alcázar de Sevilla");
   });
 });
 

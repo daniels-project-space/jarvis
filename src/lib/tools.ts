@@ -48,6 +48,7 @@ import {
   enrichOpenStreetMapPlacesWithWikimedia,
   openStreetMapDistanceKm,
   openStreetMapDirectionsUrl,
+  routeOpenStreetMapItinerary,
   searchOpenStreetMapPlaces,
   type OpenStreetMapPlace,
 } from "./openstreetmap";
@@ -1042,15 +1043,15 @@ export const TOOL_DEFS = [
   {
     name: "travel_map",
     description:
-      "Show a real interactive city/local MapLibre map whenever Daniel asks to see places, attractions, waypoints, a route, or an itinerary. Works for an explicit location anywhere in the world or his saved current location; never assume the UK. Pass his exact taste in preferences (including niche/non-touristy follow-ups) instead of reducing it to a fixed category. For route/itinerary requests, include_bookings defaults on so a matching read-only Gmail hotel booking can become the labelled starting base; no Calendar or Gmail state is changed. The panel shows honest centre/base labels, numbered live place pins, and an optional suggested stop order with open route links.",
+      "Show a real interactive city/local MapLibre map whenever Daniel asks to see places, attractions, waypoints, a route, or an itinerary. Works for an explicit location anywhere in the world or his saved current location; never assume the UK. Pass his exact taste in preferences (including niche/non-touristy follow-ups) instead of reducing it to a fixed category. Automatically re-check connected Gmail for a time-valid stay actually in that city and show it as a labelled booked-location reference (or route base); never reveal another city’s stay, an expired stay, or an undated stay. include_bookings:false is the explicit privacy/latency opt-out. No Calendar or Gmail state is changed. The panel shows honest centre/base labels, numbered live place pins, and an optional routed stop order with timing.",
     parameters: {
       type: "object",
       properties: {
         location: { type: "string", description: "City, neighbourhood, landmark, or address; omit only to use Daniel's saved live location" },
         query: { type: "string", description: "What to put on the map; defaults to interesting places and attractions" },
         preferences: { type: "string", description: "Daniel's exact taste or refinement, e.g. 'niche, local, non-touristy ceramics and architecture'" },
-        include_bookings: { type: "boolean", description: "Use matching Gmail booking as the map base. Defaults true for route requests, otherwise false for speed." },
-        route: { type: "boolean", description: "Order the pins into a suggested route and draw a clearly labelled connector" },
+        include_bookings: { type: "boolean", description: "Re-check and show a time-valid Gmail stay that is verified inside this mapped city. Defaults true; false opts out." },
+        route: { type: "boolean", description: "Order the pins into a timed, street-geometry route when a public router verifies it." },
         travel_mode: { type: "string", enum: ["walking", "driving", "transit", "bicycling"], description: "Directions mode; default walking" },
       },
     },
@@ -2941,19 +2942,73 @@ async function searchTravelPlaces(
   return { places, provider: "openstreetmap" };
 }
 
-function chooseTravelBooking(bookings: ConfirmedBooking[], location?: string): ConfirmedBooking | undefined {
-  const needle = String(location ?? "").toLocaleLowerCase();
-  const now = Date.now();
-  return [...bookings]
-    .filter((booking) => booking.kind === "stay" && booking.location)
+type CityBookingState = "active" | "upcoming";
+
+type LocalTravelBooking = {
+  booking: ConfirmedBooking;
+  place: TravelPlace;
+  state: CityBookingState;
+};
+
+const MAX_CITY_BOOKING_CANDIDATES = 3;
+const CITY_BOOKING_SEARCH_RADIUS_METRES = 30_000;
+const CITY_BOOKING_MAX_DISTANCE_KM = 35;
+
+function cityBookingState(booking: ConfirmedBooking, now = Date.now()): CityBookingState | undefined {
+  const start = Number(booking.start);
+  const end = Number(booking.end ?? booking.start);
+  // A city reference is deliberately time-bounded. Do not keep an old or
+  // undated Gmail stay visible just because it happens to geocode nearby.
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start || end < now) return undefined;
+  return start <= now && now <= end ? "active" : "upcoming";
+}
+
+function rankedCityBookingCandidates(
+  bookings: ConfirmedBooking[],
+  location: string | undefined,
+  now: number,
+): Array<{ booking: ConfirmedBooking; state: CityBookingState; index: number }> {
+  const needle = String(location ?? "").trim().toLocaleLowerCase();
+  return bookings
+    .map((booking, index) => ({ booking, state: cityBookingState(booking, now), index }))
+    .filter((candidate): candidate is { booking: ConfirmedBooking; state: CityBookingState; index: number } =>
+      candidate.booking.kind === "stay" && Boolean(candidate.booking.location) && Boolean(candidate.state),
+    )
     .sort((left, right) => {
-      const leftMatch = needle && `${left.bookingName ?? ""} ${left.location ?? ""}`.toLocaleLowerCase().includes(needle) ? 1 : 0;
-      const rightMatch = needle && `${right.bookingName ?? ""} ${right.location ?? ""}`.toLocaleLowerCase().includes(needle) ? 1 : 0;
-      if (leftMatch !== rightMatch) return rightMatch - leftMatch;
-      const leftFuture = (left.end ?? left.start ?? 0) >= now ? 1 : 0;
-      const rightFuture = (right.end ?? right.start ?? 0) >= now ? 1 : 0;
-      return rightFuture - leftFuture || (left.start ?? Number.MAX_SAFE_INTEGER) - (right.start ?? Number.MAX_SAFE_INTEGER);
-    })[0];
+      const leftText = needle && `${left.booking.bookingName ?? ""} ${left.booking.location ?? ""}`.toLocaleLowerCase().includes(needle) ? 1 : 0;
+      const rightText = needle && `${right.booking.bookingName ?? ""} ${right.booking.location ?? ""}`.toLocaleLowerCase().includes(needle) ? 1 : 0;
+      if (leftText !== rightText) return rightText - leftText;
+      const leftActive = left.state === "active" ? 1 : 0;
+      const rightActive = right.state === "active" ? 1 : 0;
+      if (leftActive !== rightActive) return rightActive - leftActive;
+      const startOrder = Number(left.booking.start) - Number(right.booking.start);
+      return startOrder || left.index - right.index;
+    })
+    .slice(0, MAX_CITY_BOOKING_CANDIDATES);
+}
+
+/**
+ * Finds a time-valid stay actually inside the mapped city. A textual city
+ * match is only a ranking hint: place aliases and street-only confirmations
+ * are resolved against the city bounds before any booking details are shown.
+ */
+async function findLocalTravelBooking(
+  bookings: ConfirmedBooking[],
+  center: TravelMapPoint,
+  location: string | undefined,
+  now: number,
+): Promise<LocalTravelBooking | undefined> {
+  for (const candidate of rankedCityBookingCandidates(bookings, location, now)) {
+    const lookup = await searchTravelPlaces(candidate.booking.location!, {
+      center,
+      radiusMetres: CITY_BOOKING_SEARCH_RADIUS_METRES,
+      maxResults: 1,
+    }).catch(() => undefined);
+    const place = lookup?.places[0];
+    if (!place || openStreetMapDistanceKm(center, place) > CITY_BOOKING_MAX_DISTANCE_KM) continue;
+    return { booking: candidate.booking, place, state: candidate.state };
+  }
+  return undefined;
 }
 
 function currentAddressBearingStay(bookings: ConfirmedBooking[], now = Date.now()): ConfirmedBooking | undefined {
@@ -2972,6 +3027,7 @@ function currentAddressBearingStay(bookings: ConfirmedBooking[], now = Date.now(
 async function travelMap(args: any): Promise<string> {
   const request = normalizeTravelMapRequest(args ?? {});
   try {
+    const now = Date.now();
     const bookingsPromise: Promise<{ bookings: ConfirmedBooking[]; unavailable: boolean }> = request.includeBookings
       // Search confirmation mail broadly, then validate the selected stay
       // against the mapped city. Exact Gmail text such as "Sevilla" misses
@@ -3021,7 +3077,7 @@ async function travelMap(args: any): Promise<string> {
       // guess from an upcoming or finished reservation.
       if (!center && request.includeBookings) {
         bookingLookup = await bookingsPromise;
-        currentStay = currentAddressBearingStay(bookingLookup.bookings);
+        currentStay = currentAddressBearingStay(bookingLookup.bookings, now);
         if (currentStay?.location) {
           const stayLookup = await searchTravelPlaces(currentStay.location, { maxResults: 1 }).catch(() => undefined);
           const stay = stayLookup?.places[0];
@@ -3043,30 +3099,25 @@ async function travelMap(args: any): Promise<string> {
     if (!center) return "I don't have a usable map location yet.";
 
     bookingLookup ??= await bookingsPromise;
-    const bookingCandidate = currentStay ?? chooseTravelBooking(bookingLookup.bookings, request.location ?? center.label);
+    const localBooking = currentStay
+      ? {
+        booking: currentStay,
+        place: { ...center, name: center.label, address: center.detail ?? center.label, dist: 0, mapsUri: "", provider: "openstreetmap" as const },
+        state: "active" as const,
+      }
+      : await findLocalTravelBooking(bookingLookup.bookings, center, request.location ?? center.label, now);
     const placeQuery = currentStay?.location
       ? placeSearchTextQuery({ ...request, location: currentStay.location })
       : placeSearchTextQuery(request);
     // Do not parallelise public Nominatim requests: the shared adapter keeps
     // owner-scale usage within its rate limit.
     const foundLookup = await searchTravelPlaces(placeQuery, { center, radiusMetres: 14_000, maxResults: 10 });
-    const candidateLookup = !currentStay && bookingCandidate?.location
-      ? await searchTravelPlaces(bookingCandidate.location, { center, radiusMetres: 30_000, maxResults: 1 }).catch(() => undefined)
-      : undefined;
     const found = await enrichOpenStreetMapPlacesWithWikimedia(foundLookup.places);
-    const candidateGeocode = candidateLookup?.places[0];
     if (!found.length) return `I couldn't find places matching “${placeQuery}”.`;
 
-    // A booking is allowed to become the route origin only after its address
-    // geocodes near the requested city. This prevents a future stay in another
-    // country from silently becoming today's route base.
-    const bookingDistanceKm = candidateGeocode
-      ? openStreetMapDistanceKm(center, candidateGeocode)
-      : Number.POSITIVE_INFINITY;
-    const booking = currentStay ?? (bookingCandidate && candidateGeocode && bookingDistanceKm <= 80
-      ? bookingCandidate
-      : undefined);
-    const bookingGeocode = currentStay ? center : booking ? candidateGeocode : undefined;
+    const booking = localBooking?.booking;
+    const bookingGeocode = localBooking?.place;
+    const bookingState = localBooking?.state;
     const bookingStatus = !request.includeBookings
       ? "not_requested"
       : currentStay
@@ -3085,14 +3136,37 @@ async function travelMap(args: any): Promise<string> {
       .sort((left, right) => (left.dist ?? 99) - (right.dist ?? 99))
       .slice(0, request.route ? 8 : 10);
     const places = request.route ? orderTravelMapPoints(basePoint, selected) : selected;
-    const routeUrl = request.route && places.length
-      ? openStreetMapDirectionsUrl({ origin: basePoint, destination: places.at(-1)!, mode: request.travelMode })
+    const routePoints = [basePoint, ...places];
+    const calculatedRoute = request.route && places.length
+      ? await routeOpenStreetMapItinerary({ points: routePoints, mode: request.travelMode })
       : undefined;
-    const route = request.route ? {
-      label: `Suggested ${request.travelMode} order · straight map connector`,
-      note: "The line shows stop order, not street geometry. The directions link opens the final stop; use each place's controls for a specific route.",
+    const routeUrl = request.route && places.length
+      ? openStreetMapDirectionsUrl({
+        origin: basePoint,
+        waypoints: places.slice(0, -1),
+        destination: places.at(-1)!,
+        mode: request.travelMode,
+      })
+      : undefined;
+    const route = request.route ? calculatedRoute ? {
+      label: `Suggested ${request.travelMode} route · street geometry`,
+      note: "Timed route follows public OpenStreetMap road/path data through the numbered stops in order.",
       mode: request.travelMode,
-      coordinates: [basePoint, ...places].map((point) => [point.lng, point.lat]),
+      coordinates: calculatedRoute.coordinates,
+      directionsUrl: routeUrl,
+      order: places.map((place) => place.name),
+      distanceMeters: calculatedRoute.distanceMeters,
+      durationSeconds: calculatedRoute.durationSeconds,
+      legs: calculatedRoute.legs.map((leg, index) => ({ ...leg, to: places[index]!.name })),
+      attribution: calculatedRoute.attribution,
+    } : {
+      label: request.travelMode === "transit"
+        ? "Public-transit timing unavailable"
+        : `Suggested ${request.travelMode} route unavailable`,
+      note: request.travelMode === "transit"
+        ? "This free router has no live public-transit profile, so Jarvis will not substitute walking or driving timing. Place markers and individual directions remain available."
+        : "No verified street geometry or timing was returned. Jarvis is showing markers only, not a straight-line estimate.",
+      mode: request.travelMode,
       directionsUrl: routeUrl,
       order: places.map((place) => place.name),
     } : undefined;
@@ -3102,6 +3176,11 @@ async function travelMap(args: any): Promise<string> {
       source: currentStay ? "Read-only Gmail current stay" : "Read-only Gmail booking",
       lat: bookingGeocode?.lat,
       lng: bookingGeocode?.lng,
+      stayStatus: bookingState,
+      start: booking.start,
+      end: booking.end,
+      timeZone: booking.timeZone,
+      checkedAt: now,
     } : undefined;
     const locationLabel = request.location ?? center.label;
     await showWidget({
@@ -3118,14 +3197,19 @@ async function travelMap(args: any): Promise<string> {
         message: bookingStatus === "current_stay"
           ? "Confirmed active Gmail stay set the map centre and route base."
           : bookingStatus === "matched"
-          ? "Confirmed Gmail stay verified near this map."
+          ? `Confirmed ${bookingState === "active" ? "active" : "upcoming"} Gmail stay verified in this city.`
           : bookingStatus === "unavailable"
             ? "Gmail booking lookup is currently unavailable; the route starts from the map centre."
             : bookingStatus === "no_local_match"
               ? "Confirmed stays were found, but none could be verified near this map; the route starts from the map centre."
-              : bookingStatus === "not_found"
-                ? "No confirmed Gmail stay was found; the route starts from the map centre."
+            : bookingStatus === "not_found"
+                ? "No time-valid Gmail stay was found in this city; the route starts from the map centre."
                 : undefined,
+        stayStatus: bookingState,
+        start: booking?.start,
+        end: booking?.end,
+        timeZone: booking?.timeZone,
+        checkedAt: now,
       },
       route,
       provider: foundLookup.provider,
@@ -3134,11 +3218,18 @@ async function travelMap(args: any): Promise<string> {
     const bookingResult = base
       ? currentStay
         ? `${base.label} is the confirmed active Gmail stay and set this map's centre and read-only booking base.`
-        : `${base.label} is verified near ${locationLabel} and marked as the read-only Gmail booking base.`
+        : `${base.label} is the confirmed ${bookingState} Gmail stay in ${locationLabel} and is shown as the read-only booked-location reference.`
       : request.includeBookings
         ? `${bookingStatus === "unavailable" ? "Gmail booking lookup was unavailable" : "No confirmed Gmail stay near this map was verified"}; the route starts from the map centre. Do not claim or imply that a booking address was used.`
         : "No booking base was requested.";
-    return `Interactive OpenStreetMap opened for ${locationLabel} with ${places.length} place pin${places.length === 1 ? "" : "s"}. Opening hours are shown only when OpenStreetMap tags them; ratings and admission prices are not claimed. Linked Wikipedia images and articles appear only for exact OpenStreetMap Wikipedia tags${routeUrl ? `; the suggested ${request.travelMode} route link opens the final stop` : ""}. ${bookingResult} Keep the map visible and answer with a short, preference-aware summary.`;
+    const timingResult = calculatedRoute
+      ? `The routed itinerary is ${Math.round(calculatedRoute.distanceMeters / 100) / 10} km and about ${Math.max(1, Math.round(calculatedRoute.durationSeconds / 60))} minutes across ${calculatedRoute.legs.length} leg${calculatedRoute.legs.length === 1 ? "" : "s"}.`
+      : request.route
+        ? request.travelMode === "transit"
+          ? "Live public-transit timing is unavailable and was not estimated."
+          : "No street route timing was available, so no straight-line estimate is shown."
+        : "";
+    return `Interactive OpenStreetMap opened for ${locationLabel} with ${places.length} place pin${places.length === 1 ? "" : "s"}. Opening hours and entry prices are shown only when OpenStreetMap tags them, with prices explicitly marked for venue verification. Linked Wikipedia images and articles appear only for exact OpenStreetMap Wikipedia tags${routeUrl ? `; the suggested ${request.travelMode} route link includes every stop` : ""}. ${timingResult} ${bookingResult} Keep the map visible and answer with a short, preference-aware summary.`;
   } catch (error: any) {
     return `Travel map lookup failed: ${String(error?.message ?? error).slice(0, 120)}.`;
   }
