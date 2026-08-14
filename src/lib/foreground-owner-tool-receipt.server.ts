@@ -85,7 +85,12 @@ function validPayload(value: unknown, now: number): value is ForegroundOwnerTool
     || !validIdentifier(value.claimToken) || !validIdentifier(value.callId)
     || !validIdentifier(value.target)) return false;
   if (value.operation !== "discover" && value.operation !== "invoke") return false;
-  if (!Number.isSafeInteger(value.issuedAt) || !Number.isSafeInteger(value.expiresAt)) return false;
+  if (
+    typeof value.issuedAt !== "number"
+    || typeof value.expiresAt !== "number"
+    || !Number.isSafeInteger(value.issuedAt)
+    || !Number.isSafeInteger(value.expiresAt)
+  ) return false;
   if (value.issuedAt < 0 || value.expiresAt <= value.issuedAt || value.expiresAt > value.issuedAt + RECEIPT_TTL_MS) return false;
   // A small clock-skew allowance avoids rejecting a receipt while still making
   // it an intentionally short per-dynamic-call credential.
