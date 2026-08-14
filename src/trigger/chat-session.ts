@@ -161,6 +161,23 @@ function conversationPreamble() {
     `When Daniel's request implies a supported visual or live-data capability, execute the most specific safe tool before the final reply; never claim that you cannot show a map, chart, weather, search result, briefing, planner, or document when its tool is available. Then keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
 }
 
+// Luna is picked by pickConversationTier() only for short greetings and
+// acknowledgements. On a cold runner, routing it onto the main conversation
+// thread pays for thread/start's full baseInstructions — PERSONA plus the
+// entire CAPABILITIES tool-routing manual and INFRA_MAP — just to say "hi".
+// This keeps the same voice and full tool-bridge access (dynamic tools are
+// wired at the app-server level below, not in this text) while dropping the
+// routing/infra reference manual a greeting never needs. It only governs the
+// one-time cost of starting the dedicated fast-lane thread in processChatQueue
+// below; terra/sol always use the full conversationPreamble() on the main
+// thread, unchanged.
+function lunaFastPreamble() {
+  return PERSONA +
+    `\n\n${REMEMBER}\n\n` +
+    JARVIS_TOOL_INSTRUCTIONS + " " +
+    `Keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
+}
+
 async function runTurn(
   server: CodexAppServer,
   conversationId: string,
@@ -195,7 +212,7 @@ async function runTurn(
       history,
       contextBlock: freshContext,
       imageInputs,
-      preamble: conversationPreamble(),
+      preamble: model === "luna" ? lunaFastPreamble() : conversationPreamble(),
       modelTier: model,
       allowTools: true,
       invocationContext,
@@ -524,9 +541,17 @@ async function processChatQueue(
       const contextReadyAt = Date.now();
       const model = pickConversationTier(visibleUserText);
       const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
+      // Luna-tier turns get their own lightweight Codex thread (see
+      // lunaFastPreamble above) so a cold runner's first greeting doesn't pay
+      // for the full conversation preamble. Attachments/owner-tool grants stay
+      // on the richer main thread unconditionally — those never come from a
+      // trivial greeting in practice, and this leaves their existing behavior
+      // (including the private-file thread-forgetting below) untouched.
+      const lunaFastLane = model === "luna" && claim.attachments.length === 0 && !claim.ownerToolAccess;
+      const codexConversationId = lunaFastLane ? `${claim.threadId}::luna-fast` : claim.threadId;
       const turn = await session.runTurn((activeServer, onStarted) => runTurn(
         activeServer,
-        claim.threadId,
+        codexConversationId,
         claim.assistantId,
         claim.claimToken,
         claim.userText,
