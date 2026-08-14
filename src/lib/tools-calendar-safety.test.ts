@@ -13,6 +13,8 @@ const mock = vi.hoisted(() => ({
   saveTrip: vi.fn(),
   computeTransfer: vi.fn(),
   buildItinerary: vi.fn(),
+  refreshTripItineraryRoutes: vi.fn(),
+  saveTripItinerary: vi.fn(),
   tripToCalendar: vi.fn(),
   tripToMindmap: vi.fn(),
 }));
@@ -40,6 +42,8 @@ vi.mock("./travel", () => ({
   saveTrip: mock.saveTrip,
   computeTransfer: mock.computeTransfer,
   buildItinerary: mock.buildItinerary,
+  refreshTripItineraryRoutes: mock.refreshTripItineraryRoutes,
+  saveTripItinerary: mock.saveTripItinerary,
   tripToCalendar: mock.tripToCalendar,
   tripToMindmap: mock.tripToMindmap,
 }));
@@ -67,6 +71,8 @@ describe("legacy calendar write boundary", () => {
     mock.getTrip.mockResolvedValue(reviewedTrip());
     mock.computeTransfer.mockResolvedValue({ durationText: "25 min", distanceText: "8 km" });
     mock.buildItinerary.mockReturnValue([]);
+    mock.refreshTripItineraryRoutes.mockResolvedValue([]);
+    mock.saveTripItinerary.mockResolvedValue(undefined);
     mock.tripToMindmap.mockResolvedValue("");
     mock.saveTrip.mockResolvedValue(undefined);
   });

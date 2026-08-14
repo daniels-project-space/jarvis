@@ -4,7 +4,7 @@ import { resolveEmbedLayoutMode, resolvePanelRoute } from "./panel-contract";
 
 describe("semantic panel routing", () => {
   it.each([
-    ["board", "board"], ["scene", "scene"], ["canvas", "canvas"], ["creations", "creations"],
+    ["board", "board"], ["scene", "scene"], ["canvas", "canvas"], ["creations", "creations"], ["travel", "travel"],
     ["list", "list"], ["site", "site"], ["video", "iframe"], ["image", "image"], ["code", "code"],
   ])("routes %s content through its one renderer", (type, renderer) => {
     expect(resolvePanelRoute({ type, value: "" }).renderer).toBe(renderer);
@@ -28,7 +28,7 @@ describe("semantic panel routing", () => {
     expect(route.keepOrbVisible).toBe(false);
   });
 
-  it.each(["trip", "fleet", "pdf", "site", "url"])(
+  it.each(["trip", "travel", "fleet", "pdf", "site", "url"])(
     "gives %s the complete workspace instead of a squeezed side stage",
     (type) => {
       expect(resolvePanelRoute({ type, value: "" }).presentation).toBe("workspace");

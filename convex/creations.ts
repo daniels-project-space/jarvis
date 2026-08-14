@@ -287,6 +287,157 @@ export const updateTripProvider = mutation({
   },
 });
 
+function validItineraryDate(value: unknown): boolean {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T12:00:00Z`));
+}
+
+function validItineraryString(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length <= max;
+}
+
+function validItineraryCoordinate(value: unknown, max: number): boolean {
+  return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= max;
+}
+
+/**
+ * Convex accepts a JSON string for backwards-compatible TripDoc storage, but
+ * it must still be a bounded, render-safe itinerary rather than arbitrary
+ * agent-shaped data. The server-side normalizer adds legacy defaults later;
+ * this gate protects the durable document at its write boundary.
+ */
+function validTripItineraryPayload(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length > 45) return false;
+  let coordinates = 0;
+  for (const day of value) {
+    if (!day || typeof day !== "object" || Array.isArray(day)) return false;
+    const record = day as Record<string, unknown>;
+    if (!validItineraryDate(record.date) || !validItineraryString(record.label, 80)) return false;
+    if (record.status !== undefined && record.status !== "draft" && record.status !== "locked") return false;
+    if (!Array.isArray(record.items) || record.items.length > 24) return false;
+    for (const item of record.items) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      const stop = item as Record<string, unknown>;
+      if (
+        !validItineraryString(stop.id, 180) ||
+        !validItineraryDate(stop.date) ||
+        !validItineraryString(stop.title, 180) ||
+        !["flight", "hotel", "transfer", "activity", "booking"].includes(String(stop.kind)) ||
+        !["generated", "owner", "gmail", "recommendation"].includes(String(stop.source))
+      ) return false;
+      if (stop.time !== undefined && (typeof stop.time !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(stop.time))) return false;
+      if (stop.durationMinutes !== undefined && (!Number.isFinite(stop.durationMinutes) || Number(stop.durationMinutes) <= 0 || Number(stop.durationMinutes) > 1_440)) return false;
+      if ((stop.lat === undefined) !== (stop.lng === undefined)) return false;
+      if (stop.lat !== undefined && (!validItineraryCoordinate(stop.lat, 90) || !validItineraryCoordinate(stop.lng, 180))) return false;
+      if (stop.placeId !== undefined && !validItineraryString(stop.placeId, 180)) return false;
+      if (stop.link !== undefined && (!validItineraryString(stop.link, 1_600) || !/^https?:\/\//.test(stop.link))) return false;
+      if (stop.note !== undefined && !validItineraryString(stop.note, 400)) return false;
+      if (stop.locked !== undefined && typeof stop.locked !== "boolean") return false;
+    }
+    if (record.route === undefined) continue;
+    if (!record.route || typeof record.route !== "object" || Array.isArray(record.route)) return false;
+    const route = record.route as Record<string, unknown>;
+    if (!["walking", "bicycling", "driving", "transit"].includes(String(route.mode)) || !["ready", "unavailable", "stale"].includes(String(route.status))) return false;
+    if (route.coordinates !== undefined) {
+      if (!Array.isArray(route.coordinates) || route.coordinates.length > 2_000) return false;
+      coordinates += route.coordinates.length;
+      if (coordinates > 12_000) return false;
+      for (const point of route.coordinates) {
+        if (!Array.isArray(point) || point.length < 2 || !validItineraryCoordinate(point[0], 180) || !validItineraryCoordinate(point[1], 90)) return false;
+      }
+    }
+    for (const metric of ["durationSeconds", "distanceMeters"]) {
+      if (route[metric] !== undefined && (!Number.isFinite(route[metric]) || Number(route[metric]) < 0)) return false;
+    }
+    if (route.status === "ready" && (!Array.isArray(route.coordinates) || route.coordinates.length < 2 || !Number.isFinite(route.durationSeconds) || !Number.isFinite(route.distanceMeters))) return false;
+    if (route.legs !== undefined) {
+      if (!Array.isArray(route.legs) || route.legs.length > 24) return false;
+      for (const leg of route.legs) {
+        if (!leg || typeof leg !== "object" || Array.isArray(leg)) return false;
+        const edge = leg as Record<string, unknown>;
+        if (!validItineraryString(edge.fromItemId, 180) || !validItineraryString(edge.toItemId, 180) || !Number.isFinite(edge.durationSeconds) || Number(edge.durationSeconds) < 0 || !Number.isFinite(edge.distanceMeters) || Number(edge.distanceMeters) < 0) return false;
+      }
+    }
+    if (route.attribution !== undefined && !validItineraryString(route.attribution, 320)) return false;
+    if (route.directionsUrl !== undefined && (!validItineraryString(route.directionsUrl, 1_600) || !/^https?:\/\//.test(route.directionsUrl))) return false;
+    if (route.calculatedAt !== undefined && (!Number.isFinite(route.calculatedAt) || Number(route.calculatedAt) < 0)) return false;
+  }
+  return true;
+}
+
+// A day-plan write must not replace provider results that are still arriving
+// from independent scouting tasks. This mutation reads the live TripDoc and
+// changes only its itinerary metadata in the same Convex transaction.
+export const updateTripItinerary = mutation({
+  args: {
+    id: v.id("creations"),
+    // JSON array of day plans. Keeping this encoded lets the TripDoc remain
+    // backward-compatible while still validating the bounded payload here.
+    itinerary: v.string(),
+    // Strictly increasing client/server plan revision; stale route results are
+    // rejected instead of overwriting a newer itinerary.
+    planRevision: v.number(),
+    mindmapCreationId: v.optional(v.string()),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    if (
+      a.itinerary.length > 120_000 ||
+      !Number.isSafeInteger(a.planRevision) ||
+      a.planRevision < 1 ||
+      a.planRevision > 1_000_000 ||
+      (a.mindmapCreationId !== undefined && (a.mindmapCreationId.length < 1 || a.mindmapCreationId.length > 160))
+    ) {
+      return { ok: false as const, reason: "invalid" as const };
+    }
+
+    let itinerary: unknown;
+    try {
+      itinerary = JSON.parse(a.itinerary);
+    } catch {
+      return { ok: false as const, reason: "invalid" as const };
+    }
+    if (
+      !validTripItineraryPayload(itinerary)
+    ) {
+      return { ok: false as const, reason: "invalid" as const };
+    }
+
+    const row = await ctx.db.get(a.id);
+    if (!row) return { ok: false as const, reason: "not_found" as const };
+    if (row.kind !== "trip" || !row.data) return { ok: false as const, reason: "not_trip" as const };
+
+    let doc: any;
+    try {
+      doc = JSON.parse(row.data);
+    } catch {
+      return { ok: false as const, reason: "invalid_trip" as const };
+    }
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+      return { ok: false as const, reason: "invalid_trip" as const };
+    }
+
+    const currentRevision = Number.isSafeInteger(doc.planRevision) && doc.planRevision >= 0 ? doc.planRevision : 0;
+    if (a.planRevision <= currentRevision) {
+      return { ok: false as const, reason: "stale" as const, planRevision: currentRevision, updatedAt: row.updatedAt };
+    }
+
+    doc.itinerary = itinerary;
+    doc.planRevision = a.planRevision;
+    if (a.mindmapCreationId !== undefined) doc.mindmapCreationId = a.mindmapCreationId;
+
+    const updatedAt = Date.now();
+    await ctx.db.patch(a.id, {
+      // Retain the durable creation title; an itinerary patch must not roll
+      // back an unrelated title edit encoded in a stale TripDoc payload.
+      title: row.title.slice(0, 120),
+      data: JSON.stringify(doc),
+      updatedAt,
+    });
+    return { ok: true as const, planRevision: a.planRevision, updatedAt };
+  },
+});
+
 // Board persistence with op-queue merge: the client saves its full element
 // state but must NOT clobber ops the brain queued while it was drawing —
 // ops newer than appliedUpTo survive the save.

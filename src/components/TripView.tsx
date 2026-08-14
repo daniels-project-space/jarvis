@@ -5,38 +5,131 @@ import { useJarvisQuery } from "@/lib/secure-convex";
 import { viewerFetch } from "@/lib/viewer-request";
 import "maplibre-gl/dist/maplibre-gl.css";
 
-// The trip planner panel: a REAL dark 3D map (MapLibre globe projection on
-// Carto's dark-matter street basemap — streets appear as you zoom) with every
-// stay/activity/airport as a glowing marker, connection lines for the locked
-// plan, and the workspace beside it: budget (total AND per day), filterable
-// stay cards with galleries/perks/booking links, flights, activities, and the
-// finalized day-by-day plan. Lock buttons call the same trip tools the brain
-// uses; everything renders reactively from the trip's creations row.
+// The trip planner panel: a real dark 3D map (MapLibre globe projection on
+// Carto's dark-matter street basemap) plus a reactive workspace. Persisted
+// itinerary routes are deliberately rendered only from their stored geometry;
+// a straight line between two markers is not a route and must never look like
+// one here.
 
-type TripDoc = any;
+type Coordinate = [number, number];
+type ItineraryItem = {
+  id?: string;
+  placeId?: string;
+  time?: string;
+  durationMinutes?: number;
+  title: string;
+  kind: string;
+  lat?: number;
+  lng?: number;
+  link?: string;
+  note?: string;
+  source?: string;
+};
+type ItineraryRouteLeg = {
+  fromItemId?: string;
+  toItemId?: string;
+  durationSeconds?: number;
+  distanceMeters?: number;
+};
+type ItineraryRoute = {
+  mode?: string;
+  status?: string;
+  coordinates?: Coordinate[];
+  durationSeconds?: number;
+  distanceMeters?: number;
+  legs?: ItineraryRouteLeg[];
+  attribution?: string;
+};
+type ItineraryDay = {
+  date: string;
+  label?: string;
+  status?: string;
+  items: ItineraryItem[];
+  route?: ItineraryRoute;
+};
+type TripDoc = { itinerary?: ItineraryDay[]; [key: string]: any };
 type Marker = { key: string; lat: number; lng: number; kind: "stay" | "activity" | "airport"; name: string; locked?: boolean };
 
 const KIND_COLOR: Record<string, string> = { stay: "#00ff88", activity: "#5cc8ff", airport: "#ffb454" };
+const GLASS = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
+
+const validLatLng = (lat: unknown, lng: unknown) =>
+  typeof lat === "number" && Number.isFinite(lat) && lat >= -90 && lat <= 90 && typeof lng === "number" && Number.isFinite(lng) && lng >= -180 && lng <= 180;
+
+const validRouteCoordinates = (route?: ItineraryRoute | null): Coordinate[] =>
+  (route?.coordinates ?? []).filter(
+    (coordinate): coordinate is Coordinate =>
+      Array.isArray(coordinate) && coordinate.length >= 2 && validLatLng(coordinate[1], coordinate[0]),
+  );
+
+const routeModeLabel = (mode?: string) => {
+  switch (mode) {
+    case "walking":
+      return "walk";
+    case "bicycling":
+    case "cycling":
+      return "cycle";
+    case "driving":
+      return "drive";
+    case "transit":
+      return "transit";
+    default:
+      return mode;
+  }
+};
+
+const durationText = (minutes: unknown) => {
+  if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes < 0) return null;
+  const wholeMinutes = Math.round(minutes);
+  const hours = Math.floor(wholeMinutes / 60);
+  return hours ? `${hours}h${wholeMinutes % 60 ? ` ${wholeMinutes % 60}m` : ""}` : `${wholeMinutes} min`;
+};
+
+const durationSecondsText = (seconds: unknown) =>
+  typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0 ? durationText(seconds / 60) : null;
+
+const distanceText = (meters: unknown) => {
+  if (typeof meters !== "number" || !Number.isFinite(meters) || meters < 0) return null;
+  return meters >= 1000 ? `${(meters / 1000).toFixed(meters >= 10_000 ? 0 : 1)} km` : `${Math.round(meters)} m`;
+};
+
+const routeStatusText = (route?: ItineraryRoute | null) => {
+  switch (route?.status) {
+    case "ready":
+      return "route ready";
+    case "searching":
+    case "pending":
+      return "routing…";
+    case "unavailable":
+      return "route unavailable";
+    case "not_enough_points":
+      return "add another mapped place to route";
+    default:
+      return route?.status ? route.status.replace(/_/g, " ") : null;
+  }
+};
 
 function MapView({
   center,
   markers,
-  links,
+  route,
   selected,
   onSelect,
 }: {
   center: { lat: number; lng: number };
   markers: Marker[];
-  links: { a: string; b: string }[];
+  route?: ItineraryRoute | null;
   selected: string | null;
   onSelect: (key: string) => void;
 }) {
   const mountRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
   const markerObjs = useRef<Map<string, any>>(new Map());
+  const lastViewportRef = useRef("");
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
   const [mapReady, setMapReady] = useState(false);
+  const routeCoordinates = useMemo(() => validRouteCoordinates(route), [route]);
 
   useEffect(() => {
     let dead = false;
@@ -59,12 +152,18 @@ function MapView({
       }
       map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-right");
       map.on("load", () => {
-        map.addSource("plan-links", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+        map.addSource("itinerary-route", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         map.addLayer({
-          id: "plan-links",
+          id: "itinerary-route-glow",
           type: "line",
-          source: "plan-links",
-          paint: { "line-color": "#ffffff", "line-width": 2, "line-opacity": 0.75, "line-dasharray": [1.5, 1.5] },
+          source: "itinerary-route",
+          paint: { "line-color": "#56d9ff", "line-width": 9, "line-opacity": 0.17, "line-blur": 4 },
+        });
+        map.addLayer({
+          id: "itinerary-route",
+          type: "line",
+          source: "itinerary-route",
+          paint: { "line-color": "#8cecff", "line-width": 3, "line-opacity": 0.94 },
         });
         setMapReady(true);
       });
@@ -82,12 +181,15 @@ function MapView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // markers + fit + connection lines, reactively
+  // Markers, persisted route geometry, and the camera all react to the plan.
+  // The route source intentionally remains empty when a route was unavailable.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
+    let dead = false;
     (async () => {
       const maplibregl = (await import("maplibre-gl")).default;
+      if (dead || mapRef.current !== map) return;
       const seen = new Set<string>();
       for (const m of markers) {
         seen.add(m.key);
@@ -100,6 +202,7 @@ function MapView({
           el.style.background = m.locked ? "#ffffff" : KIND_COLOR[m.kind];
           el.style.boxShadow = `0 0 ${m.locked || selected === m.key ? 18 : 9}px ${KIND_COLOR[m.kind]}`;
           el.style.outline = m.locked || selected === m.key ? `2px solid ${KIND_COLOR[m.kind]}` : "none";
+          existing.setLngLat([m.lng, m.lat]);
           continue;
         }
         const el = document.createElement("div");
@@ -120,32 +223,38 @@ function MapView({
           markerObjs.current.delete(k);
         }
       }
-      // fit once when markers first arrive
-      if (markers.length > 2 && !(map as any).__fitted) {
-        (map as any).__fitted = true;
-        const b = new maplibregl.LngLatBounds();
-        markers.forEach((m) => b.extend([m.lng, m.lat]));
-        map.fitBounds(b, { padding: 60, pitch: 42, duration: 1600, maxZoom: 13 });
+
+      const routeSource = map.getSource("itinerary-route");
+      if (routeSource) {
+        (routeSource as any).setData({
+          type: "FeatureCollection",
+          features:
+            routeCoordinates.length > 1
+              ? [{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: routeCoordinates } }]
+              : [],
+        });
       }
-      // locked-plan connection lines
-      const byKey = new Map(markers.map((m) => [m.key, m]));
-      const feats = links
-        .filter((l) => byKey.has(l.a) && byKey.has(l.b))
-        .map((l) => ({
-          type: "Feature" as const,
-          geometry: {
-            type: "LineString" as const,
-            coordinates: [
-              [byKey.get(l.a)!.lng, byKey.get(l.a)!.lat],
-              [byKey.get(l.b)!.lng, byKey.get(l.b)!.lat],
-            ],
-          },
-          properties: {},
-        }));
-      const src = map.getSource("plan-links");
-      if (src) (src as any).setData({ type: "FeatureCollection", features: feats });
+
+      // A newly discussed route/day or updated coordinates should move the
+      // camera. Selection changes deliberately do not reset the user's view.
+      const viewportPoints: Coordinate[] = routeCoordinates.length > 1 ? routeCoordinates : markers.map((marker) => [marker.lng, marker.lat]);
+      const viewportKey = JSON.stringify({ center, points: viewportPoints });
+      if (viewportKey === lastViewportRef.current) return;
+      lastViewportRef.current = viewportKey;
+      if (viewportPoints.length > 1) {
+        const bounds = new maplibregl.LngLatBounds();
+        viewportPoints.forEach((point) => bounds.extend(point));
+        map.fitBounds(bounds, { padding: 60, pitch: 42, duration: 1100, maxZoom: 13 });
+      } else if (viewportPoints.length === 1) {
+        map.easeTo({ center: viewportPoints[0], zoom: 12.4, duration: 850 });
+      } else if (validLatLng(center.lat, center.lng)) {
+        map.easeTo({ center: [center.lng, center.lat], duration: 850 });
+      }
     })();
-  }, [markers, links, selected, mapReady]);
+    return () => {
+      dead = true;
+    };
+  }, [center, markers, routeCoordinates, selected, mapReady]);
 
   return <div ref={mountRef} className="h-full w-full [&_.maplibregl-ctrl-attrib]:!bg-black/40 [&_.maplibregl-ctrl-attrib]:!text-[9px]" />;
 }
@@ -191,6 +300,283 @@ async function retryTrip(tripId: string, doc: any) {
 
 const gbp = (n?: number) => (n != null ? `£${Math.round(n).toLocaleString("en-GB")}` : "£?");
 
+const itineraryItemKey = (day: ItineraryDay, item: ItineraryItem, index: number) => item.id ?? `${day.date}:${index}:${item.title}`;
+
+const itineraryKindColor = (kind?: string) => {
+  if (kind === "flight") return "bg-amber";
+  if (kind === "hotel" || kind === "stay") return "bg-cyan";
+  if (kind === "transfer") return "bg-slate";
+  return "bg-sky-400";
+};
+
+export function TripTimeline({
+  days,
+  activeDate,
+  onSelectDay,
+}: {
+  days: ItineraryDay[];
+  activeDate: string | null;
+  onSelectDay: (date: string) => void;
+}) {
+  const day = days.find((candidate) => candidate.date === activeDate) ?? days[0];
+  if (!day) {
+    return (
+      <div className={`${GLASS} p-4 text-center text-[12px] text-slate`}>
+        Pick places to build a dated itinerary. JARVIS will add route timing only when a real route is available.
+      </div>
+    );
+  }
+
+  const route = day.route;
+  const routeFacts = [durationSecondsText(route?.durationSeconds), distanceText(route?.distanceMeters)].filter(Boolean);
+  const routeLabel = routeStatusText(route);
+  const incomingLegFor = (item: ItineraryItem) =>
+    item.id ? route?.legs?.find((leg) => leg.toItemId === item.id) : undefined;
+
+  return (
+    <section aria-label="Itinerary timeline" className="space-y-2.5">
+      {days.length > 1 && (
+        <div role="tablist" aria-label="Itinerary days" className="flex gap-1 overflow-x-auto pb-0.5">
+          {days.map((candidate) => {
+            const active = candidate.date === day.date;
+            return (
+              <button
+                key={candidate.date}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => onSelectDay(candidate.date)}
+                className={`shrink-0 rounded-lg px-2.5 py-1.5 text-left text-[10px] transition ${active ? "bg-cyan/15 text-cyan ring-1 ring-cyan/40" : "bg-white/[0.035] text-slate ring-1 ring-white/10 hover:text-ice"}`}
+              >
+                <span className="block font-medium uppercase tracking-wider">{candidate.label ?? candidate.date}</span>
+                <span className="block text-[9px] opacity-70">{candidate.items?.length ?? 0} stops</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div className={`${GLASS} overflow-hidden p-2.5`}>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-0.5">
+          <div>
+            <div className="hud-label">{day.label ?? day.date}</div>
+            {day.status && <div className="mt-0.5 text-[9px] uppercase tracking-wider text-slate">{day.status.replace(/_/g, " ")}</div>}
+          </div>
+          {routeLabel && <span className={`rounded-full border px-2 py-0.5 text-[9px] uppercase tracking-wider ${route?.status === "unavailable" ? "border-amber/30 text-amber" : "border-cyan/30 text-cyan"}`}>{routeLabel}</span>}
+        </div>
+
+        {route && (
+          <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-white/8 bg-black/20 px-2 py-1.5 text-[10px] text-slate">
+            {routeModeLabel(route.mode) && <span className="uppercase tracking-wider text-ice/85">{routeModeLabel(route.mode)}</span>}
+            {routeFacts.map((fact) => <span key={fact}>{fact}</span>)}
+            {route.attribution && <span className="ml-auto text-[9px] text-slate/70">{route.attribution}</span>}
+          </div>
+        )}
+
+        <div className="space-y-1.5">
+          {(day.items ?? []).map((item, index) => {
+            const itemKey = itineraryItemKey(day, item, index);
+            const incomingLeg = incomingLegFor(item);
+            const transferFacts = [routeModeLabel(route?.mode), durationSecondsText(incomingLeg?.durationSeconds), distanceText(incomingLeg?.distanceMeters)].filter(Boolean);
+            const visitDuration = durationText(item.durationMinutes);
+            return (
+              <div key={itemKey} data-itinerary-item={itemKey}>
+                {incomingLeg && transferFacts.length > 0 && (
+                  <div className="ml-4 flex min-h-7 items-center gap-2 border-l border-dashed border-cyan/30 pl-3 text-[10px] text-cyan/90" aria-label={`Transfer to ${item.title}`}>
+                    <span aria-hidden>↓</span>
+                    <span>{transferFacts.join(" · ")}</span>
+                  </div>
+                )}
+                <article className="flex gap-2.5 rounded-lg border border-white/8 bg-black/20 p-2.5 backdrop-blur-md transition hover:border-cyan/25">
+                  <div className="w-[3.35rem] shrink-0 pt-0.5 text-right font-mono text-[11px] text-cyan">
+                    {item.time || "time tbd"}
+                  </div>
+                  <span className={`mt-0.5 h-8 w-0.5 shrink-0 rounded ${itineraryKindColor(item.kind)}`} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-start justify-between gap-x-2 gap-y-0.5">
+                      <div className="min-w-0 text-[13px] font-medium text-ice">
+                        {item.link ? (
+                          <a href={item.link} target="_blank" rel="noreferrer" className="hover:text-cyan">
+                            {item.title} ↗
+                          </a>
+                        ) : (
+                          item.title
+                        )}
+                      </div>
+                      {visitDuration && <span className="shrink-0 rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-slate">allow {visitDuration}</span>}
+                    </div>
+                    <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-slate">
+                      {item.kind && <span className="uppercase tracking-wider">{item.kind.replace(/_/g, " ")}</span>}
+                      {item.source && <span>{item.source}</span>}
+                      {item.note && <span>{item.note}</span>}
+                    </div>
+                  </div>
+                </article>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+type EditableDayStop = { name: string; time: string };
+
+/**
+ * A compact, owner-operated editor for the active day. It sends semantic
+ * actions back through the normal protected tools route; it never writes a
+ * calendar event or mutates a route client-side.
+ */
+export function TripDayControls({
+  day,
+  availableActivities,
+  busy,
+  onSelectDay,
+  onSave,
+  onLock,
+}: {
+  day: ItineraryDay;
+  availableActivities: Array<{ name: string }>;
+  busy: boolean;
+  onSelectDay: (date: string) => void;
+  onSave: (payload: { activities: string[]; times: string[]; transport_mode: string }) => void;
+  onLock: (locked: boolean) => void;
+}) {
+  const signature = JSON.stringify({
+    date: day.date,
+    routeMode: day.route?.mode,
+    items: (day.items ?? []).filter((item) => item.kind === "activity").map((item) => [item.placeId ?? item.title, item.time ?? ""]),
+  });
+  const initialRows = (): EditableDayStop[] =>
+    (day.items ?? [])
+      .filter((item) => item.kind === "activity")
+      .map((item) => ({ name: item.placeId ?? item.title, time: item.time ?? "" }));
+  const [rows, setRows] = useState<EditableDayStop[]>(initialRows);
+  const [mode, setMode] = useState(day.route?.mode ?? "walking");
+  const [addName, setAddName] = useState("");
+
+  useEffect(() => {
+    setRows(initialRows());
+    setMode(day.route?.mode ?? "walking");
+    setAddName("");
+    // `signature` is deliberately a compact value rather than the whole day
+    // object so unrelated reactive provider updates do not reset this editor.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature]);
+
+  const locked = day.status === "locked";
+  const choices = availableActivities.filter((activity) => !rows.some((row) => row.name === activity.name));
+  const updateRow = (index: number, patch: Partial<EditableDayStop>) =>
+    setRows((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
+  const move = (index: number, direction: -1 | 1) =>
+    setRows((current) => {
+      const target = index + direction;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+
+  return (
+    <section aria-label="Edit active itinerary day" className={`${GLASS} space-y-2.5 p-2.5`}>
+      <div className="flex flex-wrap items-end justify-between gap-2">
+        <label className="grid gap-1 text-[9px] uppercase tracking-wider text-slate">
+          Plan date
+          <input
+            aria-label="Plan date"
+            type="date"
+            value={day.date}
+            onChange={(event) => onSelectDay(event.target.value)}
+            className="rounded-md border border-white/10 bg-black/25 px-2 py-1 text-[11px] text-ice outline-none focus:border-cyan/50"
+          />
+        </label>
+        <label className="grid gap-1 text-[9px] uppercase tracking-wider text-slate">
+          Transport
+          <select
+            aria-label="Transport mode"
+            value={mode}
+            disabled={busy || locked}
+            onChange={(event) => setMode(event.target.value)}
+            className="rounded-md border border-white/10 bg-black/25 px-2 py-1 text-[11px] text-ice outline-none focus:border-cyan/50 disabled:opacity-45"
+          >
+            <option value="walking">walk</option>
+            <option value="bicycling">cycle</option>
+            <option value="driving">drive</option>
+            <option value="transit">transit</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="space-y-1.5">
+        {rows.map((row, index) => (
+          <div key={row.name} className="flex items-center gap-1.5 rounded-lg border border-white/8 bg-black/20 px-2 py-1.5">
+            <input
+              aria-label={`Time for ${row.name}`}
+              type="time"
+              value={row.time}
+              disabled={busy || locked}
+              onChange={(event) => updateRow(index, { time: event.target.value })}
+              className="w-[4.8rem] rounded bg-black/30 px-1 py-0.5 font-mono text-[10px] text-cyan outline-none ring-1 ring-white/10 disabled:opacity-45"
+            />
+            <span className="min-w-0 flex-1 truncate text-[11px] text-ice">{row.name}</span>
+            <button type="button" aria-label={`Move ${row.name} earlier`} disabled={busy || locked || index === 0} onClick={() => move(index, -1)} className="rounded px-1 text-slate hover:text-cyan disabled:opacity-25">↑</button>
+            <button type="button" aria-label={`Move ${row.name} later`} disabled={busy || locked || index === rows.length - 1} onClick={() => move(index, 1)} className="rounded px-1 text-slate hover:text-cyan disabled:opacity-25">↓</button>
+            <button type="button" aria-label={`Remove ${row.name}`} disabled={busy || locked} onClick={() => setRows((current) => current.filter((_, rowIndex) => rowIndex !== index))} className="rounded px-1 text-slate hover:text-red-300 disabled:opacity-25">×</button>
+          </div>
+        ))}
+        {!rows.length && <div className="rounded-lg border border-dashed border-white/10 px-2 py-2 text-[10px] text-slate">Add mapped places to route this day.</div>}
+      </div>
+
+      {choices.length > 0 && (
+        <div className="flex gap-1.5">
+          <select
+            aria-label="Add activity to active day"
+            value={addName}
+            disabled={busy || locked}
+            onChange={(event) => setAddName(event.target.value)}
+            className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-cyan/50 disabled:opacity-45"
+          >
+            <option value="">add a mapped place…</option>
+            {choices.map((activity) => <option key={activity.name} value={activity.name}>{activity.name}</option>)}
+          </select>
+          <button
+            type="button"
+            disabled={busy || locked || !addName}
+            onClick={() => {
+              if (!addName) return;
+              setRows((current) => [...current, { name: addName, time: "" }]);
+              setAddName("");
+            }}
+            className="rounded-md bg-white/5 px-2 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan disabled:opacity-35"
+          >
+            add
+          </button>
+        </div>
+      )}
+
+      <div className="flex flex-wrap gap-1.5 border-t border-white/8 pt-2">
+        {locked ? (
+          <button type="button" disabled={busy} onClick={() => onLock(false)} className="rounded-md border border-amber/30 bg-amber/10 px-2 py-1 text-[10px] text-amber hover:bg-amber/15 disabled:opacity-40">unlock day</button>
+        ) : (
+          <>
+            <button
+              type="button"
+              disabled={busy || rows.length === 0}
+              onClick={() => onSave({ activities: rows.map((row) => row.name), times: rows.map((row) => row.time), transport_mode: mode })}
+              className="rounded-md bg-cyan/15 px-2 py-1 text-[10px] text-cyan ring-1 ring-cyan/35 hover:bg-cyan/25 disabled:opacity-35"
+            >
+              save route & times
+            </button>
+            <button type="button" disabled={busy || rows.length === 0} onClick={() => onLock(true)} className="rounded-md bg-white/5 px-2 py-1 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan disabled:opacity-35">lock day</button>
+          </>
+        )}
+        <span className="ml-auto self-center text-right text-[9px] text-slate">Calendar remains separate and requires protected approval.</span>
+      </div>
+    </section>
+  );
+}
+
 export default function TripView({ value }: { value: string }) {
   let creationId = "";
   try {
@@ -209,6 +595,7 @@ export default function TripView({ value }: { value: string }) {
 
   const [tab, setTab] = useState<"stays" | "flights" | "activities" | "plan">("stays");
   const [selected, setSelected] = useState<string | null>(null);
+  const [activePlanDate, setActivePlanDate] = useState<string | null>(null);
   const [maxNight, setMaxNight] = useState<number>(0);
   const [minRating, setMinRating] = useState<number>(0);
   const [freeCancel, setFreeCancel] = useState(false);
@@ -218,26 +605,51 @@ export default function TripView({ value }: { value: string }) {
   const [actionError, setActionError] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
 
+  const itineraryDays = useMemo(
+    () =>
+      Array.isArray(doc?.itinerary)
+        ? doc.itinerary.filter(
+            (day: unknown): day is ItineraryDay =>
+              Boolean(day) && typeof day === "object" && typeof (day as ItineraryDay).date === "string" && Array.isArray((day as ItineraryDay).items),
+          )
+        : [],
+    [doc?.itinerary],
+  );
+  const activePlanDay = useMemo(
+    () => itineraryDays.find((day) => day.date === activePlanDate) ?? itineraryDays[0] ?? null,
+    [activePlanDate, itineraryDays],
+  );
+
   const markers: Marker[] = useMemo(() => {
     if (!doc) return [];
     const ms: Marker[] = [];
+    const addMarker = (marker: Marker) => {
+      if (!ms.some((existing) => existing.lat === marker.lat && existing.lng === marker.lng && existing.kind === marker.kind)) ms.push(marker);
+    };
     for (const s of doc.stays ?? [])
-      if (s.lat && s.lng) ms.push({ key: `stay:${s.name}`, lat: s.lat, lng: s.lng, kind: "stay", name: s.name, locked: doc.locked?.stay?.name === s.name });
+      if (validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.name}`, lat: s.lat, lng: s.lng, kind: "stay", name: s.name, locked: doc.locked?.stay?.name === s.name });
     for (const a of doc.activities ?? [])
-      if (a.lat && a.lng)
-        ms.push({ key: `act:${a.name}`, lat: a.lat, lng: a.lng, kind: "activity", name: a.name, locked: (doc.locked?.activities ?? []).includes(a.name) });
-    if (doc.airport?.lat) ms.push({ key: "airport", lat: doc.airport.lat, lng: doc.airport.lng, kind: "airport", name: doc.airport.name });
+      if (validLatLng(a.lat, a.lng))
+        addMarker({ key: `act:${a.name}`, lat: a.lat, lng: a.lng, kind: "activity", name: a.name, locked: (doc.locked?.activities ?? []).includes(a.name) });
+    if (validLatLng(doc.airport?.lat, doc.airport?.lng)) addMarker({ key: "airport", lat: doc.airport.lat, lng: doc.airport.lng, kind: "airport", name: doc.airport.name });
+    for (const day of itineraryDays) {
+      day.items.forEach((item, index) => {
+        const lat = Number(item.lat);
+        const lng = Number(item.lng);
+        if (!validLatLng(lat, lng)) return;
+        const kind: Marker["kind"] = item.kind === "flight" ? "airport" : item.kind === "hotel" || item.kind === "stay" ? "stay" : "activity";
+        addMarker({
+          key: `it:${itineraryItemKey(day, item, index)}`,
+          lat,
+          lng,
+          kind,
+          name: item.title,
+          locked: item.source === "confirmed" || doc.status === "planned",
+        });
+      });
+    }
     return ms;
-  }, [doc]);
-
-  const links = useMemo(() => {
-    if (!doc) return [] as { a: string; b: string }[];
-    const out: { a: string; b: string }[] = [];
-    const stayKey = doc.locked?.stay?.name ? `stay:${doc.locked.stay.name}` : null;
-    if (stayKey && doc.airport?.lat) out.push({ a: "airport", b: stayKey });
-    for (const an of doc.locked?.activities ?? []) if (stayKey) out.push({ a: stayKey, b: `act:${an}` });
-    return out;
-  }, [doc]);
+  }, [doc, itineraryDays]);
 
   if (!doc)
     return (
@@ -293,24 +705,41 @@ export default function TripView({ value }: { value: string }) {
     setSelected(key);
     if (key.startsWith("stay:")) setTab("stays");
     else if (key.startsWith("act:")) setTab("activities");
+    else if (key.startsWith("it:")) setTab("plan");
     const name = key.split(":").slice(1).join(":");
     setTimeout(() => {
-      listRef.current?.querySelector(`[data-name="${CSS.escape(name)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      const target = key.startsWith("it:")
+        ? listRef.current?.querySelector(`[data-itinerary-item="${CSS.escape(name)}"]`)
+        : listRef.current?.querySelector(`[data-name="${CSS.escape(name)}"]`);
+      target?.scrollIntoView({ behavior: "smooth", block: "center" });
     }, 60);
   };
 
-  const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
+  const glass = GLASS;
   return (
     <div className="flex min-h-0 flex-1 flex-col @min-[760px]:flex-row">
       {/* the map */}
       <div className="relative h-[30dvh] shrink-0 border-b border-white/5 @min-[760px]:h-auto @min-[760px]:w-[44%] @min-[760px]:border-b-0 @min-[760px]:border-r">
-        <MapView center={doc.center ?? { lat: 51.5074, lng: -0.1278 }} markers={markers} links={links} selected={selected} onSelect={onMapSelect} />
+        <MapView center={doc.center ?? { lat: 51.5074, lng: -0.1278 }} markers={markers} route={activePlanDay?.route} selected={selected} onSelect={onMapSelect} />
         <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-black/50 px-2 py-1 backdrop-blur">
           <div className="text-sm font-semibold text-ice">{doc.destination}</div>
           <div className="hud-label !text-[9px]">
             {doc.departDate || "dates tbd"}{doc.returnDate ? ` → ${doc.returnDate}` : ""} · {doc.adults} adults
           </div>
         </div>
+        {activePlanDay?.route && (
+          <div className="pointer-events-none absolute right-3 top-3 max-w-[52%] rounded-lg border border-white/10 bg-black/55 px-2 py-1.5 text-right backdrop-blur">
+            <div className="text-[10px] font-medium text-ice">{activePlanDay.label ?? activePlanDay.date}</div>
+            <div className="mt-0.5 text-[9px] uppercase tracking-wider text-cyan">
+              {[routeModeLabel(activePlanDay.route.mode), routeStatusText(activePlanDay.route)].filter(Boolean).join(" · ")}
+            </div>
+            {[durationSecondsText(activePlanDay.route.durationSeconds), distanceText(activePlanDay.route.distanceMeters)].filter(Boolean).length > 0 && (
+              <div className="mt-0.5 text-[10px] text-slate">
+                {[durationSecondsText(activePlanDay.route.durationSeconds), distanceText(activePlanDay.route.distanceMeters)].filter(Boolean).join(" · ")}
+              </div>
+            )}
+          </div>
+        )}
         <div className="pointer-events-none absolute bottom-2 left-3 flex gap-3 rounded-lg bg-black/50 px-2 py-1 text-[9px] uppercase tracking-widest text-slate backdrop-blur">
           <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: KIND_COLOR.stay }} />stays</span>
           <span><span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: KIND_COLOR.activity }} />activities</span>
@@ -627,27 +1056,17 @@ export default function TripView({ value }: { value: string }) {
                   </div>
                 )}
               </div>
-              {(doc.itinerary ?? []).map((day: any) => (
-                <div key={day.date} className={`${glass} p-3`}>
-                  <div className="hud-label mb-1">{day.label}</div>
-                  <div className="space-y-1">
-                    {day.items.map((it: any, i: number) => (
-                      <div key={i} className="flex gap-2 text-[13px]">
-                        <span className="w-12 shrink-0 font-mono text-cyan">{it.time || "—"}</span>
-                        <span className={`h-4 w-0.5 shrink-0 rounded ${it.kind === "flight" ? "bg-amber" : it.kind === "hotel" ? "bg-cyan" : it.kind === "transfer" ? "bg-slate" : "bg-sky-400"}`} />
-                        <span className="min-w-0 flex-1 text-ice">
-                          {it.link ? (
-                            <a href={it.link} target="_blank" rel="noreferrer" className="hover:text-cyan">{it.title} ↗</a>
-                          ) : (
-                            it.title
-                          )}
-                          {it.note && <span className="text-slate"> · {it.note}</span>}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
+              {activePlanDay && (
+                <TripDayControls
+                  day={activePlanDay}
+                  availableActivities={(doc.activities ?? []).map((activity: any) => ({ name: String(activity.name ?? "") })).filter((activity: { name: string }) => activity.name)}
+                  busy={Boolean(busy)}
+                  onSelectDay={setActivePlanDate}
+                  onSave={(payload) => void act("routing day", "schedule_day", { date: activePlanDay.date, ...payload })}
+                  onLock={(locked) => void act(locked ? "locking day" : "unlocking day", locked ? "lock_day" : "unlock_day", { date: activePlanDay.date })}
+                />
+              )}
+              <TripTimeline days={itineraryDays} activeDate={activePlanDay?.date ?? null} onSelectDay={setActivePlanDate} />
             </>
           )}
         </div>

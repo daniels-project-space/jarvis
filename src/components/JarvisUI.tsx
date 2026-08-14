@@ -44,7 +44,7 @@ import {
   spectrumBandLevel,
   type LiveVadState,
 } from "@/lib/live-vad";
-import { BookingsView, CalendarView, CanvasView, LaunchView, PdfView, CreationsView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, GoalModeLauncherView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
+import { BookingsView, CalendarView, CanvasView, LaunchView, PdfView, CreationsView, TravelLibraryView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, GoalModeLauncherView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
@@ -582,7 +582,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenGoals, onMacSetup,
+  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -597,6 +597,7 @@ function OptionsPanel({
   onMood: (m: string) => void;
   onClearMood: () => void;
   onOpenLibrary: () => void;
+  onOpenTravel: () => void;
   onOpenGoals: () => void;
   onMacSetup: () => void;
 }) {
@@ -651,6 +652,11 @@ function OptionsPanel({
           <Row label="Saved work" hint="projects, inquiries, notes, emails, boards, maps and files">
             <button onClick={onOpenLibrary} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
               open library
+            </button>
+          </Row>
+          <Row label="Travel plans" hint="saved scouting, routes, locked days and mind maps">
+            <button onClick={onOpenTravel} className="rounded-lg border border-cyan/30 px-3 py-1 text-[11px] text-cyan transition hover:bg-cyan/10">
+              open travel
             </button>
           </Row>
           <Row label="Goal Mode" hint="Sol plan → Terra/high build → Sol deep validation · durable for days">
@@ -1281,6 +1287,8 @@ function Viewport({
         <PdfView url={panel.value} title={panel.title} />
       ) : route.renderer === "creations" ? (
         <CreationsView value={panel.value} />
+      ) : route.renderer === "travel" ? (
+        <TravelLibraryView />
       ) : route.renderer === "fleet" ? (
         <GoalModeLauncherView />
       ) : route.renderer === "board" ? (
@@ -5243,6 +5251,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             setPanelFull(false);
             setPanelMin(false);
             void setPanel({ type: "creations", value: JSON.stringify({ kind: null, folder: null }), title: "saved work" });
+          }}
+          onOpenTravel={() => {
+            setOptionsOpen(false);
+            setPanelFull(false);
+            setPanelMin(false);
+            void setPanel({ type: "travel", value: JSON.stringify({}), title: "saved travel" });
           }}
           onOpenGoals={() => {
             setOptionsOpen(false);

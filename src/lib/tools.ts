@@ -881,18 +881,24 @@ export const TOOL_DEFS = [
   {
     name: "trip_update",
     description:
-      "Edit the current trip live: lock in a flight or hotel (lock_stay computes the real airport transfer from the hotel's location), add/remove activities, change the budget, or re-search hotels with different limits. The globe panel updates instantly.",
+      "Edit the current trip live: lock a flight or hotel, add/remove activities, re-search stays, discover and add a new mapped place, or arrange an exact day. schedule_day stores only real OSRM route geometry and timing between ordered places; transit is explicitly unavailable until a real provider is connected. Calendar writes are never performed here.",
     parameters: {
       type: "object",
       properties: {
         trip_id: { type: "string", description: "exact trip creation id shown in context/on the trip workspace" },
-        action: { type: "string", enum: ["lock_flight", "lock_stay", "toggle_activity", "set_budget", "rescout_stays", "show"] },
+        action: { type: "string", enum: ["lock_flight", "lock_stay", "toggle_activity", "set_budget", "rescout_stays", "add_place", "schedule_day", "set_day_transport", "lock_day", "unlock_day", "show"] },
         flight_index: { type: "number", description: "which flight from the list (1-based) for lock_flight" },
         stay: { type: "string", description: "hotel name (or fragment) for lock_stay" },
         activity: { type: "string", description: "activity name (or fragment) for toggle_activity" },
         budget_total_gbp: { type: "number" },
         max_price_per_night: { type: "number", description: "for rescout_stays" },
         vacation_rentals: { type: "boolean", description: "for rescout_stays" },
+        place: { type: "string", description: "specific new place to geocode and add for add_place; the actual OpenStreetMap result is shown, never invented" },
+        time: { type: "string", description: "optional local HH:mm for add_place" },
+        date: { type: "string", description: "specific itinerary date YYYY-MM-DD for day actions" },
+        activities: { type: "array", items: { type: "string" }, description: "ordered exact activity names for schedule_day (up to 8)" },
+        times: { type: "array", items: { type: "string" }, description: "optional local HH:mm values aligned with activities; omitted means unscheduled" },
+        transport_mode: { type: "string", enum: ["walking", "bicycling", "driving", "transit"], description: "route mode for the selected day; transit is honestly marked unavailable without a transit provider" },
       },
       required: ["trip_id", "action"],
     },
@@ -900,7 +906,7 @@ export const TOOL_DEFS = [
   {
     name: "trip_finalize",
     description:
-      "Lock the reviewed plan in: builds the day-by-day itinerary (flight, airport transfer with real drive time, check-in, activities) and saves the trip as an interactive connected-node map. This tool always leaves calendars untouched.",
+      "Lock the reviewed plan in: preserves owner-arranged days, refreshes source-backed route geometry and timings where available, and saves a reusable interactive trip map. This tool always leaves calendars untouched.",
     parameters: {
       type: "object",
       properties: {
@@ -3608,13 +3614,11 @@ async function tripPlanTool(args: any): Promise<string> {
     return "FLIGHTS UNDECIDED — do NOT search yet. Ask Daniel one short question: should I include flights, and from which airport?";
   if (args.include_flights === true && !args.origin_iata)
     return "ORIGIN MISSING — ask Daniel which airport he's flying from.";
-  const { scoutTrip, latestTrip } = await import("./travel");
-  // If the globe is already open for this destination, populate THAT doc live
-  // instead of spawning a duplicate.
-  let reuseId: string | undefined = args.trip_id ? String(args.trip_id) : undefined;
-  const existing = await latestTrip();
-  const normalizeDestination = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (!reuseId && existing && normalizeDestination(existing.doc.destination) === normalizeDestination(destination)) reuseId = existing.id;
+  const { scoutTrip } = await import("./travel");
+  // A same-city trip can be a different week, traveller set, or conversation.
+  // Only the exact visible workspace may be reused; never fall back to a
+  // global `latestTrip()` guess.
+  const reuseId: string | undefined = args.trip_id ? String(args.trip_id) : undefined;
   const { id, doc } = await scoutTrip({
     destination,
     destIata,
@@ -3645,7 +3649,7 @@ async function tripPlanTool(args: any): Promise<string> {
 }
 
 async function tripUpdateTool(args: any): Promise<string> {
-  const { getTrip, saveTrip, computeTransfer, hubAction } = await import("./travel");
+  const { getTrip, saveTrip, computeTransfer, hubAction, scheduleTripDay, addTripPlaceToDay } = await import("./travel");
   const tripId = String(args.trip_id ?? "").trim();
   if (!tripId) return "TRIP ID MISSING — use the id on the visible trip workspace; never edit an implicit latest trip.";
   const t = await getTrip(tripId);
@@ -3690,6 +3694,88 @@ async function tripUpdateTool(args: any): Promise<string> {
     await saveTrip(t.id, doc);
     return `${idx >= 0 ? "Removed" : "Added"} ${hit.name}${idx >= 0 ? " from" : " to"} the plan (${doc.locked.activities.length} activities picked).`;
   }
+  if (action === "add_place") {
+    const date = String(args.date ?? "").trim();
+    const query = String(args.place ?? "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return "Choose the exact trip day first (YYYY-MM-DD).";
+    if (!query) return "Name the place you want to add and route.";
+    const { searchOpenStreetMapPlaces } = await import("./openstreetmap");
+    const hits = await searchOpenStreetMapPlaces(`${query} in ${doc.destination}`, { maxResults: 5 }).catch(() => []);
+    const normalized = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const queryKey = normalized(query);
+    const place = hits.find((candidate) => normalized(candidate.name).includes(queryKey) || queryKey.includes(normalized(candidate.name))) ?? hits[0];
+    if (!place) return `I couldn't find a mapped OpenStreetMap result for "${query}" in or near ${doc.destination}. Try a more specific name or neighbourhood.`;
+    const mode = String(args.transport_mode ?? "").trim();
+    try {
+      const updated = await addTripPlaceToDay({
+        id: t.id,
+        doc,
+        date,
+        place: {
+          name: place.name,
+          lat: place.lat,
+          lng: place.lng,
+          link: place.mapsUri,
+          note: `OpenStreetMap${place.address ? ` · ${place.address}` : ""}`,
+        },
+        time: args.time ? String(args.time) : undefined,
+        mode: ["walking", "bicycling", "driving", "transit"].includes(mode) ? mode as any : undefined,
+      });
+      const day = updated.itinerary?.find((item) => item.date === date);
+      const route = day?.route;
+      const routeText = route?.status === "ready"
+        ? ` Real ${route.mode} timing is ${Math.round((route.durationSeconds ?? 0) / 60)} min.`
+        : route?.mode === "transit"
+          ? " Transit is honestly marked unavailable until a real transit provider is connected."
+          : " Its verified marker is saved; no route timing was invented.";
+      return `Added ${place.name}${place.address ? ` · ${place.address}` : ""} to ${day?.label ?? date} from OpenStreetMap.${routeText}`;
+    } catch (error: any) {
+      return String(error?.message ?? "That mapped place could not be added.");
+    }
+  }
+  if (["schedule_day", "set_day_transport", "lock_day", "unlock_day"].includes(action)) {
+    const date = String(args.date ?? "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return "Choose the exact trip day first (YYYY-MM-DD).";
+    const mode = String(args.transport_mode ?? "").trim();
+    if (action === "schedule_day" && (!Array.isArray(args.activities) || !args.activities.length))
+      return "Name the ordered activities for that day; I only schedule places already on this trip.";
+    if (action === "set_day_transport" && !["walking", "bicycling", "driving", "transit"].includes(mode))
+      return "Choose walking, bicycling, driving, or transit for that day.";
+    const activityNames = Array.isArray(args.activities)
+      ? args.activities.map((value: unknown) => String(value ?? "").trim()).filter(Boolean).slice(0, 8)
+      : undefined;
+    const times = Array.isArray(args.times)
+      ? args.times.map((value: unknown) => String(value ?? "").trim()).slice(0, 8)
+      : undefined;
+    if (times?.some((time: string) => time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)))
+      return "Use local times as HH:mm, for example 10:30.";
+    try {
+      const updated = await scheduleTripDay({
+        id: t.id,
+        doc,
+        date,
+        activityNames,
+        times,
+        mode: ["walking", "bicycling", "driving", "transit"].includes(mode) ? mode as any : undefined,
+        lock: action === "lock_day" ? true : action === "unlock_day" ? false : undefined,
+      });
+      const day = updated.itinerary?.find((item) => item.date === date);
+      const route = day?.route;
+      const routeText = route?.status === "ready"
+        ? ` Real ${route.mode} route: ${Math.round((route.durationSeconds ?? 0) / 60)} min across ${Math.round((route.distanceMeters ?? 0) / 100) / 10} km.`
+        : route?.status === "unavailable"
+          ? route.mode === "transit"
+            ? " Transit is marked unavailable because no real transit provider is connected; markers remain visible."
+            : " A route was not available, so only the verified place markers are shown."
+          : " Route is waiting for a refresh.";
+      if (action === "lock_day") return `${day?.label ?? date} is locked.${routeText}`;
+      if (action === "unlock_day") return `${day?.label ?? date} is editable again.${routeText}`;
+      if (action === "set_day_transport") return `${day?.label ?? date} now uses ${route?.mode ?? mode}.${routeText}`;
+      return `${day?.label ?? date} is ordered on the live map with ${day?.items.filter((item) => item.kind === "activity").length ?? 0} places.${routeText}`;
+    } catch (error: any) {
+      return String(error?.message ?? "That day could not be updated.");
+    }
+  }
   if (action === "set_budget") {
     const b = Number(args.budget_total_gbp) || 0;
     if (b <= 0) return "Give me the new total budget in pounds.";
@@ -3717,7 +3803,7 @@ async function tripUpdateTool(args: any): Promise<string> {
 }
 
 async function tripFinalizeTool(args: any): Promise<string> {
-  const { getTrip, saveTrip, computeTransfer, buildItinerary, tripToMindmap } = await import("./travel");
+  const { getTrip, saveTrip, computeTransfer, buildItinerary, refreshTripItineraryRoutes, saveTripItinerary, tripToMindmap } = await import("./travel");
   const tripId = String(args.trip_id ?? "").trim();
   if (!tripId) return "TRIP ID MISSING — finalize the exact visible trip, never whichever draft happens to be newest.";
   const t = await getTrip(tripId);
@@ -3727,13 +3813,19 @@ async function tripFinalizeTool(args: any): Promise<string> {
     return "Choose and lock a specific flight first — I won't silently select option one.";
   if (!doc.locked.stay) return "Lock a hotel first (trip_update lock_stay) — the itinerary and transfer hang off it.";
   if (!doc.transfer) doc.transfer = await computeTransfer(doc);
-  doc.itinerary = buildItinerary(doc);
+  doc.itinerary = await refreshTripItineraryRoutes(doc, buildItinerary(doc));
   const calNote = args.add_to_calendar === true
     ? " Calendar sync was requested, but no calendar items were created: protected owner approval is unavailable from this tool."
     : "";
   doc.status = "planned";
   await saveTrip(t.id, doc);
-  const mapId = await tripToMindmap(doc, t.id).catch(() => "");
+  // Finalization is idempotent: an already-saved canvas remains the trip's
+  // durable mind-map instead of each retry leaving a new orphan behind.
+  const mapId = doc.mindmapCreationId || (await tripToMindmap(doc, t.id).catch(() => ""));
+  if (mapId) {
+    doc.mindmapCreationId = mapId;
+    await saveTripItinerary(t.id, doc, doc.itinerary ?? [], mapId);
+  }
   return (
     `Trip locked in: ${doc.itinerary?.length} days planned, total ≈ £${doc.totals?.total} of £${doc.budgetGbp}.` +
     calNote +

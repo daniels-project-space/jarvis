@@ -158,7 +158,7 @@ const RULES: readonly CapabilityRule[] = [
   },
   {
     belt: "travel",
-    tools: ["bookings_lookup", "bookings_check", "trip_open", "trip_plan", "flight_search"],
+    tools: ["bookings_lookup", "bookings_check", "trip_open", "trip_plan", "trip_update", "flight_search"],
     score: 120,
     visual: true,
     reason: "travel",

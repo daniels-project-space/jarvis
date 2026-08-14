@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
+    "test:browser:trip": "playwright test -c playwright.trip.config.ts",
     "deploy:trigger": "npx --yes trigger.dev@4.5.1 deploy",
     "harness:codex-session": "tsx scripts/codex-session-concurrency-harness.ts",
     "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts",
@@ -47,6 +48,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
@@ -54,6 +56,7 @@
     "@types/three": "^0.185.1",
     "@types/web-push": "^3.6.4",
     "convex-test": "0.0.54",
+    "esbuild": "^0.27.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.11",
     "jszip": "3.10.1",

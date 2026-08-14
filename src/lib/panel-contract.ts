@@ -9,6 +9,7 @@ export type PanelRenderer =
   | "launch"
   | "pdf"
   | "creations"
+  | "travel"
   | "fleet"
   | "board"
   | "scene"
@@ -59,14 +60,15 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
               : panel.type === "launch" ? "launch"
                 : panel.type === "pdf" ? "pdf"
                   : panel.type === "creations" ? "creations"
-                    : panel.type === "fleet" ? "fleet"
-                      : panel.type === "board" ? "board"
-                        : panel.type === "scene" ? "scene"
-                          : panel.type === "url" || panel.type === "video" ? "iframe"
-                            : panel.type === "image" ? "image"
-                              : panel.type === "code" ? "code"
-                                : panel.type === "list" ? "list"
-                                  : "markdown";
+                    : panel.type === "travel" ? "travel"
+                      : panel.type === "fleet" ? "fleet"
+                        : panel.type === "board" ? "board"
+                          : panel.type === "scene" ? "scene"
+                            : panel.type === "url" || panel.type === "video" ? "iframe"
+                              : panel.type === "image" ? "image"
+                                : panel.type === "code" ? "code"
+                                  : panel.type === "list" ? "list"
+                                    : "markdown";
 
   let presentation: PanelRoute["presentation"] = "wide";
   let size = "h-[min(760px,96%)] w-[min(980px,98%)]";
@@ -101,6 +103,7 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
     case "list": size = "h-[min(760px,97%)] w-[min(1040px,99%)]"; break;
     case "doc": size = "h-[min(820px,98%)] w-[min(940px,99%)]"; break;
     case "creations": presentation = "workspace"; size = "h-full w-full"; break;
+    case "travel": presentation = "workspace"; size = "h-full w-full"; break;
     case "trip": presentation = "workspace"; size = "h-full w-full"; break;
     case "fleet": presentation = "workspace"; size = "h-full w-full"; break;
     case "pdf": presentation = "workspace"; size = "h-full w-full"; break;

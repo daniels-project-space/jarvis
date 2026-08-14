@@ -2235,3 +2235,248 @@ export function CreationsView({ value }: { value: string }) {
     </div>
   );
 }
+
+/* ------------------------------ travel library ----------------------------- */
+
+/**
+ * The travel library deliberately reads the same durable `trip` creations as
+ * the globe workspace.  Keeping this UI shape small and defensive lets older
+ * scouting records remain useful while newer itinerary documents gain richer
+ * route and mind-map metadata.
+ */
+export type TravelCreationRow = {
+  _id: string;
+  title: string;
+  data?: string;
+  updatedAt: number;
+};
+
+export type TravelPlanSummary = {
+  id: string;
+  title: string;
+  destination: string;
+  status: "scouting" | "planned" | "saved";
+  dates: string;
+  budget: string;
+  route: string;
+  stops: number;
+  mindmapCreationId?: string;
+  updatedAt: number;
+};
+
+function textValue(value: unknown, fallback = ""): string {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function moneyValue(value: unknown): string {
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount >= 0
+    ? `£${Math.round(amount).toLocaleString("en-GB")}`
+    : "budget tbd";
+}
+
+function dateValue(value: unknown): string | null {
+  const date = textValue(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(`${date}T12:00:00Z`))) return null;
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" })
+    .format(new Date(`${date}T12:00:00Z`));
+}
+
+function dateRange(departDate: unknown, returnDate: unknown): string {
+  const depart = dateValue(departDate);
+  const returning = dateValue(returnDate);
+  if (depart && returning) return `${depart} – ${returning}`;
+  if (depart) return `${depart} · return tbd`;
+  if (returning) return `depart tbd · ${returning}`;
+  return "dates tbd";
+}
+
+/** Converts untrusted JSON from a generic creation into only card-safe facts. */
+export function summarizeTravelCreation(row: TravelCreationRow): TravelPlanSummary {
+  let doc: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(row.data ?? "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) doc = parsed as Record<string, unknown>;
+  } catch {
+    // Historic or incomplete trip records still deserve an openable card.
+  }
+
+  const itinerary = Array.isArray(doc.itinerary) ? doc.itinerary : [];
+  const routeDays = itinerary.filter((day: any) => day?.route?.status === "ready").length;
+  const staleRouteDays = itinerary.filter((day: any) => day?.route?.status === "stale").length;
+  const stops = itinerary.reduce((count: number, day: any) =>
+    count + (Array.isArray(day?.items) ? day.items.filter((item: any) => item?.kind === "activity").length : 0), 0);
+  const status = doc.status === "planned" ? "planned" : doc.status === "scouting" ? "scouting" : "saved";
+  const route = itinerary.length === 0
+    ? status === "scouting" ? "route builds as you choose places" : "day plan tbd"
+    : routeDays > 0
+      ? `${routeDays}/${itinerary.length} day route${routeDays === 1 ? "" : "s"} ready`
+      : staleRouteDays > 0
+        ? `${staleRouteDays} day route${staleRouteDays === 1 ? "" : "s"} need refresh`
+        : `${itinerary.length} day plan · route tbd`;
+  const mindmapCreationId = textValue(doc.mindmapCreationId) || undefined;
+
+  return {
+    id: row._id,
+    title: textValue(doc.title, row.title || "Saved trip"),
+    destination: textValue(doc.destination, row.title || "Saved trip"),
+    status,
+    dates: dateRange(doc.departDate, doc.returnDate),
+    budget: moneyValue(doc.budgetGbp),
+    route,
+    stops,
+    mindmapCreationId,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function travelStatusLabel(status: TravelPlanSummary["status"]): string {
+  return status === "planned" ? "locked itinerary" : status === "scouting" ? "scouting live" : "saved trip";
+}
+
+function travelStatusStyle(status: TravelPlanSummary["status"]): string {
+  return status === "planned"
+    ? "border-emerald-300/25 bg-emerald-300/[0.10] text-emerald-200"
+    : status === "scouting"
+      ? "border-amber/25 bg-amber/[0.10] text-amber"
+      : "border-cyan/25 bg-cyan/[0.08] text-cyan";
+}
+
+export function TravelLibraryCards({
+  trips,
+  onOpenTrip,
+  onOpenMindmap,
+}: {
+  trips: TravelCreationRow[];
+  onOpenTrip: (trip: TravelPlanSummary) => void;
+  onOpenMindmap: (trip: TravelPlanSummary) => void;
+}) {
+  if (trips.length === 0) {
+    return (
+      <div className="glass mx-auto mt-16 max-w-lg rounded-2xl p-7 text-center">
+        <div className="text-3xl text-cyan/80">◎</div>
+        <div className="mt-3 text-base text-ice">No saved travel plans yet.</div>
+        <div className="mx-auto mt-2 max-w-sm text-xs leading-relaxed text-slate">Ask Jarvis to explore a destination, then your live scouting plan and its locked itinerary will remain here.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-3 @min-[620px]:grid-cols-2 @min-[1120px]:grid-cols-3">
+      {trips.map((row, index) => {
+        const trip = summarizeTravelCreation(row);
+        return (
+          <article key={trip.id} className="card-lift glass group relative min-h-[245px] overflow-hidden rounded-2xl border border-white/10 p-4 shadow-[0_16px_50px_rgba(0,0,0,0.18)]">
+            <div aria-hidden className="pointer-events-none absolute -right-12 -top-14 h-40 w-40 rounded-full border border-cyan/15 bg-cyan/[0.035] motion-safe:animate-pulse" style={{ animationDelay: `${index * 160}ms` }} />
+            <div aria-hidden className="pointer-events-none absolute right-7 top-9 h-20 w-20 rounded-full border border-cyan/10" />
+            <div aria-hidden className="pointer-events-none absolute right-[4.4rem] top-[4.4rem] h-1.5 w-1.5 rounded-full bg-amber/80 shadow-[0_0_14px_rgba(255,180,84,0.85)]" />
+            <div className="relative flex min-w-0 items-start justify-between gap-3">
+              <button type="button" onClick={() => onOpenTrip(trip)} className="min-w-0 text-left" aria-label={`Open ${trip.destination} travel workspace`}>
+                <div className="hud-label !text-cyan-dim">travel plan</div>
+                <h2 className="mt-1 truncate text-lg font-semibold text-ice transition-colors group-hover:text-cyan">{trip.destination}</h2>
+                <div className="mt-0.5 truncate text-[11px] text-slate">{trip.title}</div>
+              </button>
+              <span className={`shrink-0 rounded-full border px-2 py-1 text-[8px] font-medium uppercase tracking-[0.14em] ${travelStatusStyle(trip.status)}`}>{travelStatusLabel(trip.status)}</span>
+            </div>
+
+            <button type="button" onClick={() => onOpenTrip(trip)} className="relative mt-5 block w-full text-left" aria-label={`Open itinerary for ${trip.destination}`}>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="rounded-xl border border-white/8 bg-black/15 px-3 py-2.5">
+                  <div className="hud-label !text-[8px]">dates</div>
+                  <div className="mt-1 text-[11px] leading-snug text-ice">{trip.dates}</div>
+                </div>
+                <div className="rounded-xl border border-white/8 bg-black/15 px-3 py-2.5">
+                  <div className="hud-label !text-[8px]">budget</div>
+                  <div className="mt-1 font-mono text-sm text-cyan">{trip.budget}</div>
+                </div>
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-2 rounded-xl border border-cyan/10 bg-cyan/[0.035] px-3 py-2.5">
+                <span className="hud-label !text-[8px] !text-cyan-dim">route</span>
+                <span className="min-w-0 truncate text-right text-[11px] text-ice">{trip.route}</span>
+              </div>
+            </button>
+
+            <div className="relative mt-3 flex items-center justify-between gap-2 border-t border-white/7 pt-3">
+              <span className="text-[10px] text-slate">{trip.stops ? `${trip.stops} activity stop${trip.stops === 1 ? "" : "s"}` : "places ready to shape"}</span>
+              <span className="flex shrink-0 items-center gap-2">
+                <button type="button" onClick={() => onOpenTrip(trip)} className="text-[9px] uppercase tracking-[0.13em] text-cyan-dim transition hover:text-cyan">open plan ↗</button>
+                {trip.mindmapCreationId && <button type="button" onClick={() => onOpenMindmap(trip)} className="rounded-lg border border-white/10 px-2 py-1 text-[9px] uppercase tracking-[0.1em] text-slate transition hover:border-cyan/30 hover:text-cyan">mind map</button>}
+              </span>
+            </div>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+export function TravelLibraryView() {
+  const queriedRows = useJarvisQuery(api.creations.list, { kind: "trip", limit: 100 }) as TravelCreationRow[] | undefined;
+  const [filter, setFilter] = useState<"all" | "planned" | "scouting">("all");
+  const [search, setSearch] = useState("");
+  const trips = useMemo(() => queriedRows ?? [], [queriedRows]);
+  const summary = useMemo(() => trips.map(summarizeTravelCreation), [trips]);
+  const visible = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return trips.filter((trip, index) => {
+      const item = summary[index];
+      if (filter !== "all" && item.status !== filter) return false;
+      return !query || `${item.title} ${item.destination} ${item.dates}`.toLowerCase().includes(query);
+    });
+  }, [filter, search, summary, trips]);
+  const planned = summary.filter((trip) => trip.status === "planned").length;
+  const scouting = summary.filter((trip) => trip.status === "scouting").length;
+
+  const openTrip = (trip: TravelPlanSummary) => {
+    void clientMutation("ui:setPanel", {
+      type: "trip",
+      value: JSON.stringify({ creationId: trip.id }),
+      title: `trip · ${trip.destination}`,
+    });
+  };
+  const openMindmap = (trip: TravelPlanSummary) => {
+    if (!trip.mindmapCreationId) return;
+    void clientMutation("ui:setPanel", {
+      type: "canvas",
+      value: JSON.stringify({ creationId: trip.mindmapCreationId }),
+      title: `mind map · ${trip.destination}`,
+    });
+  };
+
+  return (
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-auto bg-[radial-gradient(circle_at_80%_-10%,rgba(0,255,136,0.11),transparent_34%),radial-gradient(circle_at_10%_8%,rgba(86,180,255,0.08),transparent_30%)] p-3 sm:p-5">
+      <div className="mx-auto max-w-[1480px]">
+        <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <div className="hud-label !text-cyan">saved travel</div>
+            <h1 className="mt-1 text-2xl font-semibold tracking-tight text-ice">Trips that keep their shape.</h1>
+            <p className="mt-1 max-w-xl text-xs leading-relaxed text-slate">Scouting, routes, locked days and travel mind maps all reopen from their durable trip record.</p>
+          </div>
+          <div className="flex gap-2 text-right">
+            <div className="rounded-xl border border-white/10 bg-black/15 px-3 py-2"><div className="font-mono text-base text-ice">{summary.length}</div><div className="hud-label !text-[8px]">saved</div></div>
+            <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/[0.04] px-3 py-2"><div className="font-mono text-base text-emerald-200">{planned}</div><div className="hud-label !text-[8px]">locked</div></div>
+            <div className="rounded-xl border border-amber/15 bg-amber/[0.04] px-3 py-2"><div className="font-mono text-base text-amber">{scouting}</div><div className="hud-label !text-[8px]">scouting</div></div>
+          </div>
+        </div>
+
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-white/8 bg-black/10 p-2">
+          <div className="flex items-center gap-1">
+            {(["all", "planned", "scouting"] as const).map((status) => (
+              <button key={status} type="button" onClick={() => setFilter(status)} className={`rounded-xl px-3 py-1.5 text-[10px] uppercase tracking-[0.12em] transition ${filter === status ? "bg-cyan/15 text-cyan ring-1 ring-cyan/25" : "text-slate hover:text-ice"}`}>
+                {status === "all" ? "all trips" : status}
+              </button>
+            ))}
+          </div>
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search destination…" aria-label="Search saved travel" className="min-w-[180px] flex-1 rounded-xl border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-ice outline-none placeholder:text-slate/60 focus:border-cyan/35" />
+          <span className="hud-label shrink-0 !text-[8px]">{visible.length} shown</span>
+        </div>
+
+        {queriedRows === undefined ? (
+          <div className="glass mx-auto mt-16 max-w-lg rounded-2xl p-7 text-center text-xs text-slate">Loading saved trips…</div>
+        ) : (
+          <TravelLibraryCards trips={visible} onOpenTrip={openTrip} onOpenMindmap={openMindmap} />
+        )}
+      </div>
+    </div>
+  );
+}
