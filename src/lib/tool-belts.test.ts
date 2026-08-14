@@ -54,6 +54,8 @@ describe("tool belt registry", () => {
   it("keeps the explicitly named Google Calendar lane out of background workers", () => {
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_list")).toBe(false);
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_create")).toBe(false);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_update")).toBe(false);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_delete")).toBe(false);
   });
 
   it("keeps uploaded-image display in the foreground owner lane", () => {

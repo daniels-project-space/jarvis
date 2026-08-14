@@ -2,17 +2,28 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 const mock = vi.hoisted(() => ({
+  createProposal: { action: "create" as const, event: { title: "Planning", start: 1, end: 2, allDay: false } },
   sameOrigin: vi.fn(() => true),
   controlActor: vi.fn(async () => ({ kind: "owner", authTokenHash: "owner" })),
   isOwner: vi.fn(() => true),
-  verify: vi.fn(() => ({ title: "Planning", start: 1, end: 2, allDay: false })),
+  verify: vi.fn(),
   create: vi.fn(async () => ({ event: { title: "Planning", start: "2026-08-20T09:00:00.000Z", end: "2026-08-20T10:00:00.000Z", allDay: false }, created: true })),
+  update: vi.fn(async () => ({ event: { title: "Rescheduled", start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", allDay: false } })),
+  remove: vi.fn(async () => ({ id: "jarvisabcdef0123456789", deleted: true })),
+  CalendarError: class GoogleCalendarError extends Error {},
 }));
+
+const createProposal = mock.createProposal;
 
 vi.mock("@/lib/control-session", () => ({ isSameOriginRequest: mock.sameOrigin }));
 vi.mock("@/lib/request-auth", () => ({ controlActor: mock.controlActor, isOwnerActor: mock.isOwner }));
-vi.mock("@/lib/google-calendar-approval.server", () => ({ verifyGoogleCalendarApproval: mock.verify }));
-vi.mock("@/lib/google-calendar", () => ({ createGooglePrimaryCalendarEvent: mock.create }));
+vi.mock("@/lib/google-calendar-approval.server", () => ({ verifyGoogleCalendarApprovalProposal: mock.verify }));
+vi.mock("@/lib/google-calendar", () => ({
+  createGooglePrimaryCalendarEvent: mock.create,
+  updateManagedGooglePrimaryCalendarEvent: mock.update,
+  deleteManagedGooglePrimaryCalendarEvent: mock.remove,
+  GoogleCalendarError: mock.CalendarError,
+}));
 
 import { POST } from "./route";
 
@@ -29,8 +40,10 @@ beforeEach(() => {
   mock.sameOrigin.mockReturnValue(true);
   mock.controlActor.mockResolvedValue({ kind: "owner", authTokenHash: "owner" });
   mock.isOwner.mockReturnValue(true);
-  mock.verify.mockReturnValue({ title: "Planning", start: 1, end: 2, allDay: false });
+  mock.verify.mockReturnValue({ proposal: createProposal });
   mock.create.mockResolvedValue({ event: { title: "Planning", start: "2026-08-20T09:00:00.000Z", end: "2026-08-20T10:00:00.000Z", allDay: false }, created: true });
+  mock.update.mockResolvedValue({ event: { title: "Rescheduled", start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", allDay: false } });
+  mock.remove.mockResolvedValue({ id: "jarvisabcdef0123456789", deleted: true });
 });
 
 describe("Google Calendar owner approval route", () => {
@@ -40,14 +53,43 @@ describe("Google Calendar owner approval route", () => {
 
     expect(response.status).toBe(403);
     expect(mock.create).not.toHaveBeenCalled();
+    expect(mock.update).not.toHaveBeenCalled();
+    expect(mock.remove).not.toHaveBeenCalled();
   });
 
-  it("writes only the event sealed in the approved receipt", async () => {
+  it("writes only the create event sealed in the approved receipt", async () => {
     const response = await POST(request({ token: "signed-receipt" }));
 
-    await expect(response.json()).resolves.toMatchObject({ ok: true, created: true, event: { title: "Planning" } });
+    await expect(response.json()).resolves.toMatchObject({ ok: true, action: "create", created: true, event: { title: "Planning" } });
     expect(mock.verify).toHaveBeenCalledWith("signed-receipt");
-    expect(mock.create).toHaveBeenCalledWith({ title: "Planning", start: 1, end: 2, allDay: false });
+    expect(mock.create).toHaveBeenCalledWith(createProposal.event);
+  });
+
+  it("dispatches only the revision-sealed managed update", async () => {
+    const proposal = {
+      action: "update" as const,
+      eventId: "jarvisabcdef0123456789",
+      expectedEtag: "\"revision-1\"",
+      event: { title: "Rescheduled", start: 3, end: 4, allDay: false },
+    };
+    mock.verify.mockReturnValue({ proposal });
+
+    const response = await POST(request({ token: "signed-update" }));
+
+    await expect(response.json()).resolves.toMatchObject({ ok: true, action: "update", event: { title: "Rescheduled" } });
+    expect(mock.update).toHaveBeenCalledWith({ eventId: proposal.eventId, expectedEtag: proposal.expectedEtag, event: proposal.event });
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+
+  it("dispatches only the revision-sealed managed delete", async () => {
+    const proposal = { action: "delete" as const, eventId: "jarvisabcdef0123456789", expectedEtag: "\"revision-1\"" };
+    mock.verify.mockReturnValue({ proposal });
+
+    const response = await POST(request({ token: "signed-delete" }));
+
+    await expect(response.json()).resolves.toMatchObject({ ok: true, action: "delete", deleted: true });
+    expect(mock.remove).toHaveBeenCalledWith(proposal.eventId, proposal.expectedEtag);
+    expect(mock.create).not.toHaveBeenCalled();
   });
 
   it("does not write if the receipt is invalid or expired", async () => {
@@ -56,5 +98,24 @@ describe("Google Calendar owner approval route", () => {
 
     expect(response.status).toBe(400);
     expect(mock.create).not.toHaveBeenCalled();
+    expect(mock.update).not.toHaveBeenCalled();
+    expect(mock.remove).not.toHaveBeenCalled();
+  });
+
+  it("asks for a fresh approval when the sealed event revision is stale", async () => {
+    mock.verify.mockReturnValue({
+      proposal: {
+        action: "update",
+        eventId: "jarvisabcdef0123456789",
+        expectedEtag: "\"revision-1\"",
+        event: { title: "Rescheduled", start: 3, end: 4, allDay: false },
+      },
+    });
+    mock.update.mockRejectedValue(new mock.CalendarError("This managed Google Calendar event changed after the approval was prepared."));
+
+    const response = await POST(request({ token: "stale-update" }));
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/fresh calendar change/i) });
   });
 });

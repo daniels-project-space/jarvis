@@ -1,13 +1,23 @@
 import type { NextRequest } from "next/server";
 import { isSameOriginRequest } from "@/lib/control-session";
-import { createGooglePrimaryCalendarEvent } from "@/lib/google-calendar";
-import { verifyGoogleCalendarApproval } from "@/lib/google-calendar-approval.server";
+import {
+  createGooglePrimaryCalendarEvent,
+  deleteManagedGooglePrimaryCalendarEvent,
+  GoogleCalendarError,
+  updateManagedGooglePrimaryCalendarEvent,
+} from "@/lib/google-calendar";
+import { verifyGoogleCalendarApprovalProposal } from "@/lib/google-calendar-approval.server";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
 
 export const runtime = "nodejs";
 export const maxDuration = 15;
 
 const MAX_BODY_BYTES = 5_000;
+const PRIVATE_HEADERS = { "cache-control": "private, no-store" };
+
+function eventResponse(event: { title: string; start: string; end: string; allDay: boolean }) {
+  return { title: event.title, start: event.start, end: event.end, allDay: event.allDay };
+}
 
 export async function POST(req: NextRequest) {
   if (!isSameOriginRequest(req)) return Response.json({ ok: false, error: "cross-origin approval rejected" }, { status: 403 });
@@ -19,30 +29,56 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: false, error: "approval request too large" }, { status: 413 });
   }
   const body = await req.json().catch(() => null) as { token?: unknown } | null;
-  let event;
+  let approval;
   try {
-    event = verifyGoogleCalendarApproval(body?.token);
+    approval = verifyGoogleCalendarApprovalProposal(body?.token);
   } catch {
     return Response.json({ ok: false, error: "calendar approval is invalid or expired" }, { status: 400 });
   }
+
   try {
-    const result = await createGooglePrimaryCalendarEvent(event);
-    return Response.json({
-      ok: true,
-      created: result.created,
-      event: {
-        title: result.event.title,
-        start: result.event.start,
-        end: result.event.end,
-        allDay: result.event.allDay,
-      },
-    }, { headers: { "cache-control": "private, no-store" } });
-  } catch {
+    switch (approval.proposal.action) {
+      case "create": {
+        const result = await createGooglePrimaryCalendarEvent(approval.proposal.event);
+        return Response.json({
+          ok: true,
+          action: "create",
+          created: result.created,
+          event: eventResponse(result.event),
+        }, { headers: PRIVATE_HEADERS });
+      }
+      case "update": {
+        const result = await updateManagedGooglePrimaryCalendarEvent({
+          eventId: approval.proposal.eventId,
+          expectedEtag: approval.proposal.expectedEtag,
+          event: approval.proposal.event,
+        });
+        return Response.json({
+          ok: true,
+          action: "update",
+          event: eventResponse(result.event),
+        }, { headers: PRIVATE_HEADERS });
+      }
+      case "delete": {
+        const result = await deleteManagedGooglePrimaryCalendarEvent(
+          approval.proposal.eventId,
+          approval.proposal.expectedEtag,
+        );
+        return Response.json({ ok: true, action: "delete", deleted: result.deleted }, { headers: PRIVATE_HEADERS });
+      }
+    }
+  } catch (error) {
+    if (error instanceof GoogleCalendarError && /changed after the approval was prepared/i.test(error.message)) {
+      return Response.json({
+        ok: false,
+        error: "That Jarvis-managed Google Calendar event changed before approval. Review it and request a fresh calendar change.",
+      }, { status: 409, headers: PRIVATE_HEADERS });
+    }
     // Provider payloads can contain private event details. The caller already
     // has the preview, so a stable safe error is more useful than reflection.
     return Response.json({
       ok: false,
-      error: "Google Calendar could not add that event. Reconnect Google in Options if its permission changed.",
-    }, { status: 502, headers: { "cache-control": "private, no-store" } });
+      error: "Google Calendar could not apply that change. Reconnect Google in Options if its permission changed.",
+    }, { status: 502, headers: PRIVATE_HEADERS });
   }
 }

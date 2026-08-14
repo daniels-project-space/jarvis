@@ -6,7 +6,9 @@ const mock = vi.hoisted(() => ({
   convexMutation: vi.fn(),
   convexQuery: vi.fn(),
   issueCalendarApproval: vi.fn(() => "signed-calendar-receipt"),
+  issueCalendarProposal: vi.fn(() => "signed-calendar-change-receipt"),
   googleCalendarCreate: vi.fn(),
+  googleCalendarGetManaged: vi.fn(),
 }));
 vi.mock("./context", () => ({ convexMutation: mock.convexMutation, convexQuery: mock.convexQuery }));
 vi.mock("./control-context", () => ({
@@ -21,10 +23,12 @@ vi.mock("./icloud-calendar", () => ({
 }));
 vi.mock("./google-calendar", () => ({
   createGooglePrimaryCalendarEvent: mock.googleCalendarCreate,
+  getManagedGooglePrimaryCalendarEvent: mock.googleCalendarGetManaged,
   listGooglePrimaryCalendarEvents: vi.fn(),
 }));
 vi.mock("./google-calendar-approval.server", () => ({
   issueGoogleCalendarApproval: mock.issueCalendarApproval,
+  issueGoogleCalendarApprovalProposal: mock.issueCalendarProposal,
   googleCalendarApprovalMarker: (token: string) => `[JARVIS_GOOGLE_CALENDAR_APPROVAL:${token}]`,
 }));
 
@@ -70,6 +74,11 @@ describe("Google Calendar creation approval boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mock.issueCalendarApproval.mockReturnValue("signed-calendar-receipt");
+    mock.issueCalendarProposal.mockReturnValue("signed-calendar-change-receipt");
+    mock.googleCalendarGetManaged.mockResolvedValue({
+      event: { id: "jarvisabcdef0123456789", title: "Planning session", start: "2026-08-20T09:00:00.000Z", end: "2026-08-20T10:00:00.000Z", allDay: false },
+      etag: "\"revision-1\"",
+    });
   });
 
   it("prepares a real-date event without writing until the owner clicks the receipt", async () => {
@@ -104,5 +113,32 @@ describe("Google Calendar creation approval boundary", () => {
       time: "01:30",
     })).resolves.toMatch(/does not exist in Europe\/London/i);
     expect(mock.issueCalendarApproval).not.toHaveBeenCalled();
+  });
+
+  it("prepares a managed calendar update without writing until the owner clicks", async () => {
+    const result = await executeTool("google_calendar_update", {
+      event_id: "jarvisabcdef0123456789",
+      title: "Rescheduled planning",
+      date: "2026-08-20",
+      time: "10:00",
+    });
+
+    expect(result).toContain("Ready for your approval: update Jarvis-managed");
+    expect(result).toContain("JARVIS_GOOGLE_CALENDAR_APPROVAL:signed-calendar-change-receipt");
+    expect(mock.googleCalendarGetManaged).toHaveBeenCalledWith("jarvisabcdef0123456789");
+    expect(mock.issueCalendarProposal).toHaveBeenCalledWith(expect.objectContaining({
+      action: "update", eventId: "jarvisabcdef0123456789", expectedEtag: "\"revision-1\"",
+    }));
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+
+  it("prepares a managed calendar removal without writing until the owner clicks", async () => {
+    const result = await executeTool("google_calendar_delete", { event_id: "jarvisabcdef0123456789" });
+
+    expect(result).toContain("Ready for your approval: remove Jarvis-managed");
+    expect(mock.issueCalendarProposal).toHaveBeenCalledWith({
+      action: "delete", eventId: "jarvisabcdef0123456789", expectedEtag: "\"revision-1\"",
+    });
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
   });
 });

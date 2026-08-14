@@ -35,4 +35,22 @@ describe("Google Calendar owner-approval receipt", () => {
 
     expect(() => verifyGoogleCalendarApproval(tampered, 1_000)).toThrow(/invalid or expired/i);
   });
+
+  it("seals a managed-event revision into update and delete proposals", async () => {
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = KEY;
+    const { issueGoogleCalendarApprovalProposal, verifyGoogleCalendarApprovalProposal } = await import("./google-calendar-approval.server");
+    const proposal = {
+      action: "update" as const,
+      eventId: "jarvisabcdef0123456789",
+      expectedEtag: "\"revision-1\"",
+      event,
+    };
+    const token = issueGoogleCalendarApprovalProposal(proposal, 1_000);
+
+    expect(verifyGoogleCalendarApprovalProposal(token, 1_000 + 60_000)).toEqual(expect.objectContaining({
+      proposal,
+      expiresAt: 1_000 + 600_000,
+      nonce: expect.stringMatching(/^[A-Za-z0-9_-]{16,64}$/),
+    }));
+  });
 });

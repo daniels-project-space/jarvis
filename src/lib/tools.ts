@@ -12,8 +12,8 @@ import { workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import { listICloudEvents } from "./icloud-calendar";
-import { listGooglePrimaryCalendarEvents } from "./google-calendar";
-import { googleCalendarApprovalMarker, issueGoogleCalendarApproval } from "./google-calendar-approval.server";
+import { getManagedGooglePrimaryCalendarEvent, listGooglePrimaryCalendarEvents, type GoogleCalendarCreateInput } from "./google-calendar";
+import { googleCalendarApprovalMarker, issueGoogleCalendarApproval, issueGoogleCalendarApprovalProposal } from "./google-calendar-approval.server";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
 import {
   gmailSearch,
@@ -547,6 +547,37 @@ export const TOOL_DEFS = [
         reminder_minutes_before: { type: "number", description: "Optional popup reminder, 1-40320 minutes before" },
       },
       required: ["title", "date"],
+    },
+  },
+  {
+    name: "google_calendar_update",
+    description:
+      "Prepare a time, date, or detail change for exactly one Jarvis-managed event on Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar and supplies the Jarvis-managed event ID from a prior Google Calendar listing. It cannot alter manual, shared, iCloud, or foreign events. It only renders an owner-only approval button; the change is not written until Daniel clicks it, and it is rejected if the event changed first.",
+    parameters: {
+      type: "object",
+      properties: {
+        event_id: { type: "string", description: "Exact Jarvis-managed event ID shown by google_calendar_list" },
+        title: { type: "string" },
+        date: { type: "string", description: "YYYY-MM-DD" },
+        time: { type: "string", description: "HH:MM 24h; omit for an all-day event" },
+        end_time: { type: "string", description: "HH:MM 24h; default one hour after a timed event" },
+        location: { type: "string" },
+        notes: { type: "string" },
+        reminder_minutes_before: { type: "number", description: "Optional popup reminder, 1-40320 minutes before" },
+      },
+      required: ["event_id", "title", "date"],
+    },
+  },
+  {
+    name: "google_calendar_delete",
+    description:
+      "Prepare removal of exactly one Jarvis-managed event from Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar and supplies the Jarvis-managed event ID from a prior Google Calendar listing. It cannot remove manual, shared, iCloud, or foreign events. It only renders an owner-only approval button; nothing is removed until Daniel clicks it, and it is rejected if the event changed first.",
+    parameters: {
+      type: "object",
+      properties: {
+        event_id: { type: "string", description: "Exact Jarvis-managed event ID shown by google_calendar_list" },
+      },
+      required: ["event_id"],
     },
   },
   {
@@ -2061,11 +2092,17 @@ async function googleCalendarList(args: any): Promise<string> {
           minute: "2-digit",
           hour12: false,
         }).format(new Date(event.start));
-  const lines = events.map((event) => `- ${when(event)} · ${event.title}${event.location ? ` @ ${event.location}` : ""}`);
+  const lines = events.map((event) => `- ${when(event)} · ${event.title}${event.location ? ` @ ${event.location}` : ""}${event.managed ? ` [Jarvis-managed: ${event.id}]` : ""}`);
   return `Google Calendar primary (${date}, ${days} day${days === 1 ? "" : "s"}):\n${lines.join("\n")}`;
 }
 
-async function googleCalendarCreate(args: any): Promise<string> {
+type PreparedGoogleCalendarEvent = {
+  event: GoogleCalendarCreateInput;
+  date: string;
+  time: string | null;
+};
+
+function prepareGoogleCalendarEvent(args: any): PreparedGoogleCalendarEvent | string {
   const title = String(args.title ?? "").trim();
   const date = String(args.date ?? "");
   if (!title || !isCalendarDate(date)) return "I need a title and a real date (YYYY-MM-DD).";
@@ -2096,7 +2133,7 @@ async function googleCalendarCreate(args: any): Promise<string> {
   if (reminderMinutesBefore != null && (!Number.isInteger(reminderMinutesBefore) || reminderMinutesBefore < 1 || reminderMinutesBefore > 40_320)) {
     return "The Google Calendar popup reminder must be a whole number from 1 to 40320 minutes before the event.";
   }
-  const event = {
+  const event: GoogleCalendarCreateInput = {
     title: title.slice(0, 140),
     start,
     end,
@@ -2105,11 +2142,58 @@ async function googleCalendarCreate(args: any): Promise<string> {
     notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
     reminderMinutesBefore,
   };
+  return { event, date, time: args.time ? String(args.time) : null };
+}
+
+async function googleCalendarCreate(args: any): Promise<string> {
+  const prepared = prepareGoogleCalendarEvent(args);
+  if (typeof prepared === "string") return prepared;
   // A model can prepare an event, but cannot infer an owner click from a
   // page, email, or file. The route behind the rendered button verifies this
   // short-lived signed receipt before it writes to Google's API.
-  const approval = issueGoogleCalendarApproval(event);
-  return `Ready for your approval: Google Calendar event "${event.title}" on ${date}${args.time ? ` at ${args.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
+  const approval = issueGoogleCalendarApproval(prepared.event);
+  return `Ready for your approval: Google Calendar event "${prepared.event.title}" on ${prepared.date}${prepared.time ? ` at ${prepared.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
+}
+
+async function googleCalendarUpdate(args: any): Promise<string> {
+  const eventId = String(args.event_id ?? "").trim();
+  if (!/^jarvis[a-v0-9]{5,1018}$/.test(eventId)) {
+    return "I need the exact Jarvis-managed Google Calendar event ID from a Google Calendar listing.";
+  }
+  const prepared = prepareGoogleCalendarEvent(args);
+  if (typeof prepared === "string") return prepared;
+  let existing: Awaited<ReturnType<typeof getManagedGooglePrimaryCalendarEvent>>;
+  try {
+    existing = await getManagedGooglePrimaryCalendarEvent(eventId);
+  } catch {
+    return "I can only revise a current Jarvis-managed Google Calendar event. Check the Google Calendar listing and request a fresh plan change.";
+  }
+  const approval = issueGoogleCalendarApprovalProposal({
+    action: "update",
+    eventId,
+    expectedEtag: existing.etag,
+    event: prepared.event,
+  });
+  return `Ready for your approval: update Jarvis-managed Google Calendar event "${existing.event.title}" to "${prepared.event.title}" on ${prepared.date}${prepared.time ? ` at ${prepared.time}` : " (all day)"}. The change is sealed to the current event revision and will be rejected if it changes before you approve. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
+}
+
+async function googleCalendarDelete(args: any): Promise<string> {
+  const eventId = String(args.event_id ?? "").trim();
+  if (!/^jarvis[a-v0-9]{5,1018}$/.test(eventId)) {
+    return "I need the exact Jarvis-managed Google Calendar event ID from a Google Calendar listing.";
+  }
+  let existing: Awaited<ReturnType<typeof getManagedGooglePrimaryCalendarEvent>>;
+  try {
+    existing = await getManagedGooglePrimaryCalendarEvent(eventId);
+  } catch {
+    return "I can only remove a current Jarvis-managed Google Calendar event. Check the Google Calendar listing and request a fresh plan change.";
+  }
+  const approval = issueGoogleCalendarApprovalProposal({
+    action: "delete",
+    eventId,
+    expectedEtag: existing.etag,
+  });
+  return `Ready for your approval: remove Jarvis-managed Google Calendar event "${existing.event.title}". The removal is sealed to the current event revision and will be rejected if it changes before you approve. Nothing is removed until you use the protected approval button below.\n${googleCalendarApprovalMarker(approval)}`;
 }
 
 async function calendarRemove(_args: any): Promise<string> {
@@ -4578,6 +4662,10 @@ export async function executeTool(
       return await googleCalendarList(args);
     case "google_calendar_create":
       return await googleCalendarCreate(args);
+    case "google_calendar_update":
+      return await googleCalendarUpdate(args);
+    case "google_calendar_delete":
+      return await googleCalendarDelete(args);
     case "bookings_lookup":
       return await bookingsLookup(args);
     case "bookings_check":

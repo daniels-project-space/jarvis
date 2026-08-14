@@ -365,7 +365,7 @@ function ChatHistoryArchive({ threadId }: { threadId: string }) {
 }
 
 function GoogleCalendarApprovalCard({ token }: { token: string }) {
-  const [state, setState] = useState<"ready" | "approving" | "added" | "error">("ready");
+  const [state, setState] = useState<"ready" | "approving" | "completed" | "error">("ready");
   const [detail, setDetail] = useState("");
 
   const approve = async () => {
@@ -378,10 +378,12 @@ function GoogleCalendarApprovalCard({ token }: { token: string }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ token }),
       });
-      const payload = await response.json().catch(() => ({})) as { ok?: unknown; created?: unknown; error?: unknown };
+      const payload = await response.json().catch(() => ({})) as { ok?: unknown; action?: unknown; created?: unknown; deleted?: unknown; error?: unknown };
       if (!response.ok || payload.ok !== true) throw new Error(String(payload.error ?? "Calendar approval was rejected."));
-      setState("added");
-      setDetail(payload.created === false ? "Already present in Google Calendar." : "Added to Google Calendar.");
+      setState("completed");
+      if (payload.action === "update") setDetail("Updated Google Calendar.");
+      else if (payload.action === "delete") setDetail(payload.deleted === false ? "That event was already absent from Google Calendar." : "Removed from Google Calendar.");
+      else setDetail(payload.created === false ? "Already present in Google Calendar." : "Added to Google Calendar.");
     } catch (error) {
       setState("error");
       setDetail(String(error instanceof Error ? error.message : "Calendar approval was rejected."));
@@ -390,7 +392,7 @@ function GoogleCalendarApprovalCard({ token }: { token: string }) {
 
   return (
     <div data-google-calendar-approval className="mt-1.5 inline-flex max-w-[88%] items-center gap-2 rounded-xl border border-cyan/30 bg-cyan/[0.06] px-3 py-2 text-xs text-ice">
-      {state === "added" ? (
+      {state === "completed" ? (
         <span aria-live="polite">{detail}</span>
       ) : (
         <>
@@ -400,10 +402,10 @@ function GoogleCalendarApprovalCard({ token }: { token: string }) {
             disabled={state === "approving"}
             className="rounded-lg border border-cyan/40 bg-cyan/10 px-2 py-1 font-medium text-cyan transition hover:bg-cyan/20 disabled:opacity-50"
           >
-            {state === "approving" ? "adding…" : "Approve event"}
+            {state === "approving" ? "saving…" : "Approve calendar change"}
           </button>
           <span aria-live="polite" className={state === "error" ? "text-amber" : "text-slate"}>
-            {state === "error" ? detail : "Nothing is added until you click."}
+            {state === "error" ? detail : "Nothing changes until you click."}
           </span>
         </>
       )}

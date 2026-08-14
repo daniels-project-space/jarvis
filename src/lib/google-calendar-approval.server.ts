@@ -4,18 +4,30 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import type { GoogleCalendarCreateInput } from "./google-calendar";
 import { GOOGLE_CALENDAR_APPROVAL_MARKER } from "./sanitize";
 
-const APPROVAL_VERSION = 1;
+const APPROVAL_VERSION = 2;
+const LEGACY_APPROVAL_VERSION = 1;
 const APPROVAL_TTL_MS = 10 * 60_000;
 const MAX_TOKEN_BYTES = 4_096;
 
 export class GoogleCalendarApprovalError extends Error {}
 
+export type GoogleCalendarApprovalProposal =
+  | { action: "create"; event: GoogleCalendarCreateInput }
+  | { action: "update"; eventId: string; expectedEtag: string; event: GoogleCalendarCreateInput }
+  | { action: "delete"; eventId: string; expectedEtag: string };
+
+export type VerifiedGoogleCalendarApproval = {
+  proposal: GoogleCalendarApprovalProposal;
+  nonce: string;
+  expiresAt: number;
+};
+
 type ApprovalPayload = {
-  version: number;
+  version: typeof APPROVAL_VERSION;
   issuedAt: number;
   expiresAt: number;
   nonce: string;
-  event: GoogleCalendarCreateInput;
+  proposal: GoogleCalendarApprovalProposal;
 };
 
 function approvalKey(): Buffer {
@@ -70,30 +82,51 @@ function normalizedEvent(value: unknown): GoogleCalendarCreateInput {
   };
 }
 
+function normalizedManagedEventId(value: unknown): string {
+  const eventId = boundedText(value, "Managed event ID", 1_024, true)!;
+  if (!/^jarvis[a-v0-9]{5,1018}$/.test(eventId)) {
+    throw new GoogleCalendarApprovalError("Calendar approval can only change a managed event.");
+  }
+  return eventId;
+}
+
+function normalizedEtag(value: unknown): string {
+  const etag = boundedText(value, "Event revision", 512, true)!;
+  if (!/^[\x21-\x7E]+$/.test(etag)) {
+    throw new GoogleCalendarApprovalError("Calendar approval has an invalid event revision.");
+  }
+  return etag;
+}
+
+function normalizedProposal(value: unknown): GoogleCalendarApprovalProposal {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
+  }
+  const input = value as Record<string, unknown>;
+  if (input.action === "create") return { action: "create", event: normalizedEvent(input.event) };
+  if (input.action === "update") {
+    return {
+      action: "update",
+      eventId: normalizedManagedEventId(input.eventId),
+      expectedEtag: normalizedEtag(input.expectedEtag),
+      event: normalizedEvent(input.event),
+    };
+  }
+  if (input.action === "delete") {
+    return {
+      action: "delete",
+      eventId: normalizedManagedEventId(input.eventId),
+      expectedEtag: normalizedEtag(input.expectedEtag),
+    };
+  }
+  throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
+}
+
 function sign(encodedPayload: string): Buffer {
   return createHmac("sha256", approvalKey()).update(encodedPayload).digest();
 }
 
-/**
- * A tool call can prepare an event but never create one. This short-lived,
- * signed receipt is consumed only by a same-origin owner click in the UI.
- * Replays are harmless because the Calendar insert itself has a deterministic
- * idempotency key.
- */
-export function issueGoogleCalendarApproval(input: GoogleCalendarCreateInput, now = Date.now()): string {
-  const event = normalizedEvent(input);
-  const payload: ApprovalPayload = {
-    version: APPROVAL_VERSION,
-    issuedAt: now,
-    expiresAt: now + APPROVAL_TTL_MS,
-    nonce: randomBytes(16).toString("base64url"),
-    event,
-  };
-  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  return `${encodedPayload}.${sign(encodedPayload).toString("base64url")}`;
-}
-
-export function verifyGoogleCalendarApproval(token: unknown, now = Date.now()): GoogleCalendarCreateInput {
+function verifyPayload(token: unknown, now: number): { payload: Record<string, unknown>; nonce: string; expiresAt: number } {
   if (typeof token !== "string" || token.length < 40 || token.length > MAX_TOKEN_BYTES) {
     throw new GoogleCalendarApprovalError("Calendar approval is invalid or expired.");
   }
@@ -110,27 +143,74 @@ export function verifyGoogleCalendarApproval(token: unknown, now = Date.now()): 
   ) {
     throw new GoogleCalendarApprovalError("Calendar approval is invalid or expired.");
   }
-  let payload: ApprovalPayload;
+  let payload: Record<string, unknown>;
   try {
     const raw = Buffer.from(parts[0], "base64url");
     if (!raw.byteLength || raw.byteLength > 3_000 || raw.toString("base64url") !== parts[0]) throw new Error("invalid encoding");
-    payload = JSON.parse(raw.toString("utf8")) as ApprovalPayload;
+    const parsed = JSON.parse(raw.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid payload");
+    payload = parsed as Record<string, unknown>;
   } catch {
     throw new GoogleCalendarApprovalError("Calendar approval is invalid or expired.");
   }
+  const issuedAt = payload.issuedAt;
+  const expiresAt = payload.expiresAt;
+  const nonce = payload.nonce;
   if (
-    !payload ||
-    payload.version !== APPROVAL_VERSION ||
-    !Number.isFinite(payload.issuedAt) ||
-    !Number.isFinite(payload.expiresAt) ||
-    payload.expiresAt < now ||
-    payload.expiresAt - payload.issuedAt !== APPROVAL_TTL_MS ||
-    typeof payload.nonce !== "string" ||
-    !/^[A-Za-z0-9_-]{16,64}$/.test(payload.nonce)
+    !Number.isFinite(issuedAt) ||
+    !Number.isFinite(expiresAt) ||
+    (expiresAt as number) < now ||
+    (expiresAt as number) - (issuedAt as number) !== APPROVAL_TTL_MS ||
+    typeof nonce !== "string" ||
+    !/^[A-Za-z0-9_-]{16,64}$/.test(nonce)
   ) {
     throw new GoogleCalendarApprovalError("Calendar approval is invalid or expired.");
   }
-  return normalizedEvent(payload.event);
+  return { payload, nonce, expiresAt: expiresAt as number };
+}
+
+/**
+ * A tool can prepare a change but cannot write it. The receipt is accepted
+ * only from a same-origin owner click. Update/delete proposals additionally
+ * seal Google Calendar's observed revision; a stale or replayed write loses
+ * its If-Match race instead of overwriting a changed plan.
+ */
+export function issueGoogleCalendarApprovalProposal(proposal: GoogleCalendarApprovalProposal, now = Date.now()): string {
+  const payload: ApprovalPayload = {
+    version: APPROVAL_VERSION,
+    issuedAt: now,
+    expiresAt: now + APPROVAL_TTL_MS,
+    nonce: randomBytes(16).toString("base64url"),
+    proposal: normalizedProposal(proposal),
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return `${encodedPayload}.${sign(encodedPayload).toString("base64url")}`;
+}
+
+/** Backward-compatible create helper used by existing callers and cards. */
+export function issueGoogleCalendarApproval(input: GoogleCalendarCreateInput, now = Date.now()): string {
+  return issueGoogleCalendarApprovalProposal({ action: "create", event: input }, now);
+}
+
+export function verifyGoogleCalendarApprovalProposal(token: unknown, now = Date.now()): VerifiedGoogleCalendarApproval {
+  const { payload, nonce, expiresAt } = verifyPayload(token, now);
+  if (payload.version === LEGACY_APPROVAL_VERSION) {
+    // Keep already-rendered v1 create cards valid for their short remaining TTL.
+    return { proposal: { action: "create", event: normalizedEvent(payload.event) }, nonce, expiresAt };
+  }
+  if (payload.version !== APPROVAL_VERSION) {
+    throw new GoogleCalendarApprovalError("Calendar approval is invalid or expired.");
+  }
+  return { proposal: normalizedProposal(payload.proposal), nonce, expiresAt };
+}
+
+/** Retained for callers that prepare only a new event. */
+export function verifyGoogleCalendarApproval(token: unknown, now = Date.now()): GoogleCalendarCreateInput {
+  const approval = verifyGoogleCalendarApprovalProposal(token, now);
+  if (approval.proposal.action !== "create") {
+    throw new GoogleCalendarApprovalError("Calendar approval is not a create request.");
+  }
+  return approval.proposal.event;
 }
 
 export function googleCalendarApprovalMarker(token: string): string {

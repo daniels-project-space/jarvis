@@ -26,6 +26,8 @@ export type GoogleCalendarEvent = {
   location?: string;
   htmlLink?: string;
   status?: string;
+  /** True only when the provider proves this event was created by Jarvis. */
+  managed?: true;
 };
 
 export type GoogleCalendarCreateInput = {
@@ -40,6 +42,7 @@ export type GoogleCalendarCreateInput = {
 
 type GoogleCalendarEventWithMetadata = GoogleCalendarEvent & {
   privateProperties: Record<string, string>;
+  etag?: string;
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -109,6 +112,7 @@ function mapEvent(value: unknown): GoogleCalendarEventWithMetadata {
     ...(optionalText(event.location) ? { location: optionalText(event.location) } : {}),
     ...(optionalText(event.htmlLink) ? { htmlLink: optionalText(event.htmlLink) } : {}),
     ...(optionalText(event.status) ? { status: optionalText(event.status) } : {}),
+    ...(optionalText(event.etag) ? { etag: optionalText(event.etag) } : {}),
     privateProperties: privateProperties(event),
   };
 }
@@ -163,13 +167,97 @@ function eventIdentity(input: {
   return { eventId: `jarvis${dedupeKey}`, dedupeKey };
 }
 
+function normalizedEventInput(input: GoogleCalendarCreateInput): GoogleCalendarCreateInput {
+  const title = requireBoundedText(input.title, "Title", 140, true)!;
+  const start = requireEpoch(input.start, "Start");
+  const end = requireEpoch(input.end, "End");
+  if (end <= start) throw new GoogleCalendarError("End must be after start.");
+  if (typeof input.allDay !== "boolean") throw new GoogleCalendarError("All-day must be a boolean.");
+  const location = requireBoundedText(input.location, "Location", 140);
+  const notes = requireBoundedText(input.notes, "Notes", 500);
+  const reminderMinutesBefore = input.reminderMinutesBefore;
+  if (reminderMinutesBefore != null && (!Number.isInteger(reminderMinutesBefore) || reminderMinutesBefore < 1 || reminderMinutesBefore > 40_320)) {
+    throw new GoogleCalendarError("Reminder must be a whole number from 1 to 40320 minutes.");
+  }
+  return {
+    title,
+    start,
+    end,
+    allDay: input.allDay,
+    ...(location ? { location } : {}),
+    ...(notes ? { notes } : {}),
+    ...(reminderMinutesBefore != null ? { reminderMinutesBefore } : {}),
+  };
+}
+
+function calendarEventFields(input: GoogleCalendarCreateInput): Record<string, unknown> {
+  const startDate = londonDate(input.start);
+  const endDate = londonDate(input.end);
+  const allDayEnd = endDate > startDate ? endDate : addCalendarDays(startDate, 1);
+  return {
+    summary: input.title,
+    ...(input.location ? { location: input.location } : {}),
+    ...(input.notes ? { description: input.notes } : {}),
+    start: input.allDay
+      ? { date: startDate }
+      : { dateTime: new Date(input.start).toISOString(), timeZone: LONDON },
+    end: input.allDay
+      ? { date: allDayEnd }
+      : { dateTime: new Date(input.end).toISOString(), timeZone: LONDON },
+    ...(input.reminderMinutesBefore != null
+      ? { reminders: { useDefault: false, overrides: [{ method: "popup", minutes: input.reminderMinutesBefore }] } }
+      : {}),
+  };
+}
+
+function publicEvent(event: GoogleCalendarEventWithMetadata): GoogleCalendarEvent {
+  const { privateProperties: _privateProperties, etag: _etag, ...value } = event;
+  return value;
+}
+
+function requireManagedEventId(eventId: string): string {
+  if (!/^jarvis[a-v0-9]{5,1018}$/.test(eventId)) {
+    throw new GoogleCalendarError("Only a managed Google Calendar event can be changed.");
+  }
+  return eventId;
+}
+
+function requireExpectedEtag(expectedEtag: string): string {
+  if (typeof expectedEtag !== "string" || !expectedEtag || expectedEtag.length > 512 || !/^[\x21-\x7E]+$/.test(expectedEtag)) {
+    throw new GoogleCalendarError("The managed Google Calendar event revision is invalid.");
+  }
+  return expectedEtag;
+}
+
 async function getManagedPrimaryEvent(eventId: string): Promise<GoogleCalendarEventWithMetadata | null> {
   const response = await calendarFetch(`/calendars/${PRIMARY_CALENDAR}/events/${encodeURIComponent(eventId)}`, undefined, {
-    fields: "id,summary,start,end,location,status,htmlLink,extendedProperties/private",
+    fields: "id,etag,summary,start,end,location,status,htmlLink,extendedProperties/private",
   });
   if (response.status === 404) return null;
   if (!response.ok) throw responseError(response);
   return mapEvent(await responseJson(response));
+}
+
+async function currentManagedEvent(eventId: string, expectedEtag?: string): Promise<GoogleCalendarEventWithMetadata | null> {
+  requireManagedEventId(eventId);
+  const existing = await getManagedPrimaryEvent(eventId);
+  if (!existing) return null;
+  if (existing.privateProperties.jarvisManaged !== MANAGED_MARKER || !existing.etag) {
+    throw new GoogleCalendarError("Only a managed Google Calendar event can be changed.");
+  }
+  if (expectedEtag != null && existing.etag !== requireExpectedEtag(expectedEtag)) {
+    throw new GoogleCalendarError("This managed Google Calendar event changed after the approval was prepared. Review it and request a fresh approval.");
+  }
+  return existing;
+}
+
+/** Reads a single provider-verified Jarvis event so a tool can seal its revision into an approval. */
+export async function getManagedGooglePrimaryCalendarEvent(eventId: string): Promise<{ event: GoogleCalendarEvent; etag: string }> {
+  const existing = await currentManagedEvent(eventId);
+  if (!existing || !existing.etag) {
+    throw new GoogleCalendarError("That managed Google Calendar event is no longer available.");
+  }
+  return { event: publicEvent(existing), etag: existing.etag };
 }
 
 export async function listGooglePrimaryCalendarEvents(input: {
@@ -194,53 +282,26 @@ export async function listGooglePrimaryCalendarEvents(input: {
     orderBy: "startTime",
     showDeleted: "false",
     timeZone: LONDON,
-    fields: "items(id,summary,start,end,location,status,htmlLink)",
+    fields: "items(id,summary,start,end,location,status,htmlLink,extendedProperties/private)",
   });
   if (!response.ok) throw responseError(response);
   const items = asRecord(await responseJson(response)).items;
   if (!Array.isArray(items)) return [];
-  return items.map(mapEvent).map(({ privateProperties: _privateProperties, ...event }) => event);
+  return items.map(mapEvent).map((event) => ({
+    ...publicEvent(event),
+    ...(event.privateProperties.jarvisManaged === MANAGED_MARKER ? { managed: true as const } : {}),
+  }));
 }
 
 export async function createGooglePrimaryCalendarEvent(input: GoogleCalendarCreateInput): Promise<{
   event: GoogleCalendarEvent;
   created: boolean;
 }> {
-  const title = requireBoundedText(input.title, "Title", 140, true)!;
-  const start = requireEpoch(input.start, "Start");
-  const end = requireEpoch(input.end, "End");
-  if (end <= start) throw new GoogleCalendarError("End must be after start.");
-  if (typeof input.allDay !== "boolean") throw new GoogleCalendarError("All-day must be a boolean.");
-  const location = requireBoundedText(input.location, "Location", 140);
-  const notes = requireBoundedText(input.notes, "Notes", 500);
-  const reminder = input.reminderMinutesBefore;
-  if (reminder != null && (!Number.isInteger(reminder) || reminder < 1 || reminder > 40_320)) {
-    throw new GoogleCalendarError("Reminder must be a whole number from 1 to 40320 minutes.");
-  }
-
-  const identity = eventIdentity({
-    title,
-    start,
-    end,
-    allDay: input.allDay,
-    ...(location ? { location } : {}),
-    ...(notes ? { notes } : {}),
-    ...(reminder != null ? { reminderMinutesBefore: reminder } : {}),
-  });
-  const startDate = londonDate(start);
-  const endDate = londonDate(end);
-  const allDayEnd = endDate > startDate ? endDate : addCalendarDays(startDate, 1);
+  const eventInput = normalizedEventInput(input);
+  const identity = eventIdentity(eventInput);
   const event = {
     id: identity.eventId,
-    summary: title,
-    ...(location ? { location } : {}),
-    ...(notes ? { description: notes } : {}),
-    start: input.allDay
-      ? { date: startDate }
-      : { dateTime: new Date(start).toISOString(), timeZone: LONDON },
-    end: input.allDay
-      ? { date: allDayEnd }
-      : { dateTime: new Date(end).toISOString(), timeZone: LONDON },
+    ...calendarEventFields(eventInput),
     // No attendee, conference, attachment, or URL field is accepted from a
     // tool call. `sendUpdates=none` below is a second guard against email.
     guestsCanInviteOthers: false,
@@ -252,7 +313,6 @@ export async function createGooglePrimaryCalendarEvent(input: GoogleCalendarCrea
         jarvisDedupeKey: identity.dedupeKey,
       },
     },
-    ...(reminder != null ? { reminders: { useDefault: false, overrides: [{ method: "popup", minutes: reminder }] } } : {}),
   };
 
   const response = await calendarFetch(
@@ -262,8 +322,7 @@ export async function createGooglePrimaryCalendarEvent(input: GoogleCalendarCrea
   );
   if (response.ok) {
     const created = mapEvent(await responseJson(response));
-    const { privateProperties: _privateProperties, ...publicEvent } = created;
-    return { event: publicEvent, created: true };
+    return { event: publicEvent(created), created: true };
   }
   if (response.status !== 409) throw responseError(response);
 
@@ -272,30 +331,59 @@ export async function createGooglePrimaryCalendarEvent(input: GoogleCalendarCrea
   // proves it is the exact same Jarvis request.
   const existing = await getManagedPrimaryEvent(identity.eventId);
   if (existing?.privateProperties.jarvisManaged === MANAGED_MARKER && existing.privateProperties.jarvisDedupeKey === identity.dedupeKey) {
-    const { privateProperties: _privateProperties, ...publicEvent } = existing;
-    return { event: publicEvent, created: false };
+    return { event: publicEvent(existing), created: false };
   }
   throw new GoogleCalendarError("Google Calendar rejected the event ID because it is already in use by another event.");
 }
 
-/**
- * Reserved for a future owner-approved deletion flow. It only deletes an
- * event bearing Jarvis's private marker and is intentionally not exposed as a
- * chat tool until there is a durable interactive approval receipt.
- */
-export async function deleteManagedGooglePrimaryCalendarEvent(eventId: string): Promise<{ id: string; deleted: boolean }> {
-  if (!/^jarvis[a-v0-9]{5,1018}$/.test(eventId)) {
-    throw new GoogleCalendarError("Only a managed Google Calendar event can be deleted.");
+/** Changes a provider-verified Jarvis event only if the sealed revision still matches. */
+export async function updateManagedGooglePrimaryCalendarEvent(input: {
+  eventId: string;
+  expectedEtag: string;
+  event: GoogleCalendarCreateInput;
+}): Promise<{ event: GoogleCalendarEvent }> {
+  const eventId = requireManagedEventId(input.eventId);
+  const eventInput = normalizedEventInput(input.event);
+  const existing = await currentManagedEvent(eventId, input.expectedEtag);
+  if (!existing) throw new GoogleCalendarError("That managed Google Calendar event is no longer available.");
+  const response = await calendarFetch(
+    `/calendars/${PRIMARY_CALENDAR}/events/${encodeURIComponent(eventId)}`,
+    {
+      method: "PATCH",
+      headers: { "If-Match": requireExpectedEtag(input.expectedEtag) },
+      body: JSON.stringify({
+        ...calendarEventFields(eventInput),
+        // Preserve the private proof while refusing fields such as attendees,
+        // conference data, attachments, or arbitrary URLs from tool input.
+        guestsCanInviteOthers: false,
+        guestsCanModify: false,
+        guestsCanSeeOtherGuests: false,
+        extendedProperties: { private: existing.privateProperties },
+      }),
+    },
+    { sendUpdates: "none", conferenceDataVersion: "0" },
+  );
+  if (response.status === 412) {
+    throw new GoogleCalendarError("This managed Google Calendar event changed after the approval was prepared. Review it and request a fresh approval.");
   }
-  const existing = await getManagedPrimaryEvent(eventId);
+  if (!response.ok) throw responseError(response);
+  return { event: publicEvent(mapEvent(await responseJson(response))) };
+}
+
+/** Deletes a provider-verified Jarvis event only if the sealed revision still matches. */
+export async function deleteManagedGooglePrimaryCalendarEvent(eventId: string, expectedEtag: string): Promise<{ id: string; deleted: boolean }> {
+  eventId = requireManagedEventId(eventId);
+  const existing = await currentManagedEvent(eventId, expectedEtag);
   if (!existing) return { id: eventId, deleted: false };
-  if (existing.privateProperties.jarvisManaged !== MANAGED_MARKER) {
-    throw new GoogleCalendarError("Only a managed Google Calendar event can be deleted.");
-  }
-  const response = await calendarFetch(`/calendars/${PRIMARY_CALENDAR}/events/${encodeURIComponent(eventId)}`, { method: "DELETE" }, {
-    sendUpdates: "none",
-  });
+  const response = await calendarFetch(
+    `/calendars/${PRIMARY_CALENDAR}/events/${encodeURIComponent(eventId)}`,
+    { method: "DELETE", headers: { "If-Match": requireExpectedEtag(expectedEtag) } },
+    { sendUpdates: "none" },
+  );
   if (response.status === 404) return { id: eventId, deleted: false };
+  if (response.status === 412) {
+    throw new GoogleCalendarError("This managed Google Calendar event changed after the approval was prepared. Review it and request a fresh approval.");
+  }
   if (!response.ok) throw responseError(response);
   return { id: eventId, deleted: true };
 }
