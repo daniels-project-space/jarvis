@@ -195,6 +195,33 @@ describe("atomic trip itinerary persistence", () => {
     expect(JSON.parse(map?.data ?? "{}")).toMatchObject({ tripId: String(id), title: "Trip map · Lisbon" });
   });
 
+  it("preflights an oversized legacy plan before creating a map", async () => {
+    const t = convexTest(schema, modules);
+    const id = await t.run((ctx) => ctx.db.insert("creations", {
+      kind: "trip",
+      title: "Lisbon · legacy plan",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Lisbon · legacy plan",
+        destination: "Lisbon",
+        notes: "x".repeat(119_500),
+        planRevision: 0,
+      }),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+
+    await expect(t.mutation(api.creations.updateTripItinerary, {
+      id,
+      itinerary: JSON.stringify(day()),
+      planRevision: 1,
+      ensureMindmap: true,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: false, reason: "invalid_trip" });
+    const rows = await t.run((ctx) => ctx.db.query("creations").collect());
+    expect(rows.filter((row) => row.kind === "canvas")).toHaveLength(0);
+  });
+
   it("keeps the linked map current for later saved-plan changes", async () => {
     const t = convexTest(schema, modules);
     const id = await t.run((ctx) => ctx.db.insert("creations", {
@@ -219,7 +246,6 @@ describe("atomic trip itinerary persistence", () => {
       const canvasId = await ctx.db.insert("creations", {
         kind: "canvas",
         title: "Trip map · Lisbon",
-        threadId: "trip-thread",
         data: JSON.stringify({ title: "Trip map · Lisbon", tripId: String(id), nodes: [], edges: [] }),
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -248,9 +274,20 @@ describe("atomic trip itinerary persistence", () => {
     const map = await t.run((ctx) => ctx.db.get(mindmapCreationId));
     const mapData = JSON.parse(map?.data ?? "{}");
     expect(map?.updatedAt).toBe(trip?.updatedAt);
+    expect(map?.threadId).toBe("trip-thread");
     expect(mapData.nodes).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "trip", detail: "£975 of £1200 · 2 adults" }),
       expect.objectContaining({ id: "hotel", label: "🏨 New Stay" }),
     ]));
+
+    await expect(t.mutation(api.creations.update, {
+      id,
+      data: "not-json",
+      workerToken: WORKER,
+    })).rejects.toThrow("Trip plan data must be valid JSON");
+    const afterRejectedTrip = await t.run((ctx) => ctx.db.get(id));
+    const afterRejectedMap = await t.run((ctx) => ctx.db.get(mindmapCreationId));
+    expect(afterRejectedTrip?.data).toBe(trip?.data);
+    expect(afterRejectedMap?.data).toBe(map?.data);
   });
 });

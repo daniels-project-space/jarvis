@@ -44,7 +44,10 @@ async function linkedTripCanvasWrite(
   } catch {
     return { ok: false, reason: "invalid_mindmap" };
   }
-  if (!canvasRow || canvasRow.kind !== "canvas" || canvasRow.threadId !== trip.threadId || typeof canvasRow.data !== "string") {
+  // Older client-created maps predate thread filing. They are safe to repair
+  // only when unthreaded; a conflicting thread is never adopted.
+  const conflictingThread = canvasRow?.threadId !== undefined && canvasRow.threadId !== trip.threadId;
+  if (!canvasRow || canvasRow.kind !== "canvas" || conflictingThread || typeof canvasRow.data !== "string") {
     return { ok: false, reason: "invalid_mindmap" };
   }
 
@@ -208,26 +211,27 @@ export const update = mutation({
     const existing = a.data !== undefined ? await ctx.db.get(a.id) : null;
     let tripData = a.data;
     let canvasWrite: TripCanvasWrite | undefined;
-    if (existing?.kind === "trip" && typeof a.data === "string") {
+    if (existing?.kind === "trip" && a.data !== undefined) {
       let candidate: unknown;
       let persisted: unknown;
       try {
         candidate = JSON.parse(a.data);
         persisted = existing.data ? JSON.parse(existing.data) : undefined;
       } catch {
-        candidate = undefined;
+        throw new Error("Trip plan data must be valid JSON before it can update its linked map.");
       }
-      if (isRecord(candidate) && candidate.kind === "trip") {
-        // A generic save should never accidentally sever a durable map link
-        // merely because a caller was holding an older TripDoc snapshot.
-        if (typeof candidate.mindmapCreationId !== "string" && isRecord(persisted) && typeof persisted.mindmapCreationId === "string") {
-          candidate.mindmapCreationId = persisted.mindmapCreationId;
-          tripData = JSON.stringify(candidate);
-        }
-        const linked = await linkedTripCanvasWrite(ctx, existing, candidate);
-        if (!linked.ok) throw new Error(`Trip plan could not update its linked map: ${linked.reason}`);
-        canvasWrite = linked.write;
+      if (!isRecord(candidate) || candidate.kind !== "trip") {
+        throw new Error("Trip plan data must remain a trip document.");
       }
+      // A generic save should never accidentally sever a durable map link
+      // merely because a caller was holding an older TripDoc snapshot.
+      if (typeof candidate.mindmapCreationId !== "string" && isRecord(persisted) && typeof persisted.mindmapCreationId === "string") {
+        candidate.mindmapCreationId = persisted.mindmapCreationId;
+        tripData = JSON.stringify(candidate);
+      }
+      const linked = await linkedTripCanvasWrite(ctx, existing, candidate);
+      if (!linked.ok) throw new Error(`Trip plan could not update its linked map: ${linked.reason}`);
+      canvasWrite = linked.write;
     }
     const patch: Record<string, unknown> = { updatedAt: Date.now() };
     if (a.title !== undefined) patch.title = a.title.slice(0, 120);
@@ -541,6 +545,11 @@ export const updateTripItinerary = mutation({
       if (!linked.ok) return { ok: false as const, reason: linked.reason };
       canvasWrite = linked.write;
     } else if (a.ensureMindmap) {
+      // Reserve the largest accepted ID before inserting. A failing size check
+      // must happen before any canvas write, and the final guard below throws
+      // so Convex rolls the whole transaction back if this assumption changes.
+      const prospectiveData = JSON.stringify({ ...doc, mindmapCreationId: "x".repeat(160) });
+      if (prospectiveData.length > MAX_TRIP_CANVAS_BYTES) return { ok: false as const, reason: "invalid_trip" as const };
       const canvas = tripCanvas(doc);
       if (!canvas) return { ok: false as const, reason: "invalid_trip" as const };
       canvas.tripId = String(a.id);
@@ -560,7 +569,7 @@ export const updateTripItinerary = mutation({
     }
 
     const data = JSON.stringify(doc);
-    if (data.length > MAX_TRIP_CANVAS_BYTES) return { ok: false as const, reason: "invalid_trip" as const };
+    if (data.length > MAX_TRIP_CANVAS_BYTES) throw new Error("Trip plan exceeded its safe size after map creation");
     await ctx.db.patch(a.id, {
       // Retain the durable creation title; an itinerary patch must not roll
       // back an unrelated title edit encoded in a stale TripDoc payload.
