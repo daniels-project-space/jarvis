@@ -1195,7 +1195,7 @@ function SiteView({ url }: { url: string }) {
   );
 }
 
-function Viewport({
+export function Viewport({
   panel,
   onClose,
   onMinimize,
@@ -1253,6 +1253,17 @@ function Viewport({
         <BoardView value={panel.value} />
       ) : route.renderer === "scene" ? (
         <VisualSceneView value={panel.value} />
+      ) : route.renderer === "private_video" ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
+          <video
+            aria-label={panel.title ? `Private video: ${panel.title}` : "Private video"}
+            className="h-full min-h-0 w-full max-w-full flex-1 object-contain"
+            controls
+            playsInline
+            preload="metadata"
+            src={panel.value}
+          />
+        </div>
       ) : route.renderer === "iframe" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe

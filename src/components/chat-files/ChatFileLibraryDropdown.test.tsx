@@ -14,6 +14,7 @@ vi.mock("convex/react", () => ({
           { fileId: "file-1", name: "budget.csv", relativePath: "reports/budget.csv", mimeType: "text/csv", sizeBytes: 2_048, status: "ready", reviewState: "favorite" },
           { fileId: "file-2", name: "sunrise.webp", relativePath: "travel/sunrise.webp", mimeType: "image/webp", sizeBytes: 2_048, status: "ready", reviewState: "review_remove" },
           { fileId: "file-3", name: "flight.mp4", relativePath: "travel/flight.mp4", mimeType: "video/mp4", sizeBytes: 2_048, status: "stored_only" },
+          { fileId: "file-4", name: "arrival.mp4", relativePath: "travel/arrival.mp4", mimeType: "video/mp4", sizeBytes: 2_048, status: "ready" },
         ],
         status: "CanLoadMore",
         loadMore: vi.fn(),
@@ -21,7 +22,7 @@ vi.mock("convex/react", () => ({
     : { results: [], status: "Exhausted", loadMore: vi.fn() },
 }));
 
-import { ChatFileLibraryDropdown, filterFilesByReviewState, readyPrivateImagePanel } from "./ChatFileLibraryDropdown";
+import { ChatFileLibraryDropdown, filterFilesByReviewState, readyPrivateImagePanel, readyPrivateVideoPanel } from "./ChatFileLibraryDropdown";
 
 describe("private file library accessibility", () => {
   it("creates a panel input only for a ready detected image, without exposing storage keys", () => {
@@ -43,6 +44,31 @@ describe("private file library accessibility", () => {
       mimeType: "video/mp4",
       status: "stored_only",
     })).toBeNull();
+    expect(readyPrivateVideoPanel({
+      fileId: "file/one",
+      name: "arrival.mp4",
+      relativePath: "travel/arrival.mp4",
+      mimeType: "video/mp4",
+      status: "ready",
+    })).toEqual({
+      type: "private_video",
+      value: "/api/files/file%2Fone",
+      title: "travel/arrival.mp4",
+    });
+    expect(readyPrivateVideoPanel({
+      fileId: "file-3",
+      name: "flight.mp4",
+      relativePath: "travel/flight.mp4",
+      mimeType: "video/mp4",
+      status: "stored_only",
+    })).toBeNull();
+    expect(readyPrivateVideoPanel({
+      fileId: "file-2",
+      name: "sunrise.webp",
+      relativePath: "travel/sunrise.webp",
+      mimeType: "image/webp",
+      status: "ready",
+    })).toBeNull();
   });
 
   it("renders an associated dialog, named reversible review actions, and cursor continuation", () => {
@@ -61,6 +87,7 @@ describe("private file library accessibility", () => {
     expect(markup).toContain('aria-label="Attach budget.csv"');
     expect(markup).toContain('aria-label="Open budget.csv"');
     expect(markup).toContain('aria-label="Show sunrise.webp in Jarvis"');
+    expect(markup).toContain('aria-label="Show arrival.mp4 in Jarvis"');
     expect(markup).not.toContain('aria-label="Show budget.csv in Jarvis"');
     expect(markup).not.toContain('aria-label="Show flight.mp4 in Jarvis"');
     expect(markup).toContain('aria-label="Remove favourite from budget.csv"');

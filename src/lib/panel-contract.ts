@@ -13,6 +13,7 @@ export type PanelRenderer =
   | "fleet"
   | "board"
   | "scene"
+  | "private_video"
   | "iframe"
   | "image"
   | "code"
@@ -48,6 +49,13 @@ function widgetKind(value: string): string {
   }
 }
 
+// A private file panel is deliberately narrower than a normal video/embed
+// panel. It may only load the owner-authenticated file route, never an
+// arbitrary remote URL or storage-object key.
+export function isPrivateFilePanelUrl(value: string): boolean {
+  return /^\/api\/files\/[A-Za-z0-9%_-]+$/.test(value);
+}
+
 export function resolvePanelRoute(panel: PanelInput): PanelRoute {
   const widget = panel.type === "widget" ? widgetKind(panel.value) : null;
   const semanticKind = widget ? `widget:${widget}` : panel.type;
@@ -62,8 +70,9 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
                   : panel.type === "creations" ? "creations"
                     : panel.type === "travel" ? "travel"
                       : panel.type === "fleet" ? "fleet"
-                        : panel.type === "board" ? "board"
+                          : panel.type === "board" ? "board"
                           : panel.type === "scene" ? "scene"
+                            : panel.type === "private_video" && isPrivateFilePanelUrl(panel.value) ? "private_video"
                             : panel.type === "url" || panel.type === "video" ? "iframe"
                               : panel.type === "image" ? "image"
                                 : panel.type === "code" ? "code"
@@ -110,6 +119,7 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
     case "site":
     case "url": presentation = "workspace"; size = "h-full w-full"; break;
     case "video": presentation = "workspace"; size = "h-full w-full"; break;
+    case "private_video": presentation = "workspace"; size = "h-full w-full"; break;
     case "code": size = "h-[min(800px,98%)] w-[min(1040px,99%)]"; break;
   }
   return {
@@ -117,6 +127,6 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
     semanticKind,
     presentation,
     size,
-    keepOrbVisible: presentation === "compact" && panel.type !== "video",
+    keepOrbVisible: presentation === "compact" && panel.type !== "video" && panel.type !== "private_video",
   };
 }

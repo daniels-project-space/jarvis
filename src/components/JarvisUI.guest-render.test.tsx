@@ -51,7 +51,7 @@ vi.mock("next/dynamic", () => ({
 }));
 
 import Home from "../app/page";
-import JarvisUI, { MessageFileBadges, safeEmbeddedMessageText } from "./JarvisUI";
+import JarvisUI, { MessageFileBadges, safeEmbeddedMessageText, Viewport } from "./JarvisUI";
 
 describe("guest Home application render", () => {
   it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {
@@ -118,5 +118,23 @@ describe("guest Home application render", () => {
     expect(markup).toContain("saved only");
     expect(markup).toContain("Jarvis could not inspect this file&#x27;s contents.");
     expect(markup).toContain('href="/api/files/private-video"');
+  });
+
+  it("renders a ready private video through the native, owner-authenticated player", () => {
+    const markup = renderToStaticMarkup(
+      <Viewport
+        panel={{ type: "private_video", value: "/api/files/private-video", title: "Travel walkthrough" }}
+        onClose={() => undefined}
+        onMinimize={() => undefined}
+        full={false}
+        onToggleFull={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('<video');
+    expect(markup).toContain('src="/api/files/private-video"');
+    expect(markup).toContain('preload="metadata"');
+    expect(markup).toContain('aria-label="Private video: Travel walkthrough"');
+    expect(markup).not.toContain('<iframe');
   });
 });

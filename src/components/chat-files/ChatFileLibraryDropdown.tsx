@@ -13,6 +13,7 @@ type FileIdSetter = (update: string[] | ((current: string[]) => string[])) => vo
 type FileReviewState = NonNullable<ChatFileManifest["reviewState"]>;
 type ReviewFilter = "all" | Exclude<FileReviewState, "unreviewed">;
 const READY_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const READY_VIDEO_MIME_TYPES = new Set(["video/mp4", "video/quicktime", "video/webm"]);
 
 function reviewStateFor(file: Pick<ChatFileManifest, "reviewState">): FileReviewState {
   return file.reviewState === "favorite" || file.reviewState === "review_remove"
@@ -29,6 +30,16 @@ export function readyPrivateImagePanel(file: Pick<ChatFileManifest, "fileId" | "
   if (file.status !== "ready" || !READY_IMAGE_MIME_TYPES.has(mimeType)) return null;
   return {
     type: "image" as const,
+    value: `/api/files/${encodeURIComponent(file.fileId)}`,
+    title: (file.relativePath || file.name).slice(0, 120),
+  };
+}
+
+export function readyPrivateVideoPanel(file: Pick<ChatFileManifest, "fileId" | "name" | "relativePath" | "mimeType" | "status">) {
+  const mimeType = String(file.mimeType ?? "").trim().toLowerCase();
+  if (file.status !== "ready" || !READY_VIDEO_MIME_TYPES.has(mimeType)) return null;
+  return {
+    type: "private_video" as const,
     value: `/api/files/${encodeURIComponent(file.fileId)}`,
     title: (file.relativePath || file.name).slice(0, 120),
   };
@@ -261,8 +272,8 @@ export function ChatFileLibraryDropdown({
     }
   };
 
-  const showImage = async (file: LibraryFile) => {
-    const panel = readyPrivateImagePanel(file);
+  const showFileInJarvis = async (file: LibraryFile) => {
+    const panel = readyPrivateImagePanel(file) ?? readyPrivateVideoPanel(file);
     if (!panel || busyRef.current) return;
     busyRef.current = true;
     setBusyId(file.fileId);
@@ -325,7 +336,7 @@ export function ChatFileLibraryDropdown({
         )}
         {visibleFiles.map((file) => {
           const ready = file.status === "ready" || file.status === "stored_only";
-          const showableImage = Boolean(readyPrivateImagePanel(file));
+          const privatePanel = readyPrivateImagePanel(file) ?? readyPrivateVideoPanel(file);
           const retryable = file.status === "error";
           const reviewState = reviewStateFor(file);
           const deletionCandidate = view === "all" && reviewFilter === "review_remove" && reviewState === "review_remove";
@@ -349,8 +360,8 @@ export function ChatFileLibraryDropdown({
                 {ready && (
                   <a href={`/api/files/${encodeURIComponent(file.fileId)}`} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`} className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-white/8 hover:text-cyan">↗</a>
                 )}
-                {showableImage && (
-                  <button type="button" disabled={actionBusy} onClick={() => void showImage(file)} aria-label={`Show ${file.name} in Jarvis`} title="Show in Jarvis" className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-cyan/10 hover:text-cyan disabled:opacity-40">▧</button>
+                {privatePanel && (
+                  <button type="button" disabled={actionBusy} onClick={() => void showFileInJarvis(file)} aria-label={`Show ${file.name} in Jarvis`} title={privatePanel.type === "private_video" ? "Play in Jarvis" : "Show in Jarvis"} className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-cyan/10 hover:text-cyan disabled:opacity-40">{privatePanel.type === "private_video" ? "▶" : "▧"}</button>
                 )}
                 {retryable && (
                   <button type="button" disabled={actionBusy} onClick={() => void retry(file)} aria-label={`Retry ${file.name}`} className="min-h-10 rounded-lg px-2 text-[10px] text-amber-300 hover:bg-amber-300/10 disabled:opacity-40">retry</button>
