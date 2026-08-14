@@ -24,6 +24,8 @@ const contentTypes: Record<string, string> = {
   "/caption.css": "text/css; charset=utf-8",
   "/location": "text/html; charset=utf-8",
   "/location.js": "text/javascript; charset=utf-8",
+  "/booking-marker": "text/html; charset=utf-8",
+  "/booking-marker.js": "text/javascript; charset=utf-8",
 };
 
 const csp = [
@@ -123,6 +125,19 @@ const locationFixtureHtml = `<!doctype html>
   </body>
 </html>`;
 
+const bookingMarkerFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Booked location marker fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/booking-marker.js" defer></script>
+  </body>
+</html>`;
+
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
 
@@ -137,6 +152,7 @@ async function main() {
     voice: join(projectRoot, "e2e/fixtures/browser-voice-lease.browser.ts"),
     caption: join(projectRoot, "e2e/fixtures/spoken-caption-layout.browser.tsx"),
     location: join(projectRoot, "e2e/fixtures/trip-location-follow.browser.tsx"),
+    "booking-marker": join(projectRoot, "e2e/fixtures/trip-booked-stay-marker.browser.tsx"),
   },
   format: "iife",
   jsx: "automatic",
@@ -157,6 +173,7 @@ async function main() {
   const captionJsPath = join(outputDir, "caption.js");
   const captionCssPath = join(outputDir, "caption.css");
   const locationJsPath = join(outputDir, "location.js");
+  const bookingMarkerJsPath = join(outputDir, "booking-marker.js");
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
@@ -165,6 +182,7 @@ async function main() {
     access(captionJsPath),
     access(captionCssPath),
     access(locationJsPath),
+    access(bookingMarkerJsPath),
   ]);
 
   const server = createServer(async (request, response) => {
@@ -242,6 +260,11 @@ async function main() {
     response.end(locationFixtureHtml);
     return;
   }
+  if (pathname === "/booking-marker") {
+    response.writeHead(200);
+    response.end(bookingMarkerFixtureHtml);
+    return;
+  }
 
   response.writeHead(200);
   response.end(await readFile(
@@ -257,7 +280,9 @@ async function main() {
             ? captionCssPath
             : pathname === "/location.js"
               ? locationJsPath
-            : voiceJsPath,
+              : pathname === "/booking-marker.js"
+                ? bookingMarkerJsPath
+                : voiceJsPath,
   ));
   });
 
