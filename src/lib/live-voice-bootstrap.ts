@@ -17,6 +17,9 @@ export async function startLiveWithLease<T>(args: {
   openMicrophone: () => Promise<T>;
   releaseLiveLease: () => Promise<void> | void;
   isStillWanted?: () => boolean;
+  // A pending browser prompt can be shared by a replacement live start. The
+  // cancelled caller must not close a stream that the newer start has adopted.
+  shouldCloseCancelledMicrophone?: () => boolean;
   closeMicrophone?: (microphone: T) => Promise<void> | void;
 }): Promise<LiveVoiceLeaseStart<T>> {
   const isStillWanted = args.isStillWanted ?? (() => true);
@@ -53,10 +56,12 @@ export async function startLiveWithLease<T>(args: {
   }
 
   if (!isStillWanted()) {
-    try {
-      await args.closeMicrophone?.(microphone);
-    } catch {
-      // The ownership release still matters if a browser refuses a late close.
+    if (args.shouldCloseCancelledMicrophone?.() !== false) {
+      try {
+        await args.closeMicrophone?.(microphone);
+      } catch {
+        // The ownership release still matters if a browser refuses a late close.
+      }
     }
     await release();
     return { status: "cancelled" };

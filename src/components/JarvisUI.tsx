@@ -437,6 +437,31 @@ function clientId(): string {
   }
 }
 
+const LIVE_LEASE_SEQUENCE_KEY = "jarvis_live_lease_sequence";
+let fallbackLiveLeaseSequence = 0;
+
+function createLiveRemoteLease() {
+  const now = Date.now() * 1_000;
+  try {
+    const stored = Number(sessionStorage.getItem(LIVE_LEASE_SEQUENCE_KEY));
+    const previous = Number.isSafeInteger(stored) && stored > 0 ? stored : 0;
+    const sequence = Math.max(now, fallbackLiveLeaseSequence + 1, previous + 1);
+    sessionStorage.setItem(LIVE_LEASE_SEQUENCE_KEY, String(sequence));
+    fallbackLiveLeaseSequence = sequence;
+    return {
+      id: globalThis.crypto?.randomUUID?.() ?? `live-${sequence.toString(36)}-${Math.random().toString(36).slice(2)}`,
+      sequence,
+    };
+  } catch {
+    const sequence = Math.max(now, fallbackLiveLeaseSequence + 1);
+    fallbackLiveLeaseSequence = sequence;
+    return {
+      id: `live-${sequence.toString(36)}-${Math.random().toString(36).slice(2)}`,
+      sequence,
+    };
+  }
+}
+
 // Minimal, safe markdown for result panels: escape everything, then linkify
 // [title](url) + headers + bold. No raw HTML ever passes through.
 function mdToHtml(src: string): string {
@@ -1911,6 +1936,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const liveMicOpeningRef = useRef<Promise<LiveMicrophoneResources> | null>(null);
   const browserLiveLeaseRef = useRef<BrowserVoiceLease | null>(null);
   const browserLiveLeaseReleaseRef = useRef<Promise<void> | null>(null);
+  const liveRemoteLeaseRef = useRef<{ id: string; sequence: number } | null>(null);
   const liveSessionEpoch = useRef(0);
   const liveInterruptionEpoch = useRef(0);
   const voiceInterruptionPendingRef = useRef(false);
@@ -2430,7 +2456,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
       void releaseBrowserLiveLease();
       if (guest || !liveRef.current) return;
-      const liveBody = JSON.stringify({ path: "ui:setLiveOn", args: { client: me.current, on: false } });
+      const remoteLease = liveRemoteLeaseRef.current;
+      if (!remoteLease) return;
+      const liveBody = JSON.stringify({
+        path: "ui:setLiveOn",
+        args: {
+          client: me.current,
+          on: false,
+          liveLeaseId: remoteLease.id,
+          liveLeaseSequence: remoteLease.sequence,
+        },
+      });
       void viewerFetch("/api/client-mutation", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -3827,7 +3863,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (liveBeat.current) clearInterval(liveBeat.current);
     liveBeat.current = null;
     captionRef.current = null;
-    if (!guest) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+    const remoteLease = liveRemoteLeaseRef.current;
+    liveRemoteLeaseRef.current = null;
+    if (!guest && remoteLease) {
+      void setLiveOn({
+        client: me.current,
+        on: false,
+        liveLeaseId: remoteLease.id,
+        liveLeaseSequence: remoteLease.sequence,
+      }).catch(() => {});
+    }
   }
 
   function endFreeVoiceSession() {
@@ -3861,6 +3906,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     if (liveRef.current) return true;
     liveManuallyStopped.current = false;
+    const remoteLease = createLiveRemoteLease();
     unlockSpeechPlayback();
     // Live capture supersedes passive wake listening. Releasing this distinct
     // lease also tells a host-owned overlay recognizer to stop before its own
@@ -3878,12 +3924,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setLive("connecting");
     let browserLease: BrowserVoiceLease | null = null;
     let browserLeaseOutcome: BrowserVoiceLeaseResult["status"] | null = null;
-    let remoteLeaseOwned = false;
+    let releaseRequested = false;
     const releaseStartLease = async () => {
+      releaseRequested = true;
       await releaseBrowserLiveLease(browserLease);
-      if (!guest && remoteLeaseOwned) {
-        remoteLeaseOwned = false;
-        await setLiveOn({ client: me.current, on: false }).catch(() => {});
+      if (!guest) {
+        if (
+          liveRemoteLeaseRef.current?.id === remoteLease.id
+          && liveRemoteLeaseRef.current.sequence === remoteLease.sequence
+        ) liveRemoteLeaseRef.current = null;
+        await setLiveOn({
+          client: me.current,
+          on: false,
+          liveLeaseId: remoteLease.id,
+          liveLeaseSequence: remoteLease.sequence,
+        }).catch(() => {});
       }
     };
     const started = await startLiveWithLease({
@@ -3903,18 +3958,41 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         }
         browserLiveLeaseRef.current = browserLease;
         if (guest) return true;
-        const ownership = setLiveOn({ client: me.current, on: true });
+        liveRemoteLeaseRef.current = remoteLease;
+        const ownership = setLiveOn({
+          client: me.current,
+          on: true,
+          liveLeaseId: remoteLease.id,
+          liveLeaseSequence: remoteLease.sequence,
+        });
         try {
           const owned = await withClientDeadline(ownership, 5_000, "live ownership");
-          if (!owned) await releaseBrowserLiveLease(browserLease);
-          remoteLeaseOwned = owned;
+          if (!owned) {
+            if (
+              liveRemoteLeaseRef.current?.id === remoteLease.id
+              && liveRemoteLeaseRef.current.sequence === remoteLease.sequence
+            ) liveRemoteLeaseRef.current = null;
+            await releaseBrowserLiveLease(browserLease);
+          }
           return owned;
         } catch (error) {
           // A late successful claim must not leave a ghost live owner after
           // this UI has already recovered to standby.
+          releaseRequested = true;
+          if (
+            liveRemoteLeaseRef.current?.id === remoteLease.id
+            && liveRemoteLeaseRef.current.sequence === remoteLease.sequence
+          ) liveRemoteLeaseRef.current = null;
           await releaseBrowserLiveLease(browserLease);
           void ownership.then((claimed) => {
-            if (!guest && claimed && !liveRef.current) void setLiveOn({ client: me.current, on: false }).catch(() => {});
+            if (!guest && claimed && releaseRequested) {
+              void setLiveOn({
+                client: me.current,
+                on: false,
+                liveLeaseId: remoteLease.id,
+                liveLeaseSequence: remoteLease.sequence,
+              }).catch(() => {});
+            }
           }, () => undefined);
           throw error;
         }
@@ -3922,10 +4000,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       openMicrophone: ensurePersistentLiveMic,
       releaseLiveLease: releaseStartLease,
       isStillWanted: () => liveRef.current && sessionEpoch === liveSessionEpoch.current,
+      shouldCloseCancelledMicrophone: () => (
+        sessionEpoch === liveSessionEpoch.current || !liveRef.current
+      ),
       closeMicrophone: () => closePersistentLiveMic(),
     });
     if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
-      if (started.status === "ready" && !liveRef.current) closePersistentLiveMic();
+      if (
+        started.status === "ready"
+        && (sessionEpoch === liveSessionEpoch.current || !liveRef.current)
+      ) closePersistentLiveMic();
       await releaseStartLease();
       return false;
     }
@@ -3969,7 +4053,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     if (shouldMaintainLiveHeartbeat({ guest, visible: !document.hidden, live: liveRef.current })) {
       liveBeat.current = setInterval(() => {
         if (!shouldMaintainLiveHeartbeat({ guest, visible: !document.hidden, live: liveRef.current })) return;
-        void setLiveOn({ client: me.current, on: true }).catch(() => {});
+        const remoteLease = liveRemoteLeaseRef.current;
+        if (!remoteLease) return;
+        void setLiveOn({
+          client: me.current,
+          on: true,
+          liveLeaseId: remoteLease.id,
+          liveLeaseSequence: remoteLease.sequence,
+        }).catch(() => {});
       }, 20_000);
     }
     if (captureImmediately) void freeVoiceTurn();

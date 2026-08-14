@@ -3,6 +3,7 @@ import { commandAfterWake, startWake, stopWake, WAKE_COMMAND_GRACE_MS } from "./
 
 class FakeSpeechRecognition {
   static instance: FakeSpeechRecognition | null = null;
+  static instances: FakeSpeechRecognition[] = [];
   lang = "";
   continuous = false;
   interimResults = false;
@@ -15,6 +16,7 @@ class FakeSpeechRecognition {
 
   constructor() {
     FakeSpeechRecognition.instance = this;
+    FakeSpeechRecognition.instances.push(this);
   }
 
   emit(text: string, isFinal = false) {
@@ -31,6 +33,7 @@ describe("wake command capture", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     FakeSpeechRecognition.instance = null;
+    FakeSpeechRecognition.instances = [];
   });
 
   it("preserves a command spoken in the same breath", () => {
@@ -57,6 +60,35 @@ describe("wake command capture", () => {
     expect(delivered).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(delivered).toHaveBeenCalledWith("hey jarvis");
+  });
+
+  it("ignores a final wake result emitted after that recognizer was stopped", () => {
+    vi.stubGlobal("window", { webkitSpeechRecognition: FakeSpeechRecognition });
+    const delivered = vi.fn();
+
+    startWake(delivered);
+    const first = FakeSpeechRecognition.instance;
+    stopWake();
+
+    first?.emit("hey jarvis", true);
+    expect(delivered).not.toHaveBeenCalled();
+  });
+
+  it("does not let a delayed old onend spawn a third recognizer after re-arm", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { webkitSpeechRecognition: FakeSpeechRecognition });
+
+    startWake(vi.fn());
+    const first = FakeSpeechRecognition.instance;
+    stopWake();
+    startWake(vi.fn());
+    const second = FakeSpeechRecognition.instance;
+
+    first?.onend?.();
+    vi.advanceTimersByTime(120);
+
+    expect(FakeSpeechRecognition.instance).toBe(second);
+    expect(FakeSpeechRecognition.instances).toEqual([first, second]);
   });
 
   it("keeps standby visibly active while the browser rotates recognition sessions", () => {

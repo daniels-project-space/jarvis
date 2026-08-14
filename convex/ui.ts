@@ -345,17 +345,56 @@ export const getVoice = query({
 // devices, and while it's fresh no tab anywhere plays local TTS. The live
 // voice is the only possible speaker — two voices become impossible.
 export const setLiveOn = mutation({
-  args: { client: v.string(), on: v.boolean(), ...actorAuthArgs },
+  args: {
+    client: v.string(),
+    on: v.boolean(),
+    liveLeaseId: v.optional(v.string()),
+    liveLeaseSequence: v.optional(v.number()),
+    ...actorAuthArgs,
+  },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "liveOn")).first();
+    const liveLeaseSequence = a.liveLeaseSequence;
     if (!a.on) {
-      if (ex && ex.value === a.client) await ctx.db.delete(ex._id);
+      // A delayed stop from an older start must never erase a newer session
+      // from the same tab. Legacy callers without a fenced lease safely no-op.
+      if (
+        ex
+        && ex.value === a.client
+        && ex.liveLeaseId === a.liveLeaseId
+        && ex.liveLeaseSequence === a.liveLeaseSequence
+      ) await ctx.db.delete(ex._id);
       return true;
     }
+    if (
+      !a.liveLeaseId
+      || typeof liveLeaseSequence !== "number"
+      || !Number.isSafeInteger(liveLeaseSequence)
+      || liveLeaseSequence <= 0
+    ) return false;
     // refuse a second live session while another client's lock is fresh
     if (ex && ex.value !== a.client && Date.now() - ex.updatedAt < 45_000) return false;
-    const doc = { key: "liveOn", type: "flag", value: a.client, updatedAt: Date.now() };
+    const freshSameClient = ex && ex.value === a.client && Date.now() - ex.updatedAt < 45_000;
+    if (
+      freshSameClient
+      && Number.isSafeInteger(ex.liveLeaseSequence)
+      && (
+        ex.liveLeaseSequence! > liveLeaseSequence
+        || (
+          ex.liveLeaseSequence === liveLeaseSequence
+          && ex.liveLeaseId !== a.liveLeaseId
+        )
+      )
+    ) return false;
+    const doc = {
+      key: "liveOn",
+      type: "flag",
+      value: a.client,
+      liveLeaseId: a.liveLeaseId,
+      liveLeaseSequence,
+      updatedAt: Date.now(),
+    };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
     return true;

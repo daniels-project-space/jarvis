@@ -2059,6 +2059,10 @@ export default defineSchema({
     type: v.string(), // "url" | "markdown" | "image"
     value: v.string(),
     title: v.optional(v.string()),
+    // The live-mode row uses these to fence delayed claims and releases from a
+    // superseded browser start. Other UI rows intentionally leave them empty.
+    liveLeaseId: v.optional(v.string()),
+    liveLeaseSequence: v.optional(v.number()),
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
 

@@ -93,6 +93,8 @@ describe("live voice bootstrap policy", () => {
     expect(toggleLive).toContain("startLiveWithLease({");
     expect(toggleLive).toContain("openMicrophone: ensurePersistentLiveMic");
     expect(toggleLive).not.toContain("const microphone = ensurePersistentLiveMic");
+    expect(toggleLive).toContain("shouldCloseCancelledMicrophone:");
+    expect(toggleLive).toContain("sessionEpoch === liveSessionEpoch.current || !liveRef.current");
   });
 
   it("takes an origin-wide browser lease before a guest or overlay can open capture", () => {
@@ -177,6 +179,41 @@ describe("live voice bootstrap policy", () => {
     await expect(start).resolves.toEqual({ status: "cancelled" });
     expect(closeMicrophone).toHaveBeenCalledWith({ id: "late" });
     expect(releaseLiveLease).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a shared late microphone open when a newer start adopted it", async () => {
+    const microphone = deferred<{ id: string }>();
+    const closeFirstMicrophone = vi.fn();
+    const releaseFirstLease = vi.fn(async () => {});
+    const releaseSecondLease = vi.fn(async () => {});
+    let firstWanted = true;
+    let secondWanted = false;
+
+    const first = startLiveWithLease({
+      acquireLiveLease: async () => true,
+      openMicrophone: () => microphone.promise,
+      releaseLiveLease: releaseFirstLease,
+      isStillWanted: () => firstWanted,
+      shouldCloseCancelledMicrophone: () => !secondWanted,
+      closeMicrophone: closeFirstMicrophone,
+    });
+    await Promise.resolve();
+
+    firstWanted = false;
+    secondWanted = true;
+    const second = startLiveWithLease({
+      acquireLiveLease: async () => true,
+      openMicrophone: () => microphone.promise,
+      releaseLiveLease: releaseSecondLease,
+      isStillWanted: () => secondWanted,
+    });
+    microphone.resolve({ id: "shared" });
+
+    await expect(first).resolves.toEqual({ status: "cancelled" });
+    await expect(second).resolves.toEqual({ status: "ready", microphone: { id: "shared" } });
+    expect(closeFirstMicrophone).not.toHaveBeenCalled();
+    expect(releaseFirstLease).toHaveBeenCalledTimes(1);
+    expect(releaseSecondLease).not.toHaveBeenCalled();
   });
 
   it("fails closed when passive narration cannot obtain the shared voice lease", () => {

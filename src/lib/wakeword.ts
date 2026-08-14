@@ -48,11 +48,17 @@ export function startWake(
     const r = new SR();
     rec = r;
     let restartScheduled = false;
+    const isCurrent = () => wanted && rec === r;
     const restart = () => {
-      if (restartScheduled || !wanted) return;
+      if (restartScheduled || !isCurrent()) return;
       restartScheduled = true;
-      if (rec === r) rec = null;
-      setTimeout(spin, WAKE_RESTART_DELAY_MS);
+      rec = null;
+      setTimeout(() => {
+        // A stopped recognizer can emit its old `onend` after a newer standby
+        // session has already been armed. Never let that stale timer create a
+        // second listener alongside the current one.
+        if (wanted && rec === null) spin();
+      }, WAKE_RESTART_DELAY_MS);
     };
     r.lang = "en-GB";
     r.continuous = true;
@@ -69,13 +75,17 @@ export function startWake(
     let delivered = false;
     let detected = false;
     const deliver = () => {
-      if (delivered) return;
+      // A grace-window timer belongs to this recognizer too. If standby was
+      // stopped and re-armed in the meantime, it must not stop the new listener
+      // or send a phantom command from the old one.
+      if (delivered || !isCurrent()) return;
       delivered = true;
       if (wakeTimer) clearTimeout(wakeTimer);
       stopWake();
       onWake(wakeTranscript);
     };
     r.onresult = (e: any) => {
+      if (!isCurrent()) return;
       if (suppressed) return; // JARVIS is saying "jarvis" himself — never self-wake
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const text = String(e.results[i][0].transcript || "").toLowerCase().trim();
@@ -108,6 +118,7 @@ export function startWake(
       }
     };
     r.onend = () => {
+      if (!isCurrent()) return;
       if (wakeTranscript && !delivered) {
         deliver();
         return;
@@ -122,6 +133,7 @@ export function startWake(
       onState?.(false);
     };
     r.onerror = (e: any) => {
+      if (!isCurrent()) return;
       // "not-allowed" = mic permission denied — stop trying
       if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
         wanted = false;
