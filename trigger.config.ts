@@ -35,6 +35,10 @@ export default defineConfig({
             // codex-session vault service and persisted encrypted in its
             // private R2 bucket. Never fan auth.json into Trigger containers.
             "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN",
+            // Dedicated, read-only Hub context capability. It stays in the
+            // trusted worker/controller environment and is stripped from any
+            // Codex child process before spawn.
+            "JARVIS_HUB_CONTEXT_TOKEN",
             "JARVIS_PRIVATE_R2_BUCKET",
             "JARVIS_CODEX_SESSION_SOURCE",
             "JARVIS_MISSION_PROTOCOL_ROLLOUT",

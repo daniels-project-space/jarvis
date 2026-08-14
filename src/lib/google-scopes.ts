@@ -4,6 +4,9 @@
 
 export const GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 export const GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose";
+// Older connections may have this broader historical grant. It remains a
+// compatibility capability only; new consent never requests it.
+export const GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
 // `calendar.events.owned` is enough for the authenticated account's primary
 // calendar and cannot alter events on calendars merely shared with it.
@@ -26,7 +29,9 @@ export function hasGoogleScopes(scope: string, required: readonly string[]): boo
 
 export function googleCapabilities(scope: string) {
   return {
-    gmail: hasGoogleScopes(scope, [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_COMPOSE_SCOPE]),
+    gmail:
+      hasGoogleScopes(scope, [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_COMPOSE_SCOPE]) ||
+      hasGoogleScopes(scope, [GOOGLE_GMAIL_MODIFY_SCOPE]),
     calendar: hasGoogleScopes(scope, [GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE]),
   };
 }

@@ -16,13 +16,13 @@ describe("Google OAuth scope policy", () => {
     ]);
   });
 
-  it("requires the least-privilege Gmail grants before enabling Gmail tools", () => {
+  it("accepts the least-privilege grant and keeps a historical broader grant working", () => {
     expect(googleCapabilities(`${GOOGLE_GMAIL_READONLY_SCOPE} ${GOOGLE_GMAIL_COMPOSE_SCOPE}`)).toEqual({
       gmail: true,
       calendar: false,
     });
     expect(googleCapabilities(`https://www.googleapis.com/auth/gmail.modify ${GOOGLE_GMAIL_COMPOSE_SCOPE}`)).toEqual({
-      gmail: false,
+      gmail: true,
       calendar: false,
     });
   });

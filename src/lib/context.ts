@@ -3,13 +3,13 @@ import { currentAdminSession } from "./control-context";
 import { compileContext } from "./context-compiler";
 import { resolveConvexUrl } from "./convex-url";
 import { PORTFOLIO_NORTH_STAR, PROJECT_REGISTRY } from "./project-registry";
+import { HUB_CONTEXT_URL, hubContextRequestArgs } from "./hub-context";
 
 // Server-side context bundle for the brain: memory, business intel, hub
 // (to-dos/calendar/wealth), cloud stack, running agents, fresh findings.
 // Used by the subscription conversation worker on every turn.
 
 const CONVEX_URL = resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL, process.env.CONVEX_URL);
-const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
 let hubCache: { value: any; expiresAt: number } | null = null;
 let hubRequest: Promise<any> | null = null;
 let brainLastKnownGood: { value: any; capturedAt: number } | null = null;
@@ -65,11 +65,13 @@ export async function convexMutation(path: string, args: unknown): Promise<any> 
 export const convexQuery = (path: string, args: unknown = {}) => q(CONVEX_URL, path, args);
 
 async function hubSnapshot(signal?: AbortSignal) {
+  const args = hubContextRequestArgs();
+  // Project Hub accepts only its dedicated `jarvis-context` capability. Do
+  // not fall back to VAULT_ACCESS_TOKEN: its scope is intentionally broader.
+  if (!args) return null;
   if (hubCache && hubCache.expiresAt > Date.now()) return hubCache.value;
   if (hubRequest) return hubRequest;
-  hubRequest = q(HUB_URL, "jarvisContext:snapshot", {
-    vaultToken: process.env.VAULT_ACCESS_TOKEN,
-  }, signal).then((value) => {
+  hubRequest = q(HUB_CONTEXT_URL, "jarvisContext:snapshot", args, signal).then((value) => {
     // The remote-work hub is expensive relative to a conversational turn and
     // does not change token-by-token. A short shared cache removes a whole
     // network dependency from rapid follow-ups while keeping work data fresh.
