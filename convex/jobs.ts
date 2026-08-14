@@ -67,6 +67,10 @@ import {
   resolveBackgroundExecutionProfileForWorkOrder,
 } from "../src/lib/background-execution-profile";
 import {
+  canonicalNovitaPatchProposalOutcome,
+  canonicalNovitaPatchProposalReservation,
+} from "../src/lib/novita-patch-proposal-receipt";
+import {
   exactTerminalWorkReceipt,
   insertFreshTerminalWorkReceipt,
   type RecoveryDisposition,
@@ -3397,7 +3401,7 @@ export const scrubSensitiveOutput = mutation({
   args: { jobId: v.id("jobs"), ...viewerAuthArgs },
   handler: async (ctx, a) => {
     await requireViewer(ctx, a);
-    const row: any = await ctx.db.get(a.jobId);
+    const row = await ctx.db.get(a.jobId);
     if (!row) return { scrubbed: false, fields: [] as string[] };
     const patch: Record<string, string> = {};
     for (const field of ["result", "checkpoint", "log", "progress", "verificationNote", "question"] as const) {
@@ -4392,6 +4396,181 @@ export const authorizeExecutionBoundary = mutation({
       toolScope: authority.workOrder.toolScope,
       mcpScope: authority.workOrder.mcpScope,
     };
+  },
+});
+
+// The Qwen draft is optional, but its paid egress is not retryable. This
+// creates one irrevocable reservation per immutable work-order revision before
+// a worker may read the vault or make a network request. A stranded reservation
+// intentionally remains held: a missed draft is safer than double billing.
+export const reserveNovitaPatchProposal = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    expectedAttempt: v.number(),
+    workerRunId: v.string(),
+    authorityDigest: v.string(),
+    workOrderRevisionDigest: v.string(),
+    dispatchGeneration: v.number(),
+    dispatchPhase: v.string(),
+    dispatchReceiptDigest: v.string(),
+    dispatchPayloadDigest: v.string(),
+    receiptId: v.string(),
+    requestDigest: v.string(),
+    sourceFileCount: v.number(),
+    inputBytes: v.number(),
+    reservationDigest: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row: any = await ctx.db.get(a.jobId);
+    const attempt = row ? await attemptFor(ctx, a.jobId, a.expectedAttempt) : null;
+    if (!row || !attempt || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
+      || row.workerRunId !== a.workerRunId
+      || row.dispatchGeneration !== a.dispatchGeneration
+      || row.dispatchPhase !== a.dispatchPhase
+      || row.dispatchReceiptDigest !== a.dispatchReceiptDigest
+      || row.dispatchPayloadDigest !== a.dispatchPayloadDigest
+      || !/^[a-f0-9]{64}$/.test(a.receiptId)
+      || !/^[a-f0-9]{64}$/.test(a.requestDigest)
+      || !/^[a-f0-9]{64}$/.test(a.reservationDigest)
+      || !Number.isSafeInteger(a.sourceFileCount) || a.sourceFileCount < 1 || a.sourceFileCount > 3
+      || !Number.isSafeInteger(a.inputBytes) || a.inputBytes < 1) return null;
+    const dispatch = await claimedDispatchReceiptForRow(ctx, row, a.workerRunId);
+    if (!dispatch || dispatch.receiptDigest !== a.dispatchReceiptDigest || dispatch.payloadDigest !== a.dispatchPayloadDigest
+      || dispatch.authorityDigest !== a.authorityDigest || dispatch.workOrderRevisionDigest !== a.workOrderRevisionDigest) return null;
+    const authority = await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest);
+    if (!authority || authority.workOrderRevisionDigest !== a.workOrderRevisionDigest) return null;
+    const executionProfile = authority.workOrder.backgroundExecutionProfile === undefined
+      ? resolveBackgroundExecutionProfileForWorkOrder({
+        modelTier: authority.workOrder.minimumModel,
+        readonly: authority.workOrder.readonly,
+        repositoryCapabilities: authority.workOrder.toolScope,
+      })
+      : resolveBackgroundExecutionProfile(authority.workOrder.backgroundExecutionProfile);
+    if (!executionProfile.accepted || executionProfile.profile.version !== 2) return null;
+    const attestation = executionProfile.profile.novitaPatchProposer;
+    if (a.inputBytes > attestation.requestLimits.maxInputBytes) return null;
+    const expectedReservationDigest = await sha256Hex(canonicalNovitaPatchProposalReservation({
+      workOrderRevisionDigest: authority.workOrderRevisionDigest,
+      attestation,
+      requestDigest: a.requestDigest,
+      sourceFileCount: a.sourceFileCount,
+      inputBytes: a.inputBytes,
+    }));
+    const expectedReceiptId = await sha256Hex([
+      "jarvis-novita-patch-proposal-receipt-v1",
+      String(authority.workOrderRevisionId),
+      expectedReservationDigest,
+    ].join(":"));
+    if (a.reservationDigest !== expectedReservationDigest || a.receiptId !== expectedReceiptId) return null;
+    const existing = await ctx.db
+      .query("novitaPatchProposalReceipts")
+      .withIndex("by_work_order_revision", (q) => q.eq("workOrderRevisionId", authority.workOrderRevisionId))
+      .take(2);
+    if (existing.length > 0) return { disposition: "held" as const };
+    const now = Date.now();
+    await ctx.db.insert("novitaPatchProposalReceipts", {
+      protocolVersion: 1,
+      workOrderRevisionId: authority.workOrderRevisionId,
+      workOrderRevision: authority.workOrderRevision,
+      workOrderRevisionDigest: authority.workOrderRevisionDigest,
+      jobId: row._id,
+      canonicalProjectId: authority.canonicalProjectId,
+      repository: authority.repository ?? undefined,
+      schedulingBindingDigest: authority.schedulingBindingDigest,
+      authorityDigest: authority.authorityDigest,
+      workAttemptId: attempt._id,
+      ownerAttempt: a.expectedAttempt,
+      ownerWorkerRunId: a.workerRunId,
+      ownerDispatchReceiptDigest: a.dispatchReceiptDigest,
+      ownerDispatchPayloadDigest: a.dispatchPayloadDigest,
+      adapterId: attestation.adapterId,
+      configDigest: attestation.configDigest,
+      endpointId: attestation.endpointId,
+      requestDigest: a.requestDigest,
+      sourceFileCount: a.sourceFileCount,
+      inputBytes: a.inputBytes,
+      reservationDigest: expectedReservationDigest,
+      status: "reserved",
+      reservedAt: now,
+    });
+    return { disposition: "execute" as const, receiptId: expectedReceiptId, reservationDigest: expectedReservationDigest };
+  },
+});
+
+// The original owner can settle its reservation even if the mutable job has
+// since checkpointed. Replays are accepted only when byte-for-byte identical;
+// no reservation is ever reclaimed or re-opened.
+export const settleNovitaPatchProposal = mutation({
+  args: {
+    workOrderRevisionId: v.id("workOrderRevisions"),
+    jobId: v.id("jobs"),
+    ownerAttempt: v.number(),
+    ownerWorkerRunId: v.string(),
+    authorityDigest: v.string(),
+    ownerDispatchReceiptDigest: v.string(),
+    ownerDispatchPayloadDigest: v.string(),
+    receiptId: v.string(),
+    reservationDigest: v.string(),
+    outcome: v.union(
+      v.literal("proposed"), v.literal("no_change"), v.literal("skipped"),
+      v.literal("unavailable"), v.literal("rejected"),
+    ),
+    outcomeDigest: v.string(),
+    outputBytes: v.number(),
+    failureClass: v.optional(v.union(
+      v.literal("configuration"), v.literal("input"), v.literal("transport"),
+      v.literal("timeout"), v.literal("http"), v.literal("response"),
+    )),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    if (!/^[a-f0-9]{64}$/.test(a.receiptId) || !/^[a-f0-9]{64}$/.test(a.authorityDigest)
+      || !/^[a-f0-9]{64}$/.test(a.reservationDigest)
+      || !/^[a-f0-9]{64}$/.test(a.outcomeDigest)
+      || !Number.isSafeInteger(a.outputBytes) || a.outputBytes < 0 || a.outputBytes > 64_000) return false;
+    const rows = await ctx.db
+      .query("novitaPatchProposalReceipts")
+      .withIndex("by_work_order_revision", (q) => q.eq("workOrderRevisionId", a.workOrderRevisionId))
+      .take(2);
+    if (rows.length !== 1) return false;
+    const receipt = rows[0];
+    if (receipt.jobId !== a.jobId || receipt.ownerAttempt !== a.ownerAttempt
+      || receipt.ownerWorkerRunId !== a.ownerWorkerRunId
+      || receipt.authorityDigest !== a.authorityDigest
+      || receipt.ownerDispatchReceiptDigest !== a.ownerDispatchReceiptDigest
+      || receipt.ownerDispatchPayloadDigest !== a.ownerDispatchPayloadDigest
+      || receipt.reservationDigest !== a.reservationDigest) return false;
+    const expectedReceiptId = await sha256Hex([
+      "jarvis-novita-patch-proposal-receipt-v1",
+      String(receipt.workOrderRevisionId),
+      receipt.reservationDigest,
+    ].join(":"));
+    if (a.receiptId !== expectedReceiptId) return false;
+    const expectedOutcomeDigest = await sha256Hex(canonicalNovitaPatchProposalOutcome({
+      reservationDigest: receipt.reservationDigest,
+      outcome: a.outcome,
+      failureClass: a.failureClass,
+      outputBytes: a.outputBytes,
+    }));
+    if (a.outcomeDigest !== expectedOutcomeDigest) return false;
+    if (receipt.status === "settled") {
+      return receipt.outcome === a.outcome
+        && receipt.outcomeDigest === a.outcomeDigest
+        && receipt.outputBytes === a.outputBytes
+        && receipt.failureClass === a.failureClass;
+    }
+    await ctx.db.patch(receipt._id, {
+      status: "settled",
+      outcome: a.outcome,
+      outcomeDigest: a.outcomeDigest,
+      outputBytes: a.outputBytes,
+      failureClass: a.failureClass,
+      settledAt: Date.now(),
+    });
+    return true;
   },
 });
 

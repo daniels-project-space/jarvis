@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import type { NovitaPatchProposerAttestation } from "../lib/novita-patch-proposer-attestation";
-import { parseNovitaPatchProposal, requestNovitaPatchProposal } from "./novita-qwen-patch-proposer";
+import {
+  derivedNovitaEndpointBearer,
+  parseNovitaPatchProposal,
+  requestNovitaPatchProposal,
+} from "./novita-qwen-patch-proposer";
 
 function runtimeConfig() {
   const withoutDigest = {
@@ -14,6 +18,7 @@ function runtimeConfig() {
     imageDigest: "sha256:c2f3b1b964e47809b722b5e75b61b1e7b39a50f70388cf2bf2418f16a9f31da2",
     quantization: "gptq-int4",
     api: "openai-chat-completions",
+    endpointAuth: "hmac-sha256-v1",
     requestLimits: { maxInputBytes: 12_000, maxOutputTokens: 800, maxTurns: 1, timeoutMs: 30_000 },
   } as const;
   const configDigest = createHash("sha256").update(JSON.stringify(withoutDigest)).digest("hex");
@@ -57,7 +62,8 @@ describe("Novita Qwen patch proposer", () => {
     const [url, init] = fetchImpl.mock.calls[0];
     expect(String(url)).toBe("https://qwen.endpoint.novita.ai/private-endpoint/v1/chat/completions");
     expect(init).toMatchObject({ method: "POST", redirect: "error" });
-    expect(init.headers.authorization).toBe("Bearer secret-not-in-result");
+    expect(init.headers.authorization).toBe(`Bearer ${derivedNovitaEndpointBearer("secret-not-in-result", attestation())}`);
+    expect(init.headers.authorization).not.toContain("secret-not-in-result");
     expect(JSON.parse(init.body)).toMatchObject({
       model: "Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4",
       max_tokens: 800,
@@ -85,6 +91,28 @@ describe("Novita Qwen patch proposer", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it("fails closed before vault access when only the endpoint URL drifts", async () => {
+    const altered = runtimeConfig();
+    const getApiKey = vi.fn();
+    const fetchImpl = vi.fn();
+    const result = await requestNovitaPatchProposal({
+      attestation: attestation(),
+      task: "Fix src/example.ts.",
+      files: [{ path: "src/example.ts", content: "export const value = 1;\n" }],
+      getApiKey,
+      environment: {
+        JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({
+          ...altered,
+          endpointUrl: "https://other.endpoint.novita.ai/private-endpoint",
+        }),
+      },
+      fetchImpl,
+    });
+    expect(result).toEqual({ status: "unavailable", reason: "runtime_config_digest_mismatch" });
+    expect(getApiKey).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("rejects a patch that touches an unprovided or unsafe path", () => {
     const limits = attestation().requestLimits;
     expect(parseNovitaPatchProposal({
@@ -106,6 +134,53 @@ describe("Novita Qwen patch proposer", () => {
       attestation: attestation(),
       task: "Fix src/example.ts.",
       files: [{ path: "src/example.ts", content: "x".repeat(20_000) }],
+      getApiKey,
+      environment: environment(),
+      fetchImpl,
+    });
+    expect(result).toEqual({ status: "skipped", reason: "source_context_out_of_bounds" });
+    expect(getApiKey).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("counts prompt framing in the input cap before it reads the vault", async () => {
+    const fetchImpl = vi.fn();
+    const getApiKey = vi.fn();
+    const result = await requestNovitaPatchProposal({
+      attestation: attestation(),
+      task: "Fix src/example.ts.",
+      files: [{ path: "src/example.ts", content: "x".repeat(11_900) }],
+      getApiKey,
+      environment: environment(),
+      fetchImpl,
+    });
+    expect(result).toEqual({ status: "skipped", reason: "request_out_of_bounds" });
+    expect(getApiKey).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("rejects a declared oversized response without parsing it", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("{}", {
+      headers: { "content-type": "application/json", "content-length": "999999" },
+    }));
+    const result = await requestNovitaPatchProposal({
+      attestation: attestation(),
+      task: "Fix src/example.ts.",
+      files: [{ path: "src/example.ts", content: "export const value = 1;\n" }],
+      getApiKey: vi.fn().mockResolvedValue("control-key"),
+      environment: environment(),
+      fetchImpl,
+    });
+    expect(result).toEqual({ status: "rejected", reason: "response_out_of_bounds" });
+  });
+
+  it("rejects source content that contains a credential pattern before vault access", async () => {
+    const fetchImpl = vi.fn();
+    const getApiKey = vi.fn();
+    const result = await requestNovitaPatchProposal({
+      attestation: attestation(),
+      task: "Fix src/example.ts.",
+      files: [{ path: "src/example.ts", content: "const key = 'nvapi-abcdefghijk';\n" }],
       getApiKey,
       environment: environment(),
       fetchImpl,

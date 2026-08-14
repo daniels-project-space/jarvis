@@ -60,7 +60,9 @@ const backgroundExecutionProfileValidator = v.union(
   v.object({
     version: v.literal(2),
     provider: v.literal("codex-subscription"),
-    modelTier: missionSupervisorModelTierValidator,
+    // The untrusted Qwen stage is reviewed by Terra; it never lowers the
+    // sealed Codex executor to the draft model's budget tier.
+    modelTier: v.literal("terra"),
     readonly: v.boolean(),
     authority: backgroundExecutionAuthorityValidator,
     repositoryCapabilities: v.array(v.string()),
@@ -73,6 +75,7 @@ const backgroundExecutionProfileValidator = v.union(
       imageDigest: v.string(),
       quantization: v.literal("gptq-int4"),
       api: v.literal("openai-chat-completions"),
+      endpointAuth: v.literal("hmac-sha256-v1"),
       requestLimits: v.object({
         maxInputBytes: v.number(),
         maxOutputTokens: v.number(),
@@ -2036,6 +2039,46 @@ export default defineSchema({
   })
     .index("by_job_attempt", ["jobId", "attempt"])
     .index("by_createdAt", ["createdAt"]),
+
+  // One irrevocable, hash-only reservation per immutable work-order revision
+  // fences the optional paid Novita draft across all worker retries. A lost
+  // worker deliberately leaves this held rather than risking a second egress.
+  novitaPatchProposalReceipts: defineTable({
+    protocolVersion: v.literal(1),
+    workOrderRevisionId: v.id("workOrderRevisions"),
+    workOrderRevision: v.number(),
+    workOrderRevisionDigest: v.string(),
+    jobId: v.id("jobs"),
+    canonicalProjectId: v.string(),
+    repository: v.optional(v.string()),
+    schedulingBindingDigest: v.string(),
+    authorityDigest: v.string(),
+    workAttemptId: v.id("workAttempts"),
+    ownerAttempt: v.number(),
+    ownerWorkerRunId: v.string(),
+    ownerDispatchReceiptDigest: v.string(),
+    ownerDispatchPayloadDigest: v.string(),
+    adapterId: v.literal("novita-qwen-patch-proposer-v1"),
+    configDigest: v.string(),
+    endpointId: v.string(),
+    requestDigest: v.string(),
+    sourceFileCount: v.number(),
+    inputBytes: v.number(),
+    reservationDigest: v.string(),
+    status: v.union(v.literal("reserved"), v.literal("settled")),
+    outcome: v.optional(v.union(
+      v.literal("proposed"), v.literal("no_change"), v.literal("skipped"),
+      v.literal("unavailable"), v.literal("rejected"),
+    )),
+    outcomeDigest: v.optional(v.string()),
+    outputBytes: v.optional(v.number()),
+    failureClass: v.optional(v.union(
+      v.literal("configuration"), v.literal("input"), v.literal("transport"),
+      v.literal("timeout"), v.literal("http"), v.literal("response"),
+    )),
+    reservedAt: v.number(),
+    settledAt: v.optional(v.number()),
+  }).index("by_work_order_revision", ["workOrderRevisionId"]),
 
   // Cold, append-only repository review evidence. It is content-addressed
   // and never patched; jobs retain only the small binding fields above.

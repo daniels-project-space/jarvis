@@ -64,12 +64,13 @@ describe("background execution profile", () => {
       imageDigest: "sha256:c2f3b1b964e47809b722b5e75b61b1e7b39a50f70388cf2bf2418f16a9f31da2",
       quantization: "gptq-int4",
       api: "openai-chat-completions",
+      endpointAuth: "hmac-sha256-v1",
       requestLimits: { maxInputBytes: 12_000, maxOutputTokens: 800, maxTurns: 1, timeoutMs: 30_000 },
     } as const;
     const profile = accepted({
       version: 2,
       provider: "codex-subscription",
-      modelTier: "luna",
+      modelTier: "terra",
       readonly: false,
       authority: { external: false, apps: false, secrets: false, network: false },
       repositoryCapabilities: ["repository_read_file", "repository_list_files", "repository_write_file"],
@@ -79,6 +80,10 @@ describe("background execution profile", () => {
     expect(resolveBackgroundExecutionProfile({ ...profile, endpointUrl: "https://untrusted.example" })).toMatchObject({
       accepted: false,
       code: "invalid_profile",
+    });
+    expect(resolveBackgroundExecutionProfile({ ...profile, modelTier: "luna" })).toMatchObject({
+      accepted: false,
+      code: "invalid_model_tier",
     });
   });
 

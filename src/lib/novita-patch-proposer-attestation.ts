@@ -23,6 +23,7 @@ export type NovitaPatchProposerAttestation = Readonly<{
   imageDigest: string;
   quantization: "gptq-int4";
   api: "openai-chat-completions";
+  endpointAuth: "hmac-sha256-v1";
   requestLimits: NovitaPatchProposerLimits;
 }>;
 
@@ -42,6 +43,7 @@ const ATTESTATION_KEYS = new Set([
   "imageDigest",
   "quantization",
   "api",
+  "endpointAuth",
   "requestLimits",
 ]);
 
@@ -91,7 +93,8 @@ export function resolveNovitaPatchProposerAttestation(value: unknown): NovitaPat
     || typeof value.modelRevision !== "string" || !MODEL_REVISION.test(value.modelRevision)
     || typeof value.imageDigest !== "string" || !IMAGE_DIGEST.test(value.imageDigest)
     || value.quantization !== "gptq-int4"
-    || value.api !== "openai-chat-completions") return null;
+    || value.api !== "openai-chat-completions"
+    || value.endpointAuth !== "hmac-sha256-v1") return null;
   return Object.freeze({
     adapterId: NOVITA_PATCH_PROPOSER_ADAPTER_ID,
     configDigest: value.configDigest,
@@ -101,6 +104,7 @@ export function resolveNovitaPatchProposerAttestation(value: unknown): NovitaPat
     imageDigest: value.imageDigest,
     quantization: "gptq-int4",
     api: "openai-chat-completions",
+    endpointAuth: "hmac-sha256-v1",
     requestLimits: limits,
   });
 }
@@ -133,13 +137,29 @@ export function configuredNovitaPatchProposer(
 }
 
 function taskNamesBoundedSourceFile(task: string): boolean {
-  return /(?:^|[\s`'"(])(?:src|app|convex|scripts)\/[A-Za-z0-9_./-]+\.(?:[cm]?[jt]sx?|json)(?=$|[\s`'"),.:;])/i.test(task);
+  return /(?:^|[\s`'"(])(?:src|app|convex|scripts)\/[A-Za-z0-9_./-]+\.(?:[cm]?[jt]sx?)(?=$|[\s`'"),.:;])/i.test(task);
+}
+
+/**
+ * The only class of source change that may receive an untrusted Qwen draft.
+ * This is deliberately narrower than general engineering work: no deployment,
+ * migration, security, architecture, or multi-file task can qualify.
+ */
+export function isBoundedNovitaPatchTask(task: string): boolean {
+  const normalized = task.trim();
+  if (!normalized || normalized.length > 480 || !taskNamesBoundedSourceFile(normalized)) return false;
+  if (/\b(?:deploy|publish|merge|production|migration|security|architecture|redesign|multi[- ]?file|database|credential|secret)\b/i.test(normalized)) {
+    return false;
+  }
+  return /\b(?:fix|correct|rename|update|add)\b/i.test(normalized)
+    && /\b(?:typo|spelling|comment|copy|label|text|constant|test(?: expectation)?|one[- ]line|small)\b/i.test(normalized);
 }
 
 /**
  * Selection stays intentionally conservative. The delegate is an untrusted,
- * no-tool draft writer, so only simple, explicit, owned-repository coding
- * work may request it. Everything else remains Codex-only.
+ * no-tool draft writer. A trusted Terra Codex turn still performs every edit,
+ * verification, review, and delivery step, so only tiny explicitly named
+ * owned-repository fixes may request it. Everything else remains Codex-only.
  */
 export function novitaPatchProposerForWorkOrder(input: Readonly<{
   task: string;
@@ -153,14 +173,14 @@ export function novitaPatchProposerForWorkOrder(input: Readonly<{
 }>): NovitaPatchProposerAttestation | undefined {
   const configured = configuredNovitaPatchProposer();
   if (!configured
-    || input.modelTier !== "luna"
+    || input.modelTier !== "terra"
     || input.readonly
     || input.sourceProvider !== "github"
     || !input.repository || !isOwnedRepositoryScope(input.repository)
     || input.risk !== "low"
     || input.approvalRequired
     || input.mcpScope.length > 0
-    || !taskNamesBoundedSourceFile(input.task)) return undefined;
+    || !isBoundedNovitaPatchTask(input.task)) return undefined;
   return configured.attestation;
 }
 
@@ -174,6 +194,7 @@ export function canonicalNovitaPatchProposerAttestation(value: NovitaPatchPropos
     imageDigest: value.imageDigest,
     quantization: value.quantization,
     api: value.api,
+    endpointAuth: value.endpointAuth,
     requestLimits: value.requestLimits,
   });
 }

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest, type TestConvex } from "convex-test";
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import schema from "../../convex/schema";
@@ -84,6 +85,7 @@ import {
   agentWorker,
   createProductionAgentRunnerDependencies,
   handoffCompletedAgentWorker,
+  novitaSourceFilesForTask,
   runAgentMaintenance,
   runAgentHarness,
   type AgentRunnerBoundaryObservation,
@@ -1609,5 +1611,25 @@ describe("production Trigger worker authority harness", () => {
     expect((dependencies.providerFetch as any)).not.toHaveBeenCalled();
     const state = await t.run(async (ctx) => ctx.db.get(jobId));
     expect(state).toMatchObject({ status: "pending", attempt: 2, steerRevision: 1 });
+  });
+
+  it("does not send a named source file when it contains a controller secret", () => {
+    const repo = mkdtempSync("/tmp/jarvis-novita-source-");
+    const secret = "outbound-secret-value";
+    const previous = process.env.JARVIS_OUTBOUND_SECRET;
+    process.env.JARVIS_OUTBOUND_SECRET = secret;
+    try {
+      mkdirSync(join(repo, "src"));
+      writeFileSync(join(repo, "src", "example.ts"), `export const credential = "${secret}";\n`);
+      expect(novitaSourceFilesForTask(
+        repo,
+        "Fix the typo in src/example.ts.",
+        12_000,
+      )).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.JARVIS_OUTBOUND_SECRET;
+      else process.env.JARVIS_OUTBOUND_SECRET = previous;
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

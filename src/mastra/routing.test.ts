@@ -72,4 +72,16 @@ describe("routeWork", () => {
   it("does not honour a cheap override for hard work", () => {
     expect(routeWork("Production security architecture migration", { requestedModel: "luna" }).model).toBe("sol");
   });
+
+  it("keeps a named tiny owned code fix low risk while retaining Terra review", () => {
+    expect(routeWork("Fix the typo in src/lib/example.ts.", {
+      repo: "daniels-project-space/jarvis",
+    })).toMatchObject({
+      agentId: "paul",
+      model: "terra",
+      risk: "low",
+      readonly: false,
+      approvalRequired: false,
+    });
+  });
 });

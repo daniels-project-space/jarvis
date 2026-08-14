@@ -222,6 +222,9 @@ export function resolveBackgroundExecutionProfile(
   if (version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION && !novitaPatchProposer) {
     return rejected("invalid_profile", "Novita patch-proposer attestation is invalid");
   }
+  if (version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION && modelTier !== "terra") {
+    return rejected("invalid_model_tier", "Novita patch drafts require a Terra Codex reviewer");
+  }
 
   if (version === BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION && novitaPatchProposer) {
     return Object.freeze({
