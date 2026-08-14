@@ -11,8 +11,8 @@ vi.mock("convex/react", () => ({
   usePaginatedQuery: (query: { _name?: string } | undefined) => query?._name === "files:paginatedForThread"
     ? {
         results: [
-          { fileId: "file-1", name: "budget.csv", relativePath: "reports/budget.csv", mimeType: "text/csv", sizeBytes: 2_048, status: "ready" },
-          { fileId: "file-2", name: "sunrise.webp", relativePath: "travel/sunrise.webp", mimeType: "image/webp", sizeBytes: 2_048, status: "ready" },
+          { fileId: "file-1", name: "budget.csv", relativePath: "reports/budget.csv", mimeType: "text/csv", sizeBytes: 2_048, status: "ready", reviewState: "favorite" },
+          { fileId: "file-2", name: "sunrise.webp", relativePath: "travel/sunrise.webp", mimeType: "image/webp", sizeBytes: 2_048, status: "ready", reviewState: "review_remove" },
           { fileId: "file-3", name: "flight.mp4", relativePath: "travel/flight.mp4", mimeType: "video/mp4", sizeBytes: 2_048, status: "stored_only" },
         ],
         status: "CanLoadMore",
@@ -21,7 +21,7 @@ vi.mock("convex/react", () => ({
     : { results: [], status: "Exhausted", loadMore: vi.fn() },
 }));
 
-import { ChatFileLibraryDropdown, readyPrivateImagePanel } from "./ChatFileLibraryDropdown";
+import { ChatFileLibraryDropdown, filterFilesByReviewState, readyPrivateImagePanel } from "./ChatFileLibraryDropdown";
 
 describe("private file library accessibility", () => {
   it("creates a panel input only for a ready detected image, without exposing storage keys", () => {
@@ -45,7 +45,7 @@ describe("private file library accessibility", () => {
     })).toBeNull();
   });
 
-  it("renders an associated dialog, named file actions, and cursor continuation", () => {
+  it("renders an associated dialog, named reversible review actions, and cursor continuation", () => {
     const markup = renderToStaticMarkup(
       <ChatFileLibraryDropdown
         threadId="main"
@@ -63,8 +63,22 @@ describe("private file library accessibility", () => {
     expect(markup).toContain('aria-label="Show sunrise.webp in Jarvis"');
     expect(markup).not.toContain('aria-label="Show budget.csv in Jarvis"');
     expect(markup).not.toContain('aria-label="Show flight.mp4 in Jarvis"');
-    expect(markup).toContain('aria-label="Delete budget.csv"');
+    expect(markup).toContain('aria-label="Remove favourite from budget.csv"');
+    expect(markup).toContain('aria-label="Restore sunrise.webp from removal review"');
+    expect(markup).not.toContain('aria-label="Delete budget.csv permanently"');
     expect(markup).toContain("Load more files");
     expect(markup).toContain("8 files per message");
+    expect(markup).toContain("Review marks never delete files");
+  });
+
+  it("filters durable states without treating legacy rows as removal candidates", () => {
+    const files = [
+      { fileId: "favorite", name: "favorite.jpg", relativePath: "favorite.jpg", mimeType: "image/jpeg", sizeBytes: 1, status: "ready", reviewState: "favorite" as const },
+      { fileId: "remove", name: "remove.jpg", relativePath: "remove.jpg", mimeType: "image/jpeg", sizeBytes: 1, status: "ready", reviewState: "review_remove" as const },
+      { fileId: "legacy", name: "legacy.jpg", relativePath: "legacy.jpg", mimeType: "image/jpeg", sizeBytes: 1, status: "ready" },
+    ];
+    expect(filterFilesByReviewState(files, "favorite").map((file) => file.fileId)).toEqual(["favorite"]);
+    expect(filterFilesByReviewState(files, "review_remove").map((file) => file.fileId)).toEqual(["remove"]);
+    expect(filterFilesByReviewState(files, "all")).toHaveLength(3);
   });
 });

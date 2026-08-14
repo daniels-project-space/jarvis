@@ -22,6 +22,17 @@ const uploadDescriptor = v.object({
   sha256: v.string(),
 });
 
+const fileReviewState = v.union(
+  v.literal("unreviewed"),
+  v.literal("favorite"),
+  v.literal("review_remove"),
+);
+
+const libraryReviewFilter = v.union(
+  v.literal("favorite"),
+  v.literal("review_remove"),
+);
+
 const extractedChunk = v.object({
   ordinal: v.number(),
   text: v.string(),
@@ -88,6 +99,7 @@ function publicFile(row: any) {
     pageCount: row.pageCount,
     sheetNames: row.sheetNames,
     errorCode: row.errorCode,
+    reviewState: row.reviewState ?? "unreviewed",
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -208,6 +220,7 @@ export const reserveBatch = mutation({
         ingestAttempt: 0,
         searchText: `${file.name} ${file.relativePath}`.slice(0, 1_000),
         libraryVisible: true,
+        reviewState: "unreviewed",
         createdAt: now,
         updatedAt: now,
       });
@@ -506,6 +519,7 @@ export const paginatedLibrary = query({
   args: {
     paginationOpts: paginationOptsValidator,
     search: v.optional(v.string()),
+    reviewState: v.optional(libraryReviewFilter),
     ...viewerAuthArgs,
   },
   handler: async (ctx, args) => {
@@ -514,13 +528,22 @@ export const paginatedLibrary = query({
     const result = search
       ? await ctx.db
           .query("files")
-          .withSearchIndex("search_metadata", (q) => q.search("searchText", search).eq("libraryVisible", true))
+          .withSearchIndex("search_metadata", (q) => {
+            const filter = q.search("searchText", search).eq("libraryVisible", true);
+            return args.reviewState ? filter.eq("reviewState", args.reviewState) : filter;
+          })
           .paginate(args.paginationOpts)
-      : await ctx.db
-          .query("files")
-          .withIndex("by_library_updated", (q) => q.eq("libraryVisible", true))
-          .order("desc")
-          .paginate(args.paginationOpts);
+      : args.reviewState
+        ? await ctx.db
+            .query("files")
+            .withIndex("by_library_review_updated", (q) => q.eq("libraryVisible", true).eq("reviewState", args.reviewState))
+            .order("desc")
+            .paginate(args.paginationOpts)
+        : await ctx.db
+            .query("files")
+            .withIndex("by_library_updated", (q) => q.eq("libraryVisible", true))
+            .order("desc")
+            .paginate(args.paginationOpts);
     return { ...result, page: result.page.map(publicFile) };
   },
 });
@@ -567,6 +590,52 @@ export const paginatedForThread = query({
         ? [{ ...publicFile(row), pinned: result.page[index].pinned }]
         : []),
     };
+  },
+});
+
+// Review is deliberately metadata-only: it never schedules deletion, touches
+// R2, or changes a thread/message link. "unreviewed" is the reversible clear.
+export const setReviewState = mutation({
+  args: { fileId: v.id("files"), reviewState: fileReviewState, ...actorAuthArgs },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const file = await ctx.db.get(args.fileId);
+    if (!file || file.status === "deleted" || file.status === "deleting") return null;
+    const now = Date.now();
+    await ctx.db.patch(file._id, { reviewState: args.reviewState, updatedAt: now });
+    return publicFile({ ...file, reviewState: args.reviewState, updatedAt: now });
+  },
+});
+
+// Tool calls must be bound to the exact user message that attached the file.
+// This is still metadata-only: no R2 operation or thread/message link changes.
+export const setReviewStateForMessage = mutation({
+  args: {
+    messageId: v.id("chatMessages"),
+    fileId: v.id("files"),
+    reviewState: fileReviewState,
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const message = await ctx.db.get(args.messageId);
+    if (!message || message.role !== "user") {
+      throw new ConvexError({ code: "INVALID_FILE_MESSAGE", message: "File review requires a user message" });
+    }
+    const attachment = await ctx.db
+      .query("messageFiles")
+      .withIndex("by_message_file", (q) => q.eq("messageId", message._id).eq("fileId", args.fileId))
+      .first();
+    if (!attachment) {
+      throw new ConvexError({ code: "FILE_NOT_ATTACHED", message: "That file is not attached to this message" });
+    }
+    const file = await ctx.db.get(args.fileId);
+    if (!file || file.status === "deleted" || file.status === "deleting") {
+      throw new ConvexError({ code: "FILE_NOT_REVIEWABLE", message: "Attached file is unavailable for review" });
+    }
+    const now = Date.now();
+    await ctx.db.patch(file._id, { reviewState: args.reviewState, updatedAt: now });
+    return publicFile({ ...file, reviewState: args.reviewState, updatedAt: now });
   },
 });
 
@@ -982,6 +1051,7 @@ export const authorizeFileTool = query({
       [/^(?:timer|remind_at|reminder_cancel)$/, /\b(?:set|start|create|cancel|remove)\b.{0,24}\b(?:timer|reminder|alarm)\b|\bremind me\b/],
       [/^todo_(?:add|done|remove)$/, /\b(?:add|create|mark|complete|remove|delete)\b.{0,24}\b(?:todo|task|checklist)\b/],
       [/^calendar_(?:add|remove)$/, /\b(?:add|create|put|remove|delete)\b.{0,30}\b(?:calendar|appointment|event)\b/],
+      [/^review_uploaded_file$/, /\b(?:favorite|favourite)\b.{0,36}\b(?:this|that|the|uploaded|attached)?\s*(?:file|document|upload|image|photo|picture)\b|\b(?:mark|set|make|flag)\b.{0,36}\b(?:as\s+)?(?:a\s+)?(?:favorite|favourite)\b|\b(?:mark|flag|set)\b.{0,36}\bfor\s+(?:review\s+)?remov(?:al|e)\b|\b(?:clear|reset|remove)\b.{0,36}\breview(?:\s+(?:state|status|mark))?\b/],
       [/^bookings_check$/, /\b(?:check|import|add)\b.{0,30}\bbookings?\b|\bbookings?\b.{0,30}\b(?:calendar|import)\b/],
       [/^(?:remember)$/, /\b(?:remember|memorize|memorise|save (?:this|that) (?:to|in) memory)\b/],
       [/^(?:create_image|store_image)$/, /\b(?:create|generate|render|make|save|store)\b.{0,30}\b(?:image|picture|photo|art|illustration)\b/],

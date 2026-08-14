@@ -15,6 +15,8 @@ describe("capability router", () => {
     ["Make a mind map for the launch", "creative", "mind_map"],
     ["Summarise https://youtu.be/abcDEF12345", "creative", "youtube_transcript"],
     ["Find me a YouTube video about camera lighting", "creative", "youtube_search"],
+    ["Favourite this attached image", "core", "review_uploaded_file"],
+    ["Mark this uploaded file for removal review", "core", "review_uploaded_file"],
   ])("routes %s to %s/%s", (intent, belt, tool) => {
     const ranking = rankCapabilities(intent);
     expect(ranking.candidates[0]).toMatchObject({ belt, tool });

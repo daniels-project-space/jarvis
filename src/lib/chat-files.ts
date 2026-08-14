@@ -37,6 +37,8 @@ export type ChatFileStatus =
   | "error"
   | "deleted";
 
+export type ChatFileReviewState = "unreviewed" | "favorite" | "review_remove";
+
 export type ChatFileManifest = {
   fileId: string;
   name: string;
@@ -44,6 +46,8 @@ export type ChatFileManifest = {
   mimeType: string;
   sizeBytes: number;
   status: string;
+  // Legacy records omit this field; callers must treat that as unreviewed.
+  reviewState?: ChatFileReviewState;
   summary?: string;
   selection?: "message" | "named_reference" | "recent_followup";
   excerpts?: Array<{

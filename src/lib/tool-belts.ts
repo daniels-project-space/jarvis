@@ -3,7 +3,7 @@ const TOOL_BELT_REGISTRY = {
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_view",
     "google_calendar_list", "google_calendar_create", "google_calendar_update", "google_calendar_delete",
-    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image",
+    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image", "review_uploaded_file",
   ]),
   work: new Set([
     "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "show", "net_worth", "memory_map",
@@ -65,6 +65,9 @@ for (const name of [
   "google_calendar_update",
   "google_calendar_delete",
 ]) SUBSCRIPTION_TOOL_NAMES.delete(name);
+// review_uploaded_file deliberately remains subscription-routable: its
+// mutation requires the exact current user-message attachment and explicit
+// original-user review intent, so it cannot browse arbitrary private files.
 // The subscription model already supplies the reasoning. These legacy tools
 // invoke metered text models and would duplicate both latency and intelligence.
 SUBSCRIPTION_TOOL_NAMES.delete("deliberate");

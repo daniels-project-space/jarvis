@@ -267,15 +267,23 @@ export default defineSchema({
     sheetNames: v.optional(v.array(v.string())),
     errorCode: v.optional(v.string()),
     libraryVisible: v.optional(v.boolean()),
+    // A reversible owner review marker. It intentionally does not affect the
+    // private R2 object or a file's thread/message provenance.
+    reviewState: v.optional(v.union(
+      v.literal("unreviewed"),
+      v.literal("favorite"),
+      v.literal("review_remove"),
+    )),
     deletePreviousStatus: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_status_updated", ["status", "updatedAt"])
     .index("by_library_updated", ["libraryVisible", "updatedAt"])
+    .index("by_library_review_updated", ["libraryVisible", "reviewState", "updatedAt"])
     .index("by_sha256", ["sha256"])
     .index("by_updatedAt", ["updatedAt"])
-    .searchIndex("search_metadata", { searchField: "searchText", filterFields: ["status", "libraryVisible"] }),
+    .searchIndex("search_metadata", { searchField: "searchText", filterFields: ["status", "libraryVisible", "reviewState"] }),
 
   // One browser reservation covers a bounded multi-file or folder upload.
   // requestId and its returned fileIds make retries idempotent before any R2

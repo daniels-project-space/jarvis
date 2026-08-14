@@ -58,8 +58,10 @@ describe("tool belt registry", () => {
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_delete")).toBe(false);
   });
 
-  it("keeps uploaded-image display in the foreground owner lane", () => {
+  it("keeps image display foreground-only but permits exact message-scoped file review", () => {
     expect(TOOL_BELTS.core.has("show_uploaded_image")).toBe(true);
     expect(SUBSCRIPTION_TOOL_NAMES.has("show_uploaded_image")).toBe(false);
+    expect(TOOL_BELTS.core.has("review_uploaded_file")).toBe(true);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("review_uploaded_file")).toBe(true);
   });
 });

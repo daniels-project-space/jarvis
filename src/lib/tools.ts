@@ -1224,6 +1224,19 @@ export const TOOL_DEFS = [
       required: ["file_id"],
     },
   },
+  {
+    name: "review_uploaded_file",
+    description:
+      "Save a reversible review label for one exact file attached to Daniel's current message. Use only when he explicitly asks to favourite an attached file, mark it for removal review, or clear that review. favorite and review_remove never delete the file, its private bytes, or its chat links. Pass the exact attached file_id; the tool refuses any file not attached to this message.",
+    parameters: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "the exact id of a file attached to the current user message" },
+        review_state: { type: "string", enum: ["unreviewed", "favorite", "review_remove"], description: "favorite keeps it; review_remove is only a reversible removal-review marker; unreviewed clears either marker" },
+      },
+      required: ["file_id", "review_state"],
+    },
+  },
   // Gmail supports search, reading, subscription discovery, and draft creation.
   // Destructive inbox actions are intentionally not tool definitions: a model-
   // supplied `confirmed: true` is not an owner approval receipt.
@@ -4280,6 +4293,38 @@ async function showUploadedImage(args: any): Promise<string> {
   return "Opened the selected ready image on screen and attached an owner-authenticated download card.";
 }
 
+const FILE_REVIEW_STATES = new Set(["unreviewed", "favorite", "review_remove"] as const);
+type FileReviewState = typeof FILE_REVIEW_STATES extends Set<infer State> ? State : never;
+
+async function reviewUploadedFile(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
+  const fileId = String(args.file_id ?? "").trim();
+  if (!fileId) return "TOOL DID NOTHING: no file_id passed.";
+  const candidateState = String(args.review_state ?? "").trim();
+  if (!FILE_REVIEW_STATES.has(candidateState as FileReviewState)) {
+    return "TOOL DID NOTHING: review_state must be unreviewed, favorite, or review_remove.";
+  }
+  const messageId = invocationContext?.userMessageId;
+  if (!messageId) {
+    return "TOOL DID NOTHING: this review needs trusted current-message provenance.";
+  }
+  const reviewState = candidateState as FileReviewState;
+  const reviewed = await convexMutation("files:setReviewStateForMessage", {
+    messageId,
+    fileId,
+    reviewState,
+  }).catch(() => null) as { reviewState?: FileReviewState } | null;
+  if (!reviewed || reviewed.reviewState !== reviewState) {
+    return "TOOL DID NOTHING: the selected file is not attached to this message or is no longer available for review.";
+  }
+  if (reviewState === "favorite") {
+    return "Saved the exact attached file as a favourite. Its private bytes and chat links were left untouched.";
+  }
+  if (reviewState === "review_remove") {
+    return "Marked the exact attached file for removal review. Nothing was deleted; it remains available until Daniel explicitly deletes it from the review list.";
+  }
+  return "Cleared the review marker on the exact attached file. Nothing was deleted.";
+}
+
 export async function executeTool(
   name: string,
   args: any,
@@ -5146,6 +5191,8 @@ export async function executeTool(
       return await openFileAsDoc(args);
     case "show_uploaded_image":
       return await showUploadedImage(args);
+    case "review_uploaded_file":
+      return await reviewUploadedFile(args, invocationContext);
     case "gmail_search": {
       const query = typeof args.query === "string" ? args.query : undefined;
       const maxResults = Number(args.max_results) || 20;

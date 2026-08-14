@@ -47,6 +47,14 @@ function looksLikePlaceToPlaceRoute(original: string): boolean {
 
 const RULES: readonly CapabilityRule[] = [
   {
+    belt: "core",
+    tools: ["review_uploaded_file"],
+    score: 178,
+    visual: false,
+    reason: "attached_file_review",
+    matches: (value) => /\b(?:favorite|favourite)\b.{0,40}\b(?:file|document|upload|image|photo|picture)\b|\b(?:mark|flag|set)\b.{0,40}\b(?:this|that|attached|uploaded|file|document|image|photo).{0,40}\b(?:review\s+)?remov(?:al|e)\b|\b(?:clear|reset|remove)\b.{0,40}\breview(?:\s+(?:state|status|mark))?\b/i.test(value),
+  },
+  {
     belt: "business",
     tools: ["price_chart", "market_analysis", "market"],
     score: 180,

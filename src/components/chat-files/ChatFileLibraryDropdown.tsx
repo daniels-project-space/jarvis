@@ -10,7 +10,19 @@ import { viewerFetchWithTimeout } from "@/lib/viewer-request";
 
 type LibraryFile = ChatFileManifest & { pinned?: boolean; updatedAt?: number };
 type FileIdSetter = (update: string[] | ((current: string[]) => string[])) => void;
+type FileReviewState = NonNullable<ChatFileManifest["reviewState"]>;
+type ReviewFilter = "all" | Exclude<FileReviewState, "unreviewed">;
 const READY_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+function reviewStateFor(file: Pick<ChatFileManifest, "reviewState">): FileReviewState {
+  return file.reviewState === "favorite" || file.reviewState === "review_remove"
+    ? file.reviewState
+    : "unreviewed";
+}
+
+export function filterFilesByReviewState(files: LibraryFile[], filter: ReviewFilter): LibraryFile[] {
+  return filter === "all" ? files : files.filter((file) => reviewStateFor(file) === filter);
+}
 
 export function readyPrivateImagePanel(file: Pick<ChatFileManifest, "fileId" | "name" | "relativePath" | "mimeType" | "status">) {
   const mimeType = String(file.mimeType ?? "").trim().toLowerCase();
@@ -49,6 +61,8 @@ export function ChatFileLibraryDropdown({
   const [view, setView] = useState<"chat" | "all">("chat");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("all");
+  const [reviewOverrides, setReviewOverrides] = useState<Record<string, FileReviewState>>({});
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState("");
   const busyRef = useRef(false);
@@ -69,16 +83,39 @@ export function ChatFileLibraryDropdown({
   );
   const libraryPage = usePaginatedQuery(
     api.files.paginatedLibrary,
-    viewerToken && view === "all" ? { search: debouncedSearch || undefined, viewerToken } : "skip",
+    viewerToken && view === "all" ? {
+      search: debouncedSearch || undefined,
+      reviewState: reviewFilter === "all" ? undefined : reviewFilter,
+      viewerToken,
+    } : "skip",
     { initialNumItems: 32 },
   );
   const activePage = view === "chat" ? threadPage : libraryPage;
   const files = useMemo(() => {
     const seen = new Set<string>();
-    return (activePage.results as LibraryFile[]).filter((file) => !seen.has(file.fileId) && Boolean(seen.add(file.fileId)));
-  }, [activePage.results]);
+    return (activePage.results as LibraryFile[])
+      .filter((file) => !seen.has(file.fileId) && Boolean(seen.add(file.fileId)))
+      .map((file) => ({ ...file, reviewState: reviewOverrides[file.fileId] ?? reviewStateFor(file) }));
+  }, [activePage.results, reviewOverrides]);
+  const visibleFiles = useMemo(
+    () => view === "all" ? filterFilesByReviewState(files, reviewFilter) : files,
+    [files, reviewFilter, view],
+  );
   const selected = new Set(selectedFileIds);
   const actionBusy = Boolean(busyId);
+
+  useEffect(() => {
+    const reported = activePage.results as LibraryFile[];
+    setReviewOverrides((current) => {
+      let next = current;
+      for (const file of reported) {
+        if (!Object.hasOwn(current, file.fileId) || current[file.fileId] !== reviewStateFor(file)) continue;
+        if (next === current) next = { ...current };
+        delete next[file.fileId];
+      }
+      return next;
+    });
+  }, [activePage.results]);
 
   useEffect(() => {
     searchRef.current?.focus();
@@ -179,6 +216,30 @@ export function ChatFileLibraryDropdown({
     }
   };
 
+  const setReviewState = async (file: LibraryFile, reviewState: FileReviewState) => {
+    if (busyRef.current || reviewStateFor(file) === reviewState) return;
+    busyRef.current = true;
+    setBusyId(file.fileId);
+    setError("");
+    try {
+      const response = await viewerFetchWithTimeout(`/api/files/${encodeURIComponent(file.fileId)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reviewState }),
+      }, 15_000);
+      const payload = await response.json().catch(() => null) as { reviewState?: unknown; error?: unknown } | null;
+      if (!response.ok || payload?.reviewState !== reviewState) {
+        throw new Error(String(payload?.error ?? `${file.name} could not be reviewed.`));
+      }
+      setReviewOverrides((current) => ({ ...current, [file.fileId]: reviewState }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : `${file.name} could not be reviewed.`);
+    } finally {
+      busyRef.current = false;
+      setBusyId("");
+    }
+  };
+
   const remove = async (file: LibraryFile) => {
     if (busyRef.current || !window.confirm(`Delete ${file.name} from Jarvis private storage?`)) return;
     busyRef.current = true;
@@ -243,44 +304,65 @@ export function ChatFileLibraryDropdown({
           <button id="jarvis-file-tab-chat" ref={chatTabRef} type="button" role="tab" aria-controls="jarvis-file-results" aria-selected={view === "chat"} tabIndex={view === "chat" ? 0 : -1} onKeyDown={onTabKeyDown} onClick={() => switchTab("chat")} className={`min-h-10 flex-1 rounded-md px-2 py-1.5 text-[11px] ${view === "chat" ? "bg-white/10 text-white" : "text-slate-400"}`}>This chat</button>
           <button id="jarvis-file-tab-all" ref={allTabRef} type="button" role="tab" aria-controls="jarvis-file-results" aria-selected={view === "all"} tabIndex={view === "all" ? 0 : -1} onKeyDown={onTabKeyDown} onClick={() => switchTab("all")} className={`min-h-10 flex-1 rounded-md px-2 py-1.5 text-[11px] ${view === "all" ? "bg-white/10 text-white" : "text-slate-400"}`}>All files</button>
         </div>
+        {view === "all" && (
+          <div className="mb-2 flex rounded-lg bg-white/[0.025] p-0.5" role="group" aria-label="File review filter">
+            {([
+              ["all", "All"],
+              ["favorite", "Favourites"],
+              ["review_remove", "Review"],
+            ] as const).map(([filter, label]) => (
+              <button key={filter} type="button" aria-pressed={reviewFilter === filter} onClick={() => setReviewFilter(filter)} className={`min-h-9 flex-1 rounded-md px-2 text-[10px] ${reviewFilter === filter ? "bg-cyan/15 text-cyan" : "text-slate-400 hover:bg-white/8"}`}>{label}</button>
+            ))}
+          </div>
+        )}
         <input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} type="search" aria-label={`Search ${view === "chat" ? "this chat" : "all private files"}`} placeholder="Search files…" className="min-h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs text-white outline-none placeholder:text-slate-500 focus:border-cyan/40" />
       </div>
       {error && <p role="alert" className="mx-3 mt-3 rounded-lg border border-red-400/25 bg-red-500/10 px-3 py-2 text-xs text-red-200">{error}</p>}
       <div id="jarvis-file-results" role="tabpanel" aria-labelledby={view === "chat" ? "jarvis-file-tab-chat" : "jarvis-file-tab-all"} className="min-h-0 flex-1 overflow-y-auto p-2">
         {loadingFirstPage && <p role="status" className="px-3 py-8 text-center text-xs text-cyan">Loading private files…</p>}
-        {!loadingFirstPage && !files.length && (
-          <p className="px-3 py-8 text-center text-xs text-slate-400">{debouncedSearch ? "No files match this search." : "No private files yet. Add a file or folder from the chat composer."}</p>
+        {!loadingFirstPage && !visibleFiles.length && (
+          <p className="px-3 py-8 text-center text-xs text-slate-400">{debouncedSearch ? "No files match this search." : reviewFilter === "favorite" ? "No favourites found yet." : reviewFilter === "review_remove" ? "No files are marked for removal review." : "No private files yet. Add a file or folder from the chat composer."}</p>
         )}
-        {files.map((file) => {
+        {visibleFiles.map((file) => {
           const ready = file.status === "ready" || file.status === "stored_only";
           const showableImage = Boolean(readyPrivateImagePanel(file));
           const retryable = file.status === "error";
+          const reviewState = reviewStateFor(file);
+          const deletionCandidate = view === "all" && reviewFilter === "review_remove" && reviewState === "review_remove";
           return (
-            <div key={file.fileId} className="group flex min-h-14 items-center gap-2 rounded-xl px-2 py-2 hover:bg-white/[0.045] sm:gap-3 sm:px-3">
-              <button
-                type="button"
-                disabled={!ready || actionBusy}
-                onClick={() => void toggle(file)}
-                aria-label={`${selected.has(file.fileId) ? "Remove" : "Attach"} ${file.name}`}
-                aria-pressed={selected.has(file.fileId)}
-                className={`grid size-10 shrink-0 place-items-center rounded-lg border text-sm sm:size-9 ${selected.has(file.fileId) ? "border-cyan bg-cyan text-black" : "border-white/20 text-transparent"} disabled:opacity-30`}
-              >
-                ✓
-              </button>
-              <button type="button" disabled={!ready || actionBusy} onClick={() => void toggle(file)} className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default">
-                <span className="block truncate text-xs text-slate-100">{file.relativePath || file.name}</span>
-                <span className="mt-0.5 block truncate text-[10px] text-slate-400">{fileSize(file.sizeBytes)} · {file.status}{file.summary ? ` · ${file.summary}` : ""}</span>
-              </button>
-              {ready && (
-                <a href={`/api/files/${encodeURIComponent(file.fileId)}`} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`} className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-white/8 hover:text-cyan">↗</a>
-              )}
-              {showableImage && (
-                <button type="button" disabled={actionBusy} onClick={() => void showImage(file)} aria-label={`Show ${file.name} in Jarvis`} title="Show in Jarvis" className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-cyan/10 hover:text-cyan disabled:opacity-40">▧</button>
-              )}
-              {retryable && (
-                <button type="button" disabled={actionBusy} onClick={() => void retry(file)} aria-label={`Retry ${file.name}`} className="min-h-10 rounded-lg px-2 text-[10px] text-amber-300 hover:bg-amber-300/10 disabled:opacity-40">retry</button>
-              )}
-              <button type="button" disabled={actionBusy} onClick={() => void remove(file)} aria-label={`Delete ${file.name}`} className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40">⌫</button>
+            <div key={file.fileId} className="group rounded-xl px-2 py-2 hover:bg-white/[0.045] sm:px-3">
+              <div className="flex min-h-11 items-center gap-2 sm:gap-3">
+                <button
+                  type="button"
+                  disabled={!ready || actionBusy}
+                  onClick={() => void toggle(file)}
+                  aria-label={`${selected.has(file.fileId) ? "Remove" : "Attach"} ${file.name}`}
+                  aria-pressed={selected.has(file.fileId)}
+                  className={`grid size-10 shrink-0 place-items-center rounded-lg border text-sm sm:size-9 ${selected.has(file.fileId) ? "border-cyan bg-cyan text-black" : "border-white/20 text-transparent"} disabled:opacity-30`}
+                >
+                  ✓
+                </button>
+                <button type="button" disabled={!ready || actionBusy} onClick={() => void toggle(file)} className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default">
+                  <span className="block truncate text-xs text-slate-100">{file.relativePath || file.name}</span>
+                  <span className="mt-0.5 block truncate text-[10px] text-slate-400">{fileSize(file.sizeBytes)} · {file.status}{reviewState === "favorite" ? " · favourite" : reviewState === "review_remove" ? " · removal review" : ""}{file.summary ? ` · ${file.summary}` : ""}</span>
+                </button>
+                {ready && (
+                  <a href={`/api/files/${encodeURIComponent(file.fileId)}`} target="_blank" rel="noreferrer" aria-label={`Open ${file.name}`} className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-white/8 hover:text-cyan">↗</a>
+                )}
+                {showableImage && (
+                  <button type="button" disabled={actionBusy} onClick={() => void showImage(file)} aria-label={`Show ${file.name} in Jarvis`} title="Show in Jarvis" className="grid size-10 shrink-0 place-items-center rounded-lg text-sm text-slate-400 hover:bg-cyan/10 hover:text-cyan disabled:opacity-40">▧</button>
+                )}
+                {retryable && (
+                  <button type="button" disabled={actionBusy} onClick={() => void retry(file)} aria-label={`Retry ${file.name}`} className="min-h-10 rounded-lg px-2 text-[10px] text-amber-300 hover:bg-amber-300/10 disabled:opacity-40">retry</button>
+                )}
+              </div>
+              <div className="ml-12 mt-1.5 flex flex-wrap items-center gap-1.5 sm:ml-11">
+                <button type="button" disabled={actionBusy} onClick={() => void setReviewState(file, reviewState === "favorite" ? "unreviewed" : "favorite")} aria-label={reviewState === "favorite" ? `Remove favourite from ${file.name}` : `Favourite ${file.name}`} aria-pressed={reviewState === "favorite"} className={`min-h-9 rounded-md px-2 text-[10px] disabled:opacity-40 ${reviewState === "favorite" ? "bg-amber-300/15 text-amber-200" : "text-slate-400 hover:bg-white/8 hover:text-amber-200"}`}>{reviewState === "favorite" ? "★ Favourite" : "☆ Favourite"}</button>
+                <button type="button" disabled={actionBusy} onClick={() => void setReviewState(file, reviewState === "review_remove" ? "unreviewed" : "review_remove")} aria-label={reviewState === "review_remove" ? `Restore ${file.name} from removal review` : `Mark ${file.name} for removal review`} aria-pressed={reviewState === "review_remove"} className={`min-h-9 rounded-md px-2 text-[10px] disabled:opacity-40 ${reviewState === "review_remove" ? "bg-rose-400/15 text-rose-200" : "text-slate-400 hover:bg-white/8 hover:text-rose-200"}`}>{reviewState === "review_remove" ? "Restore" : "Review for removal"}</button>
+                {deletionCandidate && (
+                  <button type="button" disabled={actionBusy} onClick={() => void remove(file)} aria-label={`Delete ${file.name} permanently`} className="min-h-9 rounded-md px-2 text-[10px] text-red-300 hover:bg-red-500/10 disabled:opacity-40">Delete permanently</button>
+                )}
+              </div>
             </div>
           );
         })}
@@ -290,7 +372,7 @@ export function ChatFileLibraryDropdown({
           </button>
         )}
       </div>
-      <footer className="border-t border-white/8 px-4 py-2 text-[10px] text-slate-400">4 MB per file · 40 files / 64 MB per batch · 8 files per message</footer>
+      <footer className="border-t border-white/8 px-4 py-2 text-[10px] text-slate-400">4 MB per file · 40 files / 64 MB per batch · 8 files per message · Review marks never delete files</footer>
     </section>
   );
 }

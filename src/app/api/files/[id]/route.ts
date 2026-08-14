@@ -22,6 +22,8 @@ function disposition(name: string, download: boolean): string {
 }
 
 const SAFE_INLINE_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
+const REVIEW_STATES = new Set(["unreviewed", "favorite", "review_remove"] as const);
+type ReviewState = typeof REVIEW_STATES extends Set<infer State> ? State : never;
 
 export async function GET(req: NextRequest, context: { params: Promise<{ id: string }> }) {
   const actor = await controlActor(req);
@@ -52,6 +54,35 @@ export async function GET(req: NextRequest, context: { params: Promise<{ id: str
     if (value) headers.set(name, value);
   }
   return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+// This is deliberately metadata-only. A removal-review marker is not a delete
+// request and never touches a private object, link, or message provenance.
+export async function PATCH(req: NextRequest, context: { params: Promise<{ id: string }> }) {
+  if (!isSameOriginRequest(req)) return Response.json({ error: "cross-origin review rejected" }, { status: 403 });
+  const actor = await controlActor(req);
+  if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
+  const body = await req.json().catch(() => null) as { reviewState?: unknown } | null;
+  const candidateState = typeof body?.reviewState === "string" ? body.reviewState : "";
+  if (!REVIEW_STATES.has(candidateState as ReviewState)) {
+    return Response.json({ error: "review state must be unreviewed, favorite, or review_remove" }, { status: 400 });
+  }
+  const { id: fileId } = await context.params;
+  const reviewState = candidateState as ReviewState;
+  const reviewed = await controlMutation("files:setReviewState", {
+    fileId,
+    reviewState,
+    ...controlCredentials(actor),
+  }).catch(() => null) as { fileId?: string; reviewState?: ReviewState } | null;
+  if (!reviewed || reviewed.reviewState !== reviewState) {
+    return Response.json({ error: "file is not available for review" }, { status: 409 });
+  }
+  return Response.json({
+    ok: true,
+    fileId: reviewed.fileId ?? fileId,
+    reviewState,
+  }, { headers: { "cache-control": "private, no-store" } });
 }
 
 export async function DELETE(req: NextRequest, context: { params: Promise<{ id: string }> }) {
