@@ -84,6 +84,8 @@ export type TripStay = {
   city?: string;
   /** Provider label retained when multiple cities are compared on one globe. */
   source?: string;
+  /** Durable city/base identity, distinct from the display-only city label. */
+  cityContextId?: string;
 };
 export type TripActivity = {
   /** Stable source-backed key; allows duplicate venue names across towns. */
@@ -110,9 +112,13 @@ export type TripActivity = {
   city?: string;
   /** The persisted discovery collection that produced this candidate. */
   discoveryId?: string;
+  /** Durable city/base identity for cross-city itinerary routing. */
+  cityContextId?: string;
   source?: "OpenStreetMap";
 };
 export type TripBookingReference = {
+  /** The exact city context this Gmail-derived reference was independently verified against. */
+  cityContextId?: string;
   city: string;
   title: string;
   bookingName?: string;
@@ -127,8 +133,23 @@ export type TripBookingReference = {
   state: "active" | "upcoming";
   verifiedAt: number;
 };
+export type TripCityContext = {
+  /** Stable city-plus-coordinate key; never infer identity from a city name alone. */
+  id: string;
+  city: string;
+  center: { lat: number; lng: number };
+  source: "destination" | "explore";
+  createdAt: number;
+  updatedAt: number;
+  /** Present only after an independently geocoded, time-valid Gmail stay match. */
+  bookingReference?: TripBookingReference;
+  /** Timestamp of the successful Gmail refresh for this exact city context. */
+  bookingCheckedAt?: number;
+};
 export type TripDiscovery = {
   id: string;
+  /** Links this collection, its route, and every candidate to one map base. */
+  cityContextId?: string;
   city: string;
   query: string;
   center: { lat: number; lng: number };
@@ -188,6 +209,10 @@ export type TripDoc = {
   bookingsCheckedAt?: number;
   /** Source-verified, city-scoped Gmail stay references for the active globe. */
   bookingReferences?: TripBookingReference[];
+  /** Durable city bases shared by stays, discoveries, Gmail references, and the globe. */
+  cityContexts?: TripCityContext[];
+  /** Selected city/base restored when a live or permanent travel plan reopens. */
+  activeCityContextId?: string;
   /** Persisted arbitrary-city exploration result sets shown on the same globe. */
   discoveries?: TripDiscovery[];
 };
@@ -318,6 +343,15 @@ export async function openTrip(a: {
     center = { lat: geocoded.latitude, lng: geocoded.longitude };
     destinationCenter = center;
   }
+  const openedAt = Date.now();
+  const initialCityContext = destinationCenter ? {
+    id: tripCityContextId(a.destination, destinationCenter),
+    city: a.destination.trim().slice(0, 120),
+    center: destinationCenter,
+    source: "destination" as const,
+    createdAt: openedAt,
+    updatedAt: openedAt,
+  } satisfies TripCityContext : undefined;
   const doc: TripDoc = {
     kind: "trip",
     title: `${a.destination} · planning`,
@@ -336,6 +370,7 @@ export async function openTrip(a: {
     threadId,
     center,
     destinationCenter,
+    ...(initialCityContext ? { cityContexts: [initialCityContext], activeCityContextId: initialCityContext.id } : {}),
     airport,
     flights: [],
     stays: [],
@@ -417,6 +452,7 @@ export async function scoutTrip(a: {
   }
   if (!id) throw new Error("Trip workspace could not be created");
   const tripId = id;
+  const priorActiveCity = prior ? activeTripCityContext(prior) : undefined;
   const threadId = prior?.threadId || ((await convexQuery("ui:getActiveThread", {})) as string) || "main";
   const preservePlan = Boolean(prior && prior.departDate === a.departDate && prior.returnDate === a.returnDate);
   const doc: TripDoc = {
@@ -433,8 +469,10 @@ export async function scoutTrip(a: {
     status: storage === "creation" && preservePlan && prior?.status === "planned" ? "planned" : "scouting",
     includeFlights: a.includeFlights !== false,
     threadId,
-    center: prior?.center ?? { lat: 41.39, lng: 2.17 },
+    center: priorActiveCity?.center ?? prior?.center ?? { lat: 41.39, lng: 2.17 },
     destinationCenter: prior?.destinationCenter,
+    cityContexts: prior?.cityContexts,
+    activeCityContextId: prior?.activeCityContextId,
     airport: prior?.airport,
     flights: [],
     stays: [],
@@ -592,7 +630,13 @@ export async function scoutTrip(a: {
       bookings: freshBookings.bookings,
       now: freshBookings.checkedAt,
     });
-    finalTrip.doc.bookingReferences = setTripBookingReference(finalTrip.doc.bookingReferences, reference, finalTrip.doc.destination);
+    const destinationContext = normalizeTripCityContexts(finalTrip.doc, freshBookings.checkedAt)
+      .find((context) => sameTripCity(context.city, finalTrip.doc.destination));
+    if (destinationContext) {
+      setTripCityContextBookingReference(finalTrip.doc, destinationContext.id, reference, freshBookings.checkedAt);
+    } else {
+      finalTrip.doc.bookingReferences = setTripBookingReference(finalTrip.doc.bookingReferences, reference, finalTrip.doc.destination);
+    }
     try {
       await saveTrip(finalTrip.id, finalTrip.doc, false, { storage: finalTrip.storage, sourceMessageId: a.sourceMessageId });
     } catch (error: any) {
@@ -608,7 +652,9 @@ export async function latestTrip(): Promise<TripRecord | null> {
   const row: any = await convexQuery("creations:latest", { kind: "trip" });
   if (!row?.data) return null;
   try {
-    return { id: String(row._id), doc: JSON.parse(row.data), storage: "creation" };
+    const doc = JSON.parse(row.data) as TripDoc;
+    normalizeTripCityContexts(doc);
+    return { id: String(row._id), doc, storage: "creation" };
   } catch {
     return null;
   }
@@ -622,7 +668,9 @@ export async function getTrip(id: string, context: TripStorageContext = { storag
     }).catch(() => null);
     if (!row?.data || row.state !== "draft") return null;
     try {
-      return { id: String(row._id), doc: JSON.parse(row.data), storage: "draft" };
+      const doc = JSON.parse(row.data) as TripDoc;
+      normalizeTripCityContexts(doc);
+      return { id: String(row._id), doc, storage: "draft" };
     } catch {
       return null;
     }
@@ -630,7 +678,9 @@ export async function getTrip(id: string, context: TripStorageContext = { storag
   const row: any = await convexQuery("creations:get", { id }).catch(() => null);
   if (!row?.data || row.kind !== "trip") return null;
   try {
-    return { id: String(row._id), doc: JSON.parse(row.data), storage: "creation" };
+    const doc = JSON.parse(row.data) as TripDoc;
+    normalizeTripCityContexts(doc);
+    return { id: String(row._id), doc, storage: "creation" };
   } catch {
     return null;
   }
@@ -642,6 +692,7 @@ export async function saveTrip(
   showPanel = true,
   context: TripStorageContext = { storage: "creation" },
 ): Promise<void> {
+  normalizeTripCityContexts(doc);
   doc.totals = tripTotals(doc);
   if (context.storage === "draft") {
     const expectedPlanRevision = Number.isSafeInteger(doc.planRevision) ? Number(doc.planRevision) : 0;
@@ -691,7 +742,7 @@ export function tripStayId(stay: Pick<TripStay, "id" | "name" | "lat" | "lng" | 
   return `stay:${compactTravelKey(city)}:${compactTravelKey(stay.name)}:${coordinates}`.slice(0, 180);
 }
 
-function tripActivityFromPlace(place: OpenStreetMapPlace, city: string, discoveryId: string): TripActivity {
+function tripActivityFromPlace(place: OpenStreetMapPlace, city: string, discoveryId: string, cityContextId?: string): TripActivity {
   return {
     id: `${discoveryId}:place:${compactTravelKey(place.name)}:${place.lat.toFixed(5)}:${place.lng.toFixed(5)}`.slice(0, 180),
     name: place.name.slice(0, 120),
@@ -707,6 +758,7 @@ function tripActivityFromPlace(place: OpenStreetMapPlace, city: string, discover
     ...(place.wikipediaArticle?.thumbnailUrl ? { photo: place.wikipediaArticle.thumbnailUrl } : {}),
     city,
     discoveryId,
+    ...(cityContextId ? { cityContextId } : {}),
     source: "OpenStreetMap",
   };
 }
@@ -769,19 +821,295 @@ export async function verifyTripCityBookingReference(args: {
   return undefined;
 }
 
-export function setTripBookingReference(existing: TripBookingReference[] | undefined, reference: TripBookingReference | undefined, city: string): TripBookingReference[] | undefined {
-  const cityKey = compactTravelKey(city);
-  const retained = (existing ?? []).filter((entry) => compactTravelKey(entry.city) !== cityKey);
-  return reference ? [...retained, reference].slice(-8) : retained.length ? retained.slice(-8) : undefined;
+const TRIP_CITY_CONTEXT_LIMIT = 12;
+const TRIP_BOOKING_REFERENCE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+
+function validTripCenter(value: unknown): value is { lat: number; lng: number } {
+  const point = value as { lat?: unknown; lng?: unknown } | null;
+  return Boolean(point)
+    && Number.isFinite(point?.lat)
+    && Number.isFinite(point?.lng)
+    && Math.abs(Number(point?.lat)) <= 90
+    && Math.abs(Number(point?.lng)) <= 180;
 }
 
-async function routeTripDiscovery(items: TripActivity[], mode: TripTravelMode): Promise<TripDayRoute> {
+function sameTripCity(left: string, right: string): boolean {
+  return compactTravelKey(left) === compactTravelKey(right);
+}
+
+export function tripCityContextId(city: string, center: { lat: number; lng: number }): string {
+  return `city:${compactTravelKey(city)}:${center.lat.toFixed(3)}:${center.lng.toFixed(3)}`.slice(0, 180);
+}
+
+function currentTripBookingReference(reference: TripBookingReference | undefined, now: number): TripBookingReference | undefined {
+  if (!reference) return undefined;
+  const start = Number(reference.start);
+  const end = Number(reference.end ?? reference.start);
+  const verifiedAt = Number(reference.verifiedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < now || !Number.isFinite(verifiedAt)) return undefined;
+  if (verifiedAt > now || now - verifiedAt > TRIP_BOOKING_REFERENCE_MAX_AGE_MS) return undefined;
+  return reference;
+}
+
+/**
+ * Makes legacy trip JSON city-aware on read and before each normal save. The
+ * original global candidate arrays remain intact for backwards compatibility;
+ * this is only the durable identity/selection layer that prevents unrelated
+ * towns from being averaged into one meaningless map base.
+ */
+export function normalizeTripCityContexts(doc: TripDoc, now = Date.now()): TripCityContext[] {
+  const known = new Map<string, TripCityContext>();
+  const add = (cityValue: unknown, centerValue: unknown, source: TripCityContext["source"], preferredId?: unknown) => {
+    const city = String(cityValue ?? "").trim().slice(0, 120);
+    if (!city || !validTripCenter(centerValue)) return undefined;
+    const center = { lat: Number(centerValue.lat), lng: Number(centerValue.lng) };
+    const id = typeof preferredId === "string" && preferredId.trim()
+      ? preferredId.trim().slice(0, 180)
+      : tripCityContextId(city, center);
+    const existing = known.get(id);
+    const raw = (doc.cityContexts ?? []).find((entry) => entry?.id === id);
+    const createdAt = Number.isFinite(Number(raw?.createdAt)) ? Number(raw?.createdAt) : now;
+    const updatedAt = Number.isFinite(Number(raw?.updatedAt)) ? Number(raw?.updatedAt) : createdAt;
+    const context: TripCityContext = {
+      id,
+      city,
+      center,
+      source: raw?.source === "destination" || raw?.source === "explore" ? raw.source : source,
+      createdAt: existing?.createdAt ?? createdAt,
+      updatedAt: Math.max(existing?.updatedAt ?? 0, updatedAt),
+      ...(currentTripBookingReference(raw?.bookingReference, now) ? { bookingReference: raw!.bookingReference } : {}),
+      ...(Number.isFinite(Number(raw?.bookingCheckedAt)) ? { bookingCheckedAt: Number(raw?.bookingCheckedAt) } : {}),
+    };
+    known.set(id, existing ? {
+      ...existing,
+      ...context,
+      createdAt: existing.createdAt,
+      updatedAt: Math.max(existing.updatedAt, context.updatedAt),
+      ...(existing.bookingReference && !context.bookingReference ? { bookingReference: existing.bookingReference } : {}),
+    } : context);
+    return known.get(id)!;
+  };
+
+  for (const entry of doc.cityContexts ?? []) {
+    add(entry?.city, entry?.center, entry?.source === "destination" ? "destination" : "explore", entry?.id);
+  }
+  // A verified booking is enough to restore a legacy city context even when an
+  // old draft predates `destinationCenter`. Never use the globe's fallback
+  // point for that purpose: an un-geocoded city must not quietly become
+  // Barcelona (the historical default globe position).
+  for (const reference of doc.bookingReferences ?? []) {
+    add(reference.city, { lat: reference.lat, lng: reference.lng }, "explore", reference.cityContextId);
+  }
+  const legacyCenter = validTripCenter(doc.destinationCenter)
+    ? doc.destinationCenter
+    : (!doc.discoveries?.length && validTripCenter(doc.center) ? doc.center : undefined);
+  const destinationContext = add(doc.destination, legacyCenter, "destination");
+  for (const discovery of doc.discoveries ?? []) {
+    const context = add(discovery.city, discovery.center, "explore", discovery.cityContextId);
+    if (!context) continue;
+    discovery.cityContextId = context.id;
+    for (const item of discovery.items ?? []) {
+      if (!item.cityContextId) item.cityContextId = context.id;
+    }
+  }
+
+  const contexts = [...known.values()]
+    .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id));
+  const activeId = typeof doc.activeCityContextId === "string" ? doc.activeCityContextId : undefined;
+  const keepIds = new Set<string>([
+    ...(destinationContext ? [destinationContext.id] : []),
+    ...(activeId && known.has(activeId) ? [activeId] : []),
+  ]);
+  const retained = contexts.filter((context) => keepIds.has(context.id));
+  for (const context of contexts) {
+    if (retained.length >= TRIP_CITY_CONTEXT_LIMIT) break;
+    if (!retained.some((entry) => entry.id === context.id)) retained.push(context);
+  }
+  const retainedIds = new Set(retained.map((context) => context.id));
+
+  for (const stay of doc.stays ?? []) {
+    if (stay.cityContextId && retainedIds.has(stay.cityContextId)) continue;
+    const match = retained.find((context) => sameTripCity(context.city, stay.city ?? doc.destination));
+    if (match) stay.cityContextId = match.id;
+  }
+  if (doc.locked.stay && (!doc.locked.stay.cityContextId || !retainedIds.has(doc.locked.stay.cityContextId))) {
+    const match = retained.find((context) => sameTripCity(context.city, doc.locked.stay?.city ?? doc.destination));
+    if (match) doc.locked.stay.cityContextId = match.id;
+  }
+  for (const activity of doc.activities ?? []) {
+    if (activity.cityContextId && retainedIds.has(activity.cityContextId)) continue;
+    const match = retained.find((context) => sameTripCity(context.city, activity.city ?? doc.destination));
+    if (match) activity.cityContextId = match.id;
+  }
+  const scopedContexts = new Map(retained.map((context) => [context.id, context]));
+  for (const reference of doc.bookingReferences ?? []) {
+    let match = reference.cityContextId && retainedIds.has(reference.cityContextId)
+      ? scopedContexts.get(reference.cityContextId)
+      : undefined;
+    if (!match) match = retained.find((context) => sameTripCity(context.city, reference.city));
+    if (!match) continue;
+    reference.cityContextId = match.id;
+    const live = currentTripBookingReference(reference, now);
+    if (!live) continue;
+    const current = currentTripBookingReference(match.bookingReference, now);
+    if (!current || live.verifiedAt >= current.verifiedAt) {
+      const projected = { ...live, cityContextId: match.id };
+      const next = {
+        ...match,
+        bookingReference: projected,
+        bookingCheckedAt: Math.max(Number(match.bookingCheckedAt) || 0, projected.verifiedAt),
+      };
+      scopedContexts.set(match.id, next);
+      const index = retained.findIndex((context) => context.id === match.id);
+      if (index >= 0) retained[index] = next;
+    }
+  }
+
+  doc.cityContexts = retained;
+  if (!doc.activeCityContextId || !retainedIds.has(doc.activeCityContextId)) {
+    doc.activeCityContextId = destinationContext && retainedIds.has(destinationContext.id)
+      ? destinationContext.id
+      : retained[0]?.id;
+  }
+  return retained;
+}
+
+export function activeTripCityContext(doc: TripDoc, now = Date.now()): TripCityContext | undefined {
+  const contexts = normalizeTripCityContexts(doc, now);
+  return contexts.find((context) => context.id === doc.activeCityContextId) ?? contexts[0];
+}
+
+export function setTripBookingReference(
+  existing: TripBookingReference[] | undefined,
+  reference: TripBookingReference | undefined,
+  city: string,
+  cityContextId?: string,
+): TripBookingReference[] | undefined {
+  const cityKey = compactTravelKey(city);
+  const retained = (existing ?? []).filter((entry) => cityContextId
+    ? entry.cityContextId !== cityContextId
+    : compactTravelKey(entry.city) !== cityKey);
+  const scoped = reference
+    ? { ...reference, ...(cityContextId ? { cityContextId } : {}) }
+    : undefined;
+  return scoped ? [...retained, scoped].slice(-8) : retained.length ? retained.slice(-8) : undefined;
+}
+
+/** Selects an already-known city base. Call the refresh helper separately for Gmail freshness. */
+export function selectTripCityContext(doc: TripDoc, cityContextId: string, now = Date.now()): TripCityContext {
+  const context = normalizeTripCityContexts(doc, now).find((entry) => entry.id === cityContextId);
+  if (!context) throw new Error("Choose one of this trip's saved cities before changing the map base.");
+  doc.activeCityContextId = context.id;
+  return context;
+}
+
+export function setTripCityContextBookingReference(
+  doc: TripDoc,
+  cityContextId: string,
+  reference: TripBookingReference | undefined,
+  checkedAt = Date.now(),
+): TripCityContext {
+  const context = normalizeTripCityContexts(doc, checkedAt).find((entry) => entry.id === cityContextId);
+  if (!context) throw new Error("Choose one of this trip's saved cities before updating its booking reference.");
+  const scoped = reference ? { ...reference, cityContextId: context.id } : undefined;
+  doc.cityContexts = (doc.cityContexts ?? []).map((entry) => entry.id === context.id ? {
+    ...entry,
+    updatedAt: checkedAt,
+    bookingCheckedAt: checkedAt,
+    ...(scoped ? { bookingReference: scoped } : { bookingReference: undefined }),
+  } : entry);
+  doc.bookingReferences = setTripBookingReference(doc.bookingReferences, scoped, context.city, context.id);
+  return (doc.cityContexts ?? []).find((entry) => entry.id === context.id) ?? context;
+}
+
+/**
+ * Revalidates one selected city against Gmail. A provider failure deliberately
+ * retains the last verified reference rather than fabricating a newer check.
+ */
+export async function refreshTripCityContextBookings(args: {
+  doc: TripDoc;
+  cityContextId: string;
+  now?: number;
+}): Promise<{ context: TripCityContext; bookingReference?: TripBookingReference; refreshed: boolean }> {
+  const now = args.now ?? Date.now();
+  const context = selectTripCityContext(args.doc, args.cityContextId, now);
+  const bookings = await lookupGmailBookingsReadOnly({ days: 730, maxResults: 24 }).catch(() => undefined);
+  if (!bookings) {
+    return {
+      context,
+      bookingReference: currentTripBookingReference(context.bookingReference, now),
+      refreshed: false,
+    };
+  }
+  const relevant = bookingsForTripWindow(bookings, args.doc.departDate, args.doc.returnDate);
+  args.doc.confirmedBookings = relevant;
+  args.doc.bookingsCheckedAt = now;
+  const reference = await verifyTripCityBookingReference({
+    doc: args.doc,
+    city: context.city,
+    center: context.center,
+    bookings: relevant,
+    now,
+  });
+  const updated = setTripCityContextBookingReference(args.doc, context.id, reference, now);
+  return { context: updated, bookingReference: reference, refreshed: true };
+}
+
+/** Upserts a map-valid city base, selects it, and performs one read-only Gmail refresh. */
+export async function activateTripCityContext(args: {
+  doc: TripDoc;
+  city: string;
+  source: TripCityContext["source"];
+  center?: { lat: number; lng: number };
+  now?: number;
+}): Promise<{ context: TripCityContext; bookingReference?: TripBookingReference; refreshed: boolean }> {
+  const city = args.city.trim().slice(0, 120);
+  if (!city) throw new Error("Name the city or town to set as the travel map base.");
+  let center = args.center;
+  if (!validTripCenter(center)) {
+    const match = (await searchOpenStreetMapPlaces(city, { maxResults: 1 }))[0];
+    if (!match) throw new Error(`I couldn't locate ${city} on the map.`);
+    center = { lat: match.lat, lng: match.lng };
+  }
+  const now = args.now ?? Date.now();
+  const id = tripCityContextId(city, center);
+  const contexts = normalizeTripCityContexts(args.doc, now);
+  const prior = contexts.find((entry) => entry.id === id);
+  const next: TripCityContext = {
+    id,
+    city,
+    center,
+    source: prior?.source === "destination" ? "destination" : args.source,
+    createdAt: prior?.createdAt ?? now,
+    updatedAt: now,
+    ...(prior?.bookingReference ? { bookingReference: prior.bookingReference } : {}),
+    ...(prior?.bookingCheckedAt ? { bookingCheckedAt: prior.bookingCheckedAt } : {}),
+  };
+  args.doc.cityContexts = [...contexts.filter((entry) => entry.id !== id), next];
+  args.doc.activeCityContextId = id;
+  return await refreshTripCityContextBookings({ doc: args.doc, cityContextId: id, now });
+}
+
+async function routeTripDiscovery(
+  items: TripActivity[],
+  mode: TripTravelMode,
+  bookingReference?: TripBookingReference,
+): Promise<TripDayRoute> {
   const mapped = items.filter((item): item is TripActivity & { id: string; lat: number; lng: number } =>
     Boolean(item.id) && Number.isFinite(item.lat) && Number.isFinite(item.lng),
   );
   const calculatedAt = Date.now();
-  if (mapped.length < 2 || mode === "transit") return { mode, status: "unavailable", calculatedAt };
-  const route = await routeOpenStreetMapItinerary({ points: mapped.map((item) => ({ lat: item.lat, lng: item.lng })), mode });
+  const liveBooking = currentTripBookingReference(bookingReference, calculatedAt);
+  const bookedBase = liveBooking && validTripCenter(liveBooking)
+    ? {
+      id: `booking:${liveBooking.cityContextId ?? compactTravelKey(liveBooking.city)}:${liveBooking.start}`.slice(0, 180),
+      lat: Number(liveBooking.lat),
+      lng: Number(liveBooking.lng),
+    }
+    : undefined;
+  const stops = bookedBase ? [bookedBase, ...mapped] : mapped;
+  if (stops.length < 2 || mode === "transit") return { mode, status: "unavailable", calculatedAt };
+  const route = await routeOpenStreetMapItinerary({ points: stops.map((item) => ({ lat: item.lat, lng: item.lng })), mode });
   if (!route) return { mode, status: "unavailable", calculatedAt };
   return {
     mode,
@@ -790,16 +1118,16 @@ async function routeTripDiscovery(items: TripActivity[], mode: TripTravelMode): 
     durationSeconds: route.durationSeconds,
     distanceMeters: route.distanceMeters,
     legs: route.legs.map((leg, index) => ({
-      fromItemId: mapped[index]!.id,
-      toItemId: mapped[index + 1]!.id,
+      fromItemId: stops[index]!.id,
+      toItemId: stops[index + 1]!.id,
       durationSeconds: leg.durationSeconds,
       distanceMeters: leg.distanceMeters,
     })),
     attribution: route.attribution,
     directionsUrl: openStreetMapDirectionsUrl({
-      origin: mapped[0]!,
-      destination: mapped[mapped.length - 1]!,
-      waypoints: mapped.slice(1, -1),
+      origin: stops[0]!,
+      destination: stops[stops.length - 1]!,
+      waypoints: stops.slice(1, -1),
       mode,
     }),
     calculatedAt,
@@ -831,28 +1159,37 @@ export async function discoverTripPlaces(args: {
 
   const fetchedAt = Date.now();
   const discoveryId = `discovery:${fetchedAt.toString(36)}:${compactTravelKey(city)}:${compactTravelKey(query)}`.slice(0, 180);
-  const items = places.map((place) => tripActivityFromPlace(place, city, discoveryId));
-  const mode = isTripTravelMode(args.mode) ? args.mode : "walking";
-  const route = args.includeRoute === false ? undefined : await routeTripDiscovery(items.slice(0, 8), mode);
-  const freshBookings = await lookupGmailBookingsReadOnly({ days: 730, maxResults: 24 }).catch(() => undefined);
-  if (freshBookings) {
-    const relevant = bookingsForTripWindow(freshBookings, args.doc.departDate, args.doc.returnDate);
-    if (relevant.length) args.doc.confirmedBookings = mergeTripBookings(args.doc.confirmedBookings, relevant);
-    args.doc.bookingsCheckedAt = fetchedAt;
-  }
-  const bookingReference = await verifyTripCityBookingReference({
+  const activated = await activateTripCityContext({
     doc: args.doc,
     city,
     center,
-    bookings: freshBookings ?? args.doc.confirmedBookings,
+    source: "explore",
     now: fetchedAt,
   });
-  const discovery: TripDiscovery = { id: discoveryId, city, query, center, fetchedAt, provider: "OpenStreetMap", items, route, ...(bookingReference ? { bookingReference } : {}) };
-  const matchingCityAndQuery = (entry: TripDiscovery) => compactTravelKey(entry.city) === compactTravelKey(city) && compactTravelKey(entry.query) === compactTravelKey(query);
+  const items = places.map((place) => tripActivityFromPlace(place, city, discoveryId, activated.context.id));
+  const mode = isTripTravelMode(args.mode) ? args.mode : "walking";
+  const route = args.includeRoute === false
+    ? undefined
+    : await routeTripDiscovery(items.slice(0, 8), mode, activated.bookingReference);
+  const discovery: TripDiscovery = {
+    id: discoveryId,
+    cityContextId: activated.context.id,
+    city,
+    query,
+    center,
+    fetchedAt,
+    provider: "OpenStreetMap",
+    items,
+    route,
+    ...(activated.bookingReference ? { bookingReference: activated.bookingReference } : {}),
+  };
+  const matchingCityAndQuery = (entry: TripDiscovery) => (
+    entry.cityContextId === activated.context.id
+    || compactTravelKey(entry.city) === compactTravelKey(city)
+  ) && compactTravelKey(entry.query) === compactTravelKey(query);
   args.doc.discoveries = [...(args.doc.discoveries ?? []).filter((entry) => !matchingCityAndQuery(entry)), discovery].slice(-8);
   const known = new Set(args.doc.activities.map((activity) => tripActivityId(activity)));
   args.doc.activities = [...args.doc.activities, ...items.filter((item) => !known.has(tripActivityId(item)))];
-  args.doc.bookingReferences = setTripBookingReference(args.doc.bookingReferences, bookingReference, city);
   await saveTrip(args.id, args.doc, true, { storage: args.storage ?? "creation", sourceMessageId: args.sourceMessageId });
   return { doc: args.doc, discovery };
 }
@@ -952,6 +1289,7 @@ function defaultActivityItems(doc: TripDoc, date: string, pool: TripActivity[], 
       title: activity.name,
       kind: "activity" as const,
       placeId: tripActivityId(activity),
+      cityContextId: activity.cityContextId,
       lat: Number.isFinite(activity.lat) ? activity.lat : undefined,
       lng: Number.isFinite(activity.lng) ? activity.lng : undefined,
       link: activity.mapsLink,
@@ -968,11 +1306,15 @@ function defaultActivityItems(doc: TripDoc, date: string, pool: TripActivity[], 
  */
 export function buildItinerary(doc: TripDoc): TripItineraryDay[] {
   const existing = new Map(normalizeTripItinerary(doc.itinerary).map((day) => [day.date, day]));
+  const activeCity = activeTripCityContext(doc);
   const f = doc.locked.flight;
   const returnFlight = doc.locked.returnFlight;
   const stay = doc.locked.stay;
-  const picked = doc.activities.filter((activity) => doc.locked.activities.includes(tripActivityId(activity)) || doc.locked.activities.includes(activity.name));
-  const pool = picked.length ? picked : doc.activities.slice(0, 8);
+  const cityActivities = activeCity
+    ? doc.activities.filter((activity) => activity.cityContextId === activeCity.id)
+    : doc.activities;
+  const picked = cityActivities.filter((activity) => doc.locked.activities.includes(tripActivityId(activity)) || doc.locked.activities.includes(activity.name));
+  const pool = picked.length ? picked : cityActivities.slice(0, 8);
   const nights = Math.max(1, Math.round((Date.parse(doc.returnDate) - Date.parse(doc.departDate)) / 86_400_000));
   const days: TripItineraryDay[] = [];
   let activityOffset = 0;
@@ -1032,6 +1374,7 @@ export function buildItinerary(doc: TripDoc): TripItineraryDay[] {
             time: "15:00",
             title: `Check in — ${stay.name}`,
             kind: "hotel",
+            cityContextId: stay.cityContextId,
             lat: stay.lat,
             lng: stay.lng,
             link: stay.link,
@@ -1047,6 +1390,7 @@ export function buildItinerary(doc: TripDoc): TripItineraryDay[] {
             time: "11:00",
             title: `Check out — ${stay.name}`,
             kind: "hotel",
+            cityContextId: stay.cityContextId,
             lat: stay.lat,
             lng: stay.lng,
             source: "generated",
@@ -1095,22 +1439,70 @@ export function buildItinerary(doc: TripDoc): TripItineraryDay[] {
   return days;
 }
 
+function bookingOverlapsTripDay(reference: TripBookingReference, date: string): boolean {
+  const dayStart = Date.parse(`${date}T00:00:00Z`);
+  const dayEnd = dayStart + 86_400_000 - 1;
+  return Number.isFinite(dayStart) && Number(reference.start) <= dayEnd && Number(reference.end ?? reference.start) >= dayStart;
+}
+
+function itemCityContextId(doc: TripDoc, item: TripItineraryItem): string | undefined {
+  if (item.cityContextId) return item.cityContextId;
+  const activity = activityForItem(doc, item);
+  if (activity?.cityContextId) return activity.cityContextId;
+  if (item.kind === "hotel") return doc.locked.stay?.cityContextId;
+  return undefined;
+}
+
 function routeItemsForDay(doc: TripDoc, day: TripItineraryDay): Array<{ item: TripItineraryItem; lat: number; lng: number }> {
+  const contexts = normalizeTripCityContexts(doc);
   const stops = day.items.flatMap((item) => {
     const point = itemCoordinates(doc, item);
     return point ? [{ item, ...point }] : [];
   });
-  // On a free day the hotel is an implicit first stop: it gives the map a
-  // real first-mile leg without inventing a fake visible activity tile.
+  const firstContextId = day.items.map((item) => itemCityContextId(doc, item)).find(Boolean);
+  const cityContext = contexts.find((context) => context.id === firstContextId)
+    ?? (firstContextId ? undefined : activeTripCityContext(doc));
+  const hasCityHotel = stops.some((stop) => stop.item.kind === "hotel"
+    && (!cityContext || itemCityContextId(doc, stop.item) === cityContext.id));
+  const currentBooking = cityContext ? currentTripBookingReference(cityContext.bookingReference, Date.now()) : undefined;
+  const bookingReference = currentBooking && bookingOverlapsTripDay(currentBooking, day.date)
+    ? currentBooking
+    : undefined;
+  // A Gmail booking is an independently geocoded, time-valid base for this
+  // city. It is deliberately scoped to its own context, so an old Barcelona
+  // hotel cannot become the origin of a Seville walking route.
+  if (stops.length && bookingReference && !hasCityHotel) {
+    stops.unshift({
+      item: {
+        id: `booking:${cityContext!.id}:${day.date}`.slice(0, 180),
+        cityContextId: cityContext!.id,
+        date: day.date,
+        title: bookingReference.bookingName ?? bookingReference.title,
+        kind: "hotel",
+        lat: bookingReference.lat,
+        lng: bookingReference.lng,
+        note: "Gmail booking reference · independently geocoded",
+        source: "gmail",
+        locked: true,
+      },
+      lat: bookingReference.lat,
+      lng: bookingReference.lng,
+    });
+    return stops;
+  }
+  // On a free day the selected city's locked hotel is an implicit first stop:
+  // it gives the map a real first-mile leg without inventing a visible tile.
   if (
     stops.length &&
-    !stops.some((stop) => stop.item.kind === "hotel") &&
+    !hasCityHotel &&
     Number.isFinite(doc.locked.stay?.lat) &&
-    Number.isFinite(doc.locked.stay?.lng)
+    Number.isFinite(doc.locked.stay?.lng) &&
+    (!cityContext || doc.locked.stay?.cityContextId === cityContext.id)
   ) {
     stops.unshift({
       item: {
         id: `stay:${day.date}`,
+        cityContextId: doc.locked.stay?.cityContextId,
         date: day.date,
         title: doc.locked.stay?.name ?? "Booked stay",
         kind: "hotel",
@@ -1226,6 +1618,7 @@ export async function scheduleTripDay(args: {
     title: activity.name,
     kind: "activity" as const,
     placeId: tripActivityId(activity),
+    cityContextId: activity.cityContextId,
     lat: activity.lat,
     lng: activity.lng,
     link: activity.mapsLink,
@@ -1250,7 +1643,7 @@ export async function addTripPlaceToDay(args: {
   storage?: TripStorage;
   sourceMessageId?: string;
   date: string;
-  place: { id?: string; name: string; lat: number; lng: number; link?: string; note?: string };
+  place: { id?: string; name: string; lat: number; lng: number; link?: string; note?: string; cityContextId?: string };
   time?: string;
   mode?: TripTravelMode;
 }): Promise<TripDoc> {
@@ -1273,6 +1666,7 @@ export async function addTripPlaceToDay(args: {
     title: args.place.name.trim().slice(0, 180),
     kind: "activity",
     placeId,
+    cityContextId: args.place.cityContextId?.trim().slice(0, 180) || undefined,
     lat: args.place.lat,
     lng: args.place.lng,
     link: args.place.link,

@@ -34,6 +34,7 @@ function day() {
       kind: "activity",
       lat: 38.72,
       lng: -9.14,
+      cityContextId: "lisbon",
       link: "https://www.openstreetmap.org/node/1",
       source: "owner",
     }, {
@@ -45,6 +46,7 @@ function day() {
       kind: "activity",
       lat: 38.716,
       lng: -9.13,
+      cityContextId: "sintra",
       link: "https://www.openstreetmap.org/node/2",
       source: "owner",
     }],
@@ -75,6 +77,35 @@ describe("atomic trip itinerary persistence", () => {
         kind: "trip",
         title: "Lisbon · planning",
         destination: "Lisbon",
+        destinationCenter: { lat: 38.7223, lng: -9.1393 },
+        center: { lat: 38.7223, lng: -9.1393 },
+        cityContexts: [{
+          id: "lisbon",
+          city: "Lisbon",
+          center: { lat: 38.7223, lng: -9.1393 },
+          source: "destination",
+          createdAt: 1,
+          updatedAt: 2,
+          bookingReference: { title: "Hotel Tejo", location: "Lisbon", lat: 38.72, lng: -9.14 },
+          bookingCheckedAt: 3,
+        }, {
+          id: "sintra",
+          city: "Sintra",
+          center: { lat: 38.798, lng: -9.39 },
+          source: "explore",
+          createdAt: 4,
+          updatedAt: 5,
+        }],
+        activeCityContextId: "lisbon",
+        discoveries: [{
+          id: "sintra-palaces",
+          city: "Sintra",
+          query: "palaces",
+          center: { lat: 38.798, lng: -9.39 },
+          fetchedAt: 6,
+          provider: "OpenStreetMap",
+          items: [{ id: "pena", name: "Pena Palace", cityContextId: "sintra" }],
+        }],
         providers: { stays: { status: "ready", source: "Google Hotels", count: 8 } },
         stays: [{ name: "Hotel Tejo" }],
         planRevision: 0,
@@ -119,10 +150,16 @@ describe("atomic trip itinerary persistence", () => {
     const mapData = JSON.parse(mapAfterFirst?.data ?? "{}");
     expect(mapData).toMatchObject({ tripId: String(id), title: "Trip map · Lisbon" });
     expect(mapData.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "city:lisbon", label: "📍 Lisbon · active", detail: expect.stringContaining("booked: Hotel Tejo") }),
+      expect.objectContaining({ id: "city:sintra", label: "📍 Sintra" }),
+      expect.objectContaining({ id: "discovery:sintra-palaces", label: "⌕ Sintra · palaces" }),
       expect.objectContaining({ id: "day-1:2026-09-12:activity:museum:0", label: "City Museum" }),
       expect.objectContaining({ id: "day-1:2026-09-12:activity:gallery:1", label: "Riverside Gallery" }),
     ]));
     expect(mapData.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ from: "trip", to: "city:lisbon", label: "active city" }),
+      expect.objectContaining({ from: "city:sintra", to: "discovery:sintra-palaces", label: "discoveries" }),
+      expect.objectContaining({ from: "city:lisbon", to: "day-1:2026-09-12:activity:museum:0", label: "planned stop" }),
       expect.objectContaining({ label: "walking · 15 min · 1.1 km" }),
     ]));
 
@@ -146,6 +183,70 @@ describe("atomic trip itinerary persistence", () => {
     const mapAfterRejected = await t.run(async (ctx) => ctx.db.get(mindmapCreationId));
     expect(mapAfterRejected?.data).toBe(mapAfterFirst?.data);
     expect(mapAfterRejected?.updatedAt).toBe(mapAfterFirst?.updatedAt);
+  });
+
+  it("scopes permanent primary provider candidates without moving the active city centre", async () => {
+    const t = convexTest(schema, modules);
+    const id = await t.run((ctx) => ctx.db.insert("creations", {
+      kind: "trip",
+      title: "Lisbon and Edinburgh · planning",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Lisbon and Edinburgh · planning",
+        destination: "Lisbon",
+        destinationCenter: { lat: 38.7223, lng: -9.1393 },
+        center: { lat: 55.9533, lng: -3.1883 },
+        cityContexts: [{
+          id: "lisbon",
+          city: "Lisbon",
+          center: { lat: 38.7223, lng: -9.1393 },
+          source: "destination",
+          createdAt: 1,
+          updatedAt: 1,
+        }, {
+          id: "edinburgh",
+          city: "Edinburgh",
+          center: { lat: 55.9533, lng: -3.1883 },
+          source: "explore",
+          createdAt: 1,
+          updatedAt: 1,
+        }],
+        activeCityContextId: "edinburgh",
+      }),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+
+    await expect(t.mutation(api.creations.updateTripProvider, {
+      id,
+      provider: "stays",
+      status: "ready",
+      source: "Google Hotels",
+      items: [
+        { name: "Hotel Tejo", lat: 38.72, lng: -9.14 },
+        { name: "Old Town Rooms", lat: 55.95, lng: -3.19, cityContextId: "edinburgh" },
+      ],
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+    await expect(t.mutation(api.creations.updateTripProvider, {
+      id,
+      provider: "activities",
+      status: "ready",
+      source: "OpenStreetMap",
+      items: [{ name: "Belém Tower", lat: 38.6916, lng: -9.216 }],
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+
+    const row = await t.run((ctx) => ctx.db.get(id)) as { data?: string } | null;
+    expect(JSON.parse(row?.data ?? "{}")).toMatchObject({
+      activeCityContextId: "edinburgh",
+      center: { lat: 55.9533, lng: -3.1883 },
+      stays: [
+        { name: "Hotel Tejo", cityContextId: "lisbon" },
+        { name: "Old Town Rooms", cityContextId: "edinburgh" },
+      ],
+      activities: [{ name: "Belém Tower", cityContextId: "lisbon" }],
+    });
   });
 
   it("creates and links a legacy permanent trip map in the itinerary transaction", async () => {

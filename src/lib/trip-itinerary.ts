@@ -15,6 +15,12 @@ export type TripItineraryItemSource = "generated" | "owner" | "gmail" | "recomme
 export type TripItineraryItem = {
   /** Stable across reorders so legs, tiles, and a saved mind map stay linked. */
   id: string;
+  /**
+   * Durable city/base identity for a stop. This is intentionally separate from
+   * the human-facing place name: two towns can have same-named venues, and a
+   * verified booked stay may only anchor routes inside its own city context.
+   */
+  cityContextId?: string;
   date: string;
   time?: string;
   durationMinutes?: number;
@@ -139,6 +145,7 @@ function normalizeItem(raw: any, date: string, ordinal: number): TripItineraryIt
   const source = VALID_SOURCES.has(raw?.source as TripItineraryItemSource) ? raw.source as TripItineraryItemSource : "generated";
   return {
     id,
+    cityContextId: cleanText(raw?.cityContextId, 180) || undefined,
     date: itemDate,
     time: isTripTime(raw?.time) ? raw.time : undefined,
     durationMinutes: Number.isFinite(duration) && duration > 0 && duration <= 1_440 ? Math.round(duration) : undefined,

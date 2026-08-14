@@ -42,6 +42,63 @@ function isRecord(value: unknown): value is TripCanvasRecord {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+type TripCenter = { lat: number; lng: number };
+type DestinationCityContext = { id: string; knownIds: Set<string> };
+
+function tripCenter(value: unknown): TripCenter | undefined {
+  if (!isRecord(value) || !Number.isFinite(value.lat) || !Number.isFinite(value.lng)) return undefined;
+  const lat = Number(value.lat);
+  const lng = Number(value.lng);
+  return Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? { lat, lng } : undefined;
+}
+
+function compactCityKey(value: unknown): string {
+  return typeof value === "string"
+    ? value.trim().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase().replace(/[^a-z0-9]+/g, "")
+    : "";
+}
+
+function cityContextId(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= 180 && !/[\u0000-\u001f\u007f]/.test(value)
+    ? value
+    : undefined;
+}
+
+function activeCityContextCenter(doc: TripCanvasRecord): TripCenter | undefined {
+  const activeId = cityContextId(doc.activeCityContextId);
+  if (!activeId || !Array.isArray(doc.cityContexts)) return undefined;
+  for (const rawContext of doc.cityContexts) {
+    if (!isRecord(rawContext) || rawContext.id !== activeId) continue;
+    return tripCenter(rawContext.center);
+  }
+  return undefined;
+}
+
+function destinationCityContext(doc: TripCanvasRecord): DestinationCityContext | undefined {
+  if (!Array.isArray(doc.cityContexts)) return undefined;
+  const contexts = doc.cityContexts
+    .filter(isRecord)
+    .flatMap((context) => cityContextId(context.id) ? [context] : []);
+  const knownIds = new Set(contexts.map((context) => String(context.id)));
+  if (!knownIds.size) return undefined;
+  const destination = compactCityKey(doc.destination);
+  const selected = contexts.find((context) => context.source === "destination" && compactCityKey(context.city) === destination)
+    ?? contexts.find((context) => compactCityKey(context.city) === destination)
+    ?? contexts.find((context) => context.source === "destination");
+  return selected ? { id: String(selected.id), knownIds } : undefined;
+}
+
+function scopePrimaryDestinationCandidates(value: unknown, destination: DestinationCityContext | undefined): unknown {
+  if (!destination || !Array.isArray(value)) return value;
+  return value.map((rawCandidate) => {
+    if (!isRecord(rawCandidate)) return rawCandidate;
+    const existingId = cityContextId(rawCandidate.cityContextId);
+    return existingId && destination.knownIds.has(existingId)
+      ? rawCandidate
+      : { ...rawCandidate, cityContextId: destination.id };
+  });
+}
+
 function tripCanvasTitle(canvas: TripCanvasRecord, fallback: string): string {
   return typeof canvas.title === "string" ? canvas.title.slice(0, 120) : fallback.slice(0, 120);
 }
@@ -380,15 +437,23 @@ export const updateTripProvider = mutation({
     await requireActor(ctx, a);
     const row = await ctx.db.get(a.id);
     if (!row || row.kind !== "trip" || !row.data) return false;
-    let doc: any;
+    let rawDoc: unknown;
     try {
-      doc = JSON.parse(row.data);
+      rawDoc = JSON.parse(row.data);
     } catch {
       return false;
     }
+    if (!isRecord(rawDoc)) return false;
+    // Existing provider payloads are deliberately opaque. Keep the writable
+    // JSON record separate from the structural guard so unrelated future
+    // fields remain intact while this mutation updates its own subtrees.
+    const doc: any = rawDoc;
     const now = Date.now();
     doc.providers = doc.providers ?? {};
-    const count = Array.isArray(a.items) ? a.items.length : a.items ? 1 : 0;
+    const items = a.provider === "stays" || a.provider === "activities"
+      ? scopePrimaryDestinationCandidates(a.items, destinationCityContext(doc))
+      : a.items;
+    const count = Array.isArray(items) ? items.length : items ? 1 : 0;
     doc.providers[a.provider] = {
       status: a.status,
       source: a.source,
@@ -396,19 +461,12 @@ export const updateTripProvider = mutation({
       checkedAt: now,
       error: a.error?.slice(0, 300),
     };
-    if (a.items !== undefined) {
-      if (a.provider === "airport") doc.airport = a.items || undefined;
-      else doc[a.provider] = a.items;
+    if (items !== undefined) {
+      if (a.provider === "airport") doc.airport = items || undefined;
+      else doc[a.provider] = items;
     }
-    const points = [...(doc.stays ?? []), ...(doc.activities ?? [])].filter(
-      (item: any) => Number.isFinite(item?.lat) && Number.isFinite(item?.lng),
-    );
-    if (points.length) {
-      doc.center = {
-        lat: points.reduce((sum: number, item: any) => sum + item.lat, 0) / points.length,
-        lng: points.reduce((sum: number, item: any) => sum + item.lng, 0) / points.length,
-      };
-    }
+    const preferredCenter = activeCityContextCenter(doc) ?? tripCenter(doc.destinationCenter) ?? tripCenter(doc.center);
+    if (preferredCenter) doc.center = preferredCenter;
     const nights = Math.max(1, Math.round((Date.parse(doc.returnDate) - Date.parse(doc.departDate)) / 86_400_000) || 1);
     const flightOption = doc.locked?.flight ?? doc.flights?.[0];
     const projectedStay = doc.locked?.stay ?? doc.stays?.[0];
@@ -483,6 +541,11 @@ function validTripItineraryPayload(value: unknown): boolean {
       if ((stop.lat === undefined) !== (stop.lng === undefined)) return false;
       if (stop.lat !== undefined && (!validItineraryCoordinate(stop.lat, 90) || !validItineraryCoordinate(stop.lng, 180))) return false;
       if (stop.placeId !== undefined && !validItineraryString(stop.placeId, 180)) return false;
+      // A stop can remain tied to its original city/base even after another
+      // town becomes the active map context. The ID is opaque here on purpose:
+      // legacy plans may not have city contexts yet, and context ownership is
+      // established by the surrounding TripDoc rather than this route write.
+      if (stop.cityContextId !== undefined && !validItineraryString(stop.cityContextId, 180)) return false;
       if (stop.link !== undefined && (!validItineraryString(stop.link, 1_600) || !/^https?:\/\//.test(stop.link))) return false;
       if (stop.note !== undefined && !validItineraryString(stop.note, 400)) return false;
       if (stop.locked !== undefined && typeof stop.locked !== "boolean") return false;

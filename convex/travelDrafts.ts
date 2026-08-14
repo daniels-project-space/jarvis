@@ -3,7 +3,10 @@ import { v } from "convex/values";
 import { actorAuthArgs, hasWorkerCapability, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { tripCanvas } from "./tripCanvas";
 
-const SCHEMA_VERSION = 1;
+// V2 adds durable multi-city context metadata inside the opaque TripDoc. The
+// document parser deliberately still accepts V1 rows so they are upgraded only
+// when the owner or a provider writes them again.
+const SCHEMA_VERSION = 2;
 const MAX_DATA_BYTES = 120_000;
 const MAX_THREAD_LENGTH = 120;
 const MAX_TITLE_LENGTH = 120;
@@ -144,6 +147,68 @@ function finiteNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+type TripCenter = { lat: number; lng: number };
+
+function tripCenter(value: unknown): TripCenter | undefined {
+  if (!isRecord(value) || !Number.isFinite(value.lat) || !Number.isFinite(value.lng)) return undefined;
+  const lat = Number(value.lat);
+  const lng = Number(value.lng);
+  return Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? { lat, lng } : undefined;
+}
+
+/**
+ * `center` drives the live map, so it must mean one selected city rather than
+ * an arithmetic midpoint between unrelated scouting result sets. A missing or
+ * stale selection intentionally falls back to the immutable destination
+ * geocode, then the document's existing centre for V1 compatibility.
+ */
+function activeCityContextCenter(doc: JsonRecord): TripCenter | undefined {
+  const activeId = typeof doc.activeCityContextId === "string" ? doc.activeCityContextId : undefined;
+  if (!activeId || !Array.isArray(doc.cityContexts)) return undefined;
+  for (const rawContext of doc.cityContexts) {
+    if (!isRecord(rawContext) || rawContext.id !== activeId) continue;
+    return tripCenter(rawContext.center);
+  }
+  return undefined;
+}
+
+function compactCityKey(value: unknown): string {
+  return typeof value === "string"
+    ? value.trim().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase().replace(/[^a-z0-9]+/g, "")
+    : "";
+}
+
+/**
+ * Provider searches in this mutation are for the trip's primary destination.
+ * They must not silently turn an explicit valid cross-city candidate into a
+ * destination result, but missing or stale IDs need the durable destination
+ * context so the globe never receives an unscoped primary result.
+ */
+function destinationCityContext(doc: JsonRecord): { id: string; knownIds: Set<string> } | undefined {
+  if (!Array.isArray(doc.cityContexts)) return undefined;
+  const contexts = doc.cityContexts
+    .filter(isRecord)
+    .flatMap((context) => boundedString(context.id, 180, 1) ? [context] : []);
+  const knownIds = new Set(contexts.map((context) => String(context.id)));
+  if (!knownIds.size) return undefined;
+  const destination = compactCityKey(doc.destination);
+  const destinationContext = contexts.find((context) => context.source === "destination" && compactCityKey(context.city) === destination)
+    ?? contexts.find((context) => compactCityKey(context.city) === destination)
+    ?? contexts.find((context) => context.source === "destination");
+  return destinationContext ? { id: String(destinationContext.id), knownIds } : undefined;
+}
+
+function scopePrimaryDestinationCandidates(value: unknown, destination: { id: string; knownIds: Set<string> } | undefined): unknown {
+  if (!destination || !Array.isArray(value)) return value;
+  return value.map((rawCandidate) => {
+    if (!isRecord(rawCandidate)) return rawCandidate;
+    const cityContextId = boundedString(rawCandidate.cityContextId, 180, 1) ? rawCandidate.cityContextId : undefined;
+    return cityContextId && destination.knownIds.has(cityContextId)
+      ? rawCandidate
+      : { ...rawCandidate, cityContextId: destination.id };
+  });
+}
+
 function safeText(value: unknown, max: number, fallback = ""): string {
   return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, max) : fallback;
 }
@@ -151,14 +216,9 @@ function safeText(value: unknown, max: number, fallback = ""): string {
 /** Mirrors the derived live-map fields on permanent trips without touching the owner-plan revision. */
 function refreshProviderDerivedState(doc: JsonRecord, providers: JsonRecord, now: number): void {
   const stays = Array.isArray(doc.stays) ? doc.stays.filter(isRecord) : [];
-  const activities = Array.isArray(doc.activities) ? doc.activities.filter(isRecord) : [];
-  const points = [...stays, ...activities].filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng));
-  if (points.length) {
-    doc.center = {
-      lat: points.reduce((sum, item) => sum + finiteNumber(item.lat), 0) / points.length,
-      lng: points.reduce((sum, item) => sum + finiteNumber(item.lng), 0) / points.length,
-    };
-  }
+  const previousCenter = tripCenter(doc.center);
+  const preferredCenter = activeCityContextCenter(doc) ?? tripCenter(doc.destinationCenter) ?? previousCenter;
+  if (preferredCenter) doc.center = preferredCenter;
 
   const locked = isRecord(doc.locked) ? doc.locked : {};
   const flight = isRecord(locked.flight) ? locked.flight : stays[0];
@@ -288,6 +348,7 @@ export const updatePlan = mutation({
       title: a.title,
       destination: a.destination,
       data: parsed.data,
+      schemaVersion: SCHEMA_VERSION,
       planRevision,
       updatedAt,
     });
@@ -315,8 +376,8 @@ export const patchProvider = mutation({
     if (!boundedString(a.source, MAX_SOURCE_LENGTH, 1) || (a.error !== undefined && !boundedString(a.error, MAX_PROVIDER_ERROR_LENGTH))) {
       return { ok: false as const, reason: "invalid" as const };
     }
-    const items = parseProviderItems(a.itemsJson);
-    if (items === null) return { ok: false as const, reason: "invalid" as const };
+    const parsedItems = parseProviderItems(a.itemsJson);
+    if (parsedItems === null) return { ok: false as const, reason: "invalid" as const };
     const row = await ctx.db.get(a.id);
     if (!row) return { ok: false as const, reason: "not_found" as const };
     if (sourceMessageRequired(a.workerToken, a.sourceMessageId)) {
@@ -331,6 +392,9 @@ export const patchProvider = mutation({
     const parsed = parseTripDoc(row.data, row.title, row.destination, row.threadId, row.planRevision, "scouting");
     if (!parsed) return { ok: false as const, reason: "invalid_draft" as const };
     const doc = parsed.doc;
+    const items = (a.provider === "stays" || a.provider === "activities")
+      ? scopePrimaryDestinationCandidates(parsedItems, destinationCityContext(doc))
+      : parsedItems;
     const providers = isRecord(doc.providers) ? { ...doc.providers } : {};
     const now = Date.now();
     providers[a.provider as Provider] = {
@@ -349,7 +413,7 @@ export const patchProvider = mutation({
     const data = JSON.stringify(doc);
     if (data.length > MAX_DATA_BYTES) return { ok: false as const, reason: "invalid" as const };
     const updatedAt = now;
-    await ctx.db.patch(a.id, { data, updatedAt });
+    await ctx.db.patch(a.id, { data, schemaVersion: SCHEMA_VERSION, updatedAt });
     return { ok: true as const, planRevision: row.planRevision, updatedAt };
   },
 });
@@ -432,6 +496,7 @@ export const lockDraft = mutation({
     await ctx.db.patch(a.id, {
       state: "locked",
       lockedCreationId: creationId,
+      schemaVersion: SCHEMA_VERSION,
       updatedAt: now,
       expiresAt: Math.max(row.expiresAt, now + LOCK_RECEIPT_LIFETIME_MS),
     });

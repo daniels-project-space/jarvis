@@ -12,11 +12,15 @@ const mock = vi.hoisted(() => ({
   scheduleTripDay: vi.fn(),
   addTripPlaceToDay: vi.fn(),
   discoverTripPlaces: vi.fn(),
+  activateTripCityContext: vi.fn(),
+  refreshTripCityContextBookings: vi.fn(),
+  selectTripCityContext: vi.fn(),
   tripActivityId: vi.fn((activity: { id?: string; name: string }) => activity.id ?? `osm:${activity.name}`),
   tripStayId: vi.fn((stay: { id?: string; name: string }) => stay.id ?? `stay:${stay.name}`),
   bookingsForTripWindow: vi.fn(),
+  normalizeTripCityContexts: vi.fn(),
   replaceConfirmedBookings: vi.fn(),
-  setTripBookingReference: vi.fn(),
+  setTripCityContextBookingReference: vi.fn(),
   verifyTripCityBookingReference: vi.fn(),
   scanGmailBookingConfirmations: vi.fn(),
   searchOpenStreetMapPlaces: vi.fn(),
@@ -38,11 +42,15 @@ vi.mock("./travel", () => ({
   scheduleTripDay: mock.scheduleTripDay,
   addTripPlaceToDay: mock.addTripPlaceToDay,
   discoverTripPlaces: mock.discoverTripPlaces,
+  activateTripCityContext: mock.activateTripCityContext,
+  refreshTripCityContextBookings: mock.refreshTripCityContextBookings,
+  selectTripCityContext: mock.selectTripCityContext,
   tripActivityId: mock.tripActivityId,
   tripStayId: mock.tripStayId,
   bookingsForTripWindow: mock.bookingsForTripWindow,
+  normalizeTripCityContexts: mock.normalizeTripCityContexts,
   replaceConfirmedBookings: mock.replaceConfirmedBookings,
-  setTripBookingReference: mock.setTripBookingReference,
+  setTripCityContextBookingReference: mock.setTripCityContextBookingReference,
   verifyTripCityBookingReference: mock.verifyTripCityBookingReference,
 }));
 
@@ -83,9 +91,13 @@ describe("trip itinerary tool actions", () => {
     mock.addTripPlaceToDay.mockResolvedValue(routed);
     mock.scanGmailBookingConfirmations.mockResolvedValue([]);
     mock.bookingsForTripWindow.mockReturnValue([]);
+    mock.normalizeTripCityContexts.mockReturnValue([]);
     mock.replaceConfirmedBookings.mockReturnValue(0);
-    mock.setTripBookingReference.mockReturnValue([]);
+    mock.setTripCityContextBookingReference.mockReturnValue(undefined);
     mock.verifyTripCityBookingReference.mockResolvedValue(undefined);
+    mock.activateTripCityContext.mockResolvedValue({ context: { id: "city:lisbon", city: "Lisbon" }, refreshed: true });
+    mock.selectTripCityContext.mockReturnValue({ id: "city:lisbon", city: "Lisbon" });
+    mock.refreshTripCityContextBookings.mockResolvedValue({ context: { id: "city:lisbon", city: "Lisbon" }, refreshed: true });
     mock.searchOpenStreetMapPlaces.mockResolvedValue([{
       name: "Neighbourhood Gallery",
       address: "Alfama, Lisbon",
@@ -151,6 +163,7 @@ describe("trip itinerary tool actions", () => {
     mock.getTrip.mockResolvedValueOnce({ id: "draft-1", doc: bookingTrip, storage: "draft" });
     mock.scanGmailBookingConfirmations.mockResolvedValueOnce([{ marker: "stay-1", kind: "stay", location: "Lisbon", start: Date.parse("2026-09-02T14:00:00Z"), end: Date.parse("2026-09-03T11:00:00Z") }]);
     mock.bookingsForTripWindow.mockReturnValueOnce([{ marker: "stay-1", kind: "stay", location: "Lisbon", start: Date.parse("2026-09-02T14:00:00Z"), end: Date.parse("2026-09-03T11:00:00Z") }]);
+    mock.normalizeTripCityContexts.mockReturnValueOnce([{ id: "city:lisbon", city: "Lisbon", center: { lat: 38.7223, lng: -9.1393 } }]);
     mock.convexMutation.mockResolvedValue({});
 
     await expect(executeTool("bookings_check", { draft_id: "draft-1" })).resolves.toContain("refreshed into");
@@ -158,6 +171,27 @@ describe("trip itinerary tool actions", () => {
     expect(mock.getTrip).toHaveBeenCalledWith("draft-1", expect.objectContaining({ storage: "draft" }));
     expect(mock.saveTrip).toHaveBeenCalledWith("draft-1", bookingTrip, true, expect.objectContaining({ storage: "draft" }));
     expect(mock.verifyTripCityBookingReference).toHaveBeenCalledWith(expect.objectContaining({ city: "Lisbon" }));
+    expect(mock.setTripCityContextBookingReference).toHaveBeenCalledWith(bookingTrip, "city:lisbon", undefined, expect.any(Number));
+  });
+
+  it("persists an explicit city-base selection and refreshes its time-valid booking reference", async () => {
+    mock.getTrip.mockResolvedValueOnce({ id: "trip-1", doc });
+    mock.selectTripCityContext.mockReturnValueOnce({ id: "city:granada", city: "Granada" });
+    mock.refreshTripCityContextBookings.mockResolvedValueOnce({
+      context: { id: "city:granada", city: "Granada" },
+      refreshed: true,
+      bookingReference: { title: "Hotel Albaicín" },
+    });
+
+    await expect(executeTool("trip_update", {
+      trip_id: "trip-1",
+      action: "select_city_context",
+      city_context_id: "city:granada",
+    })).resolves.toContain("Granada is now the active map base");
+
+    expect(mock.selectTripCityContext).toHaveBeenCalledWith(doc, "city:granada");
+    expect(mock.refreshTripCityContextBookings).toHaveBeenCalledWith({ doc, cityContextId: "city:granada" });
+    expect(mock.saveTrip).toHaveBeenCalledWith("trip-1", doc);
   });
 
   it("prepares one Gmail booking as a time-zone-aware owner approval without writing Calendar", async () => {

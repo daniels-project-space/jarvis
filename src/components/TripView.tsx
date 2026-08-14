@@ -47,7 +47,22 @@ type ItineraryDay = {
   items: ItineraryItem[];
   route?: ItineraryRoute;
 };
-type TripDoc = { itinerary?: ItineraryDay[]; [key: string]: any };
+type CityContext = {
+  id: string;
+  city: string;
+  center: { lat: number; lng: number };
+  source?: string;
+  createdAt?: number;
+  updatedAt?: number;
+  bookingReference?: TripBookedStayReferenceValue;
+  bookingCheckedAt?: number;
+};
+type TripDoc = {
+  itinerary?: ItineraryDay[];
+  cityContexts?: CityContext[];
+  activeCityContextId?: string;
+  [key: string]: any;
+};
 type Marker = { key: string; lat: number; lng: number; kind: "stay" | "activity" | "airport"; name: string; locked?: boolean; discoveryId?: string };
 
 const KIND_COLOR: Record<string, string> = { stay: "#00ff88", activity: "#5cc8ff", airport: "#ffb454" };
@@ -55,6 +70,52 @@ const GLASS = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-
 
 const validLatLng = (lat: unknown, lng: unknown) =>
   typeof lat === "number" && Number.isFinite(lat) && lat >= -90 && lat <= 90 && typeof lng === "number" && Number.isFinite(lng) && lng >= -180 && lng <= 180;
+
+const cityName = (value: unknown) => typeof value === "string" ? value.trim() : "";
+
+const sameCity = (left: unknown, right: unknown) => {
+  const normalizedLeft = cityName(left).toLocaleLowerCase("en-GB");
+  const normalizedRight = cityName(right).toLocaleLowerCase("en-GB");
+  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
+};
+
+const cityContextsForTrip = (doc: TripDoc | null): CityContext[] => {
+  const contexts = Array.isArray(doc?.cityContexts)
+    ? doc.cityContexts.filter(
+        (context: unknown): context is CityContext =>
+          Boolean(context)
+          && typeof context === "object"
+          && typeof (context as CityContext).id === "string"
+          && Boolean(cityName((context as CityContext).city))
+          && validLatLng((context as CityContext).center?.lat, (context as CityContext).center?.lng),
+      )
+    : [];
+  if (contexts.length) return contexts;
+
+  const legacyCity = cityName(doc?.destination ?? doc?.city);
+  const legacyCenter = validLatLng(doc?.center?.lat, doc?.center?.lng)
+    ? { lat: Number(doc?.center?.lat), lng: Number(doc?.center?.lng) }
+    : { lat: 51.5074, lng: -0.1278 };
+  return legacyCity
+    ? [{ id: "legacy-trip-city", city: legacyCity, center: legacyCenter, source: "legacy trip" }]
+    : [];
+};
+
+const belongsToCityContext = (
+  entry: unknown,
+  activeCityContext: CityContext | null,
+  cityContexts: CityContext[],
+) => {
+  if (!activeCityContext) return cityContexts.length <= 1;
+  const cityEntry = entry && typeof entry === "object" ? entry as { cityContextId?: unknown; city?: unknown } : {};
+  const entryContextId = typeof cityEntry.cityContextId === "string" ? cityEntry.cityContextId : "";
+  if (entryContextId) return entryContextId === activeCityContext.id;
+  const entryCity = cityName(cityEntry.city);
+  if (entryCity) return sameCity(entryCity, activeCityContext.city);
+  // Older single-city documents did not carry a city or a context id. Keep
+  // those entries visible only when there is no ambiguity to leak across.
+  return cityContexts.length <= 1;
+};
 
 const validRouteCoordinates = (route?: ItineraryRoute | null): Coordinate[] =>
   (route?.coordinates ?? []).filter(
@@ -662,7 +723,7 @@ export function TripDayControls({
   );
 }
 
-export default function TripView({ value }: { value: string }) {
+export default function TripView({ value, initialBookingNow = 0 }: { value: string; initialBookingNow?: number }) {
   let draftId = "";
   let creationId = "";
   try {
@@ -704,7 +765,7 @@ export default function TripView({ value }: { value: string }) {
   const [sortBy, setSortBy] = useState<"value" | "price" | "rating">("value");
   const [busy, setBusy] = useState("");
   const [actionError, setActionError] = useState("");
-  const [bookingNow, setBookingNow] = useState(0);
+  const [bookingNow, setBookingNow] = useState(initialBookingNow);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -714,6 +775,11 @@ export default function TripView({ value }: { value: string }) {
     return () => window.clearInterval(timer);
   }, []);
 
+  const cityContexts = useMemo(() => cityContextsForTrip(doc), [doc]);
+  const activeCityContext = useMemo(
+    () => cityContexts.find((context) => context.id === doc?.activeCityContextId) ?? cityContexts[0] ?? null,
+    [cityContexts, doc?.activeCityContextId],
+  );
   const itineraryDays = useMemo(
     () =>
       Array.isArray(doc?.itinerary)
@@ -725,8 +791,18 @@ export default function TripView({ value }: { value: string }) {
     [doc?.itinerary],
   );
   const discoveries = useMemo(
-    () => (Array.isArray(doc?.discoveries) ? doc.discoveries.filter((entry: any) => entry && typeof entry.id === "string" && Array.isArray(entry.items)) : []),
-    [doc?.discoveries],
+    () => (
+      Array.isArray(doc?.discoveries)
+        ? doc.discoveries.filter(
+            (entry: any) =>
+              entry
+              && typeof entry.id === "string"
+              && Array.isArray(entry.items)
+              && belongsToCityContext(entry, activeCityContext, cityContexts),
+          )
+        : []
+    ),
+    [activeCityContext, cityContexts, doc?.discoveries],
   );
   const activePlanDay = useMemo(
     () => itineraryDays.find((day) => day.date === activePlanDate) ?? itineraryDays[0] ?? null,
@@ -738,32 +814,43 @@ export default function TripView({ value }: { value: string }) {
   );
   const mapCenter = tab === "explore" && validLatLng(activeDiscovery?.center?.lat, activeDiscovery?.center?.lng)
     ? activeDiscovery.center
-    : doc?.center ?? { lat: 51.5074, lng: -0.1278 };
+    : activeCityContext?.center ?? doc?.center ?? { lat: 51.5074, lng: -0.1278 };
   const mapRoute: ItineraryRoute | undefined = tab === "explore" ? activeDiscovery?.route : activePlanDay?.route;
   const bookedStay = useMemo((): TripBookedStayReferenceValue | null => {
-    if (!bookingNow || !Array.isArray(doc?.bookingReferences)) return null;
-    const city = String(activeDiscovery?.city ?? doc?.destination ?? "").trim();
-    return (doc.bookingReferences as any[])
-      .filter((booking) => isFreshTripBookedStayReference(booking, city, bookingNow))
-      .sort((left, right) => Number(left.start) - Number(right.start))
-      .map((booking) => ({
-        city: String(booking.city),
-        title: String(booking.title ?? ""),
-        bookingName: typeof booking.bookingName === "string" ? booking.bookingName : undefined,
-        location: String(booking.location),
-        start: Number(booking.start),
-        end: Number(booking.end ?? booking.start),
-        timeZone: typeof booking.timeZone === "string" ? booking.timeZone : undefined,
-        distanceKm: Number(booking.distanceKm),
-        verifiedAt: Number(booking.verifiedAt),
-      }))[0] ?? null;
-  }, [activeDiscovery?.city, bookingNow, doc?.bookingReferences, doc?.destination]);
+    if (!bookingNow || !activeCityContext) return null;
+    const referenceFor = (booking: unknown, checkedAt?: unknown): TripBookedStayReferenceValue | null => {
+      const bookingEntry = booking && typeof booking === "object" ? booking as Record<string, unknown> : {};
+      const verifiedAt = typeof bookingEntry.verifiedAt === "number" ? bookingEntry.verifiedAt : Number(checkedAt);
+      const reference: TripBookedStayReferenceValue = {
+        city: cityName(bookingEntry.city) || activeCityContext.city,
+        title: typeof bookingEntry.title === "string" ? bookingEntry.title : "",
+        bookingName: typeof bookingEntry.bookingName === "string" ? bookingEntry.bookingName : undefined,
+        location: typeof bookingEntry.location === "string" ? bookingEntry.location : "",
+        start: Number(bookingEntry.start),
+        end: Number(bookingEntry.end ?? bookingEntry.start),
+        timeZone: typeof bookingEntry.timeZone === "string" ? bookingEntry.timeZone : undefined,
+        distanceKm: Number(bookingEntry.distanceKm),
+        verifiedAt,
+      };
+      return isFreshTripBookedStayReference(reference, activeCityContext.city, bookingNow) ? reference : null;
+    };
+    const references = [
+      activeCityContext.bookingReference && referenceFor(activeCityContext.bookingReference, activeCityContext.bookingCheckedAt),
+      ...(Array.isArray(doc?.bookingReferences)
+        ? doc.bookingReferences
+            .filter((booking: unknown) => belongsToCityContext(booking, activeCityContext, cityContexts))
+            .map((booking: unknown) => referenceFor(booking))
+        : []),
+    ].filter((reference): reference is TripBookedStayReferenceValue => Boolean(reference));
+    return references.sort((left, right) => Number(left.start) - Number(right.start))[0] ?? null;
+  }, [activeCityContext, bookingNow, cityContexts, doc?.bookingReferences]);
   const activeDiscoveryBookingReference = useMemo(() => {
     const booking = activeDiscovery?.bookingReference as TripBookedStayReferenceValue | undefined;
-    return booking && bookingNow && isFreshTripBookedStayReference(booking, String(activeDiscovery?.city ?? ""), bookingNow)
-      ? booking
+    const city = activeCityContext?.city ?? activeDiscovery?.city;
+    return booking && bookingNow && city && isFreshTripBookedStayReference({ ...booking, city: booking.city ?? city }, city, bookingNow)
+      ? { ...booking, city: booking.city ?? city }
       : null;
-  }, [activeDiscovery?.bookingReference, activeDiscovery?.city, bookingNow]);
+  }, [activeCityContext?.city, activeDiscovery?.bookingReference, activeDiscovery?.city, bookingNow]);
 
   const markers: Marker[] = useMemo(() => {
     if (!doc) return [];
@@ -772,17 +859,19 @@ export default function TripView({ value }: { value: string }) {
       if (!ms.some((existing) => existing.lat === marker.lat && existing.lng === marker.lng && existing.kind === marker.kind)) ms.push(marker);
     };
     for (const s of doc.stays ?? [])
-      if (validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.id ?? `${s.name}:${s.city ?? doc.destination}`}`, lat: s.lat, lng: s.lng, kind: "stay", name: `${s.name}${s.city ? ` · ${s.city}` : ""}`, locked: doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name });
-    for (const booking of doc.bookingReferences ?? [])
-      if (validLatLng(booking.lat, booking.lng) && isFreshTripBookedStayReference(booking, String(booking.city ?? ""), bookingNow))
-        addMarker({ key: `booking:${booking.city}:${booking.start}`, lat: booking.lat, lng: booking.lng, kind: "stay", name: `Booked location · ${booking.city}`, locked: true });
+      if (belongsToCityContext(s, activeCityContext, cityContexts) && validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.id ?? `${s.name}:${s.city ?? activeCityContext?.city ?? doc.destination}`}`, lat: s.lat, lng: s.lng, kind: "stay", name: `${s.name}${s.city ? ` · ${s.city}` : ""}`, locked: doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name });
+    for (const booking of doc.bookingReferences ?? []) {
+      const bookingForCity = activeCityContext ? { ...booking, city: cityName(booking.city) || activeCityContext.city } : booking;
+      if (belongsToCityContext(booking, activeCityContext, cityContexts) && activeCityContext && validLatLng(booking.lat, booking.lng) && isFreshTripBookedStayReference(bookingForCity, activeCityContext.city, bookingNow))
+        addMarker({ key: `booking:${bookingForCity.city}:${booking.start}`, lat: booking.lat, lng: booking.lng, kind: "stay", name: `Booked location · ${bookingForCity.city}`, locked: true });
+    }
     for (const discovery of discoveries)
       for (const item of discovery.items ?? [])
         if (validLatLng(item.lat, item.lng)) addMarker({ key: `disc:${discovery.id}:${item.id}`, lat: item.lat, lng: item.lng, kind: "activity", name: `${item.name} · ${discovery.city}`, discoveryId: discovery.id });
     for (const a of doc.activities ?? [])
-      if (validLatLng(a.lat, a.lng))
+      if (belongsToCityContext(a, activeCityContext, cityContexts) && validLatLng(a.lat, a.lng))
         addMarker({ key: `act:${a.id ?? a.name}`, lat: a.lat, lng: a.lng, kind: "activity", name: `${a.name}${a.city ? ` · ${a.city}` : ""}`, locked: (doc.locked?.activities ?? []).includes(a.id ?? a.name) || (doc.locked?.activities ?? []).includes(a.name) });
-    if (validLatLng(doc.airport?.lat, doc.airport?.lng)) addMarker({ key: "airport", lat: doc.airport.lat, lng: doc.airport.lng, kind: "airport", name: doc.airport.name });
+    if (belongsToCityContext(doc.airport, activeCityContext, cityContexts) && validLatLng(doc.airport?.lat, doc.airport?.lng)) addMarker({ key: "airport", lat: doc.airport.lat, lng: doc.airport.lng, kind: "airport", name: doc.airport.name });
     for (const day of itineraryDays) {
       day.items.forEach((item, index) => {
         const lat = Number(item.lat);
@@ -800,7 +889,7 @@ export default function TripView({ value }: { value: string }) {
       });
     }
     return ms;
-  }, [bookingNow, discoveries, doc, itineraryDays]);
+  }, [activeCityContext, bookingNow, cityContexts, discoveries, doc, itineraryDays]);
 
   if (!doc)
     return (
@@ -841,7 +930,8 @@ export default function TripView({ value }: { value: string }) {
     }
   };
 
-  const stays = (doc.stays ?? [])
+  const cityStays = (doc.stays ?? []).filter((stay: unknown) => belongsToCityContext(stay, activeCityContext, cityContexts));
+  const stays = cityStays
     .filter(
       (s: any) =>
         (!maxNight || (s.priceGbp ?? 9e9) <= maxNight) &&
@@ -856,6 +946,10 @@ export default function TripView({ value }: { value: string }) {
           ? (b.rating ?? 0) - (a.rating ?? 0)
           : (b.rating ?? 3) ** 2 / (b.priceGbp ?? 200) - (a.rating ?? 3) ** 2 / (a.priceGbp ?? 200),
     );
+  const activities = (doc.activities ?? []).filter((activity: unknown) => belongsToCityContext(activity, activeCityContext, cityContexts));
+  const activeExploreContextArgs = activeCityContext && (!cityName(exploreCity) || sameCity(exploreCity, activeCityContext.city))
+    ? { city_context_id: activeCityContext.id }
+    : {};
   const totals = doc.totals ?? { total: 0, flights: 0, stay: 0, activitiesEst: 0 };
   const projectedTotal = totals.projectedTotal ?? totals.total ?? 0;
   const lockedTotal = totals.lockedTotal ?? 0;
@@ -899,9 +993,12 @@ export default function TripView({ value }: { value: string }) {
       <div className="relative h-[30dvh] shrink-0 border-b border-white/5 @min-[760px]:h-auto @min-[760px]:w-[44%] @min-[760px]:border-b-0 @min-[760px]:border-r">
         <MapView center={mapCenter} markers={markers} route={mapRoute} selected={selected} onSelect={onMapSelect} />
         <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-black/50 px-2 py-1 backdrop-blur">
-          <div className="text-sm font-semibold text-ice">{tab === "explore" && activeDiscovery ? activeDiscovery.city : doc.destination}</div>
+          <div className="text-sm font-semibold text-ice">{activeCityContext?.city ?? (tab === "explore" && activeDiscovery ? activeDiscovery.city : doc.destination)}</div>
           <div className="hud-label !text-[9px]">
-            {tab === "explore" && activeDiscovery ? `${activeDiscovery.query} · OpenStreetMap` : `${doc.departDate || "dates tbd"}${doc.returnDate ? ` → ${doc.returnDate}` : ""} · ${doc.adults} adults`}
+            {tab === "explore" && activeDiscovery
+              ? `${activeDiscovery.query} · OpenStreetMap`
+              : `${doc.departDate || "dates tbd"}${doc.returnDate ? ` → ${doc.returnDate}` : ""} · ${doc.adults} adults`}
+            {activeCityContext && ` · centre ${activeCityContext.center.lat.toFixed(3)}, ${activeCityContext.center.lng.toFixed(3)}`}
           </div>
         </div>
         {mapRoute && (
@@ -977,6 +1074,26 @@ export default function TripView({ value }: { value: string }) {
           )}
           {actionError && <div className="mt-1.5 rounded border border-red-400/20 bg-red-400/5 px-2 py-1 text-[10px] text-red-300">{actionError}</div>}
         </div>
+        {activeCityContext && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 px-3 py-2">
+            <label className="grid gap-0.5 text-[9px] uppercase tracking-wider text-slate">
+              Active city
+              <select
+                aria-label="Active city"
+                value={activeCityContext.id}
+                disabled={Boolean(busy) || draftLocked || cityContexts.length < 2}
+                onChange={(event) => void act("switching city", "select_city_context", { city_context_id: event.target.value })}
+                className="min-w-40 rounded-md border border-white/10 bg-black/25 px-2 py-1 text-[11px] normal-case text-ice outline-none focus:border-cyan/50 disabled:opacity-55"
+              >
+                {cityContexts.map((context) => <option key={context.id} value={context.id}>{context.city}</option>)}
+              </select>
+            </label>
+            <div className="text-right">
+              <div className="text-[11px] font-medium text-ice">{activeCityContext.city}</div>
+              <div className="text-[9px] text-slate">centre {activeCityContext.center.lat.toFixed(3)}, {activeCityContext.center.lng.toFixed(3)}{activeCityContext.source ? ` · ${activeCityContext.source}` : ""}</div>
+            </div>
+          </div>
+        )}
         <div className="border-b border-white/5 px-3 pb-2 pt-2.5">
           <div className="flex flex-wrap items-baseline justify-between gap-x-3 text-sm">
             <span className="text-ice">
@@ -1003,7 +1120,7 @@ export default function TripView({ value }: { value: string }) {
               className={`shrink-0 rounded-full px-3 py-1 text-[11px] uppercase tracking-widest transition ${tab === t ? "bg-cyan/15 text-cyan ring-1 ring-cyan/40" : "text-slate hover:text-ice"}`}
             >
               {t}
-              {t === "stays" ? ` ${stays.length}` : t === "flights" ? ` ${(doc.flights ?? []).length}` : t === "activities" ? ` ${(doc.activities ?? []).length}` : t === "explore" ? ` ${discoveries.length}` : ""}
+              {t === "stays" ? ` ${stays.length}` : t === "flights" ? ` ${(doc.flights ?? []).length}` : t === "activities" ? ` ${activities.length}` : t === "explore" ? ` ${discoveries.length}` : ""}
             </button>
           ))}
           {busy && <span className="ml-auto shrink-0 animate-pulse text-[10px] text-cyan">{busy}…</span>}
@@ -1044,20 +1161,20 @@ export default function TripView({ value }: { value: string }) {
                   <option value="rating">top rated</option>
                 </select>
               </div>
-              {!doc.stays?.length && ["queued", "searching"].includes(doc.providers?.stays?.status) && (
+              {!cityStays.length && ["queued", "searching"].includes(doc.providers?.stays?.status) && (
                 <div className={`${glass} animate-pulse p-5 text-center text-sm text-cyan`}>Searching stays — the first page will appear here as soon as it lands…</div>
               )}
-              {!doc.stays?.length && doc.providers?.stays?.status === "error" && (
+              {!cityStays.length && doc.providers?.stays?.status === "error" && (
                 <div className={`${glass} border-red-400/20 p-5 text-center text-sm text-red-300`}>Stay search failed: {doc.providers.stays.error ?? "provider unavailable"}. Use retry above.</div>
               )}
-              {!doc.stays?.length && doc.providers?.stays?.status === "ready" && (
-                <div className={`${glass} p-5 text-center text-sm text-slate`}>No stays matched this budget. Raise the nightly cap or ask JARVIS to widen the search.</div>
+              {!cityStays.length && doc.providers?.stays?.status === "ready" && (
+                <div className={`${glass} p-5 text-center text-sm text-slate`}>No stays matched {activeCityContext?.city ?? "this city"}. Raise the nightly cap or ask JARVIS to widen the search.</div>
               )}
-              {!!doc.stays?.length && !stays.length && (
+              {!!cityStays.length && !stays.length && (
                 <div className={`${glass} p-5 text-center text-sm text-slate`}>No stays match these filters. Clear one or more filters to see the full shortlist.</div>
               )}
               {stays.map((s: any) => {
-                const stayRef = String(s.id ?? `${s.name}:${s.city ?? doc.destination}`);
+                const stayRef = String(s.id ?? `${s.name}:${s.city ?? activeCityContext?.city ?? doc.destination}`);
                 const stayKey = `stay:${stayRef}`;
                 const locked = doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name;
                 const sel = selected === stayKey;
@@ -1077,7 +1194,7 @@ export default function TripView({ value }: { value: string }) {
                         </span>
                       </div>
                       <div className="mt-0.5 text-[11px] text-slate">
-                        {s.city ? `${s.city} · ` : ""}★{s.rating ? Math.round(s.rating * 10) / 10 : "?"} {s.hotelClass ? "· " + "⭑".repeat(s.hotelClass) : ""} {s.propertyType ? `· ${s.propertyType}` : ""} {s.freeCancellation ? "· free cancellation" : ""}
+                        {s.city ?? activeCityContext?.city ? `${s.city ?? activeCityContext?.city} · ` : ""}★{s.rating ? Math.round(s.rating * 10) / 10 : "?"} {s.hotelClass ? "· " + "⭑".repeat(s.hotelClass) : ""} {s.propertyType ? `· ${s.propertyType}` : ""} {s.freeCancellation ? "· free cancellation" : ""}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-1">
                         {(s.amenities ?? []).map((a: string) => (
@@ -1160,16 +1277,16 @@ export default function TripView({ value }: { value: string }) {
 
           {tab === "activities" && (
             <>
-              {!(doc.activities ?? []).length && ["queued", "searching"].includes(doc.providers?.activities?.status) && (
+              {!activities.length && ["queued", "searching"].includes(doc.providers?.activities?.status) && (
                 <div className={`${glass} animate-pulse p-5 text-center text-sm text-cyan`}>Finding useful places and visual highlights…</div>
               )}
-              {!(doc.activities ?? []).length && doc.providers?.activities?.status === "error" && (
+              {!activities.length && doc.providers?.activities?.status === "error" && (
                 <div className={`${glass} border-red-400/20 p-5 text-center text-sm text-red-300`}>Activity search failed: {doc.providers.activities.error ?? "provider unavailable"}. Use retry above.</div>
               )}
-              {!(doc.activities ?? []).length && doc.providers?.activities?.status === "ready" && (
-                <div className={`${glass} p-5 text-center text-sm text-slate`}>No activities were returned for this destination.</div>
+              {!activities.length && doc.providers?.activities?.status === "ready" && (
+                <div className={`${glass} p-5 text-center text-sm text-slate`}>No activities were returned for {activeCityContext?.city ?? "this destination"}.</div>
               )}
-              {(doc.activities ?? []).map((a: any) => {
+              {activities.map((a: any) => {
               const activityId = String(a.id ?? a.name);
               const picked = (doc.locked?.activities ?? []).includes(activityId) || (doc.locked?.activities ?? []).includes(a.name);
               const sel = selected === `act:${activityId}`;
@@ -1183,7 +1300,7 @@ export default function TripView({ value }: { value: string }) {
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[13px] font-semibold text-ice">{a.name}</div>
-                    <div className="text-[10px] text-slate">OpenStreetMap place{a.city ? ` · ${a.city}` : ""} · venue details can change</div>
+                    <div className="text-[10px] text-slate">OpenStreetMap place{a.city || activeCityContext?.city ? ` · ${a.city ?? activeCityContext?.city}` : ""} · venue details can change</div>
                     {a.address && <div className="truncate text-[10px] text-slate/70">{a.address}</div>}
                     {(a.openingHours || a.charge) && (
                       <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-slate">
@@ -1215,7 +1332,7 @@ export default function TripView({ value }: { value: string }) {
               <section className={`${glass} space-y-2.5 p-3`} aria-label="Explore another place">
                 <div>
                   <div className="hud-label">explore the same live globe</div>
-                  <p className="mt-1 text-[11px] text-slate">Find real places or stays in any city without changing this trip’s destination. Results, map pins, routes, and read-only booking references stay with the plan.</p>
+                  <p className="mt-1 text-[11px] text-slate">Find real places or stays in any city without changing this trip’s destination. Results, map pins, routes, and read-only booking references stay with their selected city.</p>
                 </div>
                 <div className="grid gap-2 @min-[500px]:grid-cols-2">
                   <label className="grid gap-1 text-[9px] uppercase tracking-wider text-slate">
@@ -1224,7 +1341,7 @@ export default function TripView({ value }: { value: string }) {
                       aria-label="Explore city or town"
                       value={exploreCity}
                       onChange={(event) => setExploreCity(event.target.value)}
-                      placeholder={doc.destination}
+                      placeholder={activeCityContext?.city ?? doc.destination}
                       className="rounded-md border border-white/10 bg-black/25 px-2 py-1.5 text-[11px] normal-case text-ice outline-none focus:border-cyan/50"
                     />
                   </label>
@@ -1254,7 +1371,7 @@ export default function TripView({ value }: { value: string }) {
                   <button
                     type="button"
                     disabled={Boolean(busy)}
-                    onClick={() => void act("finding places", "discover_places", { location: exploreCity || doc.destination, query: exploreQuery || doc.vibe || "attractions", route: true, transport_mode: exploreMode })}
+                    onClick={() => void act("finding places", "discover_places", { location: exploreCity || activeCityContext?.city || doc.destination, query: exploreQuery || doc.vibe || "attractions", route: true, transport_mode: exploreMode, ...activeExploreContextArgs })}
                     className="rounded-md bg-cyan/15 px-2.5 py-1 text-[10px] text-cyan ring-1 ring-cyan/35 hover:bg-cyan/25 disabled:opacity-35"
                   >
                     find mapped places
@@ -1262,7 +1379,7 @@ export default function TripView({ value }: { value: string }) {
                   <button
                     type="button"
                     disabled={Boolean(busy)}
-                    onClick={() => void act("finding stays", "rescout_stays", { location: exploreCity || doc.destination })}
+                    onClick={() => void act("finding stays", "rescout_stays", { location: exploreCity || activeCityContext?.city || doc.destination, ...activeExploreContextArgs })}
                     className="rounded-md bg-white/5 px-2.5 py-1 text-[10px] text-ice ring-1 ring-white/10 hover:text-cyan disabled:opacity-35"
                   >
                     find stays here
@@ -1400,7 +1517,7 @@ export default function TripView({ value }: { value: string }) {
               {activePlanDay && (
                 <TripDayControls
                   day={activePlanDay}
-                  availableActivities={(doc.activities ?? []).map((activity: any) => ({ id: String(activity.id ?? activity.name ?? ""), name: String(activity.name ?? "") })).filter((activity: { id: string; name: string }) => activity.id && activity.name)}
+                  availableActivities={activities.map((activity: any) => ({ id: String(activity.id ?? activity.name ?? ""), name: String(activity.name ?? "") })).filter((activity: { id: string; name: string }) => activity.id && activity.name)}
                   busy={Boolean(busy) || draftLocked}
                   onSelectDay={setActivePlanDate}
                   onSave={(payload) => void act("routing day", "schedule_day", { date: activePlanDay.date, ...payload })}

@@ -99,6 +99,141 @@ describe("conversation-scoped travel drafts", () => {
     });
   });
 
+  it("keeps a selected CityContext centre stable across multi-city provider arrivals and upgrades V1 rows lazily", async () => {
+    const t = convexTest(schema, modules);
+    const messageId = await sourceMessage(t, "thread-multi-city");
+    const now = Date.now();
+    const created = await t.mutation(travelDrafts.createDraft, {
+      threadId: "thread-multi-city",
+      title: "Lisbon and Edinburgh · planning",
+      destination: "Lisbon",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Lisbon and Edinburgh · planning",
+        destination: "Lisbon",
+        destinationCenter: { lat: 38.7223, lng: -9.1393 },
+        center: { lat: 38.7223, lng: -9.1393 },
+        cityContexts: [{
+          id: "lisbon",
+          city: "Lisbon",
+          center: { lat: 38.7223, lng: -9.1393 },
+          source: "destination",
+          createdAt: now,
+          updatedAt: now,
+        }, {
+          id: "edinburgh",
+          city: "Edinburgh",
+          center: { lat: 55.9533, lng: -3.1883 },
+          source: "explore",
+          createdAt: now,
+          updatedAt: now,
+          futureCityField: "preserve me",
+        }],
+        activeCityContextId: "edinburgh",
+        futureTripExtension: { version: 3 },
+      }),
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    });
+    await t.run((ctx) => ctx.db.patch(created.id, { schemaVersion: 1 }));
+
+    await expect(t.mutation(travelDrafts.patchProvider, {
+      id: created.id,
+      provider: "stays",
+      status: "ready",
+      source: "Google Hotels",
+      itemsJson: JSON.stringify([
+        { name: "Hotel Tejo", lat: 38.72, lng: -9.14 },
+        { name: "Old Town Rooms", lat: 55.95, lng: -3.19, cityContextId: "edinburgh" },
+      ]),
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    })).resolves.toMatchObject({ ok: true });
+    await expect(t.mutation(travelDrafts.patchProvider, {
+      id: created.id,
+      provider: "activities",
+      status: "ready",
+      source: "OpenStreetMap",
+      itemsJson: JSON.stringify([{ name: "Belém Tower", lat: 38.6916, lng: -9.216 }]),
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    })).resolves.toMatchObject({ ok: true });
+
+    const row = await t.run((ctx) => ctx.db.get(created.id)) as { data?: string; schemaVersion?: number } | null;
+    const data = JSON.parse(row?.data ?? "{}");
+    expect(row?.schemaVersion).toBe(2);
+    expect(data).toMatchObject({
+      activeCityContextId: "edinburgh",
+      center: { lat: 55.9533, lng: -3.1883 },
+      futureTripExtension: { version: 3 },
+      stays: [
+        { name: "Hotel Tejo", cityContextId: "lisbon" },
+        { name: "Old Town Rooms", cityContextId: "edinburgh" },
+      ],
+      activities: [{ name: "Belém Tower", cityContextId: "lisbon" }],
+    });
+    expect(data.cityContexts[1]).toMatchObject({ id: "edinburgh", futureCityField: "preserve me" });
+  });
+
+  it("falls back from a missing CityContext to destinationCenter, then the legacy centre", async () => {
+    const t = convexTest(schema, modules);
+    const messageId = await sourceMessage(t, "thread-city-fallback");
+    const destinationFallback = await t.mutation(travelDrafts.createDraft, {
+      threadId: "thread-city-fallback",
+      title: "Lisbon · planning",
+      destination: "Lisbon",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Lisbon · planning",
+        destination: "Lisbon",
+        destinationCenter: { lat: 38.7223, lng: -9.1393 },
+        center: { lat: 51.5072, lng: -0.1276 },
+        cityContexts: [{ id: "lisbon", city: "Lisbon", center: { lat: 38.7223, lng: -9.1393 }, source: "destination", createdAt: 1, updatedAt: 1 }],
+        activeCityContextId: "missing-city",
+      }),
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    });
+    await t.mutation(travelDrafts.patchProvider, {
+      id: destinationFallback.id,
+      provider: "activities",
+      status: "ready",
+      source: "OpenStreetMap",
+      itemsJson: JSON.stringify([{ name: "Unrelated venue", lat: 48.8566, lng: 2.3522 }]),
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    });
+    const destinationFallbackRow = await t.run((ctx) => ctx.db.get(destinationFallback.id)) as { data?: string } | null;
+    const afterDestinationFallback = JSON.parse(destinationFallbackRow?.data ?? "{}");
+    expect(afterDestinationFallback.center).toEqual({ lat: 38.7223, lng: -9.1393 });
+
+    const legacyFallback = await t.mutation(travelDrafts.createDraft, {
+      threadId: "thread-city-fallback",
+      title: "Legacy trip · planning",
+      destination: "Legacy trip",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Legacy trip · planning",
+        destination: "Legacy trip",
+        center: { lat: 51.5072, lng: -0.1276 },
+      }),
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    });
+    await t.mutation(travelDrafts.patchProvider, {
+      id: legacyFallback.id,
+      provider: "activities",
+      status: "ready",
+      source: "OpenStreetMap",
+      itemsJson: JSON.stringify([{ name: "Elsewhere", lat: 48.8566, lng: 2.3522 }]),
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    });
+    const legacyFallbackRow = await t.run((ctx) => ctx.db.get(legacyFallback.id)) as { data?: string } | null;
+    const afterLegacyFallback = JSON.parse(legacyFallbackRow?.data ?? "{}");
+    expect(afterLegacyFallback.center).toEqual({ lat: 51.5072, lng: -0.1276 });
+  });
+
   it("validates message provenance, permits exact authenticated reads, and locks only once", async () => {
     const t = convexTest(schema, modules);
     const lisbonMessage = await sourceMessage(t, "thread-lisbon");

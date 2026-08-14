@@ -37,6 +37,21 @@ function optionalUrl(key: "url" | "image", value: unknown): TripCanvasRecord {
   return url ? { [key]: url } : {};
 }
 
+function cityContextCenterText(value: unknown): string {
+  if (!isRecord(value) || !Number.isFinite(value.lat) || !Number.isFinite(value.lng)) return "";
+  const lat = Number(value.lat);
+  const lng = Number(value.lng);
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return "";
+  return `${lat.toFixed(3)}, ${lng.toFixed(3)}`;
+}
+
+function bookingReferenceLabel(value: unknown): string {
+  if (!isRecord(value)) return "";
+  const name = safeText(value.bookingName, 60) || safeText(value.title, 60);
+  const location = safeText(value.location, 80);
+  return [name, location].filter((part, index, parts) => Boolean(part) && parts.indexOf(part) === index).join(" · ");
+}
+
 /**
  * Returns a bounded, source-safe canvas.  The client renderer derives layout
  * from this graph, so no browser-owned coordinates need to be persisted here.
@@ -55,6 +70,71 @@ export function tripCanvas(doc: TripCanvasRecord): TripCanvasRecord | null {
     color: "green",
   }];
   const edges: TripCanvasRecord[] = [];
+  const cityContextNodeIds = new Map<string, string>();
+  const seenCityContextIds = new Set<string>();
+  const activeCityContextId = safeText(doc.activeCityContextId, 180);
+  const rawCityContexts = Array.isArray(doc.cityContexts) ? doc.cityContexts : [];
+
+  // These compact nodes preserve the owner-selected city/base and its saved
+  // explorations without duplicating every raw provider candidate in the map.
+  for (const rawContext of rawCityContexts.slice(0, 24)) {
+    if (!isRecord(rawContext)) continue;
+    const contextId = safeText(rawContext.id, 180);
+    const city = safeText(rawContext.city, 80);
+    if (!contextId || !city || seenCityContextIds.has(contextId)) continue;
+    seenCityContextIds.add(contextId);
+    const nodeId = `city:${contextId}`;
+    cityContextNodeIds.set(contextId, nodeId);
+    const active = contextId === activeCityContextId;
+    const booking = bookingReferenceLabel(rawContext.bookingReference);
+    const detail = [
+      active ? "active city" : safeText(rawContext.source, 24, "city"),
+      cityContextCenterText(rawContext.center),
+      booking ? `booked: ${booking}` : "",
+    ].filter(Boolean).join(" · ");
+    nodes.push({
+      id: nodeId,
+      label: `📍 ${city}${active ? " · active" : ""}`,
+      detail,
+      parent: "trip",
+      color: active ? "green" : "slate",
+    });
+    edges.push({ from: "trip", to: nodeId, label: active ? "active city" : "city" });
+  }
+
+  const rawDiscoveries = Array.isArray(doc.discoveries) ? doc.discoveries : [];
+  const seenDiscoveryIds = new Set<string>();
+  let discoveryCount = 0;
+  for (const rawDiscovery of rawDiscoveries.slice(0, 48)) {
+    if (discoveryCount >= 24 || !isRecord(rawDiscovery)) continue;
+    const discoveryId = safeText(rawDiscovery.id, 180);
+    if (!discoveryId || seenDiscoveryIds.has(discoveryId)) continue;
+    seenDiscoveryIds.add(discoveryId);
+    discoveryCount += 1;
+    const city = safeText(rawDiscovery.city, 80, "new city");
+    const query = safeText(rawDiscovery.query, 60, "discoveries");
+    const discoveryItems = Array.isArray(rawDiscovery.items) ? rawDiscovery.items.filter(isRecord) : [];
+    // Newer discovery collections carry the context themselves. For a
+    // partially migrated collection, retain the same graph relationship from
+    // a candidate's cityContextId instead of orphaning that saved discovery.
+    const candidateContextId = discoveryItems.map((item) => safeText(item.cityContextId, 180)).find(Boolean) ?? "";
+    const contextId = safeText(rawDiscovery.cityContextId, 180) || candidateContextId;
+    const parent = cityContextNodeIds.get(contextId) ?? "trip";
+    const candidates = discoveryItems.length;
+    const booking = bookingReferenceLabel(rawDiscovery.bookingReference);
+    nodes.push({
+      id: `discovery:${discoveryId}`,
+      label: `⌕ ${city} · ${query}`,
+      detail: [
+        `${candidates} ${candidates === 1 ? "place" : "places"}`,
+        safeText(rawDiscovery.provider, 40, "discovery"),
+        booking ? `booked: ${booking}` : "",
+      ].filter(Boolean).join(" · "),
+      parent,
+      color: "blue",
+    });
+    edges.push({ from: parent, to: `discovery:${discoveryId}`, label: "discoveries" });
+  }
 
   if (flight) {
     nodes.push({
@@ -83,6 +163,8 @@ export function tripCanvas(doc: TripCanvasRecord): TripCanvasRecord | null {
         label: `${safeText(doc.transfer.durationText, 40, "transfer")} · ${safeText(doc.transfer.distanceText, 40)}`.replace(/ · $/, ""),
       });
     }
+    const stayCityNode = cityContextNodeIds.get(safeText(stay.cityContextId, 180));
+    if (stayCityNode) edges.push({ from: stayCityNode, to: "hotel", label: "stay" });
   }
 
   const days = Array.isArray(doc.itinerary) ? doc.itinerary : [];
@@ -117,6 +199,8 @@ export function tripCanvas(doc: TripCanvasRecord): TripCanvasRecord | null {
         color: "blue",
         ...optionalUrl("url", rawItem.link),
       });
+      const cityNode = cityContextNodeIds.get(safeText(rawItem.cityContextId, 180));
+      if (cityNode) edges.push({ from: cityNode, to: nodeId, label: "planned stop" });
     }
     const route = isRecord(rawDay.route) ? rawDay.route : null;
     const legs = Array.isArray(route?.legs) ? route.legs : [];
