@@ -49,7 +49,26 @@ describe("private creation assets", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(new URL("https://provider.example/result.png"), { cache: "no-store", redirect: "error" });
     expect(asset.key).toMatch(/\/thumb$/);
-    expect(mock.privateR2Put).toHaveBeenCalledWith(asset.key, expect.any(ArrayBuffer), "image/png");
+    expect(mock.privateR2Put).toHaveBeenCalledWith(asset.key, expect.any(Uint8Array), "image/png");
+  });
+
+  it("stops an oversized chunked response before buffering or storing it", async () => {
+    const tooLargeStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(16 * 1024 * 1024));
+        controller.enqueue(new Uint8Array(16 * 1024 * 1024));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(tooLargeStream, {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(storePrivateCreationAssetFromUrl("https://provider.example/chunked.png")).rejects.toThrow("creation asset too large (30MB cap)");
+
+    expect(mock.privateR2Put).not.toHaveBeenCalled();
   });
 
   it("rejects credentialed or non-HTTP source URLs before fetching", async () => {

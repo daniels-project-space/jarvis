@@ -26,6 +26,41 @@ function assertAssetSize(body: CreationAssetBody): void {
   }
 }
 
+async function readResponseBodyWithinAssetLimit(response: Response): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  // Fetch normally supplies a stream. Keep the legacy empty-body behaviour
+  // rather than falling back to arrayBuffer(), which would remove the bound.
+  if (!reader) return new Uint8Array();
+
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      if (value.byteLength > MAX_CREATION_ASSET_BYTES - totalBytes) {
+        throw new Error("creation asset too large (30MB cap)");
+      }
+      chunks.push(value);
+      totalBytes += value.byteLength;
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 function externalHttpUrl(value: string): URL {
   let url: URL;
   try {
@@ -70,7 +105,7 @@ export async function storePrivateCreationAssetFromUrl(
   if (Number.isFinite(declaredLength) && declaredLength > MAX_CREATION_ASSET_BYTES) {
     throw new Error("creation asset too large (30MB cap)");
   }
-  const bytes = await response.arrayBuffer();
+  const bytes = await readResponseBodyWithinAssetLimit(response);
   return await putPrivateCreationAsset(bytes, response.headers.get("content-type") ?? "application/octet-stream", purpose);
 }
 
