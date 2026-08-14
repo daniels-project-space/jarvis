@@ -199,6 +199,12 @@ function completionContent(value: unknown): string | null {
   return choice.message.content;
 }
 
+function completionModel(value: unknown): string | null {
+  return isRecord(value) && typeof value.model === "string" && value.model.length > 0
+    ? value.model
+    : null;
+}
+
 /**
  * The GPU gets this purpose-bound bearer, never the Novita account/billing
  * credential. Rotating the account key invalidates the derived bearer until
@@ -273,6 +279,11 @@ export async function requestNovitaPatchProposal(input: Readonly<{
     if (!contentType.toLowerCase().includes("application/json")) return Object.freeze({ status: "rejected" as const, reason: "non_json_response" });
     const payload = await boundedJsonResponse(response, responseByteLimit(config.attestation.requestLimits));
     if (payload === null) return Object.freeze({ status: "rejected" as const, reason: "response_out_of_bounds" });
+    // The provider's OpenAI-compatible response identifies the model it actually
+    // used. A request parameter alone is not enough to prove model routing.
+    if (completionModel(payload) !== config.attestation.modelId) {
+      return Object.freeze({ status: "rejected" as const, reason: "response_model_mismatch" });
+    }
     const content = completionContent(payload);
     if (!content || byteLength(content) > Math.min(28_000, config.attestation.requestLimits.maxInputBytes + 8_000)) {
       return Object.freeze({ status: "rejected" as const, reason: "completion_out_of_bounds" });

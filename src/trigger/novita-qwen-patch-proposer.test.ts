@@ -39,6 +39,7 @@ function attestation(): NovitaPatchProposerAttestation {
 describe("Novita Qwen patch proposer", () => {
   it("makes exactly one bounded, authenticated OpenAI-compatible proposal request", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(Response.json({
+      model: attestation().modelId,
       choices: [{ message: { content: JSON.stringify({
         kind: "propose_patch",
         unifiedDiff: "--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n",
@@ -70,6 +71,24 @@ describe("Novita Qwen patch proposer", () => {
       response_format: { type: "json_object" },
     });
     expect(JSON.stringify(result)).not.toContain("secret-not-in-result");
+  });
+
+  it("rejects a completion from a model other than the attested delegate", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(Response.json({
+      model: "Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-Int4",
+      choices: [{ message: { content: JSON.stringify({ kind: "no_change", reason: "No edit is needed." }) } }],
+    }));
+
+    const result = await requestNovitaPatchProposal({
+      attestation: attestation(),
+      task: "Fix src/example.ts so the constant is two.",
+      files: [{ path: "src/example.ts", content: "export const value = 1;\n" }],
+      getApiKey: vi.fn().mockResolvedValue("control-key"),
+      environment: environment(),
+      fetchImpl,
+    });
+
+    expect(result).toEqual({ status: "rejected", reason: "response_model_mismatch" });
   });
 
   it("fails closed before vault access when the runtime endpoint changes", async () => {
