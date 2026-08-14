@@ -237,9 +237,10 @@ describe("subscription subprocess capability scope", () => {
       R2_PARENT_API_TOKEN: "parent-r2-api-token",
       R2_PARENT_ACCESS_KEY_ID: "parent-r2-access-id",
       AWS_SESSION_TOKEN: "temporary-r2-session-token",
+      JARVIS_HUB_ACTIONS_TOKEN: "hub-actions-capability",
       JARVIS_CODEX_SESSION_SOURCE: "vault-broker",
     }, "spawn-scope", join(consumerRoot, "spawn-homes"));
-    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,providerProbeKeyring:process.env.JARVIS_CLOUD_PROVIDER_PROBE_KEYRING,providerProbeReceipt:process.env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,providerToken:process.env.SANDBOX0_TOKEN,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN,parentApi:process.env.R2_PARENT_API_TOKEN,parentId:process.env.R2_PARENT_ACCESS_KEY_ID,session:process.env.AWS_SESSION_TOKEN,source:process.env.JARVIS_CODEX_SESSION_SOURCE,openai:process.env.OPENAI_API_KEY,codex:process.env.CODEX_API_KEY}))"], { env, encoding: "utf8" });
+    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify({receipt:process.env.JARVIS_GIT_REVIEW_RECEIPT_SECRET,keyring:process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING,providerProbeKeyring:process.env.JARVIS_CLOUD_PROVIDER_PROBE_KEYRING,providerProbeReceipt:process.env.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,providerToken:process.env.SANDBOX0_TOKEN,convex:process.env.CONVEX_URL,trigger:process.env.TRIGGER_SECRET_KEY,github:process.env.GITHUB_TOKEN,parentApi:process.env.R2_PARENT_API_TOKEN,parentId:process.env.R2_PARENT_ACCESS_KEY_ID,session:process.env.AWS_SESSION_TOKEN,hubActions:process.env.JARVIS_HUB_ACTIONS_TOKEN,source:process.env.JARVIS_CODEX_SESSION_SOURCE,openai:process.env.OPENAI_API_KEY,codex:process.env.CODEX_API_KEY}))"], { env, encoding: "utf8" });
     expect(child.status).toBe(0);
     expect(JSON.parse(child.stdout)).toEqual({});
   });
