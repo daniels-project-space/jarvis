@@ -13,7 +13,7 @@ vi.mock("@trigger.dev/sdk/v3", () => ({
   },
 }));
 
-import { MEMORY_VAULT_CRON } from "./memory-vault";
+import { MEMORY_VAULT_CRON, obsidianMemoryFolderForKind } from "./memory-vault";
 
 describe("Obsidian memory-vault schedule", () => {
   it("consolidates the durable mirror every six hours", () => {
@@ -22,5 +22,12 @@ describe("Obsidian memory-vault schedule", () => {
       cron: MEMORY_VAULT_CRON,
       maxDuration: 180,
     });
+  });
+
+  it("keeps automatically extracted tasks in the durable Obsidian mirror", () => {
+    expect(obsidianMemoryFolderForKind("task")).toBe("80-facts");
+    expect(obsidianMemoryFolderForKind("decision")).toBe("30-decisions");
+    expect(obsidianMemoryFolderForKind("project")).toBe("20-projects");
+    expect(obsidianMemoryFolderForKind("untrusted-kind")).toBeNull();
   });
 });

@@ -20,6 +20,22 @@ type AttentionRow = { title?: unknown; detail?: unknown; status?: unknown };
 type BusinessRow = { domain?: unknown; headline?: unknown; detail?: unknown };
 type ProjectRow = { slug?: unknown; status?: unknown; summary?: unknown; data?: { recent?: unknown } };
 
+// Keep the scheduled durable mirror aligned with the real-time `remember`
+// tool. In particular, Stage 0 extracts actionable tasks into Convex; omitting
+// them here made those automatically remembered tasks invisible in Obsidian.
+const OBSIDIAN_MEMORY_FOLDERS: Readonly<Record<string, string>> = {
+  decision: "30-decisions",
+  project: "20-projects",
+  task: "80-facts",
+  preference: "80-facts",
+  fact: "80-facts",
+  knowledge: "80-facts",
+};
+
+export function obsidianMemoryFolderForKind(kind: unknown): string | null {
+  return OBSIDIAN_MEMORY_FOLDERS[String(kind || "fact")] ?? null;
+}
+
 async function q(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
@@ -151,10 +167,10 @@ export const memoryVault = schedules.task({
     let notes = 0;
     for (const m of mem) {
       const kind = String(m.kind || "fact");
-      if (!["fact", "preference", "decision", "project", "knowledge"].includes(kind)) continue;
+      const folder = obsidianMemoryFolderForKind(kind);
+      if (!folder) continue;
       const note = safeMemoryNote(m.title, m.body);
       if (!note) continue;
-      const folder = kind === "decision" ? "30-decisions" : kind === "project" ? "20-projects" : "80-facts";
       const s = slug(note.title);
       if (!s) continue;
       writeFileSync(
