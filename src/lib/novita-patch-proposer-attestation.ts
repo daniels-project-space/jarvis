@@ -14,6 +14,19 @@ export type NovitaPatchProposerLimits = Readonly<{
   timeoutMs: number;
 }>;
 
+/**
+ * Provider-side policy for the one sealed custom endpoint. This is runtime
+ * configuration (rather than durable work-order data), but its exact value is
+ * bound into configDigest before a Trigger worker can use the delegate.
+ */
+export type NovitaPatchProposerLifecycle = Readonly<{
+  provider: "novita-serverless-v1";
+  minWorkers: 0;
+  maxWorkers: 1;
+  idleTimeoutSeconds: number;
+  healthPath: string;
+}>;
+
 export type NovitaPatchProposerAttestation = Readonly<{
   adapterId: typeof NOVITA_PATCH_PROPOSER_ADAPTER_ID;
   configDigest: string;
@@ -29,6 +42,7 @@ export type NovitaPatchProposerAttestation = Readonly<{
 
 export type NovitaPatchProposerRuntimeConfig = Readonly<{
   endpointUrl: string;
+  lifecycle: NovitaPatchProposerLifecycle;
   attestation: NovitaPatchProposerAttestation;
 }>;
 
@@ -47,8 +61,9 @@ const ATTESTATION_KEYS = new Set([
   "requestLimits",
 ]);
 
-const RUNTIME_CONFIG_KEYS = new Set(["endpointUrl", ...ATTESTATION_KEYS]);
+const RUNTIME_CONFIG_KEYS = new Set(["endpointUrl", "lifecycle", ...ATTESTATION_KEYS]);
 const LIMIT_KEYS = new Set(["maxInputBytes", "maxOutputTokens", "maxTurns", "timeoutMs"]);
+const LIFECYCLE_KEYS = new Set(["provider", "minWorkers", "maxWorkers", "idleTimeoutSeconds", "healthPath"]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const MODEL_REVISION = /^[a-f0-9]{40,64}$/;
 const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -79,6 +94,25 @@ function resolvedLimits(value: unknown): NovitaPatchProposerLimits | null {
   return maxInputBytes && maxOutputTokens && maxTurns && timeoutMs
     ? Object.freeze({ maxInputBytes, maxOutputTokens, maxTurns, timeoutMs })
     : null;
+}
+
+function resolvedLifecycle(value: unknown): NovitaPatchProposerLifecycle | null {
+  if (!isRecord(value) || !exactKeys(value, LIFECYCLE_KEYS)) return null;
+  const idleTimeoutSeconds = positiveInteger(value.idleTimeoutSeconds, 60, 3_600);
+  if (value.provider !== "novita-serverless-v1"
+    || value.minWorkers !== 0
+    || value.maxWorkers !== 1
+    || !idleTimeoutSeconds
+    || typeof value.healthPath !== "string"
+    || !/^\/[A-Za-z0-9._~!$&'()*+,;=:@/%-]{0,255}$/.test(value.healthPath)
+    || value.healthPath.includes("//")) return null;
+  return Object.freeze({
+    provider: "novita-serverless-v1",
+    minWorkers: 0,
+    maxWorkers: 1,
+    idleTimeoutSeconds,
+    healthPath: value.healthPath,
+  });
 }
 
 /** Parse the non-secret immutable subset that is allowed into a work order. */
@@ -126,11 +160,13 @@ export function configuredNovitaPatchProposer(
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash
       || !url.pathname.startsWith("/")
       || (url.hostname !== "api.novita.ai" && !url.hostname.endsWith(".novita.ai"))) return null;
+    const lifecycle = resolvedLifecycle(raw.lifecycle);
+    if (!lifecycle) return null;
     const attestationValue = Object.fromEntries(
-      Object.entries(raw).filter(([key]) => key !== "endpointUrl"),
+      Object.entries(raw).filter(([key]) => key !== "endpointUrl" && key !== "lifecycle"),
     );
     const attestation = resolveNovitaPatchProposerAttestation(attestationValue);
-    return attestation ? Object.freeze({ endpointUrl: url.toString().replace(/\/$/, ""), attestation }) : null;
+    return attestation ? Object.freeze({ endpointUrl: url.toString().replace(/\/$/, ""), lifecycle, attestation }) : null;
   } catch {
     return null;
   }

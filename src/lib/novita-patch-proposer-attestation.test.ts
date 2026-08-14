@@ -19,6 +19,14 @@ const attestation = {
   requestLimits: { maxInputBytes: 12_000, maxOutputTokens: 800, maxTurns: 1, timeoutMs: 30_000 },
 } as const;
 
+const lifecycle = {
+  provider: "novita-serverless-v1",
+  minWorkers: 0,
+  maxWorkers: 1,
+  idleTimeoutSeconds: 600,
+  healthPath: "/healthz",
+} as const;
+
 describe("Novita patch-proposer attestation", () => {
   it("keeps endpoint URLs out of durable attestations", () => {
     expect(resolveNovitaPatchProposerAttestation(attestation)).toEqual(attestation);
@@ -27,17 +35,30 @@ describe("Novita patch-proposer attestation", () => {
 
   it("admits only a strict HTTPS runtime configuration", () => {
     const runtime = configuredNovitaPatchProposer({
-      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", ...attestation }),
+      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", lifecycle, ...attestation }),
     });
     expect(runtime).toMatchObject({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", attestation });
     expect(configuredNovitaPatchProposer({
-      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "http://example.test", ...attestation }),
+      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "http://example.test", lifecycle, ...attestation }),
+    })).toBeNull();
+  });
+
+  it("requires a sealed scale-to-zero lifecycle policy", () => {
+    expect(configuredNovitaPatchProposer({
+      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", ...attestation }),
+    })).toBeNull();
+    expect(configuredNovitaPatchProposer({
+      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({
+        endpointUrl: "https://qwen.endpoint.novita.ai/qwen",
+        lifecycle: { ...lifecycle, minWorkers: 1 },
+        ...attestation,
+      }),
     })).toBeNull();
   });
 
   it("selects the delegate only for bounded low-risk owned coding work", () => {
     const previous = process.env.JARVIS_NOVITA_QWEN_ATTESTATION;
-    process.env.JARVIS_NOVITA_QWEN_ATTESTATION = JSON.stringify({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", ...attestation });
+    process.env.JARVIS_NOVITA_QWEN_ATTESTATION = JSON.stringify({ endpointUrl: "https://qwen.endpoint.novita.ai/qwen", lifecycle, ...attestation });
     try {
       expect(novitaPatchProposerForWorkOrder({
         task: "Fix the typo in src/lib/example.ts.",

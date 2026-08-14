@@ -24,6 +24,7 @@ export function novitaPatchProposerRuntimeConfigDigest(
 ): string {
   const value = {
     endpointUrl: config.endpointUrl,
+    lifecycle: config.lifecycle,
     adapterId: config.attestation.adapterId,
     endpointId: config.attestation.endpointId,
     modelId: config.attestation.modelId,

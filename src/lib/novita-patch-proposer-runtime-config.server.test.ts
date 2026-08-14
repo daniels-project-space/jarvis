@@ -19,8 +19,16 @@ const baseAttestation = {
   requestLimits: { maxInputBytes: 12_000, maxOutputTokens: 800, maxTurns: 1 as const, timeoutMs: 30_000 },
 };
 
+const lifecycle = {
+  provider: "novita-serverless-v1" as const,
+  minWorkers: 0 as const,
+  maxWorkers: 1 as const,
+  idleTimeoutSeconds: 600,
+  healthPath: "/healthz",
+};
+
 function matchingEnvironment() {
-  const raw = { endpointUrl: "https://qwen.endpoint.novita.ai/qwen", ...baseAttestation };
+  const raw = { endpointUrl: "https://qwen.endpoint.novita.ai/qwen", lifecycle, ...baseAttestation };
   const parsed = configuredNovitaPatchProposer({ JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify(raw) });
   if (!parsed) throw new Error("test Novita configuration should parse");
   raw.configDigest = novitaPatchProposerRuntimeConfigDigest(parsed);

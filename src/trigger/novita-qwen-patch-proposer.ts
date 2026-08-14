@@ -6,6 +6,7 @@ import {
   type NovitaPatchProposerAttestation,
 } from "../lib/novita-patch-proposer-attestation";
 import { novitaPatchProposerRuntimeConfigDigest } from "../lib/novita-patch-proposer-runtime-config.server";
+import { verifyNovitaServerlessLifecycle } from "../lib/novita-serverless-lifecycle";
 import { redactSensitiveText } from "../lib/secret-redaction";
 
 export type NovitaProposalSourceFile = Readonly<{
@@ -260,6 +261,14 @@ export async function requestNovitaPatchProposal(input: Readonly<{
   }
   if (!controlKey) return Object.freeze({ status: "unavailable" as const, reason: "missing_api_key" });
   const fetchImpl = input.fetchImpl ?? fetch;
+  const lifecycle = await verifyNovitaServerlessLifecycle({
+    config,
+    apiKey: controlKey,
+    fetchImpl,
+  });
+  if (lifecycle.status === "unavailable") {
+    return Object.freeze({ status: "unavailable" as const, reason: `lifecycle_${lifecycle.reason}` });
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.attestation.requestLimits.timeoutMs);
   timer.unref?.();

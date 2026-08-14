@@ -28,6 +28,12 @@ if (!process.env.JARVIS_NOVITA_QWEN_ATTESTATION) {
       modelRevision: config.attestation.modelRevision,
       imageDigest: config.attestation.imageDigest,
       limits: config.attestation.requestLimits,
+      lifecycle: {
+        provider: config.lifecycle.provider,
+        minWorkers: config.lifecycle.minWorkers,
+        maxWorkers: config.lifecycle.maxWorkers,
+        idleTimeoutSeconds: config.lifecycle.idleTimeoutSeconds,
+      },
     }));
   }
 }
