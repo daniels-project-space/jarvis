@@ -13,6 +13,7 @@ import {
   normalizeUploadMime,
   type ExtractedChunk,
 } from "./chat-files";
+import { hasExpectedMediaSignature, transcribableMediaKind, type TranscribableMediaKind } from "./media-types";
 
 const MAX_PDF_PAGES = 200;
 const MAX_DOCX_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
@@ -28,6 +29,9 @@ export type FileExtractionResult = {
   pageCount?: number;
   sheetNames?: string[];
   preview?: { bytes: Uint8Array; contentType: "image/webp" };
+  /** Present only for verified containers that the private Trigger worker may
+   * send to Daniel's configured transcription services. */
+  media?: { kind: TranscribableMediaKind };
 };
 
 export class FileExtractionError extends Error {
@@ -227,6 +231,21 @@ export async function extractPrivateFile(input: {
   if (signatureMime === "application/pdf") return await extractPdf(bytes, sha256);
   if (isDocxMime(declaredMime)) return await extractDocx(bytes, sha256);
   if (signatureMime && isImageMime(signatureMime)) return await extractImage(bytes, signatureMime, sha256);
+  const mediaKind = transcribableMediaKind(declaredMime);
+  if (mediaKind) {
+    if (!hasExpectedMediaSignature(declaredMime, bytes)) {
+      throw new FileExtractionError("media_signature_mismatch", true);
+    }
+    return {
+      sha256,
+      detectedMimeType: declaredMime,
+      status: "stored_only",
+      summary: `${mediaKind === "video" ? "Video" : "Audio"} saved privately · transcription will run during secure ingestion.`,
+      text: "",
+      chunks: [],
+      media: { kind: mediaKind },
+    };
+  }
   if (isCsvMime(declaredMime, name)) {
     const text = boundedExtractedText(decodeText(bytes));
     const sheet = name.slice(0, 120);

@@ -136,6 +136,36 @@ describe("bounded Codex image materialization", () => {
     expect(getPrivate.mock.calls.map(([key]) => key)).toEqual(["bad-key", "good-key"]);
   });
 
+  it("uses a verified derived preview for video and never reads the original container as vision input", async () => {
+    const getPrivate = vi.fn(async (key: string) => new Response(png, {
+      status: 200,
+      headers: { "content-length": String(png.byteLength), "content-type": "image/webp" },
+    }));
+    const images = await materializeCodexChatImages("inspect the clip", [{
+      fileId: "video-1",
+      name: "walkthrough.mp4",
+      relativePath: "travel/walkthrough.mp4",
+      mimeType: "video/mp4",
+      sizeBytes: 3 * 1024 * 1024,
+      status: "ready",
+      r2Key: "owners/daniel/files/video-1/v1/original",
+      previewR2Key: "owners/daniel/files/video-1/v1/preview.webp",
+    }], { getPrivate });
+
+    expect(images).toMatchObject([{
+      status: "ready",
+      label: expect.stringContaining("derived representative frame"),
+    }]);
+    expect(getPrivate).toHaveBeenCalledWith(
+      "owners/daniel/files/video-1/v1/preview.webp",
+      expect.any(AbortSignal),
+    );
+    expect(getPrivate).not.toHaveBeenCalledWith(
+      "owners/daniel/files/video-1/v1/original",
+      expect.anything(),
+    );
+  });
+
   it("starts independent private image reads concurrently", async () => {
     const releases = new Map<string, () => void>();
     const getPrivate = vi.fn((key: string) => new Promise<Response>((resolve) => {

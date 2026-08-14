@@ -7,7 +7,7 @@ const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8")
 describe("reactive IO surfaces", () => {
   it("keeps one bounded command center subscription and no legacy fleet surface", () => {
     const jarvis = source("src/components/JarvisUI.tsx");
-    expect(jarvis.match(/api\.commandCenter\.snapshot/g)).toHaveLength(1);
+    expect(jarvis.match(/api\.commandCenter\.fleetSnapshot/g)).toHaveLength(1);
     expect(jarvis).not.toContain("api.jobs.active");
     expect(jarvis).not.toContain("api.jobs.list");
     expect(jarvis).not.toMatch(/api\.(?:health|reaper|cron)\./);

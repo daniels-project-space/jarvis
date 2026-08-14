@@ -4,8 +4,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mock = vi.hoisted(() => ({
   controlActor: vi.fn(),
   controlMutation: vi.fn(),
+  controlQuery: vi.fn(),
   isSameOriginRequest: vi.fn(),
   privateR2Delete: vi.fn(),
+  privateR2Get: vi.fn(),
   trigger: vi.fn(),
 }));
 
@@ -17,15 +19,15 @@ vi.mock("@/lib/request-auth", () => ({
 }));
 vi.mock("@/lib/control-session", () => ({
   controlMutation: mock.controlMutation,
-  controlQuery: vi.fn(),
+  controlQuery: mock.controlQuery,
   isSameOriginRequest: mock.isSameOriginRequest,
 }));
 vi.mock("@/lib/private-r2", () => ({
   privateR2Delete: mock.privateR2Delete,
-  privateR2Get: vi.fn(),
+  privateR2Get: mock.privateR2Get,
 }));
 
-import { DELETE, PATCH } from "./route";
+import { DELETE, GET, PATCH } from "./route";
 
 describe("private file controls", () => {
   beforeEach(() => {
@@ -38,6 +40,32 @@ describe("private file controls", () => {
       r2Keys: ["owners/daniel/files/file-1/v1/original"],
     });
     mock.trigger.mockResolvedValue({ id: "cleanup-run" });
+    mock.controlQuery.mockResolvedValue(null);
+    mock.privateR2Get.mockResolvedValue(new Response(new Uint8Array([0, 1, 2]), {
+      status: 200,
+      headers: { "content-length": "3", "content-type": "video/mp4" },
+    }));
+  });
+
+  it("streams verified private video inline through the owner-authorized media route", async () => {
+    mock.controlQuery.mockResolvedValueOnce({
+      _id: "file-1",
+      originalName: "walkthrough.mp4",
+      mimeType: "video/mp4",
+      detectedMimeType: "video/mp4",
+      status: "ready",
+      r2Key: "owners/daniel/files/file-1/v1/original",
+    });
+    const response = await GET(
+      new NextRequest("https://jarvis.example/api/files/file-1"),
+      { params: Promise.resolve({ id: "file-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("video/mp4");
+    expect(response.headers.get("content-disposition")).toContain("inline");
+    expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
+    expect(mock.privateR2Get).toHaveBeenCalledWith("owners/daniel/files/file-1/v1/original", undefined);
   });
 
   it("queues cleanup without deleting underneath an active PUT", async () => {

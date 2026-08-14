@@ -150,7 +150,7 @@ type QueueClaim = {
   attemptCount: number;
   history: Array<{ role: string; text: string }>;
   researchPrefetch?: { basis: string; context: string; expiresAt: number };
-  attachments: Array<ChatFileManifest & { r2Key: string }>;
+  attachments: Array<ChatFileManifest & { r2Key: string; previewR2Key?: string }>;
   fileCatalog: ChatThreadFileCatalogItem[];
 };
 

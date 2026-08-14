@@ -12,6 +12,7 @@ export type ReadyMessageFile = {
   status: string;
   summary?: string;
   r2Key: string;
+  previewR2Key?: string;
 };
 
 type ChatAttachment = {
@@ -220,6 +221,7 @@ export async function messageFileManifests(
   status: string;
   summary?: string;
   r2Key: string;
+  previewR2Key?: string;
   excerpts: Array<{ ordinal: number; text: string; page?: number; sheet?: string; cellRange?: string }>;
 }>> {
   const links = await ctx.db
@@ -254,6 +256,7 @@ export async function messageFileManifests(
       summary: file.summary ? String(file.summary) : undefined,
       selection: "message" as const,
       r2Key: String(file.r2Key),
+      previewR2Key: file.previewR2Key ? String(file.previewR2Key) : undefined,
       excerpts: chunks.map((chunk: any) => ({
         ordinal: Number(chunk.ordinal),
         text: String(chunk.text),
@@ -308,6 +311,7 @@ export async function recentThreadFileManifest(ctx: { db: any }, threadId: strin
       summary: file.summary ? String(file.summary) : undefined,
       selection: "recent_followup" as const,
       r2Key: String(file.r2Key),
+      previewR2Key: file.previewR2Key ? String(file.previewR2Key) : undefined,
       excerpts: chunks.map((chunk: any) => ({
         ordinal: Number(chunk.ordinal),
         text: String(chunk.text),
@@ -352,6 +356,7 @@ export async function namedThreadFileManifest(ctx: { db: any }, threadId: string
     summary: file.summary ? String(file.summary) : undefined,
     selection: "named_reference" as const,
     r2Key: String(file.r2Key),
+    previewR2Key: file.previewR2Key ? String(file.previewR2Key) : undefined,
     excerpts: chunks.map((chunk: any) => ({
       ordinal: Number(chunk.ordinal),
       text: String(chunk.text),

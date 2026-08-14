@@ -75,17 +75,31 @@ describe("deterministic private file extraction", () => {
       "voice-note.wav",
       "audio/wav",
       Buffer.from("524946462400000057415645666d74201000000001000100401f0000803e0000020010006461746100000000", "hex"),
-      "Audio saved privately · no transcript is available, so Jarvis cannot inspect its contents.",
+      "audio",
     ],
     [
       "clip.mp4",
       "video/mp4",
       Buffer.from("000000186674797069736f6d0000020069736f6d69736f3261766331", "hex"),
-      "Video saved privately · no transcript or frame analysis is available, so Jarvis cannot inspect its contents.",
+      "video",
     ],
-  ])("keeps %s available while making media-analysis limits explicit", async (name, mimeType, bytes, summary) => {
+  ])("admits a verified %s container to secure transcription ingestion", async (name, mimeType, bytes, kind) => {
     const result = await extractPrivateFile({ bytes, name, mimeType });
-    expect(result).toMatchObject({ status: "stored_only", summary, text: "", chunks: [] });
+    expect(result).toMatchObject({
+      status: "stored_only",
+      text: "",
+      chunks: [],
+      media: { kind },
+    });
+    expect(result.summary).toContain("transcription will run during secure ingestion");
+  });
+
+  it("quarantines media whose declared container signature does not match", async () => {
+    await expect(extractPrivateFile({
+      bytes: new TextEncoder().encode("not a video"),
+      name: "fake.mp4",
+      mimeType: "video/mp4",
+    })).rejects.toMatchObject({ code: "media_signature_mismatch", quarantined: true } satisfies Partial<FileExtractionError>);
   });
 
   it("quarantines declared formats whose signatures do not match", async () => {

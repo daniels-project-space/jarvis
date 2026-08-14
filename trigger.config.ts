@@ -1,5 +1,5 @@
 import { defineConfig } from "@trigger.dev/sdk/v3";
-import { additionalPackages, aptGet, syncEnvVars } from "@trigger.dev/build/extensions/core";
+import { additionalPackages, aptGet, ffmpeg, syncEnvVars } from "@trigger.dev/build/extensions/core";
 
 // Trigger hosts foreground conversation, the fleet controller and independent
 // specialist containers. Every specialist remains a pinned Codex CLI process;
@@ -39,6 +39,9 @@ export default defineConfig({
             "JARVIS_CODEX_SESSION_SOURCE",
             "JARVIS_MISSION_PROTOCOL_ROLLOUT",
             "JARVIS_MISSION_SUPERVISOR_ROLLOUT",
+            // Exact non-secret origin allowlist for private media transcription.
+            // The endpoint and bearer remain Vault-only.
+            "JARVIS_LOCAL_STT_ORIGIN",
             // Non-secret immutable identity for the optional, bounded Novita
             // patch proposer. The API key stays behind VAULT_ACCESS_TOKEN.
             "JARVIS_NOVITA_QWEN_ATTESTATION",
@@ -51,6 +54,9 @@ export default defineConfig({
         );
         return Object.keys(values).length ? values : undefined;
       }),
+      // Installs ffmpeg and ffprobe and pins their deployed paths in
+      // FFMPEG_PATH/FFPROBE_PATH for bounded private video frame extraction.
+      ffmpeg(),
     ],
   },
 });

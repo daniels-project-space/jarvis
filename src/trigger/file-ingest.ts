@@ -3,6 +3,8 @@ import { task } from "@trigger.dev/sdk/v3";
 import { FileExtractionError, extractPrivateFile, type FileExtractionResult } from "../lib/file-extraction";
 import { trustedReadyDuplicate, type ReadyDuplicateRecord } from "../lib/file-dedupe";
 import { privateFileObjectKey, privateR2Delete, privateR2Get, privateR2Put } from "../lib/private-r2";
+import { applyPrivateMediaAnalysis, MediaTranscriptionError, transcribePrivateMedia } from "./media-transcription";
+import { extractVideoPreview, MediaFrameExtractionError } from "./media-frame-extraction";
 
 const CONVEX_URL = process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "";
 
@@ -82,7 +84,7 @@ async function extractionFromDuplicate(candidate: ReadyDuplicateRecord, sha256: 
   }
 }
 
-async function runFileIngest(payload: IngestPayload) {
+export async function runFileIngest(payload: IngestPayload) {
   const fileId = String(payload.fileId ?? "");
   const ingestVersion = Math.floor(Number(payload.ingestVersion));
   if (!fileId || !Number.isSafeInteger(ingestVersion) || ingestVersion < 1) throw new Error("invalid file ingest payload");
@@ -108,8 +110,25 @@ async function runFileIngest(payload: IngestPayload) {
       fileId,
       sha256: actualSha256,
     }) as ReadyDuplicateRecord | null;
-    const reused = duplicate ? await extractionFromDuplicate(duplicate, actualSha256) : null;
-    const result = reused ?? await extractPrivateFile({ bytes: original, name: claim.originalName, mimeType: claim.mimeType });
+    // Stored-only duplicates deliberately re-run extraction. A temporarily
+    // unavailable transcription provider must not permanently suppress a later
+    // media analysis attempt simply because the original bytes match.
+    const reused = duplicate?.file.status === "ready" ? await extractionFromDuplicate(duplicate, actualSha256) : null;
+    let result = reused ?? await extractPrivateFile({ bytes: original, name: claim.originalName, mimeType: claim.mimeType });
+    if (result.status === "stored_only" && result.media) {
+      const preview = result.media.kind === "video"
+        ? await extractVideoPreview({ bytes: original })
+          // A malformed or unsupported video must remain an honest private
+          // stored-only upload, never consume retries as a durable ingest error.
+          .catch((error) => error instanceof MediaFrameExtractionError ? undefined : Promise.reject(error))
+        : undefined;
+      const transcription = await transcribePrivateMedia({ bytes: original, mimeType: claim.mimeType })
+        .catch((error) => error instanceof MediaTranscriptionError ? undefined : Promise.reject(error));
+      result = applyPrivateMediaAnalysis(result, {
+        preview: preview ? { bytes: preview.bytes, contentType: preview.contentType } : undefined,
+        transcription,
+      });
+    }
     derivedKeys = await writeDerived(fileId, ingestVersion, result);
     const completion = await convexCall("mutation", "files:completeIngest", {
       fileId,

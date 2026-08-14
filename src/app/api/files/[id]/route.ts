@@ -21,7 +21,22 @@ function disposition(name: string, download: boolean): string {
   return `${download ? "attachment" : "inline"}; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(safe)}`;
 }
 
-const SAFE_INLINE_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
+// These are decoder-only media formats served from an owner-authorized,
+// same-origin route with a sandboxed no-script policy. Every other private
+// type remains an attachment, never inline browser content.
+const SAFE_INLINE_MIME = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+]);
 const REVIEW_STATES = new Set(["unreviewed", "favorite", "review_remove"] as const);
 type ReviewState = typeof REVIEW_STATES extends Set<infer State> ? State : never;
 

@@ -14,7 +14,7 @@ import {
 } from "../lib/codex-image-data";
 import { privateCaptureObjectKey, privateR2Get } from "../lib/private-r2";
 
-type ImageAttachment = ChatFileManifest & { r2Key: string };
+type ImageAttachment = ChatFileManifest & { r2Key: string; previewR2Key?: string };
 type ImageInputDependencies = {
   getPrivate: (key: string, signal: AbortSignal) => Promise<Response>;
   fetchCapture: (url: URL, signal: AbortSignal) => Promise<Response>;
@@ -145,15 +145,23 @@ export async function materializeCodexChatImages(
     }
   }
   const remaining = CODEX_IMAGE_LIMITS.maxInputs - sources.length;
-  for (const file of attachments.filter((item) => isImageMime(item.mimeType)).slice(0, remaining)) {
+  const visualAttachments = attachments.filter((item) => isImageMime(item.mimeType)
+    || (item.status === "ready" && item.mimeType.startsWith("video/") && Boolean(item.previewR2Key)));
+  for (const file of visualAttachments.slice(0, remaining)) {
+    const derivedVideoPreview = !isImageMime(file.mimeType);
     const maximumBytes = Math.min(
       CODEX_IMAGE_LIMITS.maxSourceBytes,
-      Math.max(1, Math.floor(file.sizeBytes)),
+      // Video previews are generated below one megabyte, while image originals
+      // retain their existing per-file source bound.
+      derivedVideoPreview ? 1_000_000 : Math.max(1, Math.floor(file.sizeBytes)),
     );
     sources.push({
-      label: `attachment fileId=${serializeUntrustedFileValue(file.fileId, 128)} name=${serializeUntrustedFileValue(file.relativePath || file.name, 512)}`,
+      label: `${derivedVideoPreview ? "derived representative frame for" : "attachment"} fileId=${serializeUntrustedFileValue(file.fileId, 128)} name=${serializeUntrustedFileValue(file.relativePath || file.name, 512)}`,
       maximumBytes,
-      read: async (readSignal) => await deps.getPrivate(file.r2Key, readSignal),
+      read: async (readSignal) => await deps.getPrivate(
+        derivedVideoPreview ? file.previewR2Key! : file.r2Key,
+        readSignal,
+      ),
     });
   }
 
