@@ -1,6 +1,6 @@
 import { createRoot } from "react-dom/client";
 import { useMemo, useState } from "react";
-import { bookedStayMapMarker } from "../../src/components/TripView";
+import { bookedStayMapMarker, mergeTripMapMarker, type TripMapMarker } from "../../src/components/TripView";
 
 // This uses the production marker admission helper, but intentionally does
 // not load MapLibre or any connected data. It gives the browser test a stable
@@ -42,13 +42,23 @@ const contexts = [
 function BookedStayMarkerFixture() {
   const [activeCityId, setActiveCityId] = useState("amsterdam");
   const activeCity = contexts.find((context) => context.id === activeCityId) ?? contexts[0];
-  const markers = useMemo(
-    () => contexts.flatMap((context) => {
+  const markers = useMemo(() => {
+    // This represents a hotel-search result that resolves to the exact same
+    // place as the Gmail-confirmed booking. The booked pin must remain visible
+    // rather than being deduplicated away as an ordinary stay marker.
+    let visible: TripMapMarker[] = [{
+      key: `stay:suggested-${activeCity.id}`,
+      lat: activeCity.bookingReference.lat,
+      lng: activeCity.bookingReference.lng,
+      kind: "stay",
+      name: `Suggested stay · ${activeCity.city}`,
+    }];
+    for (const context of contexts) {
       const marker = bookedStayMapMarker(context.bookingReference, activeCity, now);
-      return marker ? [marker] : [];
-    }),
-    [activeCity],
-  );
+      if (marker) visible = mergeTripMapMarker(visible, marker);
+    }
+    return visible;
+  }, [activeCity]);
 
   return (
     <main aria-label="Fixture booked location map marker" style={{ background: "#071017", color: "#edf9ff", fontFamily: "system-ui", minHeight: "100vh", padding: 28 }}>

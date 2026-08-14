@@ -15,7 +15,7 @@ vi.mock("@/lib/secure-convex", () => ({
     args === "skip" || !tripViewFixture.doc ? undefined : { data: JSON.stringify(tripViewFixture.doc) },
 }));
 
-import TripView, { bookedStayMapMarker, isFreshTripBookedStayReference, TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
+import TripView, { bookedStayMapMarker, isFreshTripBookedStayReference, mergeTripMapMarker, TripBookedStayReference, TripDayControls, TripTimeline } from "./TripView";
 
 describe("TripTimeline", () => {
   it("keeps a time-valid Gmail stay visibly distinct from a hotel candidate", () => {
@@ -96,6 +96,28 @@ describe("TripTimeline", () => {
       locked: true,
     });
     expect(bookedStayMapMarker({ ...booking, cityContextId: "berlin" }, context, now)).toBeNull();
+  });
+
+  it("keeps a verified booked pin visible when it shares coordinates with a suggested stay", () => {
+    const bookingPin = {
+      key: "booking:amsterdam:1789200000000",
+      lat: 52.369,
+      lng: 4.9,
+      kind: "stay" as const,
+      name: "Booked location · Amsterdam",
+      locked: true,
+    };
+    const markers = mergeTripMapMarker([
+      {
+        key: "stay:suggested-canal-house",
+        lat: 52.369,
+        lng: 4.9,
+        kind: "stay",
+        name: "Suggested Canal House",
+      },
+    ], bookingPin);
+
+    expect(markers).toEqual([bookingPin]);
   });
 
   it("renders persisted stop and transfer timing without drawing a made-up connection", () => {

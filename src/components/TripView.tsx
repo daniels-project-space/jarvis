@@ -220,6 +220,29 @@ export function bookedStayMapMarker(
   };
 }
 
+/**
+ * Keep one visual pin per exact place and type, while ensuring a verified
+ * booked stay is never hidden behind a suggested or previously locked stay
+ * at the same coordinates. The booking pin has the distinct locked treatment
+ * and label that lets someone orient themselves on the active city's map.
+ */
+export function mergeTripMapMarker(markers: TripMapMarker[], marker: TripMapMarker): TripMapMarker[] {
+  const existingIndex = markers.findIndex(
+    (existing) => existing.lat === marker.lat && existing.lng === marker.lng && existing.kind === marker.kind,
+  );
+  if (existingIndex < 0) return [...markers, marker];
+
+  const existing = markers[existingIndex];
+  const incomingIsBooked = marker.key.startsWith("booking:");
+  const existingIsBooked = existing.key.startsWith("booking:");
+  if ((incomingIsBooked && !existingIsBooked) || (marker.locked && !existing.locked)) {
+    const next = [...markers];
+    next[existingIndex] = marker;
+    return next;
+  }
+  return markers;
+}
+
 const bookingDateText = (value: number | undefined, timeZone?: string) => {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
   try {
@@ -1002,9 +1025,9 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
 
   const markers: Marker[] = useMemo(() => {
     if (!doc) return [];
-    const ms: Marker[] = [];
+    let ms: Marker[] = [];
     const addMarker = (marker: Marker) => {
-      if (!ms.some((existing) => existing.lat === marker.lat && existing.lng === marker.lng && existing.kind === marker.kind)) ms.push(marker);
+      ms = mergeTripMapMarker(ms, marker);
     };
     for (const s of doc.stays ?? [])
       if (belongsToCityContext(s, activeCityContext, cityContexts) && validLatLng(s.lat, s.lng)) addMarker({ key: `stay:${s.id ?? `${s.name}:${s.city ?? activeCityContext?.city ?? doc.destination}`}`, lat: s.lat, lng: s.lng, kind: "stay", name: `${s.name}${s.city ? ` · ${s.city}` : ""}`, locked: doc.locked?.stay?.id === s.id || doc.locked?.stay?.name === s.name });

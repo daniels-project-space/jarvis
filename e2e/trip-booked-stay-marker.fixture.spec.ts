@@ -27,12 +27,14 @@ test("a fresh booked location appears only on its active city map", async ({ pag
   await page.goto("/booking-marker", { waitUntil: "networkidle" });
   await expect(page.getByRole("main", { name: "Fixture booked location map marker" })).toBeVisible();
   await expect(page.getByLabel("Map marker: Booked location · Amsterdam")).toBeVisible();
+  await expect(page.getByLabel("Map marker: Suggested stay · Amsterdam")).toHaveCount(0);
   await expect(page.getByLabel("Map marker: Booked location · Berlin")).toHaveCount(0);
   await expect(page.getByLabel("Visible marker count")).toHaveText("1 visible city-scoped marker");
   await page.screenshot({ path: testInfo.outputPath("amsterdam-booked-marker.png"), fullPage: true });
 
   await page.getByLabel("Active fixture city").selectOption("berlin");
   await expect(page.getByLabel("Map marker: Booked location · Berlin")).toBeVisible();
+  await expect(page.getByLabel("Map marker: Suggested stay · Berlin")).toHaveCount(0);
   await expect(page.getByLabel("Map marker: Booked location · Amsterdam")).toHaveCount(0);
   await expect(page.getByLabel("Visible marker count")).toHaveText("1 visible city-scoped marker");
   await page.screenshot({ path: testInfo.outputPath("berlin-booked-marker.png"), fullPage: true });
