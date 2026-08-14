@@ -62,6 +62,7 @@ const APPROVAL_KEY = Buffer.alloc(32, 9).toString("base64");
 
 afterEach(() => {
   delete process.env.GOOGLE_TOKEN_ENCRYPTION_KEY;
+  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
 
@@ -98,6 +99,7 @@ const routed = {
 describe("trip itinerary tool actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
     mock.getTrip.mockResolvedValue({ id: "trip-1", doc });
     mock.scheduleTripDay.mockResolvedValue(routed);
     mock.addTripPlaceToDay.mockResolvedValue(routed);
@@ -346,9 +348,10 @@ describe("trip itinerary tool actions", () => {
     }));
     expect(hubFetch).toHaveBeenCalledTimes(2);
     expect(JSON.parse(String(hubFetch.mock.calls[1]?.[1]?.body))).toMatchObject({
-      path: "todos:add",
+      path: "jarvisActions:createTodo",
       args: expect.objectContaining({
         tags: expect.arrayContaining([expect.stringMatching(/^source:[a-f0-9]{64}$/)]),
+        vaultToken: "dedicated-jarvis-actions-token",
       }),
     });
     expect(mock.saveTrip).toHaveBeenCalledWith("draft-apple", expect.objectContaining({
@@ -504,7 +507,7 @@ describe("trip itinerary tool actions", () => {
     const hubFetch = vi.fn(async (input: string | URL, _init?: RequestInit) => {
       const url = new URL(String(input));
       if (url.pathname === "/api/query") {
-        return new Response(JSON.stringify({ value: [{ _id: "todo-existing", done: false, tags: [`source:${sourceKey}`] }] }), { headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify({ value: [{ id: "todo-existing", done: false, tags: [`source:${sourceKey}`] }] }), { headers: { "content-type": "application/json" } });
       }
       if (url.pathname === "/api/mutation") return new Response(JSON.stringify({ value: "todo-existing" }), { headers: { "content-type": "application/json" } });
       throw new Error(`unexpected fetch ${url}`);
@@ -513,8 +516,8 @@ describe("trip itinerary tool actions", () => {
 
     await expect(executeTool("travel_offline_maps_prepare", { draft_id: "draft-update-todo" })).resolves.toContain("matching Hub to-do already exists");
     expect(JSON.parse(String(hubFetch.mock.calls[1]?.[1]?.body))).toMatchObject({
-      path: "todos:update",
-      args: expect.objectContaining({ id: "todo-existing", dueDate: flight.start - 86_400_000, tags: expect.arrayContaining([`source:${sourceKey}`]) }),
+      path: "jarvisActions:updateTodo",
+      args: expect.objectContaining({ id: "todo-existing", dueDate: flight.start - 86_400_000, vaultToken: "dedicated-jarvis-actions-token" }),
     });
   });
 });

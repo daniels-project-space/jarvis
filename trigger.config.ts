@@ -43,6 +43,9 @@ export default defineConfig({
             // trusted worker/controller environment and is stripped from any
             // Codex child process before spawn.
             "JARVIS_HUB_CONTEXT_TOKEN",
+            // Separate, narrowly scoped Hub to-do/widget actions capability.
+            // This is never made available to browser code or Codex children.
+            "JARVIS_HUB_ACTIONS_TOKEN",
             "JARVIS_PRIVATE_R2_BUCKET",
             "JARVIS_CODEX_SESSION_SOURCE",
             "JARVIS_MISSION_PROTOCOL_ROLLOUT",

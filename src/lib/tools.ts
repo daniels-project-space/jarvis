@@ -3,6 +3,12 @@ import { createHash } from "node:crypto";
 import { convexMutation, convexQuery } from "./context";
 import { getSecret, getServiceSecrets } from "./vault";
 import {
+  createHubTodo,
+  hubActionsFailureMessage,
+  listHubTodos,
+  updateHubTodo,
+} from "./hub-actions";
+import {
   creationMediaUrl,
   deletePrivateCreationAsset,
   putPrivateCreationAsset,
@@ -521,13 +527,13 @@ export const TOOL_DEFS = [
   },
   {
     name: "todo_remove",
-    description: "Delete a to-do from Daniel's hub list entirely. Pass a few words from the item's text.",
+    description: "Project Hub's scoped Jarvis connection deliberately cannot delete to-dos. Do not call this; explain that Daniel can mark the item done instead.",
     parameters: { type: "object", properties: { match: { type: "string" } }, required: ["match"] },
   },
   {
     name: "calendar_view",
     description:
-      "Read Daniel's live iCloud Calendar and show it as a beautiful visual widget, merged with legacy hub events and rental pickups/returns, as a day plan, week, or month view. Use for 'what's my day/week/month look like', 'show my calendar', 'what's on Friday'.",
+      "Read Daniel's live iCloud Calendar and show it as a beautiful visual widget, merged with rental pickups/returns, as a day plan, week, or month view. Use for 'what's my day/week/month look like', 'show my calendar', 'what's on Friday'.",
     parameters: {
       type: "object",
       properties: {
@@ -1957,13 +1963,11 @@ async function briefingWidget(): Promise<string> {
     key: "profile.current_location",
   }).catch(() => null) as { value?: string } | null;
   const weatherLocation = currentLocation?.value?.trim() || "London";
-  const [w, strip, todos, events, iCloudEvents, wealth, markets, sparks] = await Promise.all([
+  const [w, strip, todos, iCloudEvents, markets, sparks] = await Promise.all([
     fetchWeatherData(weatherLocation).catch(() => null),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: today, days: 1 }),
-    q_hub("todos:list"),
-    q_hub("events:list"),
+    listHubTodos().catch(() => null),
     listICloudEvents(Date.now() - 60_000, Date.now() + 14 * 86_400_000).catch(() => []),
-    q_hub("wealth:getWealth"),
     fetchMarketData(["bitcoin", "ethereum"], ["GC=F"]).catch(() => []),
     cryptoSparks(),
   ]);
@@ -1973,6 +1977,7 @@ async function briefingWidget(): Promise<string> {
   const rentalMarks: { time: string; kind: string; name: string }[] = [];
   for (const pck of day0?.pickups ?? []) rentalMarks.push({ time: pck.pickupTime || "12:00", kind: "pickup", name: short(pck.items?.[0]?.name ?? pck.imageAlt ?? "item") });
   for (const r of day0?.returns ?? []) rentalMarks.push({ time: r.returnTime || "18:00", kind: "return", name: short(r.items?.[0]?.name ?? r.imageAlt ?? "item") });
+  const hubTodosUnavailable = todos === null;
   const open = (Array.isArray(todos) ? todos : []).filter((t: any) => !t.done);
   // Keep the briefing instant and deterministic. The foreground Codex worker
   // supplies any judgement in its spoken summary; this data helper never calls
@@ -1989,7 +1994,7 @@ async function briefingWidget(): Promise<string> {
       why: todo.dueAt ? "due soon" : todo.priority ? "high priority" : "open next action",
     }));
   const now = Date.now();
-  const upcoming = [...(Array.isArray(events) ? events : []), ...iCloudEvents]
+  const upcoming = [...iCloudEvents]
     .filter((e: any) => (e.start ?? 0) >= now)
     .sort((a: any, b: any) => a.start - b.start)
     .slice(0, 4);
@@ -1997,7 +2002,7 @@ async function briefingWidget(): Promise<string> {
     kind: "briefing2",
     date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),
     weather: w ? { location: weatherLocation, icon: w.icon, temp: w.temp, desc: w.desc, hours: (w.hours ?? []).slice(0, 8) } : null,
-    wealth: wealth?.currentTotalGBP ? Math.round(wealth.currentTotalGBP) : null,
+    wealth: null,
     rentals: rentalMarks.sort((a, b) => a.time.localeCompare(b.time)),
     awayCount: (day0?.away ?? []).length,
     todos: picked,
@@ -2010,35 +2015,10 @@ async function briefingWidget(): Promise<string> {
   await showWidget(widget, `briefing · ${today}`);
   return (
     `Briefing 2.0 on screen (rentals timeline, tickable day-picks, calendar, markets). ` +
-    `Spoken summary material: ${w ? weatherLocation + " " + w.temp + "° " + w.desc : ""}; ${rentalMarks.length} rental movements; top pick: ${picked[0]?.text ?? "none"}. Speak two short sentences max.`
+    `Spoken summary material: ${w ? weatherLocation + " " + w.temp + "° " + w.desc : ""}; ${rentalMarks.length} rental movements; top pick: ${picked[0]?.text ?? "none"}.` +
+    (hubTodosUnavailable ? " Project Hub to-dos are unavailable until its scoped Jarvis connection is configured." : "") +
+    " Speak two short sentences max."
   );
-}
-
-// project-hub reads (todos/calendar/wealth live there)
-const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
-async function q_hub(path: string, args: unknown = {}): Promise<any> {
-  try {
-    const r = await fetch(`${HUB_URL}/api/query`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path, args, format: "json" }),
-    });
-    return (await r.json()).value;
-  } catch {
-    return null;
-  }
-}
-// project-hub WRITES — the missing half that made "added to your list, sir" a
-// lie: JARVIS could only read the hub. These actually mutate the dashboard.
-async function m_hub(path: string, args: unknown): Promise<any> {
-  const r = await fetch(`${HUB_URL}/api/mutation`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
-  });
-  const j = await r.json();
-  if (j.status === "error") throw new Error(j.errorMessage ?? `${path} failed`);
-  return j.value;
 }
 
 // "2026-07-14" + "15:30" in Europe/London → epoch ms (DST-correct).
@@ -2062,17 +2042,26 @@ const londonTimeStr = (ms: number) =>
 async function todoAdd(args: any): Promise<string> {
   const text = String(args.text ?? "").trim();
   if (!text) return "What should the to-do say?";
-  await m_hub("todos:add", {
-    text: text.slice(0, 200),
-    dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(args.due_date ?? "")) ? londonMs(String(args.due_date), "12:00") : undefined,
-    tags: Array.isArray(args.tags) ? args.tags.map(String).slice(0, 4) : ["jarvis"],
-  });
-  const open = ((await q_hub("todos:list")) ?? []).filter((t: any) => !t.done).length;
-  return `Done — "${text}" is now on the hub to-do list (${open} open). Confirm it casually in one line.`;
+  try {
+    await createHubTodo({
+      text: text.slice(0, 200),
+      dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(args.due_date ?? "")) ? londonMs(String(args.due_date), "12:00") : undefined,
+      tags: Array.isArray(args.tags) ? args.tags.map(String).slice(0, 4) : ["jarvis"],
+    });
+    const open = (await listHubTodos()).filter((todo) => !todo.done).length;
+    return `Done — "${text}" is now on the hub to-do list (${open} open). Confirm it casually in one line.`;
+  } catch (error) {
+    return hubActionsFailureMessage(error);
+  }
 }
 
 async function matchTodo(match: string, includeDone: boolean): Promise<{ hit: any | null; note: string }> {
-  const todos: any[] = (await q_hub("todos:list")) ?? [];
+  let todos: any[];
+  try {
+    todos = await listHubTodos();
+  } catch (error) {
+    return { hit: null, note: `TOOL FAILED — ${hubActionsFailureMessage(error)}` };
+  }
   const pool = includeDone ? todos : todos.filter((t: any) => !t.done);
   const m = match.toLowerCase().trim();
   const hits = pool.filter((t: any) => String(t.text).toLowerCase().includes(m));
@@ -2088,16 +2077,16 @@ async function matchTodo(match: string, includeDone: boolean): Promise<{ hit: an
 async function todoDone(args: any): Promise<string> {
   const { hit, note } = await matchTodo(String(args.match ?? ""), false);
   if (!hit) return note;
-  await m_hub("todos:update", { id: hit._id, done: true });
-  return `Ticked off: "${hit.text}".`;
+  try {
+    await updateHubTodo({ id: hit.id, done: true });
+    return `Ticked off: "${hit.text}".`;
+  } catch (error) {
+    return hubActionsFailureMessage(error);
+  }
 }
 
 async function todoRemove(args: any): Promise<string> {
-  // removal must also find already-done items, not just open ones
-  const { hit, note } = await matchTodo(String(args.match ?? ""), true);
-  if (!hit) return note;
-  await m_hub("todos:remove", { id: hit._id });
-  return `Removed from the list: "${hit.text}".`;
+  return "Project Hub's scoped Jarvis connection cannot delete to-dos. Nothing changed; I can mark the item done instead.";
 }
 
 async function calendarAdd(_args: any): Promise<string> {
@@ -2261,8 +2250,8 @@ async function calendarRemove(_args: any): Promise<string> {
   return "Calendar changes require protected owner approval, which is unavailable from this tool. Nothing was deleted.";
 }
 
-// The frosted-glass calendar widget: live iCloud events + legacy hub events +
-// rental pickups/returns in one day / week / month view.
+// The frosted-glass calendar widget: live iCloud events plus rental
+// pickups/returns in one day / week / month view.
 async function calendarView(args: any): Promise<string> {
   const view = ["day", "week", "month"].includes(String(args.view)) ? String(args.view) : "week";
   const anchor = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : londonDateStr(Date.now());
@@ -2285,20 +2274,19 @@ async function calendarView(args: any): Promise<string> {
     count = Math.ceil((dow + daysInMonth) / 7) * 7;
   }
   const stripStart = londonDateStr(startMs);
-  const [events, iCloudEvents, strip] = await Promise.all([
-    q_hub("events:list"),
+  const [iCloudEvents, strip] = await Promise.all([
     listICloudEvents(startMs, startMs + count * DAY).catch(() => []),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: stripStart, days: Math.min(count, 30) }),
   ]);
   const byDate: Record<string, any[]> = {};
-  for (const e of [...(Array.isArray(events) ? events : []), ...iCloudEvents]) {
+  for (const e of iCloudEvents) {
     const d = londonDateStr(e.start);
     (byDate[d] ??= []).push({
       title: String(e.title).slice(0, 60),
       time: e.allDay ? "" : londonTimeStr(e.start),
       kind: "event",
       location: e.location ? String(e.location).slice(0, 40) : undefined,
-      source: e.source === "icloud" ? "iCloud" : "hub",
+      source: "iCloud",
     });
   }
   const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 3).join(" ");
@@ -2591,24 +2579,23 @@ async function upsertAppleMapsOfflineTodo(preflight: {
     && Array.isArray(todo.tags)
     && todo.tags.includes(tags[3]);
   try {
-    const existing = findExisting(await q_hub("todos:list"));
-    if (existing?._id) {
-      await m_hub("todos:update", {
-        id: existing._id,
+    const existing = findExisting(await listHubTodos());
+    if (existing?.id) {
+      await updateHubTodo({
+        id: existing.id,
         text: preflight.todoText,
         dueDate: preflight.at,
-        tags,
       });
       return "existing";
     }
-    await m_hub("todos:add", { text: preflight.todoText, dueDate: preflight.at, tags });
+    await createHubTodo({ text: preflight.todoText, dueDate: preflight.at, tags });
     return "created";
   } catch {
     // A network error after the Hub accepted todos:add is ambiguous. Re-list by
     // the stable source tag before exposing a retry state, so a retry cannot
     // create a duplicate travel task.
     try {
-      const existing = findExisting(await q_hub("todos:list"));
+      const existing = findExisting(await listHubTodos());
       if (reflectsPreflight(existing)) return "existing";
     } catch {
       // The durable Jarvis reminder remains available; surface an honest retry.
@@ -3977,20 +3964,18 @@ async function draftDoc(args: any): Promise<string> {
 // commitments + open to-dos → a reasoned, time-blocked schedule.
 async function planMyDay(args: any): Promise<string> {
   const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : londonDateStr(Date.now());
-  const [todos, events, strip] = await Promise.all([
-    q_hub("todos:list"),
-    q_hub("events:list"),
+  const [todos, strip] = await Promise.all([
+    listHubTodos().catch(() => null),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: date, days: 1 }),
   ]);
   const open = (Array.isArray(todos) ? todos : []).filter((t: any) => !t.done);
-  const dayEvents = (Array.isArray(events) ? events : []).filter((e: any) => londonDateStr(e.start) === date);
   const day0 = Array.isArray(strip) ? strip[0] : null;
   const short = (s: string) => String(s || "").split(/[|,]/)[0].split(/\s+/).slice(0, 4).join(" ");
   const facts =
     `DATE: ${date} (now ${londonTimeStr(Date.now())} London)\n` +
-    `FIXED EVENTS: ${dayEvents.map((e: any) => `${e.allDay ? "all-day" : londonTimeStr(e.start)} ${e.title}`).join("; ") || "none"}\n` +
+    "FIXED EVENTS: unavailable through the scoped Project Hub connection\n" +
     `RENTALS TODAY: ${day0 ? [...(day0.pickups ?? []).map((p: any) => `pickup ${short(p.items?.[0]?.name ?? "")}${p.pickupTime ? " " + p.pickupTime : ""}`), ...(day0.returns ?? []).map((r: any) => `return ${short(r.items?.[0]?.name ?? "")}`)].join("; ") || "none" : "unknown"}\n` +
-    `OPEN TO-DOS (${open.length}): ${open.slice(0, 18).map((t: any) => `"${String(t.text).slice(0, 70)}"${t.dueDate ? ` (due ${londonDateStr(t.dueDate)})` : ""}${t.priority ? ` [p${t.priority}]` : ""}`).join("; ")}\n` +
+    `OPEN TO-DOS (${open.length}${todos === null ? "; connection unavailable" : ""}): ${open.slice(0, 18).map((t: any) => `"${String(t.text).slice(0, 70)}"${t.dueDate ? ` (due ${londonDateStr(t.dueDate)})` : ""}${t.priority ? ` [p${t.priority}]` : ""}`).join("; ")}\n` +
     (args.focus ? `DANIEL WANTS PRIORITISED: ${String(args.focus).slice(0, 300)}\n` : "");
   return (
     `LIVE DAY DATA. Build the plan yourself with your current Codex subscription reasoning; do not call another model. ` +
@@ -5428,7 +5413,12 @@ export async function executeTool(
     case "draft":
       return await draftDoc(args);
     case "todo_list": {
-      const todos: any[] = (await q_hub("todos:list")) ?? [];
+      let todos: any[];
+      try {
+        todos = await listHubTodos();
+      } catch (error) {
+        return hubActionsFailureMessage(error);
+      }
       const open = todos.filter((t: any) => !t.done).slice(0, 24);
       await showWidget(
         {
@@ -5445,29 +5435,7 @@ export async function executeTool(
       return `Tickable to-do list is on screen (${open.length} open). Speak one line — maybe which one you'd tackle first.`;
     }
     case "net_worth": {
-      const w: any = await q_hub("wealth:getWealth");
-      if (!w) return "Couldn't reach the wealth data.";
-      const cats = Object.entries(w.byCategory ?? {}).map(([k, v]: [string, any]) => ({
-        label: k,
-        value: Math.round((v.assets ?? []).reduce((a: number, x: any) => a + (x.lastValueGBP ?? 0), 0)),
-        note: `${(v.assets ?? []).length} assets`,
-      })).filter((c) => c.value > 0).sort((a, b) => b.value - a.value).slice(0, 8);
-      await showWidget(
-        {
-          kind: "stats",
-          title: "Net worth",
-          kpis: [
-            { label: "net worth", value: Math.round(w.currentTotalGBP ?? 0), prefix: "£" },
-            { label: "cashflow /mo", value: Math.round(w.netCashflowGbp ?? 0), prefix: "£" },
-            { label: "expenses /mo", value: Math.round(w.expensesMonthlyGbp ?? 0), prefix: "£" },
-            { label: "rental (mo)", value: Math.round(w.confirmedRentalGbp ?? 0), prefix: "£" },
-          ],
-          bars: cats,
-          barsLabel: "by category £",
-        },
-        "net worth",
-      );
-      return `Net worth dashboard on screen: £${Math.round(w.currentTotalGBP ?? 0).toLocaleString("en-GB")} across ${w.assetCount} assets, top category ${cats[0]?.label}. One-line takeaway only.`;
+      return "Wealth data is not available through Jarvis's narrowly scoped Project Hub connection.";
     }
     case "plan_my_day":
       return await planMyDay(args);

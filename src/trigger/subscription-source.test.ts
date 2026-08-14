@@ -38,6 +38,7 @@ describe("Codex subscription source boundary", () => {
       ["AWS_SESSION_TOKEN", "never-read-session"],
       ["VAULT_ACCESS_TOKEN", "never-read-vault"],
       ["JARVIS_HUB_CONTEXT_TOKEN", "never-read-hub-context"],
+      ["JARVIS_HUB_ACTIONS_TOKEN", "never-read-hub-actions"],
       [CODEX_SESSION_SOURCE_ENV, CODEX_SESSION_SOURCE],
     ] as const) {
       Object.defineProperty(source, name, {

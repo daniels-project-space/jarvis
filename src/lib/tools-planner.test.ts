@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
@@ -18,17 +18,20 @@ vi.mock("./icloud-calendar", () => ({
 import { executeTool } from "./tools";
 
 describe("day planner tool chain", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
     mock.convexQuery.mockResolvedValue("thread-1");
     mock.convexMutation.mockResolvedValue(undefined);
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body ?? "{}"));
-      if (body.path === "todos:list") {
+      if (body.path === "jarvisActions:listTodos") {
         return Response.json({ value: [{ text: "Finish the production validation", done: false, priority: 3 }] });
-      }
-      if (body.path === "events:list") {
-        return Response.json({ value: [{ title: "Project review", start: Date.UTC(2026, 7, 9, 14), allDay: false }] });
       }
       if (body.path === "calendar:getCalendarStrip") {
         return Response.json({ value: [{

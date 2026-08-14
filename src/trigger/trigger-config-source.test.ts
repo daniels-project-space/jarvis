@@ -13,6 +13,7 @@ describe("Trigger mission rollout environment", () => {
     expect(syncedEnvironment).toContain('"JARVIS_MISSION_PROTOCOL_ROLLOUT"');
     expect(syncedEnvironment).toContain('"JARVIS_MISSION_SUPERVISOR_ROLLOUT"');
     expect(syncedEnvironment).toContain('"JARVIS_HUB_CONTEXT_TOKEN"');
+    expect(syncedEnvironment).toContain('"JARVIS_HUB_ACTIONS_TOKEN"');
 
     const runner = readFileSync(new URL("./agent-runner.ts", import.meta.url), "utf8");
     const foregroundTools = readFileSync(new URL("../lib/tools.ts", import.meta.url), "utf8");
