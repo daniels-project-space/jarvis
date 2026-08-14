@@ -109,6 +109,26 @@ async function failForegroundStartup(message: string): Promise<never> {
   throw new Error(message);
 }
 
+async function settleUnclaimedForegroundStartupFailure(payload: ForegroundTurnPayload) {
+  const dispatchEpoch = payload.dispatchEpoch;
+  if (
+    !payload.messageId
+    || !payload.threadId
+    || typeof dispatchEpoch !== "number"
+    || !Number.isSafeInteger(dispatchEpoch)
+    || dispatchEpoch < 0
+  ) return false;
+  // This hook runs only once Trigger has exhausted retries. Convex settles
+  // the original wake-up only while its durable dispatch epoch is unchanged
+  // and unclaimed; a concurrent recovery always wins instead of losing a live
+  // reply to a delayed failure hook.
+  return await convexMutation("chatQueue:failPendingStartup", {
+    messageId: payload.messageId,
+    threadId: payload.threadId,
+    expectedDispatchEpoch: dispatchEpoch,
+  }).catch(() => false);
+}
+
 function waitForPending(
   client: ConvexClient,
   workerToken: string,
@@ -655,14 +675,30 @@ async function processChatQueue(
       await heartbeatPromise.catch(() => undefined);
       await handoffPromise;
       const retirement = await convexMutation("chatQueue:releaseRunner", { runnerId })
-        .catch(() => null) as { released?: boolean; pendingMessageId?: string | null } | null;
-      if (retirement?.released && retirement.pendingMessageId) {
+        .catch(() => null) as {
+          released?: boolean;
+          pendingMessageId?: string | null;
+          pendingThreadId?: string | null;
+          pendingDispatchEpoch?: number | null;
+        } | null;
+      if (
+        retirement?.released
+        && retirement.pendingMessageId
+        && retirement.pendingThreadId
+        && Number.isSafeInteger(retirement.pendingDispatchEpoch)
+        && (retirement.pendingDispatchEpoch as number) >= 0
+      ) {
         // Admission raced the realtime listener's final timeout. The atomic
         // retirement receipt transfers responsibility to one replacement wake;
         // this path is exceptional and adds no task to ordinary warm turns.
         await tasks.trigger(
           taskForForegroundLane(lane),
-          { messageId: retirement.pendingMessageId, source: "runner-retirement" },
+          {
+            messageId: retirement.pendingMessageId,
+            threadId: retirement.pendingThreadId,
+            dispatchEpoch: retirement.pendingDispatchEpoch,
+            source: "runner-retirement",
+          },
           { idempotencyKey: `jarvis-retire-${retirement.pendingMessageId}` },
         ).catch(() => null);
       }
@@ -703,6 +739,9 @@ export const chatTurn = task({
   queue: { name: FOREGROUND_QUEUE, concurrencyLimit: FOREGROUND_CONCURRENCY },
   machine: "small-1x",
   maxDuration: FOREGROUND_LANE_MAX_DURATION_SECONDS,
+  onFailure: async ({ payload }) => {
+    await settleUnclaimedForegroundStartupFailure(payload);
+  },
   run: async (payload: ForegroundTurnPayload) => processChatQueue(payload, "primary"),
 });
 
@@ -715,6 +754,9 @@ export const chatHandoff = task({
   queue: { name: "jarvis-foreground-handoff", concurrencyLimit: 1 },
   machine: "small-1x",
   maxDuration: FOREGROUND_LANE_MAX_DURATION_SECONDS,
+  onFailure: async ({ payload }) => {
+    await settleUnclaimedForegroundStartupFailure(payload);
+  },
   run: async (payload: ForegroundTurnPayload) => processChatQueue({ ...payload, source: "warm-handoff" }, "handoff"),
 });
 
@@ -722,7 +764,9 @@ export const chatHandoff = task({
 // Trigger, the next schedule drains the durable Convex queue.
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
-  cron: "*/5 * * * *",
+  // A lost Trigger response remains ambiguous, so it is recovered durably
+  // rather than terminally failed. Keep that bounded wait to one minute.
+  cron: "*/1 * * * *",
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,
   run: async () => {
@@ -747,7 +791,7 @@ export const chatDispatcher = schedules.task({
       trigger: async (messageId, dispatchEpoch) => {
         const handle = await tasks.trigger(
           "jarvis-chat-turn",
-          { source: "recovery", messageId },
+          { source: "recovery", messageId, threadId: pendingMessageId.threadId, dispatchEpoch },
           { idempotencyKey: `jarvis-recovery-${messageId}-${dispatchEpoch}` },
         );
         return { id: handle.id };

@@ -50,5 +50,6 @@ export const canClaimForegroundTurn = (remainingMs: number) =>
 export type ForegroundTurnPayload = {
   messageId?: string;
   threadId?: string;
+  dispatchEpoch?: number;
   source?: string;
 };

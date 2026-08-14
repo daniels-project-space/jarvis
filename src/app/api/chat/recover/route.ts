@@ -55,7 +55,12 @@ export async function POST(req: NextRequest) {
   if (recovery.status === "pending" || recovery.status === "requeued") {
     handle = await tasks.trigger(
       "jarvis-chat-turn",
-      { source: "recovery", threadId, messageId: recovery.messageId ?? messageId },
+      {
+        source: "recovery",
+        threadId,
+        messageId: recovery.messageId ?? messageId,
+        dispatchEpoch: recovery.dispatchEpoch ?? 0,
+      },
       { idempotencyKey: `jarvis-chat-recovery-${messageId}-${recovery.dispatchEpoch ?? 0}` },
     ).catch(async (error) => {
       await reportIncident(

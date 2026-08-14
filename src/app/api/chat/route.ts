@@ -122,7 +122,7 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   const handle = warm ? null : await tasks
     .trigger(
       "jarvis-chat-turn",
-      { source: "conversation", threadId, messageId: String(messageId) },
+      { source: "conversation", threadId, messageId: String(messageId), dispatchEpoch: 0 },
       { idempotencyKey: `jarvis-chat-${String(messageId)}` },
     )
     .catch(async (error) => {

@@ -51,6 +51,8 @@ const RESEARCH_PREFETCH_CONTEXT_MAX_CHARS = 3_600;
 const RESEARCH_PREFETCH_MAX_LIFETIME_MS = 60_000;
 const TERMINAL_RECOVERY_TEXT =
   "I couldn't complete that reply after several recovery attempts. Tap retry to try the request again.";
+const FOREGROUND_STARTUP_FAILURE_TEXT =
+  "Jarvis couldn't start this reply right now. Tap retry to try again.";
 const CANCELLED_REPLY_TEXT = "Reply cancelled.";
 const OWNER_TOOL_COMMITTED_REPLY_TEXT =
   "Reply cancelled. An already-started owner-authorized Gmail or Google Calendar request may still finish; check Gmail or Google Calendar before retrying.";
@@ -645,6 +647,59 @@ async function expirePending(ctx: { db: any }, user: any) {
   await settleSession(ctx, user.threadId);
 }
 
+// A Trigger task can fail before it has claimed its exact wake-up row (for
+// example, while validating the subscription session). Settle only that still
+// pending row: a concurrent worker claim wins this race and remains untouched.
+export const failPendingStartup = mutation({
+  args: {
+    messageId: v.id("chatMessages"),
+    threadId: v.string(),
+    expectedDispatchEpoch: v.number(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const user = await ctx.db.get(a.messageId);
+    if (
+      !user
+      || user.role !== "user"
+      || user.threadId !== a.threadId
+      || user.status !== "pending"
+      || !Number.isSafeInteger(a.expectedDispatchEpoch)
+      || a.expectedDispatchEpoch < 0
+      || Number(user.dispatchEpoch ?? 0) !== a.expectedDispatchEpoch
+    ) return false;
+
+    const assistant = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_parent", (q: any) => q.eq("parentMessageId", user._id))
+      .order("desc")
+      .first();
+    // A worker that won the claim will have inserted its streaming child. Do
+    // not overwrite it merely because this wake-up lost a startup race.
+    if (assistant) return false;
+
+    const now = Date.now();
+    await ctx.db.patch(user._id, { status: "error", lastProgressAt: now });
+    await ctx.db.insert("chatMessages", {
+      threadId: user.threadId,
+      role: "assistant",
+      text: FOREGROUND_STARTUP_FAILURE_TEXT,
+      status: "error",
+      parentMessageId: user._id,
+      delivery: "foreground",
+      attemptCount: Number(user.attemptCount ?? 0),
+      dispatchEpoch: Number(user.dispatchEpoch ?? 0),
+      lastProgressAt: now,
+      createdAt: user.createdAt + 1,
+    });
+    await releaseGuestTurn(ctx, user);
+    await deleteTurnEphemera(ctx, user._id);
+    await settleSession(ctx, user.threadId);
+    return true;
+  },
+});
+
 // A killed route cannot strand a claimed turn. Fresh heartbeats fence active
 // work; only genuinely stale attempts are requeued, and retries are bounded.
 export const reapStuck = mutation({
@@ -1186,7 +1241,9 @@ export const releaseRunner = mutation({
       .query("ui")
       .withIndex("by_key", (q: any) => q.eq("key", RUNNER_KEY))
       .first();
-    if (row?.value !== a.runnerId) return { released: false, pendingMessageId: null };
+    if (row?.value !== a.runnerId) {
+      return { released: false, pendingMessageId: null, pendingThreadId: null, pendingDispatchEpoch: null };
+    }
     // Lease retirement and the pending check must be one transaction. If a
     // message was admitted before this delete, the retiring worker launches a
     // replacement; if admission happens after it, Vercel observes no runner
@@ -1196,7 +1253,12 @@ export const releaseRunner = mutation({
       .query("chatMessages")
       .withIndex("by_status", (q: any) => q.eq("status", "pending"))
       .first();
-    return { released: true, pendingMessageId: pending?._id ?? null };
+    return {
+      released: true,
+      pendingMessageId: pending?._id ?? null,
+      pendingThreadId: pending?.threadId ?? null,
+      pendingDispatchEpoch: pending ? Number(pending.dispatchEpoch ?? 0) : null,
+    };
   },
 });
 

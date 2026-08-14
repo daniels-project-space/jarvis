@@ -14,6 +14,8 @@ const contentTypes: Record<string, string> = {
   "/": "text/html; charset=utf-8",
   "/fixture.js": "text/javascript; charset=utf-8",
   "/fixture.css": "text/css; charset=utf-8",
+  "/artifact": "text/html; charset=utf-8",
+  "/artifact.js": "text/javascript; charset=utf-8",
   "/voice": "text/html; charset=utf-8",
   "/voice-child": "text/html; charset=utf-8",
   "/voice.js": "text/javascript; charset=utf-8",
@@ -49,6 +51,21 @@ const fixtureHtml = `<!doctype html>
     <script src="/fixture.js" defer></script>
   </body>
 </html>`;
+
+const artifactFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Artifact card fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/artifact.js" defer></script>
+  </body>
+</html>`;
+
+const fixtureArtifactBytes = Buffer.from("jarvis artifact fixture\n", "utf8");
 
 const voiceFixtureHtml = `<!doctype html>
 <html lang="en">
@@ -116,6 +133,7 @@ async function main() {
   entryNames: "[name]",
   entryPoints: {
     fixture: join(projectRoot, "e2e/fixtures/trip-timeline.browser.tsx"),
+    artifact: join(projectRoot, "e2e/fixtures/artifact-card.browser.tsx"),
     voice: join(projectRoot, "e2e/fixtures/browser-voice-lease.browser.ts"),
     caption: join(projectRoot, "e2e/fixtures/spoken-caption-layout.browser.tsx"),
     location: join(projectRoot, "e2e/fixtures/trip-location-follow.browser.tsx"),
@@ -134,6 +152,7 @@ async function main() {
 
   const fixtureJsPath = join(outputDir, "fixture.js");
   const fixtureCssPath = join(outputDir, "fixture.css");
+  const artifactJsPath = join(outputDir, "artifact.js");
   const voiceJsPath = join(outputDir, "voice.js");
   const captionJsPath = join(outputDir, "caption.js");
   const captionCssPath = join(outputDir, "caption.css");
@@ -141,6 +160,7 @@ async function main() {
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
+    access(artifactJsPath),
     access(voiceJsPath),
     access(captionJsPath),
     access(captionCssPath),
@@ -149,11 +169,31 @@ async function main() {
 
   const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
-  const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  const pathname = url.pathname;
 
   if (method !== "GET" && method !== "HEAD") {
     response.writeHead(405, { Allow: "GET, HEAD", "Content-Security-Policy": csp });
     response.end();
+    return;
+  }
+
+  if (pathname === "/api/creation-download") {
+    // Fixture-only bytes exercise the browser download handoff; production
+    // owner authorization remains covered by the protected Next route tests.
+    if (url.searchParams.get("id") !== "fixture-pdf") {
+      response.writeHead(404, { "Content-Security-Policy": csp });
+      response.end();
+      return;
+    }
+    response.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Disposition": 'attachment; filename="fixture-report.pdf"',
+      "Content-Length": String(fixtureArtifactBytes.byteLength),
+      "Content-Security-Policy": csp,
+      "Content-Type": "application/pdf",
+    });
+    response.end(method === "HEAD" ? undefined : fixtureArtifactBytes);
     return;
   }
 
@@ -175,6 +215,11 @@ async function main() {
   if (pathname === "/") {
     response.writeHead(200);
     response.end(fixtureHtml);
+    return;
+  }
+  if (pathname === "/artifact") {
+    response.writeHead(200);
+    response.end(artifactFixtureHtml);
     return;
   }
   if (pathname === "/voice") {
@@ -202,6 +247,8 @@ async function main() {
   response.end(await readFile(
     pathname === "/fixture.js"
       ? fixtureJsPath
+      : pathname === "/artifact.js"
+        ? artifactJsPath
       : pathname === "/fixture.css"
         ? fixtureCssPath
         : pathname === "/caption.js"

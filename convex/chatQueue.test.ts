@@ -72,10 +72,86 @@ describe("durable foreground chat recovery", () => {
     await expect(t.mutation(api.chatQueue.releaseRunner, {
       runnerId: "retiring-runner",
       workerToken: WORKER,
-    })).resolves.toEqual({ released: true, pendingMessageId: messageId });
+    })).resolves.toEqual({
+      released: true,
+      pendingMessageId: messageId,
+      pendingThreadId: "main",
+      pendingDispatchEpoch: 0,
+    });
     await expect(t.query(api.chatQueue.runnerLeaseForWorker, {
       workerToken: WORKER,
     })).resolves.toBeNull();
+  });
+
+  it("settles an unclaimed startup failure without waiting for the recovery sweep", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await createTurn(t, "startup-failure");
+
+    expect(await t.mutation(api.chatQueue.failPendingStartup, {
+      messageId: userId,
+      threadId: "main",
+      expectedDispatchEpoch: 0,
+      workerToken: WORKER,
+    })).toBe(true);
+
+    expect(await t.mutation(api.chatQueue.failPendingStartup, {
+      messageId: userId,
+      threadId: "main",
+      expectedDispatchEpoch: 0,
+      workerToken: WORKER,
+    })).toBe(false);
+
+    const rows = await t.query(api.chatQueue.listMessages, { threadId: "main", workerToken: WORKER });
+    expect(rows.find((row) => row._id === userId)?.status).toBe("error");
+    expect(rows.find((row) => row.parentMessageId === userId)).toMatchObject({
+      role: "assistant",
+      status: "error",
+      text: expect.stringMatching(/couldn't start/i),
+    });
+  });
+
+  it("does not overwrite a turn that another worker has already claimed", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await createTurn(t, "startup-race");
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "startup-race-claim",
+      workerToken: WORKER,
+    });
+
+    expect(await t.mutation(api.chatQueue.failPendingStartup, {
+      messageId: userId,
+      threadId: "main",
+      expectedDispatchEpoch: 0,
+      workerToken: WORKER,
+    })).toBe(false);
+
+    const rows = await t.query(api.chatQueue.listMessages, { threadId: "main", workerToken: WORKER });
+    expect(rows.find((row) => row._id === claim?.assistantId)).toMatchObject({
+      status: "streaming",
+      claimToken: "startup-race-claim",
+    });
+  });
+
+  it("does not settle a newer recovery epoch from an older failed wake-up", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await createTurn(t, "startup-epoch-race");
+    await expect(t.mutation(api.chatQueue.requestRecovery, {
+      messageId: userId,
+      threadId: "main",
+      workerToken: WORKER,
+    })).resolves.toMatchObject({ status: "pending", dispatchEpoch: 1 });
+
+    expect(await t.mutation(api.chatQueue.failPendingStartup, {
+      messageId: userId,
+      threadId: "main",
+      expectedDispatchEpoch: 0,
+      workerToken: WORKER,
+    })).toBe(false);
+
+    const rows = await t.query(api.chatQueue.listMessages, { threadId: "main", workerToken: WORKER });
+    expect(rows.find((row) => row._id === userId)).toMatchObject({ status: "pending", dispatchEpoch: 1 });
+    expect(rows.some((row) => row.parentMessageId === userId)).toBe(false);
   });
 
   it("returns the completed assistant payload so reconnect recovery can deliver it", async () => {
