@@ -9,6 +9,7 @@
  */
 
 import type * as agents from "../agents.js";
+import type * as appleMapsOfflinePreflights from "../appleMapsOfflinePreflights.js";
 import type * as approvals from "../approvals.js";
 import type * as attention from "../attention.js";
 import type * as brainContext from "../brainContext.js";
@@ -68,6 +69,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   agents: typeof agents;
+  appleMapsOfflinePreflights: typeof appleMapsOfflinePreflights;
   approvals: typeof approvals;
   attention: typeof attention;
   brainContext: typeof brainContext;
