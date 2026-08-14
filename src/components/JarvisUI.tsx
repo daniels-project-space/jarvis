@@ -103,6 +103,7 @@ import { ChatFilePicker } from "./chat-files/ChatFilePicker";
 import { GuestChatFileAccess } from "./chat-files/GuestChatFileAccess";
 import { ChatFilePendingMonitor, type ChatFileNotice } from "./chat-files/ChatFilePendingMonitor";
 import { useChatFileDropZone } from "./chat-files/useChatFileDropZone";
+import { SPOKEN_CAPTION_TEXT_CLASS, spokenCaptionStageClassName } from "@/lib/spoken-caption-layout";
 import type { ChatFileManifest } from "@/lib/chat-files";
 import { buildSpeculativeResearchQuery } from "@/lib/speculative-research";
 import {
@@ -1466,7 +1467,7 @@ function SpokenCaption({ caption }: { caption: NonNullable<Caption> }) {
       ref={boxRef}
       data-jarvis-caption
       data-caption-phase={caption.phase ?? "ready"}
-      className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[24vh] max-w-[min(780px,86%)] overflow-hidden text-center text-base font-semibold leading-snug tracking-tight md:text-[1.4rem] lg:text-[1.6rem] ${caption.who === "you" ? "text-amber" : "text-ice"}`}
+      className={`${caption.exiting ? "cap-fade-out" : "cap-bloom"} max-h-[24vh] max-w-[min(780px,86%)] overflow-hidden text-center ${SPOKEN_CAPTION_TEXT_CLASS} ${caption.who === "you" ? "text-amber" : "text-ice"}`}
     >
       {caption.text}
     </div>
@@ -5166,7 +5167,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             </div>
           )}
           {caption && (
-            <div className="pointer-events-none absolute inset-x-2 bottom-1 z-50 flex justify-center px-3">
+            <div className="pointer-events-none absolute inset-x-2 bottom-0 z-50 flex justify-center px-3">
               <SpokenCaption caption={caption} />
             </div>
           )}
@@ -5519,7 +5520,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               finalization and narration. Compact overlays keep it beside their
               visible orb; only a truly full-screen workspace owns the surface. */}
           {caption && !fullBleed && (
-            <div className={`pointer-events-none absolute ${compactAside || (commandExpanded && !overlayUp) ? "top-[72%] hidden md:flex md:left-[62%] md:right-0" : "top-[60%] inset-x-0"} z-30 flex justify-center px-6`}>
+            <div className={`pointer-events-none absolute ${spokenCaptionStageClassName({ compactAside, commandExpanded, overlayUp })} z-30 flex justify-center px-6`}>
               <SpokenCaption caption={caption} />
             </div>
           )}

@@ -17,6 +17,9 @@ const contentTypes: Record<string, string> = {
   "/voice": "text/html; charset=utf-8",
   "/voice-child": "text/html; charset=utf-8",
   "/voice.js": "text/javascript; charset=utf-8",
+  "/caption": "text/html; charset=utf-8",
+  "/caption.js": "text/javascript; charset=utf-8",
+  "/caption.css": "text/css; charset=utf-8",
 };
 
 const csp = [
@@ -72,6 +75,22 @@ const voiceChildHtml = `<!doctype html>
   </body>
 </html>`;
 
+const captionFixtureHtml = [
+  "<!doctype html>",
+  "<html lang=\"en\">",
+  "  <head>",
+  "    <meta charset=\"utf-8\" />",
+  "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+  "    <title>Spoken caption layout fixture</title>",
+  "    <link rel=\"stylesheet\" href=\"/caption.css\" />",
+  "  </head>",
+  "  <body>",
+  "    <div id=\"root\"></div>",
+  "    <script src=\"/caption.js\" defer></script>",
+  "  </body>",
+  "</html>",
+].join("\n");
+
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
 
@@ -83,6 +102,7 @@ async function main() {
   entryPoints: {
     fixture: join(projectRoot, "e2e/fixtures/trip-timeline.browser.tsx"),
     voice: join(projectRoot, "e2e/fixtures/browser-voice-lease.browser.ts"),
+    caption: join(projectRoot, "e2e/fixtures/spoken-caption-layout.browser.tsx"),
   },
   format: "iife",
   jsx: "automatic",
@@ -99,7 +119,15 @@ async function main() {
   const fixtureJsPath = join(outputDir, "fixture.js");
   const fixtureCssPath = join(outputDir, "fixture.css");
   const voiceJsPath = join(outputDir, "voice.js");
-  await Promise.all([access(fixtureJsPath), access(fixtureCssPath), access(voiceJsPath)]);
+  const captionJsPath = join(outputDir, "caption.js");
+  const captionCssPath = join(outputDir, "caption.css");
+  await Promise.all([
+    access(fixtureJsPath),
+    access(fixtureCssPath),
+    access(voiceJsPath),
+    access(captionJsPath),
+    access(captionCssPath),
+  ]);
 
   const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
@@ -141,6 +169,11 @@ async function main() {
     response.end(voiceChildHtml);
     return;
   }
+  if (pathname === "/caption") {
+    response.writeHead(200);
+    response.end(captionFixtureHtml);
+    return;
+  }
 
   response.writeHead(200);
   response.end(await readFile(
@@ -148,7 +181,11 @@ async function main() {
       ? fixtureJsPath
       : pathname === "/fixture.css"
         ? fixtureCssPath
-        : voiceJsPath,
+        : pathname === "/caption.js"
+          ? captionJsPath
+          : pathname === "/caption.css"
+            ? captionCssPath
+            : voiceJsPath,
   ));
   });
 

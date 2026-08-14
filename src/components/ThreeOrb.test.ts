@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { createOrbMotionFrame, deriveOrbVisual } from "../lib/orb-motion";
 import { OrbRuntimeController } from "../lib/orb-runtime";
+import { spokenCaptionStageClassName } from "../lib/spoken-caption-layout";
 
 const orbSource = readFileSync(new URL("./ThreeOrb.tsx", import.meta.url), "utf8");
 const jarvisSource = readFileSync(new URL("./JarvisUI.tsx", import.meta.url), "utf8");
@@ -94,7 +95,9 @@ describe("orb side-mode layout contracts", () => {
     expect(center + diameter / 2).toBeLessThan(viewportWidth);
     // Keep captions beneath the right-side orb's visual core rather than
     // competing with it; this is deliberately lower than the prior 70%.
-    expect(jarvisSource).toContain('"top-[72%] hidden md:flex md:left-[62%] md:right-0"');
+    expect(jarvisSource).toContain("spokenCaptionStageClassName({ compactAside, commandExpanded, overlayUp })");
+    expect(spokenCaptionStageClassName({ compactAside: true, commandExpanded: false, overlayUp: false }))
+      .toBe("top-[74%] hidden md:flex md:left-[62%] md:right-0");
   });
 
   it("retains the existing mobile hide/non-aside collision policy at 390x844", () => {

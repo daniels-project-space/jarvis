@@ -7,6 +7,7 @@ import {
   speechServiceRetryDelay,
   startLiveWithLease,
 } from "./live-voice-bootstrap";
+import { SPOKEN_CAPTION_TEXT_CLASS, spokenCaptionStageClassName } from "./spoken-caption-layout";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -111,8 +112,13 @@ describe("live voice bootstrap policy", () => {
 
   it("keeps the single spoken transcript slightly smaller and lower than the orb", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
-    expect(source).toContain("text-base font-semibold leading-snug tracking-tight md:text-[1.4rem] lg:text-[1.6rem]");
-    expect(source).toContain('"top-[60%] inset-x-0"');
+    expect(source).toContain("SPOKEN_CAPTION_TEXT_CLASS");
+    expect(source).toContain("spokenCaptionStageClassName({ compactAside, commandExpanded, overlayUp })");
+    expect(SPOKEN_CAPTION_TEXT_CLASS).toBe(
+      "text-[0.95rem] font-semibold leading-snug tracking-tight md:text-[1.3rem] lg:text-[1.5rem]",
+    );
+    expect(spokenCaptionStageClassName({ compactAside: false, commandExpanded: false, overlayUp: false }))
+      .toBe("top-[63%] inset-x-0");
   });
 
   it("opens capture only after its shared live lease wins across documents", async () => {
