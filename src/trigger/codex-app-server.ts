@@ -24,10 +24,25 @@ type PendingRequest = {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 };
+export type CodexForegroundOwnerToolTurn = Readonly<{
+  messageId: string;
+  assistantId: string;
+  claimToken: string;
+}>;
+
+// Host-only authority is intentionally distinct from ToolInvocationContext.
+// The latter is validated and carried as user-message provenance; this one is
+// never serialized into the Codex app-server protocol or model-visible tool
+// arguments.
+export type CodexDynamicToolHostContext = Readonly<{
+  foregroundOwnerToolTurn?: CodexForegroundOwnerToolTurn;
+}>;
+
 type ActiveTurn = {
   turnId: string;
   threadId: string;
   invocationContext?: ToolInvocationContext;
+  toolHostContext?: CodexDynamicToolHostContext;
   toolAbortController: AbortController;
   toolCallCount: number;
   toolOutputBytes: number;
@@ -54,6 +69,7 @@ export type CodexDynamicToolCall = {
   turnId: string;
   callId: string;
   invocationContext?: ToolInvocationContext;
+  toolHostContext?: CodexDynamicToolHostContext;
   /** Aborts when the exact admitted turn is cancelled or retired. */
   signal?: AbortSignal;
   namespace: string | null;
@@ -347,6 +363,38 @@ export function validateCodexOutputSchema(outputSchema: JsonObject): JsonObject 
   return outputSchema;
 }
 
+function normalizeDynamicToolHostContext(value: unknown): CodexDynamicToolHostContext | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("dynamic tool host context must be an object");
+  }
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some((key) => key !== "foregroundOwnerToolTurn")) {
+    throw new Error("dynamic tool host context contains unknown fields");
+  }
+  const turn = input.foregroundOwnerToolTurn;
+  if (turn === undefined) return undefined;
+  if (!turn || typeof turn !== "object" || Array.isArray(turn)) {
+    throw new Error("foreground owner tool turn is invalid");
+  }
+  const fields = turn as Record<string, unknown>;
+  if (Object.keys(fields).some((key) => key !== "messageId" && key !== "assistantId" && key !== "claimToken")) {
+    throw new Error("foreground owner tool turn contains unknown fields");
+  }
+  const valid = (candidate: unknown): candidate is string => typeof candidate === "string"
+    && /^[A-Za-z0-9_.:-]{1,256}$/.test(candidate);
+  if (!valid(fields.messageId) || !valid(fields.assistantId) || !valid(fields.claimToken)) {
+    throw new Error("foreground owner tool turn identifiers are invalid");
+  }
+  return Object.freeze({
+    foregroundOwnerToolTurn: Object.freeze({
+      messageId: fields.messageId,
+      assistantId: fields.assistantId,
+      claimToken: fields.claimToken,
+    }),
+  });
+}
+
 export type CodexTurnInput = {
   conversationId: string;
   userText: string;
@@ -359,6 +407,7 @@ export type CodexTurnInput = {
   reasoningEffort?: unknown;
   allowTools?: boolean;
   invocationContext?: ToolInvocationContext;
+  toolHostContext?: CodexDynamicToolHostContext;
   outputSchema?: JsonObject;
   onDelta: (delta: string) => void;
   /** Cancels an admitted turn and interrupts the exact app-server turn id. */
@@ -456,6 +505,7 @@ export class CodexAppServer {
     const invocationContext = normalizeToolInvocationContext(input.invocationContext, {
       allowUserMessageId: true,
     });
+    const toolHostContext = normalizeDynamicToolHostContext(input.toolHostContext);
     if (input.signal?.aborted) throw new Error("Codex conversation turn was cancelled");
     await this.start();
     if (this.active.size >= this.limits.activeTurns) {
@@ -584,6 +634,7 @@ export class CodexAppServer {
         turnId,
         threadId,
         ...(invocationContext ? { invocationContext } : {}),
+        ...(toolHostContext ? { toolHostContext } : {}),
         toolAbortController,
         toolCallCount: 0,
         toolOutputBytes: 0,
@@ -761,6 +812,7 @@ export class CodexAppServer {
     const exactActiveTurn = Boolean(active && active.threadId === threadId);
     const admittedActiveTurn = exactActiveTurn ? active : undefined;
     const invocationContext = exactActiveTurn ? active?.invocationContext : undefined;
+    const toolHostContext = exactActiveTurn ? active?.toolHostContext : undefined;
     const handler = this.options.onDynamicToolCall;
     let dynamicResult: CodexDynamicToolResult;
     try {
@@ -776,6 +828,7 @@ export class CodexAppServer {
             turnId,
             callId: typeof params.callId === "string" ? params.callId : "",
             ...(invocationContext ? { invocationContext } : {}),
+            ...(toolHostContext ? { toolHostContext } : {}),
             ...(admittedActiveTurn ? { signal: admittedActiveTurn.toolAbortController.signal } : {}),
             namespace: typeof params.namespace === "string" ? params.namespace : null,
             tool: params.tool,

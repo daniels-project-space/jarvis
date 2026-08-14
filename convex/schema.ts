@@ -215,6 +215,37 @@ export default defineSchema({
     .index("by_message", ["messageId"])
     .index("by_thread", ["threadId"]),
 
+  // A non-reactive proof that this exact user row was admitted through the
+  // authenticated owner conversation. It never stores the browser session or
+  // a portable bearer; a short per-call receipt is additionally fenced to the
+  // live assistant claim before Gmail/Google Calendar can run.
+  chatTurnOwnerToolGrants: defineTable({
+    messageId: v.id("chatMessages"),
+    threadId: v.string(),
+    // The exact direct-command scope is minted at authenticated owner-message
+    // admission. Never reconstruct this from conversation/model text later.
+    toolNames: v.array(v.string()),
+    issuedAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_message", ["messageId"])
+    .index("by_thread", ["threadId"]),
+
+  // A redeemed dynamic-call receipt is the irrevocable linearization point for
+  // its Gmail/Google Calendar request. A later cancellation may stop the
+  // reply, but cannot claim an already-committed provider request vanished.
+  // Bounded cleanup happens with the owning terminal chat turn.
+  chatTurnOwnerToolUses: defineTable({
+    receiptKey: v.string(),
+    messageId: v.id("chatMessages"),
+    assistantId: v.id("chatMessages"),
+    callId: v.string(),
+    toolName: v.string(),
+    committedAt: v.number(),
+  })
+    .index("by_receipt", ["receiptKey"])
+    .index("by_message", ["messageId"]),
+
   chatSessions: defineTable({
     threadId: v.string(),
     status: v.string(), // "idle" | "working"

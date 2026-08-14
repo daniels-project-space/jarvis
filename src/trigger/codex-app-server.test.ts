@@ -125,6 +125,13 @@ describe("Codex app-server dynamic tools", () => {
         requestId: "request-1",
         userMessageId: "message-1",
       },
+      toolHostContext: {
+        foregroundOwnerToolTurn: {
+          messageId: "message-1",
+          assistantId: "assistant-1",
+          claimToken: "claim-1",
+        },
+      },
       onDelta: () => {},
     });
 
@@ -136,6 +143,7 @@ describe("Codex app-server dynamic tools", () => {
     await vi.waitFor(() => expect(writes).toHaveLength(2));
     expect(writes[1].method).toBe("turn/start");
     expect(writes[1].params).toMatchObject({ model: "gpt-5.6-luna", effort: "high" });
+    expect(JSON.stringify(writes)).not.toContain("claim-1");
     internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "turn-1" } } }));
     await Promise.resolve();
 
@@ -160,6 +168,13 @@ describe("Codex app-server dynamic tools", () => {
       invocationContext: {
         requestId: "request-1",
         userMessageId: "message-1",
+      },
+      toolHostContext: {
+        foregroundOwnerToolTurn: {
+          messageId: "message-1",
+          assistantId: "assistant-1",
+          claimToken: "claim-1",
+        },
       },
       signal: expect.any(AbortSignal),
       namespace: null,

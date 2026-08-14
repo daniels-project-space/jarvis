@@ -1,17 +1,25 @@
 import type {
   CodexDynamicToolCall,
+  CodexDynamicToolHostContext,
   CodexDynamicToolResult,
   CodexDynamicToolSpec,
 } from "./codex-app-server";
 import type { ToolInvocationContext } from "../lib/tool-invocation-context";
 import { rankCapabilities } from "../lib/capability-router";
 import {
+  issueForegroundOwnerToolReceipt,
+  type ForegroundOwnerToolTurn,
+} from "../lib/foreground-owner-tool-receipt.server";
+import {
+  FOREGROUND_OWNER_TOOL_NAMES,
   TOOL_BELT_NAMES,
+  isForegroundOwnerToolName,
   isToolBeltName,
   type ToolBeltName,
 } from "../lib/tool-belts";
 
 export const JARVIS_AGENT_TOOL_ENDPOINT = "https://jarvis-orcin-six.vercel.app/api/agent-tool";
+export const JARVIS_FOREGROUND_OWNER_TOOL_ENDPOINT = "https://jarvis-orcin-six.vercel.app/api/foreground-owner-tool";
 
 export const JARVIS_DYNAMIC_TOOLS: CodexDynamicToolSpec[] = [
   {
@@ -107,6 +115,9 @@ export type AgentToolBridgeEvent = {
 
 export type AgentToolBridgeOptions = {
   endpoint?: string;
+  ownerEndpoint?: string;
+  /** Worker-only HMAC authority shared with the foreground-owner endpoint. */
+  ownerToolReceiptSecret?: string;
   fetchImplementation?: FetchImplementation;
   timeoutMs?: number;
   searchAttachedFiles?: (messageId: string, request: {
@@ -187,6 +198,8 @@ function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
 // dynamic tools; it never receives the bearer or constructs a shell command.
 export class AgentToolBridge {
   private readonly endpoint: URL;
+  private readonly ownerEndpoint: URL;
+  private readonly ownerToolReceiptSecret?: string;
   private readonly fetchImplementation: FetchImplementation;
   private readonly timeoutMs: number;
   private readonly searchAttachedFiles?: AgentToolBridgeOptions["searchAttachedFiles"];
@@ -196,6 +209,8 @@ export class AgentToolBridge {
   constructor(private readonly token: string, options: AgentToolBridgeOptions = {}) {
     if (!token) throw new Error("JARVIS_DISPATCH_TOKEN is not configured");
     this.endpoint = new URL(options.endpoint ?? JARVIS_AGENT_TOOL_ENDPOINT);
+    this.ownerEndpoint = new URL(options.ownerEndpoint ?? JARVIS_FOREGROUND_OWNER_TOOL_ENDPOINT);
+    this.ownerToolReceiptSecret = options.ownerToolReceiptSecret;
     this.fetchImplementation = options.fetchImplementation ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? 120_000;
     this.searchAttachedFiles = options.searchAttachedFiles;
@@ -217,9 +232,22 @@ export class AgentToolBridge {
     if (call.tool === "jarvis_search_attached_files") {
       return this.searchFiles(call.arguments, call.invocationContext, call.signal);
     }
-    if (call.tool === "jarvis_get_tools") return this.getTools(call.arguments, call.signal);
+    if (call.tool === "jarvis_get_tools") {
+      return this.getTools(
+        call.arguments,
+        call.callId,
+        call.toolHostContext,
+        call.signal,
+      );
+    }
     if (call.tool === "jarvis_call_tool") {
-      return this.callTool(call.arguments, call.invocationContext, call.signal);
+      return this.callTool(
+        call.arguments,
+        call.invocationContext,
+        call.callId,
+        call.toolHostContext,
+        call.signal,
+      );
     }
     return failureResult("invalid_request", "Unknown Jarvis bridge tool.");
   }
@@ -258,12 +286,60 @@ export class AgentToolBridge {
     }
   }
 
-  private async getTools(value: unknown, signal?: AbortSignal): Promise<CodexDynamicToolResult> {
+  private foregroundOwnerTurn(
+    hostContext?: CodexDynamicToolHostContext,
+  ): ForegroundOwnerToolTurn | null {
+    const turn = hostContext?.foregroundOwnerToolTurn;
+    return turn && this.ownerToolReceiptSecret ? turn : null;
+  }
+
+  private async ownerRequest(
+    turn: ForegroundOwnerToolTurn,
+    callId: string,
+    operation: "discover" | "invoke",
+    target: string,
+    init: { method: "GET" | "POST"; body?: string },
+    metadata: Pick<AgentToolBridgeEvent, "operation" | "target">,
+    signal?: AbortSignal,
+  ): Promise<CodexDynamicToolResult | null> {
+    try {
+      const receipt = issueForegroundOwnerToolReceipt({
+        secret: this.ownerToolReceiptSecret ?? "",
+        turn,
+        callId,
+        operation,
+        target,
+      });
+      const url = new URL(this.ownerEndpoint);
+      if (operation === "discover") url.searchParams.set("belt", target);
+      return await this.request(
+        url,
+        init,
+        metadata,
+        signal,
+        { "x-jarvis-owner-tool-receipt": receipt },
+      );
+    } catch {
+      // A malformed/missing host-only turn must not fall back to the ordinary
+      // subscription bridge, which intentionally has no mailbox authority.
+      return null;
+    }
+  }
+
+  private async getTools(
+    value: unknown,
+    callId: string,
+    hostContext?: CodexDynamicToolHostContext,
+    signal?: AbortSignal,
+  ): Promise<CodexDynamicToolResult> {
     const args = record(value);
     const intent = typeof args?.intent === "string" ? args.intent.trim().slice(0, 2_000) : "";
     const activeTool = typeof args?.activeTool === "string" ? args.activeTool.trim().slice(0, 120) : undefined;
     const explicitBelt = isToolBeltName(args?.belt) ? args.belt : undefined;
-    const ranking = intent ? rankCapabilities(intent, { activeTool }) : null;
+    const ownerTurn = this.foregroundOwnerTurn(hostContext);
+    const ranking = intent
+      ? rankCapabilities(intent, { activeTool, ownerForeground: Boolean(ownerTurn) })
+      : null;
     const belt: ToolBeltName | undefined = explicitBelt ?? ranking?.candidates[0]?.belt ?? (intent ? "core" : undefined);
     if (!belt) return failureResult("invalid_request", "Provide a valid Jarvis tool belt or the current intent.");
 
@@ -275,17 +351,41 @@ export class AgentToolBridge {
       { operation: "discover", target: belt },
       signal,
     );
-    if (!response.success || !ranking) return response;
+    if (!ranking) return response;
 
-    const text = response.contentItems[0]?.type === "inputText" ? response.contentItems[0].text : "";
-    let definitions: unknown;
-    try {
-      definitions = JSON.parse(text);
-    } catch {
-      return failureResult("invalid_response", "Jarvis tool discovery returned malformed JSON.");
-    }
-    if (!Array.isArray(definitions)) {
-      return failureResult("invalid_response", "Jarvis tool discovery returned an invalid definition list.");
+    const ownerNames = ownerTurn
+      ? ranking.candidates
+        .filter((candidate) => candidate.belt === belt && FOREGROUND_OWNER_TOOL_NAMES.has(candidate.tool))
+        .map((candidate) => candidate.tool)
+      : [];
+    const ownerResponse = ownerTurn && ownerNames.length
+      ? await this.ownerRequest(
+        ownerTurn,
+        callId,
+        "discover",
+        belt,
+        { method: "GET" },
+        { operation: "discover", target: belt },
+        signal,
+      )
+      : null;
+    const successfulResponses = [response, ownerResponse]
+      .filter((candidate): candidate is CodexDynamicToolResult => Boolean(candidate?.success));
+    if (!successfulResponses.length) return ownerResponse ?? response;
+
+    const definitions: unknown[] = [];
+    for (const candidate of successfulResponses) {
+      const text = candidate.contentItems[0]?.type === "inputText" ? candidate.contentItems[0].text : "";
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return failureResult("invalid_response", "Jarvis tool discovery returned malformed JSON.");
+      }
+      if (!Array.isArray(parsed)) {
+        return failureResult("invalid_response", "Jarvis tool discovery returned an invalid definition list.");
+      }
+      definitions.push(...parsed);
     }
 
     const rankedNames = ranking.candidates
@@ -312,6 +412,8 @@ export class AgentToolBridge {
   private async callTool(
     value: unknown,
     invocationContext?: ToolInvocationContext,
+    callId?: string,
+    hostContext?: CodexDynamicToolHostContext,
     signal?: AbortSignal,
   ): Promise<CodexDynamicToolResult> {
     const input = record(value);
@@ -336,6 +438,27 @@ export class AgentToolBridge {
         return failureResult("authorization_denied", "Jarvis could not verify tool authorization, so the action was not run.");
       }
     }
+    if (isForegroundOwnerToolName(toolName)) {
+      const ownerTurn = this.foregroundOwnerTurn(hostContext);
+      if (!ownerTurn || !callId) {
+        return failureResult("authorization_denied", "This owner-only tool is unavailable outside its authenticated foreground turn.");
+      }
+      const response = await this.ownerRequest(
+        ownerTurn,
+        callId,
+        "invoke",
+        toolName,
+        {
+          method: "POST",
+          // Provenance is reconstructed by the endpoint from the signed
+          // host receipt. Never let model-supplied body context act as proof.
+          body: JSON.stringify({ name: toolName, args }),
+        },
+        { operation: "call", target: toolName },
+        signal,
+      );
+      return response ?? failureResult("authorization_denied", "Jarvis could not verify the owner foreground tool grant.");
+    }
     return this.request(new URL(this.endpoint), {
       method: "POST",
       body: JSON.stringify({
@@ -351,6 +474,7 @@ export class AgentToolBridge {
     init: { method: "GET" | "POST"; body?: string },
     metadata: Pick<AgentToolBridgeEvent, "operation" | "target">,
     turnSignal?: AbortSignal,
+    extraHeaders: Record<string, string> = {},
   ): Promise<CodexDynamicToolResult> {
     if (turnSignal?.aborted) return cancelledResult();
     const startedAt = Date.now();
@@ -377,6 +501,7 @@ export class AgentToolBridge {
     try {
       const headers: Record<string, string> = {
         accept: "application/json",
+        ...extraHeaders,
         authorization: `Bearer ${this.token}`,
       };
       if (init.body !== undefined) headers["content-type"] = "application/json";

@@ -15,6 +15,7 @@ function dynamicCall(
   args: unknown,
   invocationContext?: CodexDynamicToolCall["invocationContext"],
   signal?: AbortSignal,
+  toolHostContext?: CodexDynamicToolCall["toolHostContext"],
 ): CodexDynamicToolCall {
   return {
     threadId: "thread-1",
@@ -22,6 +23,7 @@ function dynamicCall(
     callId: "call-1",
     ...(invocationContext ? { invocationContext } : {}),
     ...(signal ? { signal } : {}),
+    ...(toolHostContext ? { toolHostContext } : {}),
     namespace: null,
     tool,
     arguments: args,
@@ -385,6 +387,65 @@ describe("foreground agent tool bridge", () => {
     ));
     expect(missingProvenance.success).toBe(false);
     expect(fetchImplementation).not.toHaveBeenCalled();
+  });
+
+  it("uses the separate signed owner endpoint for explicit Gmail turns only", async () => {
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      ownerEndpoint: "https://jarvis.test/api/foreground-owner-tool",
+      ownerToolReceiptSecret: "w".repeat(48),
+      fetchImplementation: async (input, init) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/foreground-owner-tool")) {
+          if (init?.method === "GET") return Response.json([
+            { name: "gmail_search", description: "Search Gmail." },
+            { name: "gmail_read", description: "Read Gmail." },
+            { name: "gmail_list_subscriptions", description: "List subscriptions." },
+          ]);
+          return Response.json({ result: "found matching mail" });
+        }
+        return Response.json([]);
+      },
+    });
+    const hostContext = {
+      foregroundOwnerToolTurn: {
+        messageId: "message-1",
+        assistantId: "assistant-1",
+        claimToken: "claim-1",
+      },
+    } as const;
+
+    const listed = await bridge.invoke(dynamicCall(
+      "jarvis_get_tools",
+      { intent: "Search my Gmail inbox for hotel confirmation emails" },
+      undefined,
+      undefined,
+      hostContext,
+    ));
+    const called = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "gmail_search", args: { query: "hotel" } },
+      { userMessageId: "message-1" },
+      undefined,
+      hostContext,
+    ));
+
+    expect(listed.success).toBe(true);
+    expect(called.success).toBe(true);
+    const ownerRequests = requests.filter(({ url }) => url.pathname.endsWith("/foreground-owner-tool"));
+    expect(ownerRequests).toHaveLength(2);
+    expect(ownerRequests[0].url.searchParams.get("belt")).toBe("work");
+    expect(ownerRequests[0].init?.headers).toMatchObject({
+      authorization: "Bearer dispatch-token",
+      "x-jarvis-owner-tool-receipt": expect.any(String),
+    });
+    expect(JSON.parse(String(ownerRequests[1].init?.body))).toEqual({
+      name: "gmail_search",
+      args: { query: "hotel" },
+    });
+    expect(String(ownerRequests[1].init?.body)).not.toContain("claim-1");
   });
 
   it("advertises native JSON tools without shell or capability-token instructions", () => {

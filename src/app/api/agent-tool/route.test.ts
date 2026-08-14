@@ -72,4 +72,14 @@ describe("foreground agent-tool invocation context", () => {
     expect(await response.json()).toEqual({ result: "Tool failed: requestId is invalid" });
     expect(mock.executeTool).not.toHaveBeenCalled();
   });
+
+  it("continues to deny Gmail to the dispatch-only background endpoint", async () => {
+    const response = await POST(request({
+      name: "gmail_search",
+      args: { query: "from:hotel" },
+    }));
+
+    expect(response.status).toBe(403);
+    expect(mock.executeTool).not.toHaveBeenCalled();
+  });
 });

@@ -5,9 +5,17 @@ import { ConvexError, v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { CHAT_FILE_LIMITS, FILE_READY_STATUSES } from "../src/lib/chat-files";
 import {
+  FOREGROUND_OWNER_TOOL_NAMES,
+  foregroundOwnerToolNamesForDirectRequest,
+  isForegroundOwnerToolName,
+  isToolBeltName,
+  TOOL_BELTS,
+} from "../src/lib/tool-belts";
+import {
   actorAuthArgs,
   conversationIdentity,
   conversationViewerIdentity,
+  isAdminSession,
   requireActor,
   requireWorker,
   scopedConversationThread,
@@ -43,6 +51,8 @@ const RESEARCH_PREFETCH_MAX_LIFETIME_MS = 60_000;
 const TERMINAL_RECOVERY_TEXT =
   "I couldn't complete that reply after several recovery attempts. Tap retry to try the request again.";
 const CANCELLED_REPLY_TEXT = "Reply cancelled.";
+const OWNER_TOOL_COMMITTED_REPLY_TEXT =
+  "Reply cancelled. An already-started owner-authorized Gmail or Google Calendar request may still finish; check Gmail or Google Calendar before retrying.";
 const TURN_CANCELLATION_PREFIX = "foregroundTurnCancellation";
 const GUEST_CHAT_BUCKET_CAPACITY = 3;
 const GUEST_CHAT_REFILL_MS = 2 * 60_000;
@@ -68,12 +78,49 @@ async function ensureSession(ctx: { db: any }, threadId: string) {
   return await ctx.db.get(id);
 }
 
+const FOREGROUND_OWNER_TOOL_GRANT_TTL_MS = 20 * 60_000;
+const FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN = 48;
+
 async function deleteTurnPrefetch(ctx: { db: any }, messageId: string) {
   const rows = await ctx.db
     .query("chatTurnPrefetches")
     .withIndex("by_message", (q: any) => q.eq("messageId", messageId))
     .take(4);
   for (const row of rows) await ctx.db.delete(row._id);
+}
+
+async function deleteForegroundOwnerToolState(ctx: { db: any }, messageId: string) {
+  const [grants, uses] = await Promise.all([
+    ctx.db
+      .query("chatTurnOwnerToolGrants")
+      .withIndex("by_message", (q: any) => q.eq("messageId", messageId))
+      .take(4),
+    ctx.db
+      .query("chatTurnOwnerToolUses")
+      .withIndex("by_message", (q: any) => q.eq("messageId", messageId))
+      .take(FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN + 1),
+  ]);
+  if (uses.length > FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN) {
+    throw new Error("foreground owner tool receipt cleanup bound exceeded");
+  }
+  for (const row of grants) await ctx.db.delete(row._id);
+  for (const row of uses) await ctx.db.delete(row._id);
+}
+
+async function hasCommittedForegroundOwnerToolRequest(
+  ctx: { db: any },
+  messageId: string,
+): Promise<boolean> {
+  const committed = await ctx.db
+    .query("chatTurnOwnerToolUses")
+    .withIndex("by_message", (q: any) => q.eq("messageId", messageId))
+    .take(1);
+  return committed.length > 0;
+}
+
+async function deleteTurnEphemera(ctx: { db: any }, messageId: string) {
+  await deleteTurnPrefetch(ctx, messageId);
+  await deleteForegroundOwnerToolState(ctx, messageId);
 }
 
 const utcDay = (now: number) => new Date(now).toISOString().slice(0, 10);
@@ -269,6 +316,25 @@ async function admitMessage(
     hasResearchPrefetch: validPrefetch,
     createdAt,
   });
+  // This scope is minted only after conversationIdentity accepted the
+  // authenticated owner and the submitted message starts with a direct,
+  // unquoted Gmail/Google Calendar command. No browser credential is retained:
+  // later tool calls are separately bound to the active assistant claim and a
+  // short receipt, and never rescan arbitrary conversation text for authority.
+  const ownerToolNames = foregroundOwnerToolNamesForDirectRequest(submittedText);
+  if (
+    ownerToolNames.length > 0
+    && identity.kind === "owner"
+    && await isAdminSession(ctx, a.authTokenHash)
+  ) {
+    await ctx.db.insert("chatTurnOwnerToolGrants", {
+      messageId: id,
+      threadId,
+      toolNames: ownerToolNames,
+      issuedAt: createdAt,
+      expiresAt: createdAt + FOREGROUND_OWNER_TOOL_GRANT_TTL_MS,
+    });
+  }
   await captureCurrentState(ctx, {
     text: visibleTurnText(submittedText),
     messageId: String(id),
@@ -465,11 +531,15 @@ async function recoverAssistant(ctx: { db: any }, assistant: any) {
     ? await ctx.db.get(assistant.parentMessageId)
     : null;
   const attempts = Number(parent?.attemptCount ?? assistant.attemptCount ?? 1);
+  const ownerToolCommitted = parent?.role === "user"
+    && await hasCommittedForegroundOwnerToolRequest(ctx, parent._id);
   await sealWorkerCancellationFence(ctx, assistant, `recovery:${Date.now()}`);
-  if (!parent || parent.role !== "user" || attempts >= MAX_CHAT_TURN_ATTEMPTS) {
+  if (ownerToolCommitted || !parent || parent.role !== "user" || attempts >= MAX_CHAT_TURN_ATTEMPTS) {
     await ctx.db.patch(assistant._id, {
       status: "error",
-      text: assistant.text || TERMINAL_RECOVERY_TEXT,
+      text: ownerToolCommitted
+        ? OWNER_TOOL_COMMITTED_REPLY_TEXT
+        : assistant.text || TERMINAL_RECOVERY_TEXT,
       lastProgressAt: Date.now(),
     });
     if (parent?.role === "user") {
@@ -478,13 +548,14 @@ async function recoverAssistant(ctx: { db: any }, assistant: any) {
         lastProgressAt: Date.now(),
       });
       await releaseGuestTurn(ctx, parent);
-      await deleteTurnPrefetch(ctx, parent._id);
+      await deleteTurnEphemera(ctx, parent._id);
     }
     await settleSession(ctx, assistant.threadId);
     return {
       status: "failed" as const,
       messageId: parent?._id ?? null,
       attemptCount: attempts,
+      ownerToolCommitted,
     };
   }
   await ctx.db.patch(assistant._id, {
@@ -534,6 +605,7 @@ async function issueRecoveryWake(
       createdAt: user.createdAt + 1,
     });
     await releaseGuestTurn(ctx, user);
+    await deleteTurnEphemera(ctx, user._id);
     await settleSession(ctx, user.threadId);
     return {
       status: "failed" as const,
@@ -568,7 +640,7 @@ async function expirePending(ctx: { db: any }, user: any) {
     createdAt: user.createdAt + 1,
   });
   await releaseGuestTurn(ctx, user);
-  await deleteTurnPrefetch(ctx, user._id);
+  await deleteTurnEphemera(ctx, user._id);
   await settleSession(ctx, user.threadId);
 }
 
@@ -757,9 +829,17 @@ export const cancelTurn = mutation({
       .order("desc")
       .first();
     if (assistant?.status === "done") {
-      await deleteTurnPrefetch(ctx, user._id);
+      await deleteTurnEphemera(ctx, user._id);
       return { status: "completed" as const };
     }
+
+    // Redemption is an irrevocable external-action commit point. If it won a
+    // race with this cancellation, we stop the reply but report truthfully
+    // that the already-started provider request may still finish.
+    const ownerToolCommitted = await hasCommittedForegroundOwnerToolRequest(ctx, user._id);
+    const cancellationText = ownerToolCommitted
+      ? OWNER_TOOL_COMMITTED_REPLY_TEXT
+      : CANCELLED_REPLY_TEXT;
 
     const receiptKey = cancellationReceiptKey(String(user._id));
     const existingReceipt = await ctx.db
@@ -767,11 +847,13 @@ export const cancelTurn = mutation({
       .withIndex("by_key", (q) => q.eq("key", receiptKey))
       .first();
     if (existingReceipt) {
-      await deleteTurnPrefetch(ctx, user._id);
+      await deleteTurnEphemera(ctx, user._id);
       return {
         status: "cancelled" as const,
         messageId: user._id,
         fenceReceipt: existingReceipt.value,
+        ownerToolCommitted: ownerToolCommitted
+          || assistant?.text === OWNER_TOOL_COMMITTED_REPLY_TEXT,
       };
     }
 
@@ -792,14 +874,14 @@ export const cancelTurn = mutation({
     if (assistant?.status === "streaming") {
       await ctx.db.patch(assistant._id, {
         status: "error",
-        text: CANCELLED_REPLY_TEXT,
+        text: cancellationText,
         lastProgressAt: now,
       });
     } else if (!assistant || assistant.status === "superseded") {
       await ctx.db.insert("chatMessages", {
         threadId,
         role: "assistant",
-        text: CANCELLED_REPLY_TEXT,
+        text: cancellationText,
         status: "error",
         parentMessageId: user._id,
         delivery: "foreground",
@@ -811,9 +893,14 @@ export const cancelTurn = mutation({
       await ctx.db.patch(user._id, { status: "error", lastProgressAt: now });
     }
     await releaseGuestTurn(ctx, user);
-    await deleteTurnPrefetch(ctx, user._id);
+    await deleteTurnEphemera(ctx, user._id);
     await settleSession(ctx, threadId);
-    return { status: "cancelled" as const, messageId: user._id, fenceReceipt };
+    return {
+      status: "cancelled" as const,
+      messageId: user._id,
+      fenceReceipt,
+      ownerToolCommitted,
+    };
   },
 });
 
@@ -876,6 +963,17 @@ async function claimPending(
     lastProgressAt: now,
     createdAt: pending.createdAt + 1,
   });
+  const ownerToolGrant = await ctx.db
+    .query("chatTurnOwnerToolGrants")
+    .withIndex("by_message", (q: any) => q.eq("messageId", pending._id))
+    .first();
+  const ownerToolAccess = Boolean(
+    ownerToolGrant
+      && ownerToolGrant.threadId === pending.threadId
+      && ownerToolGrant.expiresAt > now
+      && Array.isArray(ownerToolGrant.toolNames)
+      && ownerToolGrant.toolNames.some(isForegroundOwnerToolName),
+  );
 
   const all = await ctx.db
     .query("chatMessages")
@@ -972,6 +1070,7 @@ async function claimPending(
     userMessageId: pending._id,
     assistantId,
     claimToken,
+    ownerToolAccess,
     attemptCount,
     history,
     researchPrefetch,
@@ -1142,6 +1241,113 @@ export const turnCancellationForWorker = query({
   },
 });
 
+async function foregroundOwnerToolNamesForLiveClaim(
+  ctx: { db: any },
+  claim: { messageId: any; assistantId: any; claimToken: string },
+): Promise<string[]> {
+  const [message, assistant, grant, cancellation] = await Promise.all([
+    ctx.db.get(claim.messageId),
+    ctx.db.get(claim.assistantId),
+    ctx.db
+      .query("chatTurnOwnerToolGrants")
+      .withIndex("by_message", (q: any) => q.eq("messageId", claim.messageId))
+      .first(),
+    ctx.db
+      .query("ui")
+      .withIndex("by_key", (q: any) => q.eq("key", cancellationReceiptKey(String(claim.messageId))))
+      .first(),
+  ]);
+  const now = Date.now();
+  if (
+    !message || message.role !== "user"
+    || !assistant || assistant.role !== "assistant"
+    || assistant.status !== "streaming"
+    || assistant.delivery !== "foreground"
+    || assistant.parentMessageId !== message._id
+    || assistant.threadId !== message.threadId
+    || assistant.claimToken !== claim.claimToken
+    || !grant || grant.messageId !== message._id
+    || grant.threadId !== message.threadId
+    || grant.expiresAt <= now
+    || cancellation
+  ) return [];
+  // This is the exact authenticated admission scope. Do not rescan the user
+  // row here: the model, quoted text, or attachments must never expand it.
+  return [...FOREGROUND_OWNER_TOOL_NAMES].filter((name) =>
+    Array.isArray(grant.toolNames) && grant.toolNames.includes(name),
+  );
+}
+
+// The Vercel foreground-owner endpoint is dispatch-authenticated, but this
+// second worker-only fence is the authority: it ties every definition lookup
+// to the current streaming assistant row and the exact claim token.
+export const foregroundOwnerToolDefinitionsForWorker = query({
+  args: {
+    messageId: v.id("chatMessages"),
+    assistantId: v.id("chatMessages"),
+    claimToken: v.string(),
+    belt: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    if (!isToolBeltName(a.belt)) return { allowed: false, toolNames: [] as string[] };
+    const allowedNames = await foregroundOwnerToolNamesForLiveClaim(ctx, a);
+    const toolNames = allowedNames.filter((name) => TOOL_BELTS[a.belt].has(name));
+    return { allowed: toolNames.length > 0, toolNames };
+  },
+});
+
+// One dynamic call ID can be redeemed at most once. This is deliberately a
+// mutation rather than a query so a stale Trigger/Vercel retry cannot replay a
+// Gmail draft or a Calendar proposal after the model has moved on.
+export const redeemForegroundOwnerToolForWorker = mutation({
+  args: {
+    messageId: v.id("chatMessages"),
+    assistantId: v.id("chatMessages"),
+    claimToken: v.string(),
+    callId: v.string(),
+    toolName: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const toolName = a.toolName.trim();
+    const callId = a.callId.trim();
+    if (!isForegroundOwnerToolName(toolName) || !/^[A-Za-z0-9_.:-]{1,256}$/.test(callId)) {
+      return { allowed: false };
+    }
+    const allowedNames = await foregroundOwnerToolNamesForLiveClaim(ctx, a);
+    if (!allowedNames.includes(toolName)) return { allowed: false };
+    const receiptKey = `${String(a.assistantId)}:${callId}`;
+    const [existing, uses] = await Promise.all([
+      ctx.db
+        .query("chatTurnOwnerToolUses")
+        .withIndex("by_receipt", (q: any) => q.eq("receiptKey", receiptKey))
+        .first(),
+      ctx.db
+        .query("chatTurnOwnerToolUses")
+        .withIndex("by_message", (q: any) => q.eq("messageId", a.messageId))
+        .take(FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN + 1),
+    ]);
+    if (existing || uses.length >= FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN) {
+      return { allowed: false };
+    }
+    // This insert is the irrevocable linearization point. Once it succeeds,
+    // cancellation/recovery may retire the reply but cannot safely pretend a
+    // provider request that starts immediately afterward did not happen.
+    await ctx.db.insert("chatTurnOwnerToolUses", {
+      receiptKey,
+      messageId: a.messageId,
+      assistantId: a.assistantId,
+      callId,
+      toolName,
+      committedAt: Date.now(),
+    });
+    return { allowed: true };
+  },
+});
+
 export const pendingSignal = query({
   args: { workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
@@ -1217,7 +1423,7 @@ export const finalize = mutation({
           lastProgressAt: Date.now(),
         });
         await releaseGuestTurn(ctx, parent);
-        await deleteTurnPrefetch(ctx, parent._id);
+        await deleteTurnEphemera(ctx, parent._id);
       }
     }
     await settleSession(ctx, a.threadId);
@@ -1292,7 +1498,7 @@ export const clearThread = mutation({
         throw new Error("message file cleanup bound exceeded");
       }
       for (const link of provenance) await ctx.db.delete(link._id);
-      await deleteTurnPrefetch(ctx, r._id);
+      await deleteTurnEphemera(ctx, r._id);
       await ctx.db.delete(r._id);
     }
     return rows.length;

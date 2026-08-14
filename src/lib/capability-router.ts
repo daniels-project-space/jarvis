@@ -1,4 +1,6 @@
 import {
+  FOREGROUND_OWNER_TOOL_NAMES,
+  foregroundOwnerToolNamesForDirectRequest,
   SUBSCRIPTION_TOOL_NAMES,
   TOOL_BELT_NAMES,
   TOOL_BELTS,
@@ -21,6 +23,12 @@ export type CapabilityRanking = {
 export type CapabilityRoutingOptions = {
   activeTool?: string;
   limit?: number;
+  /**
+   * Enables the separate, turn-fenced owner foreground catalog. Normal
+   * subscription workers never set this and therefore never discover Gmail or
+   * Google Calendar capabilities.
+   */
+  ownerForeground?: boolean;
 };
 
 type CapabilityRule = {
@@ -130,7 +138,8 @@ const RULES: readonly CapabilityRule[] = [
     score: 145,
     visual: true,
     reason: "web_search",
-    matches: (value) => /\b(?:search (?:the )?(?:web|internet|online)|look (?:it|this|that)?\s*up|find (?:me )?(?:online|current|latest)|search results?|google)\b/i.test(value),
+    matches: (value) => !/\b(?:google\s*calendar|gcal)\b/i.test(value)
+      && /\b(?:search (?:the )?(?:web|internet|online)|look (?:it|this|that)?\s*up|find (?:me )?(?:online|current|latest)|search results?|google)\b/i.test(value),
   },
   {
     belt: "work",
@@ -186,9 +195,12 @@ export function rankCapabilities(
   const normalized = original.replace(/\s+/g, " ").toLowerCase();
   const explicitVisual = EXPLICIT_VISUAL_RE.test(normalized);
   const ranked = new Map<string, CapabilityCandidate>();
+  const allowedToolNames = options.ownerForeground
+    ? new Set([...SUBSCRIPTION_TOOL_NAMES, ...FOREGROUND_OWNER_TOOL_NAMES])
+    : SUBSCRIPTION_TOOL_NAMES;
 
   const add = (candidate: CapabilityCandidate) => {
-    if (!TOOL_BELTS[candidate.belt].has(candidate.tool) || !SUBSCRIPTION_TOOL_NAMES.has(candidate.tool)) return;
+    if (!TOOL_BELTS[candidate.belt].has(candidate.tool) || !allowedToolNames.has(candidate.tool)) return;
     const previous = ranked.get(candidate.tool);
     if (!previous || candidate.score > previous.score) ranked.set(candidate.tool, candidate);
   };
@@ -202,6 +214,23 @@ export function rankCapabilities(
       visual: rule.visual,
       reason: rule.reason,
     }));
+  }
+
+  // Mailbox and Google Calendar access is deliberately not a general tool
+  // rule. This only chooses a foreground discovery lane; the endpoint grants
+  // definitions solely from the direct-command scope recorded at admission.
+  if (options.ownerForeground) {
+    foregroundOwnerToolNamesForDirectRequest(original).forEach((tool, index) => {
+      const belt = beltsForTool(tool)[0];
+      if (!belt) return;
+      add({
+        belt,
+        tool,
+        score: 188 - index * 2,
+        visual: false,
+        reason: tool.startsWith("gmail_") ? "owner_gmail" : "owner_google_calendar",
+      });
+    });
   }
 
   const activeTool = String(options.activeTool ?? "").trim();

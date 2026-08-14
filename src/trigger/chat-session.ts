@@ -146,6 +146,7 @@ type QueueClaim = {
   userMessageId: Id<"chatMessages">;
   assistantId: Id<"chatMessages">;
   claimToken: string;
+  ownerToolAccess?: boolean;
   attemptCount: number;
   history: Array<{ role: string; text: string }>;
   researchPrefetch?: { basis: string; context: string; expiresAt: number };
@@ -172,6 +173,7 @@ async function runTurn(
   model: string,
   hasPrivateFiles: boolean,
   invocationContext: CodexTurnInput["invocationContext"],
+  toolHostContext: CodexTurnInput["toolHostContext"],
   cancellationAbort: AbortController,
   onStage?: (stage: "codexAck" | "firstDelta" | "firstConvexPaint") => void,
 ){
@@ -197,6 +199,7 @@ async function runTurn(
       modelTier: model,
       allowTools: true,
       invocationContext,
+      ...(toolHostContext ? { toolHostContext } : {}),
       signal: cancellationAbort.signal,
       onTurnStarted: () => onStage?.("codexAck"),
       onDelta: (delta) => {
@@ -346,6 +349,7 @@ async function processChatQueue(
   }
   const runnerId = randomUUID();
   const bridge = new AgentToolBridge(dispatchToken, {
+    ownerToolReceiptSecret: workerToken,
     searchAttachedFiles: async (messageId, request) => await convexCall("query", "files:searchAttachedFiles", {
       messageId,
       mode: request.mode,
@@ -535,6 +539,15 @@ async function processChatQueue(
           requestId: claim.requestId,
           userMessageId: claim.userMessageId,
         },
+        claim.ownerToolAccess
+          ? {
+            foregroundOwnerToolTurn: {
+              messageId: String(claim.userMessageId),
+              assistantId: String(claim.assistantId),
+              claimToken: claim.claimToken,
+            },
+          }
+          : undefined,
         cancellationAbort,
         (stage) => {
           if (stage === "codexAck") onStarted();
