@@ -7,6 +7,7 @@ import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAu
 import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
+import { isCodexSessionUnavailableCode } from "../src/lib/codex-session-status";
 import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
 import { attemptWorkspaceKey } from "../src/lib/workspace-protocol";
 import {
@@ -5166,6 +5167,7 @@ export const requestInput = mutation({
     workerRunId: v.optional(v.string()),
     question: v.string(),
     checkpoint: v.optional(v.string()),
+    controllerSessionHoldCode: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -5198,6 +5200,9 @@ export const requestInput = mutation({
       )
     ) return false;
     const now = Date.now();
+    if (a.controllerSessionHoldCode !== undefined && !isCodexSessionUnavailableCode(a.controllerSessionHoldCode)) {
+      throw new Error("Invalid controller-session hold code");
+    }
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!attempt || attempt.status !== "running") return false;
     if (isSupervisorOwnedJob(row)) {
@@ -5221,6 +5226,8 @@ export const requestInput = mutation({
       stage: "needs Daniel",
       progress: a.question.slice(0, 400),
       checkpoint: a.checkpoint?.slice(0, 6000) ?? row.checkpoint,
+      controllerSessionHoldCode: a.controllerSessionHoldCode,
+      controllerSessionRepairRequired: a.controllerSessionHoldCode !== undefined ? true : undefined,
       heartbeatAt: now,
     });
     if (

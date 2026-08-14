@@ -80,6 +80,10 @@ import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { googleOAuthReturnNotice, type GoogleOAuthReturnNotice } from "@/lib/google-oauth-return";
 import { hubContextStatusPresentation, type HubContextStatus } from "@/lib/hub-context-status";
 import {
+  controllerSessionStatusPresentation,
+  type ControllerSessionReadiness,
+} from "@/lib/codex-session-status";
+import {
   isNovitaPatchProposerStatus,
   novitaPatchProposerStatusPresentation,
   type NovitaPatchProposerStatus,
@@ -548,7 +552,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice,
+  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice, controllerSessionReadiness,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -567,6 +571,7 @@ function OptionsPanel({
   onOpenGoals: () => void;
   onMacSetup: () => void;
   googleOAuthNotice: GoogleOAuthReturnNotice | null;
+  controllerSessionReadiness: ControllerSessionReadiness | undefined;
 }) {
   const Row = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
     <div className="flex items-center justify-between gap-4 py-2.5">
@@ -604,6 +609,16 @@ function OptionsPanel({
     return () => controller.abort();
   }, []);
   const hubContext = hubContextStatusPresentation(hubContextStatus);
+  const controllerSession = controllerSessionStatusPresentation(
+    controllerSessionReadiness?.state === "repair_required"
+      ? "repair_required"
+      : controllerSessionReadiness?.state === "clear"
+        ? "clear"
+        : "checking",
+    controllerSessionReadiness?.state === "repair_required"
+      ? controllerSessionReadiness.code
+      : null,
+  );
   const [novitaPatchProposerStatus, setNovitaPatchProposerStatus] = useState<NovitaPatchProposerStatus>("checking");
   useEffect(() => {
     const controller = new AbortController();
@@ -633,6 +648,11 @@ function OptionsPanel({
         <div className="divide-y divide-white/5">
           <Row label="Agent intelligence" hint="Codex CLI via ChatGPT subscription · foreground and agents">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-cyan">Codex CLI · adaptive</span>
+          </Row>
+          <Row label="Background agent session" hint={controllerSession.hint}>
+            <span className={`rounded-lg border px-3 py-1 text-[11px] ${controllerSession.tone === "ready" ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : controllerSession.tone === "attention" ? "border-amber-300/30 bg-amber-300/10 text-amber-100" : "border-white/10 bg-black/20 text-slate"}`}>
+              {controllerSession.label}
+            </span>
           </Row>
           <Row label="Voice" hint="private neural speech · free no-silence fallback">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Jarvis · private neural</span>
@@ -1650,6 +1670,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     api.commandCenter.fleetSnapshot,
     embedded || guest || !activeThreadReady ? "skip" : {},
   ) as CompactWorkSnapshot | undefined;
+  const controllerSessionReadiness = useJarvisQuery(
+    api.controllerSession.status,
+    guest ? "skip" : {},
+  ) as ControllerSessionReadiness | undefined;
   const [workDetailJobId, setWorkDetailJobId] = useState<string | null>(null);
   const workDetail = useJarvisQuery(
     api.jobs.detail,
@@ -3571,6 +3595,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const owner = intent.agentId
       ? ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry" } as const)[intent.agentId]
       : "the right specialist";
+    if (controllerSessionReadiness?.state === "repair_required") {
+      const repair = controllerSessionStatusPresentation("repair_required", controllerSessionReadiness.code);
+      const reply = `I haven’t started ${owner}. ${repair.hint}`;
+      showCaption({ who: "you", text: requestedText });
+      showCaption({ who: "jarvis", text: reply, phase: "ready" });
+      if (!background) {
+        updateConversationMood(reply);
+        lastSpokenText.current = { text: reply, ts: Date.now() };
+        await narrateText({
+          text: reply,
+          claim: narrationClaim(`dispatch-session-hold:${Date.now()}`, reply),
+          captionText: reply,
+        });
+      }
+      return;
+    }
     const startingReply = `Starting ${owner}.`;
     document.documentElement.dataset.jarvisFirstTokenMs = "0";
     if (!background) setSending(true);
@@ -5621,6 +5661,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             void setPanel({ type: "widget", value: JSON.stringify({ kind: "mac_setup" }), title: "Mac shortcut setup" });
           }}
           googleOAuthNotice={googleOAuthNotice}
+          controllerSessionReadiness={controllerSessionReadiness}
         />
       )}
 

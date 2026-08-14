@@ -38,6 +38,7 @@ import {
   type AgentProvider,
 } from "./subscription-runtime";
 import { backgroundSubscriptionValidityMs } from "./subscription-validity";
+import { codexSessionUnavailableCode } from "../lib/codex-session-status";
 import {
   GOAL_PLAN_RESULT_MAX_CHARS,
   parseGoalPlan,
@@ -3245,12 +3246,14 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         // same job only rents more Trigger runs while the required repair is
         // external. Convert it into the existing fenced input/attention hold
         // instead; the exact dispatch closes and no automatic retry is queued.
-        if (/^JARVIS_CODEX_SESSION_UNAVAILABLE\[[a-z_]+\]:/.test(message)) {
+        const controllerSessionHoldCode = codexSessionUnavailableCode(message);
+        if (controllerSessionHoldCode) {
           const heldForSessionRepair = await convexMutation("jobs:requestInput", {
             jobId: job.jobId,
             expectedAttempt,
             authorityDigest,
             workerRunId: String(job.workerRunId),
+            controllerSessionHoldCode,
             question: `Jarvis needs the controller-managed Codex session repaired before this background task can continue. ${message.slice(0, 900)}`,
             checkpoint: `Background work paused before Codex could start. ${message.slice(0, 1_200)}`,
           }).catch(() => false);

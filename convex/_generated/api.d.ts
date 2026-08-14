@@ -17,6 +17,7 @@ import type * as chatQueue from "../chatQueue.js";
 import type * as commandCenter from "../commandCenter.js";
 import type * as controlAuth from "../controlAuth.js";
 import type * as controlPlane from "../controlPlane.js";
+import type * as controllerSession from "../controllerSession.js";
 import type * as creationFiling from "../creationFiling.js";
 import type * as creations from "../creations.js";
 import type * as currentState from "../currentState.js";
@@ -75,6 +76,7 @@ declare const fullApi: ApiFromModules<{
   commandCenter: typeof commandCenter;
   controlAuth: typeof controlAuth;
   controlPlane: typeof controlPlane;
+  controllerSession: typeof controllerSession;
   creationFiling: typeof creationFiling;
   creations: typeof creations;
   currentState: typeof currentState;
