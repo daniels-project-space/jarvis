@@ -1,4 +1,5 @@
 import "server-only";
+import { createHash } from "node:crypto";
 import { convexMutation, convexQuery } from "./context";
 import { getSecret, getServiceSecrets } from "./vault";
 import { r2DeleteFreshCreation, r2Put, r2StoreFromUrl } from "./r2";
@@ -596,7 +597,7 @@ export const TOOL_DEFS = [
   {
     name: "bookings_check",
     description:
-      "Check confirmed Gmail bookings and optionally refresh one exact Jarvis trip workspace. A booked location appears on a city globe only after its address is time-valid and independently verified near that city. Use draft_id while discussing or creation_id for a saved plan; legacy trip_id means a permanent plan only. It never creates Calendar events; Gmail remains read-only.",
+      "Check confirmed Gmail bookings and optionally refresh one exact Jarvis trip workspace. A booked location appears on a city globe only after its address is time-valid and independently verified near that city. Use draft_id while discussing or creation_id for a saved plan; legacy trip_id means a permanent plan only. Gmail remains read-only. With sync_calendar=true, this prepares exactly one dated confirmation for a protected owner approval card; it never writes an event itself. If several dated confirmations exist, first use the opaque booking_id returned by this tool.",
     parameters: {
       type: "object",
       properties: {
@@ -604,7 +605,8 @@ export const TOOL_DEFS = [
         draft_id: { type: "string", description: "Optional exact live conversation draft id to refresh" },
         creation_id: { type: "string", description: "Optional exact permanent trip id to refresh" },
         trip_id: { type: "string", description: "Legacy optional permanent trip id only; do not use for a live draft" },
-        sync_calendar: { type: "boolean", description: "Request a Calendar import. This tool will not write events; it returns an owner-approval-required result until a protected import flow exists." },
+        sync_calendar: { type: "boolean", description: "Prepare one Google Calendar import for owner approval. No Calendar event is written by this tool." },
+        booking_id: { type: "string", description: "Opaque booking selection ID returned when several dated confirmations need a choice; use only with sync_calendar=true" },
       },
     },
   },
@@ -2084,7 +2086,7 @@ async function googleCalendarList(args: any): Promise<string> {
     event.allDay
       ? event.start
       : new Intl.DateTimeFormat("en-GB", {
-          timeZone: "Europe/London",
+          timeZone: event.timeZone ?? "Europe/London",
           weekday: "short",
           day: "numeric",
           month: "short",
@@ -2306,6 +2308,39 @@ function bookingBoardItem(booking: ConfirmedBooking) {
   };
 }
 
+function bookingSourceDedupeKey(booking: ConfirmedBooking): string {
+  return createHash("sha256")
+    .update("jarvis-gmail-booking-v1\0")
+    .update(booking.id)
+    .update("\0")
+    .update(booking.marker)
+    .digest("hex");
+}
+
+function bookingCalendarSelectionId(booking: ConfirmedBooking): string {
+  return `booking-${bookingSourceDedupeKey(booking).slice(0, 16)}`;
+}
+
+function bookingCalendarEvent(booking: ConfirmedBooking): GoogleCalendarCreateInput | null {
+  if (typeof booking.start !== "number" || !Number.isFinite(booking.start)) return null;
+  const start = booking.start;
+  const end = typeof booking.end === "number" && Number.isFinite(booking.end) && booking.end > start
+    ? booking.end
+    : start + (booking.allDay ? 86_400_000 : 60 * 60_000);
+  const title = String(booking.title || booking.provider || "Confirmed booking").trim().slice(0, 140) || "Confirmed booking";
+  const location = booking.location?.trim().slice(0, 140);
+  return {
+    title,
+    start,
+    end,
+    allDay: booking.allDay,
+    ...(booking.timeZone ? { timeZone: booking.timeZone } : {}),
+    ...(location ? { location } : {}),
+    notes: `Confirmed ${booking.kind} imported from Gmail.`,
+    sourceDedupeKey: bookingSourceDedupeKey(booking),
+  };
+}
+
 async function bookingsLookup(args: any): Promise<string> {
   const days = Math.max(7, Math.min(730, Math.round(Number(args.days) || 365)));
   const maxResults = Math.max(1, Math.min(40, Math.round(Number(args.max_results) || 20)));
@@ -2361,10 +2396,33 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
     readOnly: !workspace,
     items: bookings.map(bookingBoardItem),
   }, "confirmed bookings");
-  const calendarNote = syncCalendar
-    ? " Calendar import was requested, but no events were created: it needs a protected owner-approval flow and this tool cannot accept a model-supplied confirmation."
-    : " Calendar left untouched.";
-  return `Found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"} in Gmail.${calendarNote}${tripNote} Speak one short summary and leave the full booking board on screen.`;
+  let calendarNote = " Calendar left untouched.";
+  let calendarApprovalMarker = "";
+  if (syncCalendar) {
+    const importable = bookings.flatMap((booking) => {
+      const event = bookingCalendarEvent(booking);
+      return event ? [{ booking, event }] : [];
+    });
+    const requestedBookingId = String(args.booking_id ?? "").trim();
+    const selected = requestedBookingId
+      ? importable.find(({ booking }) => bookingCalendarSelectionId(booking) === requestedBookingId)
+      : importable.length === 1 ? importable[0] : undefined;
+    if (requestedBookingId && !selected) {
+      calendarNote = " Calendar import was not prepared: that booking selection is not a current dated Gmail confirmation. Nothing was added.";
+    } else if (!importable.length) {
+      calendarNote = " Calendar import was not prepared because none of these Gmail confirmations has a usable start date. Nothing was added.";
+    } else if (!selected) {
+      const choices = importable
+        .map(({ booking }) => `${bookingCalendarSelectionId(booking)} (${String(booking.title).slice(0, 100)})`)
+        .join("; ");
+      calendarNote = ` Calendar import needs one explicit booking_id because ${importable.length} dated confirmations are available: ${choices}. Nothing was added.`;
+    } else {
+      const approval = issueGoogleCalendarApprovalProposal({ action: "create", event: selected.event });
+      calendarNote = ` Ready for your approval: add Gmail confirmation \"${selected.event.title}\" to Google Calendar${selected.booking.timeZone ? ` in ${selected.booking.timeZone}` : ""}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.`;
+      calendarApprovalMarker = googleCalendarApprovalMarker(approval);
+    }
+  }
+  return `Found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"} in Gmail.${calendarNote}${tripNote} Speak one short summary and leave the full booking board on screen.${calendarApprovalMarker ? `\n${calendarApprovalMarker}` : ""}`;
 }
 
 async function publishHostAction(action: JarvisHostAction): Promise<void> {

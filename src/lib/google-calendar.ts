@@ -23,6 +23,7 @@ export type GoogleCalendarEvent = {
   start: string;
   end: string;
   allDay: boolean;
+  timeZone?: string;
   location?: string;
   htmlLink?: string;
   status?: string;
@@ -35,9 +36,13 @@ export type GoogleCalendarCreateInput = {
   start: number;
   end: number;
   allDay: boolean;
+  /** IANA time zone for a time-sensitive event; defaults to Europe/London. */
+  timeZone?: string;
   location?: string;
   notes?: string;
   reminderMinutesBefore?: number;
+  /** Server-derived, opaque source key used only for idempotent imports. */
+  sourceDedupeKey?: string;
 };
 
 type GoogleCalendarEventWithMetadata = GoogleCalendarEvent & {
@@ -100,6 +105,7 @@ function mapEvent(value: unknown): GoogleCalendarEventWithMetadata {
   const endDateTime = optionalText(end.dateTime);
   const startDate = optionalText(start.date);
   const endDate = optionalText(end.date);
+  const timeZone = providerTimeZone(start.timeZone) ?? providerTimeZone(end.timeZone);
   if (!id || (!startDateTime && !startDate) || (!endDateTime && !endDate)) {
     throw new GoogleCalendarError("Google Calendar returned an incomplete event.");
   }
@@ -109,6 +115,7 @@ function mapEvent(value: unknown): GoogleCalendarEventWithMetadata {
     start: startDateTime ?? startDate!,
     end: endDateTime ?? endDate!,
     allDay: !startDateTime,
+    ...(timeZone ? { timeZone } : {}),
     ...(optionalText(event.location) ? { location: optionalText(event.location) } : {}),
     ...(optionalText(event.htmlLink) ? { htmlLink: optionalText(event.htmlLink) } : {}),
     ...(optionalText(event.status) ? { status: optionalText(event.status) } : {}),
@@ -134,9 +141,40 @@ function requireEpoch(value: unknown, label: string): number {
   return value;
 }
 
-function londonDate(ms: number): string {
+function validTimeZone(value: string): boolean {
+  if (!/^[A-Za-z_+-]+\/[A-Za-z0-9_+\-/]+$/.test(value)) return false;
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: value }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizedTimeZone(value: unknown): string | undefined {
+  const timeZone = requireBoundedText(value, "Time zone", 80);
+  if (!timeZone) return undefined;
+  if (!validTimeZone(timeZone)) throw new GoogleCalendarError("Time zone must be a supported IANA time zone.");
+  return timeZone;
+}
+
+function providerTimeZone(value: unknown): string | undefined {
+  const timeZone = optionalText(value);
+  return timeZone && timeZone.length <= 80 && validTimeZone(timeZone) ? timeZone : undefined;
+}
+
+function normalizedSourceDedupeKey(value: unknown): string | undefined {
+  const sourceDedupeKey = requireBoundedText(value, "Source dedupe key", 64);
+  if (!sourceDedupeKey) return undefined;
+  if (!/^[a-f0-9]{64}$/.test(sourceDedupeKey)) {
+    throw new GoogleCalendarError("Source dedupe key must be an opaque SHA-256 digest.");
+  }
+  return sourceDedupeKey;
+}
+
+function calendarDate(ms: number, timeZone: string): string {
   const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: LONDON,
+    timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -155,12 +193,15 @@ function eventIdentity(input: {
   start: number;
   end: number;
   allDay: boolean;
+  timeZone?: string;
   location?: string;
   notes?: string;
   reminderMinutesBefore?: number;
+  sourceDedupeKey?: string;
 }): { eventId: string; dedupeKey: string } {
-  const canonical = JSON.stringify(input);
-  const dedupeKey = createHash("sha256").update(canonical).digest("hex");
+  const { sourceDedupeKey, ...canonicalInput } = input;
+  const canonical = JSON.stringify(canonicalInput);
+  const dedupeKey = sourceDedupeKey ?? createHash("sha256").update(canonical).digest("hex");
   // Google's allowed event-id alphabet is base32hex (a-v, 0-9). A SHA-256
   // hex digest is a valid subset, and the stable ID lets a retry resolve a
   // completed insert without creating a duplicate event.
@@ -175,6 +216,8 @@ function normalizedEventInput(input: GoogleCalendarCreateInput): GoogleCalendarC
   if (typeof input.allDay !== "boolean") throw new GoogleCalendarError("All-day must be a boolean.");
   const location = requireBoundedText(input.location, "Location", 140);
   const notes = requireBoundedText(input.notes, "Notes", 500);
+  const timeZone = normalizedTimeZone(input.timeZone);
+  const sourceDedupeKey = normalizedSourceDedupeKey(input.sourceDedupeKey);
   const reminderMinutesBefore = input.reminderMinutesBefore;
   if (reminderMinutesBefore != null && (!Number.isInteger(reminderMinutesBefore) || reminderMinutesBefore < 1 || reminderMinutesBefore > 40_320)) {
     throw new GoogleCalendarError("Reminder must be a whole number from 1 to 40320 minutes.");
@@ -184,15 +227,18 @@ function normalizedEventInput(input: GoogleCalendarCreateInput): GoogleCalendarC
     start,
     end,
     allDay: input.allDay,
+    ...(timeZone ? { timeZone } : {}),
     ...(location ? { location } : {}),
     ...(notes ? { notes } : {}),
     ...(reminderMinutesBefore != null ? { reminderMinutesBefore } : {}),
+    ...(sourceDedupeKey ? { sourceDedupeKey } : {}),
   };
 }
 
 function calendarEventFields(input: GoogleCalendarCreateInput): Record<string, unknown> {
-  const startDate = londonDate(input.start);
-  const endDate = londonDate(input.end);
+  const timeZone = input.timeZone ?? LONDON;
+  const startDate = calendarDate(input.start, timeZone);
+  const endDate = calendarDate(input.end, timeZone);
   const allDayEnd = endDate > startDate ? endDate : addCalendarDays(startDate, 1);
   return {
     summary: input.title,
@@ -200,10 +246,10 @@ function calendarEventFields(input: GoogleCalendarCreateInput): Record<string, u
     ...(input.notes ? { description: input.notes } : {}),
     start: input.allDay
       ? { date: startDate }
-      : { dateTime: new Date(input.start).toISOString(), timeZone: LONDON },
+      : { dateTime: new Date(input.start).toISOString(), timeZone },
     end: input.allDay
       ? { date: allDayEnd }
-      : { dateTime: new Date(input.end).toISOString(), timeZone: LONDON },
+      : { dateTime: new Date(input.end).toISOString(), timeZone },
     ...(input.reminderMinutesBefore != null
       ? { reminders: { useDefault: false, overrides: [{ method: "popup", minutes: input.reminderMinutesBefore }] } }
       : {}),
@@ -346,13 +392,16 @@ export async function updateManagedGooglePrimaryCalendarEvent(input: {
   const eventInput = normalizedEventInput(input.event);
   const existing = await currentManagedEvent(eventId, input.expectedEtag);
   if (!existing) throw new GoogleCalendarError("That managed Google Calendar event is no longer available.");
+  const eventWithExistingTimeZone = eventInput.timeZone || !existing.timeZone
+    ? eventInput
+    : { ...eventInput, timeZone: existing.timeZone };
   const response = await calendarFetch(
     `/calendars/${PRIMARY_CALENDAR}/events/${encodeURIComponent(eventId)}`,
     {
       method: "PATCH",
       headers: { "If-Match": requireExpectedEtag(input.expectedEtag) },
       body: JSON.stringify({
-        ...calendarEventFields(eventInput),
+        ...calendarEventFields(eventWithExistingTimeZone),
         // Preserve the private proof while refusing fields such as attendees,
         // conference data, attachments, or arbitrary URLs from tool input.
         guestsCanInviteOthers: false,

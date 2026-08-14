@@ -53,6 +53,29 @@ function boundedText(value: unknown, label: string, maxLength: number, required 
   return text || undefined;
 }
 
+function normalizedTimeZone(value: unknown): string | undefined {
+  const timeZone = boundedText(value, "Time zone", 80);
+  if (!timeZone) return undefined;
+  if (!/^[A-Za-z_+-]+\/[A-Za-z0-9_+\-/]+$/.test(timeZone)) {
+    throw new GoogleCalendarApprovalError("Calendar approval has an invalid time zone.");
+  }
+  try {
+    new Intl.DateTimeFormat("en", { timeZone }).format(0);
+  } catch {
+    throw new GoogleCalendarApprovalError("Calendar approval has an invalid time zone.");
+  }
+  return timeZone;
+}
+
+function normalizedSourceDedupeKey(value: unknown): string | undefined {
+  const sourceDedupeKey = boundedText(value, "Source dedupe key", 64);
+  if (!sourceDedupeKey) return undefined;
+  if (!/^[a-f0-9]{64}$/.test(sourceDedupeKey)) {
+    throw new GoogleCalendarApprovalError("Calendar approval has an invalid source dedupe key.");
+  }
+  return sourceDedupeKey;
+}
+
 function normalizedEvent(value: unknown): GoogleCalendarCreateInput {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
@@ -67,6 +90,8 @@ function normalizedEvent(value: unknown): GoogleCalendarCreateInput {
   if (typeof input.allDay !== "boolean") throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
   const location = boundedText(input.location, "Location", 140);
   const notes = boundedText(input.notes, "Notes", 500);
+  const timeZone = normalizedTimeZone(input.timeZone);
+  const sourceDedupeKey = normalizedSourceDedupeKey(input.sourceDedupeKey);
   const reminder = input.reminderMinutesBefore;
   if (reminder != null && (!Number.isInteger(reminder) || (reminder as number) < 1 || (reminder as number) > 40_320)) {
     throw new GoogleCalendarApprovalError("Calendar approval has an invalid reminder.");
@@ -76,9 +101,11 @@ function normalizedEvent(value: unknown): GoogleCalendarCreateInput {
     start,
     end,
     allDay: input.allDay,
+    ...(timeZone ? { timeZone } : {}),
     ...(location ? { location } : {}),
     ...(notes ? { notes } : {}),
     ...(reminder != null ? { reminderMinutesBefore: reminder as number } : {}),
+    ...(sourceDedupeKey ? { sourceDedupeKey } : {}),
   };
 }
 

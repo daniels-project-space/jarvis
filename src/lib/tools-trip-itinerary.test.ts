@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
@@ -46,7 +46,14 @@ vi.mock("./travel", () => ({
   verifyTripCityBookingReference: mock.verifyTripCityBookingReference,
 }));
 
+import { extractGoogleCalendarApproval } from "./sanitize";
 import { executeTool } from "./tools";
+
+const APPROVAL_KEY = Buffer.alloc(32, 9).toString("base64");
+
+afterEach(() => {
+  delete process.env.GOOGLE_TOKEN_ENCRYPTION_KEY;
+});
 
 const doc = {
   title: "Lisbon · Sep",
@@ -151,5 +158,75 @@ describe("trip itinerary tool actions", () => {
     expect(mock.getTrip).toHaveBeenCalledWith("draft-1", expect.objectContaining({ storage: "draft" }));
     expect(mock.saveTrip).toHaveBeenCalledWith("draft-1", bookingTrip, true, expect.objectContaining({ storage: "draft" }));
     expect(mock.verifyTripCityBookingReference).toHaveBeenCalledWith(expect.objectContaining({ city: "Lisbon" }));
+  });
+
+  it("prepares one Gmail booking as a time-zone-aware owner approval without writing Calendar", async () => {
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = APPROVAL_KEY;
+    const booking = {
+      id: "gmail-stay-1",
+      marker: "jarvis-gmail-booking:gmail-stay-1",
+      kind: "stay" as const,
+      title: "🏨 Hotel Aurora · confirmed",
+      provider: "Booking.com",
+      start: Date.parse("2026-09-02T14:00:00+02:00"),
+      end: Date.parse("2026-09-05T11:00:00+02:00"),
+      allDay: false,
+      confirmationCode: "PRIVATE-REF",
+      location: "Calle Aurora 12, Madrid",
+      timeZone: "Europe/Madrid",
+    };
+    mock.scanGmailBookingConfirmations.mockResolvedValue([booking]);
+
+    const result = await executeTool("bookings_check", { sync_calendar: true });
+    const token = extractGoogleCalendarApproval(result);
+    expect(result).toContain("Ready for your approval");
+    expect(token).toBeTruthy();
+    const { verifyGoogleCalendarApprovalProposal } = await import("./google-calendar-approval.server");
+    const firstApproval = verifyGoogleCalendarApprovalProposal(token!);
+    expect(firstApproval.proposal.action).toBe("create");
+    if (firstApproval.proposal.action !== "create") throw new Error("expected create approval");
+    expect(firstApproval.proposal.event).toMatchObject({
+      title: booking.title,
+      start: booking.start,
+      end: booking.end,
+      allDay: false,
+      timeZone: "Europe/Madrid",
+      location: booking.location,
+      sourceDedupeKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(firstApproval.proposal.event.notes).not.toContain(booking.confirmationCode);
+
+    const retryToken = extractGoogleCalendarApproval(await executeTool("bookings_check", { sync_calendar: true }));
+    const retryApproval = verifyGoogleCalendarApprovalProposal(retryToken!);
+    if (retryApproval.proposal.action !== "create") throw new Error("expected create approval");
+    expect(retryApproval.proposal.event.sourceDedupeKey).toBe(firstApproval.proposal.event.sourceDedupeKey);
+  });
+
+  it("requires an explicit opaque booking choice before preparing a multi-booking import", async () => {
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = APPROVAL_KEY;
+    mock.scanGmailBookingConfirmations.mockResolvedValue([
+      {
+        id: "gmail-stay-1", marker: "jarvis-gmail-booking:gmail-stay-1", kind: "stay", title: "🏨 Hotel Aurora · confirmed", provider: "Booking.com",
+        start: Date.parse("2026-09-02T14:00:00+02:00"), end: Date.parse("2026-09-05T11:00:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
+      },
+      {
+        id: "gmail-flight-2", marker: "jarvis-gmail-booking:gmail-flight-2", kind: "flight", title: "✈ Iberia 123 · confirmed", provider: "Iberia",
+        start: Date.parse("2026-09-01T09:00:00+01:00"), end: Date.parse("2026-09-01T12:00:00+02:00"), allDay: false, timeZone: "Europe/Madrid",
+      },
+    ]);
+
+    const needsChoice = await executeTool("bookings_check", { sync_calendar: true });
+    expect(needsChoice).toContain("needs one explicit booking_id");
+    expect(extractGoogleCalendarApproval(needsChoice)).toBeNull();
+    const bookingId = needsChoice.match(/booking-[a-f0-9]{16}/)?.[0];
+    expect(bookingId).toBeTruthy();
+
+    const selectedResult = await executeTool("bookings_check", { sync_calendar: true, booking_id: bookingId });
+    const { verifyGoogleCalendarApprovalProposal } = await import("./google-calendar-approval.server");
+    const selectedApproval = verifyGoogleCalendarApprovalProposal(extractGoogleCalendarApproval(selectedResult)!);
+    expect(selectedApproval.proposal).toMatchObject({
+      action: "create",
+      event: { title: "🏨 Hotel Aurora · confirmed" },
+    });
   });
 });

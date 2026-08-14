@@ -36,6 +36,20 @@ describe("Google Calendar owner-approval receipt", () => {
     expect(() => verifyGoogleCalendarApproval(tampered, 1_000)).toThrow(/invalid or expired/i);
   });
 
+  it("seals a valid booking time zone and opaque source key into a create receipt", async () => {
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = KEY;
+    const { issueGoogleCalendarApproval, verifyGoogleCalendarApproval } = await import("./google-calendar-approval.server");
+    const bookingEvent = {
+      ...event,
+      timeZone: "America/New_York",
+      sourceDedupeKey: "a".repeat(64),
+    };
+    const token = issueGoogleCalendarApproval(bookingEvent, 1_000);
+
+    expect(verifyGoogleCalendarApproval(token, 1_000 + 60_000)).toEqual(bookingEvent);
+    expect(() => issueGoogleCalendarApproval({ ...bookingEvent, sourceDedupeKey: "gmail-message-id" }, 1_000)).toThrow(/source dedupe/i);
+  });
+
   it("seals a managed-event revision into update and delete proposals", async () => {
     process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = KEY;
     const { issueGoogleCalendarApprovalProposal, verifyGoogleCalendarApprovalProposal } = await import("./google-calendar-approval.server");

@@ -45,14 +45,17 @@ describe("Google Calendar primary-calendar boundary", () => {
   });
 
   it("lists only the primary calendar with a bounded selected response", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ items: [remoteEvent()] }), {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ items: [remoteEvent({
+      start: { dateTime: new Date(start).toISOString(), timeZone: "Europe/Madrid" },
+      end: { dateTime: new Date(end).toISOString(), timeZone: "Europe/Madrid" },
+    })] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(listGooglePrimaryCalendarEvents({ start, end, maxResults: 2 })).resolves.toEqual([
-      expect.objectContaining({ id: "jarvisabcdef0123456789", title: "Planning session", allDay: false }),
+      expect.objectContaining({ id: "jarvisabcdef0123456789", title: "Planning session", allDay: false, timeZone: "Europe/Madrid" }),
     ]);
 
     const [input] = fetchMock.mock.calls[0] as unknown as [URL];
@@ -91,6 +94,58 @@ describe("Google Calendar primary-calendar boundary", () => {
     expect(body.attendees).toBeUndefined();
     expect(body.conferenceData).toBeUndefined();
     expect(body.extendedProperties).toMatchObject({ private: { jarvisManaged: "jarvis-google-calendar-v1" } });
+  });
+
+  it("keeps an imported booking in its local time zone with a stable source identity", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(remoteEvent()), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const bookingStart = Date.parse("2026-09-02T14:00:00+02:00");
+    const bookingEnd = Date.parse("2026-09-02T15:00:00+02:00");
+    const sourceDedupeKey = "a".repeat(64);
+
+    await expect(createGooglePrimaryCalendarEvent({
+      title: "Hotel Aurora · confirmed",
+      start: bookingStart,
+      end: bookingEnd,
+      allDay: false,
+      timeZone: "Europe/Madrid",
+      sourceDedupeKey,
+    })).resolves.toMatchObject({ created: true });
+
+    const [, timedInit] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    const timedBody = JSON.parse(String(timedInit.body)) as Record<string, any>;
+    expect(timedBody.id).toBe(`jarvis${sourceDedupeKey}`);
+    expect(timedBody.start).toEqual({ dateTime: new Date(bookingStart).toISOString(), timeZone: "Europe/Madrid" });
+    expect(timedBody.end).toEqual({ dateTime: new Date(bookingEnd).toISOString(), timeZone: "Europe/Madrid" });
+    expect(timedBody.extendedProperties).toMatchObject({ private: { jarvisDedupeKey: sourceDedupeKey } });
+
+    // The 25-hour US daylight-saving day still becomes one all-day date range.
+    const allDayStart = Date.parse("2026-11-01T00:00:00-07:00");
+    await createGooglePrimaryCalendarEvent({
+      title: "Arrival day",
+      start: allDayStart,
+      end: allDayStart + 86_400_000,
+      allDay: true,
+      timeZone: "America/Los_Angeles",
+    });
+    const [, allDayInit] = fetchMock.mock.calls[1] as unknown as [URL, RequestInit];
+    const allDayBody = JSON.parse(String(allDayInit.body)) as Record<string, any>;
+    expect(allDayBody.start).toEqual({ date: "2026-11-01" });
+    expect(allDayBody.end).toEqual({ date: "2026-11-02" });
+  });
+
+  it("rejects an invalid booking time zone before acquiring a Calendar token", async () => {
+    await expect(createGooglePrimaryCalendarEvent({
+      title: "Impossible zone",
+      start,
+      end,
+      allDay: false,
+      timeZone: "not-a-zone",
+    })).rejects.toThrow(/time zone/i);
+    expect(mock.accessToken).not.toHaveBeenCalled();
   });
 
   it("turns a post-commit retry into a verified idempotent result", async () => {

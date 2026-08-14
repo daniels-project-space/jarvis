@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
@@ -29,7 +29,12 @@ vi.mock("./icloud-calendar", () => ({
   listICloudEvents: vi.fn(),
 }));
 
+import { extractGoogleCalendarApproval } from "./sanitize";
 import { executeTool, TOOL_DEFS } from "./tools";
+
+afterEach(() => {
+  delete process.env.GOOGLE_TOKEN_ENCRYPTION_KEY;
+});
 
 function osmPlace(name: string, address: string, lat: number, lng: number) {
   return { name, display_name: address, lat: String(lat), lon: String(lng), type: "attraction" };
@@ -424,11 +429,12 @@ describe("travel_map tool", () => {
     expect(panel.base).toBeUndefined();
   });
 
-  it("keeps booking imports read-only even when a calendar sync is explicitly requested", async () => {
+  it("keeps Gmail read-only while a calendar sync only creates an owner approval", async () => {
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 8).toString("base64");
     const result = await executeTool("bookings_check", { sync_calendar: true });
 
-    expect(result).toContain("no events were created");
-    expect(result).toContain("protected owner-approval flow");
+    expect(result).toContain("Ready for your approval");
+    expect(extractGoogleCalendarApproval(result)).toBeTruthy();
     expect(mock.createICloudEvent).not.toHaveBeenCalled();
     const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
     const panel = JSON.parse(String(panelCall?.[1]?.value));
