@@ -52,6 +52,7 @@ import {
 } from "@/lib/live-vad";
 import { BookingsView, CalendarView, CanvasView, LaunchView, PdfView, CreationsView, TravelLibraryView, StructuredListView, CandlesView, MarketChartLoading, VideoListView, GoalModeLauncherView, FeedView, WeatherView, TodosView, Briefing2View, ShopView, DocView, WebResultsView, PlacesView, RankingView, PanelUnavailable } from "./Views";
 import { MediaCard, type Attachment } from "./MediaCard";
+import { PrivateVideoPlayer } from "./PrivateVideoPlayer";
 import { parseFastChartIntent, parseFastNetWorthIntent, type FastChartIntent, type FastNetWorthIntent } from "@/lib/fast-intents";
 import { parseWorkModelTier, workModelLabel } from "@/lib/work-models";
 import { isMeaningfulSpeechTranscript, isRecentVoiceDuplicate, shouldIgnoreHandsFreeTranscript } from "@/lib/transcript";
@@ -1254,16 +1255,7 @@ export function Viewport({
       ) : route.renderer === "scene" ? (
         <VisualSceneView value={panel.value} />
       ) : route.renderer === "private_video" ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
-          <video
-            aria-label={panel.title ? `Private video: ${panel.title}` : "Private video"}
-            className="h-full min-h-0 w-full max-w-full flex-1 object-contain"
-            controls
-            playsInline
-            preload="metadata"
-            src={panel.value}
-          />
-        </div>
+        <PrivateVideoPlayer url={panel.value} title={panel.title} />
       ) : route.renderer === "iframe" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <iframe

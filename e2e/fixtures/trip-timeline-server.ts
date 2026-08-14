@@ -1,14 +1,17 @@
+import { execFile } from "node:child_process";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { build } from "esbuild";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const projectRoot = resolve(here, "../..");
 const rawPort = Number(process.env.PLAYWRIGHT_TRIP_FIXTURE_PORT ?? "4179");
 const port = Number.isInteger(rawPort) && rawPort >= 1024 && rawPort <= 65535 ? rawPort : 4179;
+const execFileAsync = promisify(execFile);
 
 const contentTypes: Record<string, string> = {
   "/": "text/html; charset=utf-8",
@@ -16,6 +19,8 @@ const contentTypes: Record<string, string> = {
   "/fixture.css": "text/css; charset=utf-8",
   "/artifact": "text/html; charset=utf-8",
   "/artifact.js": "text/javascript; charset=utf-8",
+  "/private-video": "text/html; charset=utf-8",
+  "/private-video.js": "text/javascript; charset=utf-8",
   "/voice": "text/html; charset=utf-8",
   "/voice-child": "text/html; charset=utf-8",
   "/voice.js": "text/javascript; charset=utf-8",
@@ -67,7 +72,23 @@ const artifactFixtureHtml = `<!doctype html>
   </body>
 </html>`;
 
+const privateVideoFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Private video player fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/private-video.js" defer></script>
+  </body>
+</html>`;
+
 const fixtureArtifactBytes = Buffer.from("jarvis artifact fixture\n", "utf8");
+// A deterministic 160×90 one-second H.264 MP4 is generated in the fixture
+// temp directory so the browser test exercises a real metadata load.
+let fixtureVideoBytes: Buffer;
 
 const voiceFixtureHtml = `<!doctype html>
 <html lang="en">
@@ -140,6 +161,17 @@ const bookingMarkerFixtureHtml = `<!doctype html>
 
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
+  const fixtureVideoPath = join(outputDir, "fixture-video.mp4");
+  await execFileAsync("ffmpeg", [
+    "-loglevel", "error",
+    "-f", "lavfi",
+    "-i", "color=c=0x174a68:s=160x90:d=1",
+    "-c:v", "libx264",
+    "-pix_fmt", "yuv420p",
+    "-y",
+    fixtureVideoPath,
+  ]);
+  fixtureVideoBytes = await readFile(fixtureVideoPath);
 
   await build({
   absWorkingDir: projectRoot,
@@ -149,6 +181,7 @@ async function main() {
   entryPoints: {
     fixture: join(projectRoot, "e2e/fixtures/trip-timeline.browser.tsx"),
     artifact: join(projectRoot, "e2e/fixtures/artifact-card.browser.tsx"),
+    "private-video": join(projectRoot, "e2e/fixtures/private-video-player.browser.tsx"),
     voice: join(projectRoot, "e2e/fixtures/browser-voice-lease.browser.ts"),
     caption: join(projectRoot, "e2e/fixtures/spoken-caption-layout.browser.tsx"),
     location: join(projectRoot, "e2e/fixtures/trip-location-follow.browser.tsx"),
@@ -169,6 +202,7 @@ async function main() {
   const fixtureJsPath = join(outputDir, "fixture.js");
   const fixtureCssPath = join(outputDir, "fixture.css");
   const artifactJsPath = join(outputDir, "artifact.js");
+  const privateVideoJsPath = join(outputDir, "private-video.js");
   const voiceJsPath = join(outputDir, "voice.js");
   const captionJsPath = join(outputDir, "caption.js");
   const captionCssPath = join(outputDir, "caption.css");
@@ -178,6 +212,7 @@ async function main() {
     access(fixtureJsPath),
     access(fixtureCssPath),
     access(artifactJsPath),
+    access(privateVideoJsPath),
     access(voiceJsPath),
     access(captionJsPath),
     access(captionCssPath),
@@ -215,6 +250,21 @@ async function main() {
     return;
   }
 
+  if (pathname === "/api/files/fixture-video") {
+    // The actual production route also checks owner authorization. This local
+    // fixture only proves the native player loads its same-origin file URL.
+    response.writeHead(200, {
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "no-store",
+      "Content-Length": String(fixtureVideoBytes.byteLength),
+      "Content-Security-Policy": csp,
+      "Content-Type": "video/mp4",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response.end(method === "HEAD" ? undefined : fixtureVideoBytes);
+    return;
+  }
+
   if (!(pathname in contentTypes)) {
     response.writeHead(404, { "Content-Security-Policy": csp });
     response.end();
@@ -238,6 +288,11 @@ async function main() {
   if (pathname === "/artifact") {
     response.writeHead(200);
     response.end(artifactFixtureHtml);
+    return;
+  }
+  if (pathname === "/private-video") {
+    response.writeHead(200);
+    response.end(privateVideoFixtureHtml);
     return;
   }
   if (pathname === "/voice") {
@@ -272,7 +327,9 @@ async function main() {
       ? fixtureJsPath
       : pathname === "/artifact.js"
         ? artifactJsPath
-      : pathname === "/fixture.css"
+        : pathname === "/private-video.js"
+          ? privateVideoJsPath
+        : pathname === "/fixture.css"
         ? fixtureCssPath
         : pathname === "/caption.js"
           ? captionJsPath
