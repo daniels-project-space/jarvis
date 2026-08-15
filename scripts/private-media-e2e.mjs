@@ -11,6 +11,7 @@ import { mkdtemp, readFile, rmdir, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import JSZip from "jszip";
 
 const execFileAsync = promisify(execFile);
 const BASE = process.env.BASE ?? "https://jarvis-orcin-six.vercel.app";
@@ -148,6 +149,53 @@ async function generatedVideo() {
   }
 }
 
+async function generatedXlsx() {
+  // Keep this fixture completely synthetic: the assertions below prove that
+  // production ingest preserves both sheet names and the exact indexed cell
+  // count without sending any user document through the system.
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+      <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+      <Default Extension="xml" ContentType="application/xml"/>
+      <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+      <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+      <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+      <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+    </Types>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+    </Relationships>`);
+  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+      <sheets>
+        <sheet name="Sample plan" sheetId="1" r:id="rId1"/>
+        <sheet name="Sample transit" sheetId="2" r:id="rId2"/>
+      </sheets>
+    </workbook>`);
+  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+      <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+    </Relationships>`);
+  zip.file("xl/sharedStrings.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">
+      <si><t>Category</t></si><si><t>Value</t></si><si><t>Demo</t></si>
+    </sst>`);
+  zip.file("xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+      <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+      <row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>42</v></c></row>
+      <row r="3"><c r="A3" t="b"><v>1</v></c><c r="B3"><f>SUM(B2:B2)</f><v>42</v></c></row>
+    </sheetData></worksheet>`);
+  zip.file("xl/worksheets/sheet2.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+      <row r="1"><c r="A1" t="inlineStr"><is><t>Connection at 10:30</t></is></c></row>
+    </sheetData></worksheet>`);
+  return await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+}
+
 await authenticate();
 
 const text = Buffer.from(
@@ -166,6 +214,33 @@ const textResult = await uploadAndVerify({
   },
 });
 
+const xlsx = await generatedXlsx();
+const xlsxResult = await uploadAndVerify({
+  name: "jarvis-private-proof.xlsx",
+  relativePath: "e2e/jarvis-private-proof.xlsx",
+  mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  bytes: xlsx,
+  assertManifest: (file) => {
+    const expectedSheets = ["Sample plan", "Sample transit"];
+    if (
+      file?.status !== "ready"
+      || file?.summary !== "Excel workbook · 2 sheets · 7 cells indexed"
+      || JSON.stringify(file?.sheetNames) !== JSON.stringify(expectedSheets)
+      || file?.chunkCount !== 2
+      || !Number(file?.extractedChars)
+    ) {
+      throw new Error(`XLSX did not preserve synthetic sheet/cell context: ${JSON.stringify({
+        status: file?.status,
+        summary: file?.summary,
+        sheetNames: file?.sheetNames,
+        chunkCount: file?.chunkCount,
+        extractedChars: file?.extractedChars,
+        errorCode: file?.errorCode,
+      })}`);
+    }
+  },
+});
+
 const video = await generatedVideo();
 const videoResult = await uploadAndVerify({
   name: "jarvis-private-proof.mp4",
@@ -179,4 +254,4 @@ const videoResult = await uploadAndVerify({
   },
 });
 
-console.log(JSON.stringify({ ok: true, text: textResult, video: videoResult }));
+console.log(JSON.stringify({ ok: true, text: textResult, xlsx: xlsxResult, video: videoResult }));
