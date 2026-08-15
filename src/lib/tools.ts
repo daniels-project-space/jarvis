@@ -34,8 +34,10 @@ import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type Confir
 import { buildAppleMapsOfflinePreflight } from "./apple-maps-offline";
 import {
   appleMapsOfflineGmailIdentity,
+  appleMapsOfflineHubTodoTag,
   appleMapsOfflinePreflightSourceKey,
   currentAppleMapsOfflineCityProof,
+  matchesAppleMapsOfflineHubTodoTag,
   matchesAppleMapsOfflineCityProof,
   type AppleMapsOfflineCityProof,
 } from "./apple-maps-offline-refresh";
@@ -2465,12 +2467,8 @@ async function offlineMapCalendarStatus(): Promise<OfflineMapCalendarStatus> {
  * deleting offline map regions inside the Maps app, so the URL/card is a
  * truthful handoff rather than a claimed device action.
  */
-function appleMapsOfflineTodoTag(sourceKey: string): string {
-  return `source:${sourceKey}`;
-}
-
 function appleMapsOfflineTodoTags(sourceKey: string): string[] {
-  return ["jarvis", "travel", "apple-maps", appleMapsOfflineTodoTag(sourceKey)];
+  return ["jarvis", "travel", "apple-maps", appleMapsOfflineHubTodoTag(sourceKey)];
 }
 
 function appleMapsOfflineCityKey(value: unknown): string {
@@ -2539,13 +2537,15 @@ async function upsertAppleMapsOfflineTodo(preflight: {
 }): Promise<"created" | "existing" | "needs_retry"> {
   const tags = appleMapsOfflineTodoTags(preflight.sourceKey);
   const findExisting = (todos: unknown): any | undefined => Array.isArray(todos)
-    ? todos.find((todo: any) => !todo?.done && Array.isArray(todo?.tags) && todo.tags.includes(tags[3]))
+    ? todos.find((todo: any) => !todo?.done
+      && Array.isArray(todo?.tags)
+      && todo.tags.some((tag: unknown) => matchesAppleMapsOfflineHubTodoTag(tag, preflight.sourceKey)))
     : undefined;
   const reflectsPreflight = (todo: any): boolean => Boolean(todo)
     && String(todo.text ?? "") === preflight.todoText
     && Number(todo.dueDate) === preflight.at
     && Array.isArray(todo.tags)
-    && todo.tags.includes(tags[3]);
+    && todo.tags.some((tag: unknown) => matchesAppleMapsOfflineHubTodoTag(tag, preflight.sourceKey));
   try {
     const existing = findExisting(await listHubTodos());
     if (existing?.id) {
@@ -2559,9 +2559,9 @@ async function upsertAppleMapsOfflineTodo(preflight: {
     await createHubTodo({ text: preflight.todoText, dueDate: preflight.at, tags });
     return "created";
   } catch {
-    // A network error after the Hub accepted todos:add is ambiguous. Re-list by
-    // the stable source tag before exposing a retry state, so a retry cannot
-    // create a duplicate travel task.
+    // A network error after the bounded Hub facade accepted a create is
+    // ambiguous. Re-list by the stable source tag before exposing a retry
+    // state, so a retry cannot create a duplicate travel task.
     try {
       const existing = findExisting(await listHubTodos());
       if (reflectsPreflight(existing)) return "existing";

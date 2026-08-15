@@ -1,8 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
 import { refreshAppleMapsOfflinePreflights } from "./apple-maps-offline-refresh";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 const now = 1_900_000_000_000;
 const preflight = {
@@ -31,9 +35,19 @@ describe("saved Apple Maps preflight maintenance", () => {
   it("updates only the registered reminder and to-do when its exact Gmail itinerary changes", async () => {
     const query = vi.fn().mockResolvedValue([row]);
     const mutation = vi.fn().mockResolvedValue({ ok: true });
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({ value: [] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ value: "todo-1" }), { status: 200 }));
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
+    const fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const body = JSON.parse(String(init?.body)) as { path?: string; args?: Record<string, unknown> };
+      expect(url.pathname).toBe(body.path === "jarvisActions:listTodos" ? "/api/query" : "/api/mutation");
+      if (body.path === "jarvisActions:listTodos") {
+        return new Response(JSON.stringify({ value: [] }), { headers: { "content-type": "application/json" } });
+      }
+      if (body.path === "jarvisActions:createTodo") {
+        return new Response(JSON.stringify({ value: { id: "todo-1" } }), { headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected Hub path ${body.path}`);
+    });
     const result = await refreshAppleMapsOfflinePreflights({
       query, mutation, fetch: fetch as typeof globalThis.fetch, now: () => now,
       lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? flight : stay),
@@ -44,6 +58,35 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.objectContaining({
       id: row._id, expectedUpdatedAt: row.updatedAt, calendarRefreshRequired: true,
       preflight: expect.objectContaining({ flightStart: flight.start, sourceKey: row.sourceKey }),
+    }));
+    const payloads = fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as { path: string; args: Record<string, unknown> });
+    expect(payloads).toEqual([
+      expect.objectContaining({ path: "jarvisActions:listTodos", args: { vaultToken: "dedicated-jarvis-actions-token" } }),
+      expect.objectContaining({
+        path: "jarvisActions:createTodo",
+        args: expect.objectContaining({
+          vaultToken: "dedicated-jarvis-actions-token",
+          tags: expect.arrayContaining([expect.stringMatching(/^src-[a-f0-9]{36}$/)]),
+        }),
+      }),
+    ]);
+    expect(payloads.map((payload) => payload.path)).not.toContain("todos:add");
+    expect(payloads.map((payload) => payload.path)).not.toContain("todos:list");
+  });
+
+  it("fails closed when the dedicated Hub capability is absent and never calls legacy Hub todos", async () => {
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "");
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    const fetch = vi.fn();
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([row]), mutation, fetch: fetch as typeof globalThis.fetch, now: () => now,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? flight : stay),
+    })).resolves.toEqual({ due: 1, refreshed: 1, pending: 0, skipped: 0 });
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.objectContaining({
+      todoStatus: "needs_retry",
     }));
   });
 

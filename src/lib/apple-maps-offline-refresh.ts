@@ -54,6 +54,31 @@ export function appleMapsOfflinePreflightSourceKey(creationId: string): string {
     .digest("hex");
 }
 
+// Project Hub deliberately keeps visible to-do tags small and restricted to
+// letters, numbers, spaces, and hyphens. Preserve the stable source identity
+// without sending its 64-char key (or a colon) across that boundary.
+const HUB_TODO_TAG_PREFIX = "src-";
+const HUB_TODO_TAG_HEX_LENGTH = 36;
+
+export function appleMapsOfflineHubTodoTag(sourceKey: string): string {
+  return `${HUB_TODO_TAG_PREFIX}${createHash("sha256")
+    .update("jarvis-apple-maps-offline-hub-todo-tag-v1\0")
+    .update(String(sourceKey))
+    .digest("hex")
+    .slice(0, HUB_TODO_TAG_HEX_LENGTH)}`;
+}
+
+/**
+ * Older preflights used an invalid long `source:<hash>` tag through the
+ * legacy Hub route. Recognise one if it exists so an upgrade updates it in
+ * place rather than making a second travel reminder; new writes use only the
+ * bounded tag above.
+ */
+export function matchesAppleMapsOfflineHubTodoTag(tag: unknown, sourceKey: string): boolean {
+  const value = typeof tag === "string" ? tag : "";
+  return value === appleMapsOfflineHubTodoTag(sourceKey) || value === `source:${sourceKey}`;
+}
+
 export function appleMapsOfflineGmailIdentity(
   booking: ConfirmedBooking,
   selectionId: string,

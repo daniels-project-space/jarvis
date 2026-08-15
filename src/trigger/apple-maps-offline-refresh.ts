@@ -1,14 +1,16 @@
 import { buildAppleMapsOfflinePreflight } from "../lib/apple-maps-offline";
 import {
   appleMapsOfflineGmailIdentity,
+  appleMapsOfflineHubTodoTag,
   currentAppleMapsOfflineCityProof,
+  matchesAppleMapsOfflineHubTodoTag,
   matchesAppleMapsOfflineCityProof,
   type AppleMapsOfflineCityProof,
   type AppleMapsOfflineGmailIdentity,
 } from "../lib/apple-maps-offline-refresh";
 import { lookupGmailBookingForAppleMapsPreflight, type ConfirmedBooking } from "../lib/booking-email";
+import { createHubTodo, listHubTodos, updateHubTodo } from "../lib/hub-actions";
 
-const HUB_URL = "https://fantastic-roadrunner-485.convex.cloud";
 export const APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS = 6 * 60 * 60_000;
 const RETRY_AFTER_TRANSIENT_FAILURE_MS = 10 * 60_000;
 
@@ -49,37 +51,29 @@ function nextRefreshAt(preflightAt: number, now: number): number {
   return Math.max(now + 60_000, Math.min(preflightAt - 5 * 60_000, now + APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS));
 }
 
-function todoTag(sourceKey: string): string {
-  return `source:${sourceKey}`;
-}
-
 async function upsertTodo(
   preflight: { sourceKey: string; todoText: string; at: number },
   fetchImpl: typeof globalThis.fetch,
 ): Promise<"created" | "existing" | "needs_retry"> {
-  const tag = todoTag(preflight.sourceKey);
-  const tags = ["jarvis", "travel", "apple-maps", tag];
+  const tags = ["jarvis", "travel", "apple-maps", appleMapsOfflineHubTodoTag(preflight.sourceKey)];
+  const options = { fetchImpl };
   try {
-    const read = await fetchImpl(`${HUB_URL}/api/query`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path: "todos:list", args: {}, format: "json" }), cache: "no-store",
-    });
-    const todos = (await read.json().catch(() => ({})))?.value;
+    const todos = await listHubTodos(options);
     const existing = Array.isArray(todos)
-      ? todos.find((todo: any) => !todo?.done && Array.isArray(todo?.tags) && todo.tags.includes(tag))
+      ? todos.find((todo: any) => !todo?.done
+        && Array.isArray(todo?.tags)
+        && todo.tags.some((tag: unknown) => matchesAppleMapsOfflineHubTodoTag(tag, preflight.sourceKey)))
       : undefined;
-    const path = existing?._id ? "todos:update" : "todos:add";
-    const args = existing?._id
-      ? { id: existing._id, text: preflight.todoText, dueDate: preflight.at, tags }
-      : { text: preflight.todoText, dueDate: preflight.at, tags };
-    const write = await fetchImpl(`${HUB_URL}/api/mutation`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path, args, format: "json" }), cache: "no-store",
-    });
-    const payload = await write.json().catch(() => ({}));
-    if (!write.ok || payload?.status === "error") return "needs_retry";
-    return existing?._id ? "existing" : "created";
+    if (existing?.id) {
+      await updateHubTodo({ id: existing.id, text: preflight.todoText, dueDate: preflight.at }, options);
+      return "existing";
+    }
+    await createHubTodo({ text: preflight.todoText, dueDate: preflight.at, tags }, options);
+    return "created";
   } catch {
+    // The scoped adapter rejects a missing capability before any network call.
+    // The durable Jarvis reminder remains saved and the TripDoc exposes this
+    // retry state instead of falling back to the old unauthenticated route.
     return "needs_retry";
   }
 }

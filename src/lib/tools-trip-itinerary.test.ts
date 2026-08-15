@@ -350,7 +350,7 @@ describe("trip itinerary tool actions", () => {
     expect(JSON.parse(String(hubFetch.mock.calls[1]?.[1]?.body))).toMatchObject({
       path: "jarvisActions:createTodo",
       args: expect.objectContaining({
-        tags: expect.arrayContaining([expect.stringMatching(/^source:[a-f0-9]{64}$/)]),
+        tags: expect.arrayContaining([expect.stringMatching(/^src-[a-f0-9]{36}$/)]),
         vaultToken: "dedicated-jarvis-actions-token",
       }),
     });

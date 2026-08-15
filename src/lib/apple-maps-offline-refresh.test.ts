@@ -4,8 +4,10 @@ vi.mock("server-only", () => ({}));
 
 import {
   appleMapsOfflineGmailIdentity,
+  appleMapsOfflineHubTodoTag,
   appleMapsOfflinePreflightSourceKey,
   currentAppleMapsOfflineCityProof,
+  matchesAppleMapsOfflineHubTodoTag,
   matchesAppleMapsOfflineGmailIdentity,
   matchesAppleMapsOfflineCityProof,
 } from "./apple-maps-offline-refresh";
@@ -26,6 +28,17 @@ describe("saved Apple Maps preflight refresh identity", () => {
   it("keeps a saved-trip source key stable when Gmail replaces an itinerary message", () => {
     expect(appleMapsOfflinePreflightSourceKey("creation-1")).toBe(appleMapsOfflinePreflightSourceKey("creation-1"));
     expect(appleMapsOfflinePreflightSourceKey("creation-1")).not.toBe(appleMapsOfflinePreflightSourceKey("creation-2"));
+  });
+
+  it("derives one stable Hub-compatible tag from the durable source key", () => {
+    const sourceKey = appleMapsOfflinePreflightSourceKey("creation-1");
+    const tag = appleMapsOfflineHubTodoTag(sourceKey);
+    expect(tag).toBe(appleMapsOfflineHubTodoTag(sourceKey));
+    expect(tag).toMatch(/^src-[a-f0-9]{36}$/);
+    expect(tag).toHaveLength(40);
+    expect(matchesAppleMapsOfflineHubTodoTag(tag, sourceKey)).toBe(true);
+    // Keep any already-created legacy row idempotent during the rollout.
+    expect(matchesAppleMapsOfflineHubTodoTag(`source:${sourceKey}`, sourceKey)).toBe(true);
   });
 
   it("permits only the exact booking or a provider-matched replacement with the same confirmation", () => {
