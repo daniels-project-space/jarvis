@@ -10,7 +10,7 @@ const NOVITA_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 // A digest pin is only meaningful when it is the terminal identity of an
 // untagged OCI-style image reference. In particular, do not accept an
 // attested digest merely occurring inside a mutable tag or another suffix.
-const CONTENT_ADDRESSED_IMAGE_REFERENCE = /^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@(?<digest>sha256:[a-f0-9]{64})$/;
+const CONTENT_ADDRESSED_IMAGE_REFERENCE = /^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@(sha256:[a-f0-9]{64})$/;
 
 export type NovitaServerlessLifecycleCheck = Readonly<{
   status: "ready" | "idle";
@@ -62,7 +62,7 @@ function endpointPort(value: unknown): number | null {
 
 function isExactAttestedImageReference(value: unknown, expectedDigest: string): boolean {
   if (typeof value !== "string") return false;
-  return CONTENT_ADDRESSED_IMAGE_REFERENCE.exec(value)?.groups?.digest === expectedDigest;
+  return CONTENT_ADDRESSED_IMAGE_REFERENCE.exec(value)?.[1] === expectedDigest;
 }
 
 async function boundedJson(response: Response): Promise<unknown | "too_large" | null> {
