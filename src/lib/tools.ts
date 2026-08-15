@@ -14,6 +14,7 @@ import {
   putPrivateCreationAsset,
   storePrivateCreationAssetFromUrl,
 } from "./creation-assets";
+import { renderMindMapSvg } from "./mind-map-artifact";
 import { privateR2Get } from "./private-r2";
 import { readyPrivateFilePanel } from "./private-file-panel";
 import { transcribableMediaKind } from "./media-types";
@@ -3137,15 +3138,58 @@ async function mindMap(args: any, invocationContext?: ToolInvocationContext): Pr
     if (!cleanNodes.length) return "Give me at least one node.";
     const { good } = resolveRefs(cleanNodes, cleanEdges);
     const doc = { title, nodes: cleanNodes, edges: good };
+    const filing = await creationFiling(args, "mind maps");
     const id = await convexMutation("creations:create", {
       kind: "canvas",
       title,
       data: JSON.stringify(doc),
       ...(invocationContext?.userMessageId ? { sourceMessageId: invocationContext.userMessageId } : {}),
-      ...(await creationFiling(args, "mind maps")),
+      ...filing,
     });
-    await convexMutation("ui:setPanel", { type: "canvas", value: JSON.stringify({ ...doc, creationId: String(id) }), title: `map · ${title}` });
-    return `Mind map "${title}" is live on screen. Node ids: ${cleanNodes.map((n: any) => n.id).join(", ")}. Keep talking — use mind_map update (these exact ids) to add/change/remove as the conversation flows.`;
+    if (typeof id !== "string" || !id) return "Mind map could not be saved, so no image or download card was posted.";
+    let panelShown = true;
+    try {
+      await convexMutation("ui:setPanel", { type: "canvas", value: JSON.stringify({ ...doc, creationId: String(id) }), title: `map · ${title}` });
+    } catch {
+      panelShown = false;
+    }
+    let asset: Awaited<ReturnType<typeof putPrivateCreationAsset>>;
+    try {
+      asset = await putPrivateCreationAsset(renderMindMapSvg(doc), "image/svg+xml");
+    } catch {
+      return `Mind map "${title}" is saved${panelShown ? " and live on screen" : ", but it could not be shown on screen"}, but its private image snapshot could not be created. No download card was posted.`;
+    }
+    let artifactId: unknown;
+    try {
+      artifactId = await convexMutation("creations:create", {
+        kind: "image",
+        title: `${title} · mind map`,
+        data: JSON.stringify({ sourceCreationId: id, format: "svg", type: "mind_map_snapshot" }),
+        assetR2Key: asset.key,
+        assetContentType: asset.contentType,
+        ...filing,
+      });
+      if (typeof artifactId !== "string" || !artifactId) throw new Error("creation persistence returned no id");
+    } catch {
+      await deletePrivateCreationAsset(asset).catch(() => undefined);
+      return `Mind map "${title}" is saved${panelShown ? " and live on screen" : ", but it could not be shown on screen"}, but its image snapshot could not be saved. The fresh private image was cleaned up and no download card was posted.`;
+    }
+    const mediaUrl = creationMediaUrl(artifactId);
+    const downloadUrl = `/api/creation-download?id=${encodeURIComponent(artifactId)}`;
+    try {
+      await convexMutation("chatQueue:postCard", {
+        threadId: filing.threadId,
+        type: "image",
+        value: mediaUrl,
+        title: `${title} · mind map.svg`,
+        downloadUrl,
+      });
+    } catch {
+      return `Mind map "${title}" is saved${panelShown ? " and live on screen" : ", but it could not be shown on screen"}, and has a private image snapshot in the creations library, but its download card could not be posted.`;
+    }
+    return panelShown
+      ? `Mind map "${title}" is live on screen, saved with a private image snapshot, and attached with a secure download card. Node ids: ${cleanNodes.map((n: any) => n.id).join(", ")}. Keep talking — use mind_map update (these exact ids) to add/change/remove as the conversation flows.`
+      : `Mind map "${title}" is saved with a private image snapshot and attached with a secure download card, but its live panel could not be shown. Node ids: ${cleanNodes.map((n: any) => n.id).join(", ")}. Keep talking — use mind_map update (these exact ids) to add/change/remove as the conversation flows.`;
   }
 
   const existing: any = await convexQuery("creations:latest", { kind: "canvas", titleMatch: args.title ? String(args.title) : undefined });

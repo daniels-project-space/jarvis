@@ -102,7 +102,7 @@ const privatePdfFixtureHtml = `<!doctype html>
   </body>
 </html>`;
 
-const fixtureArtifactBytes = Buffer.from("jarvis artifact fixture\n", "utf8");
+const fixtureArtifactBytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"></svg>\n', "utf8");
 const fixturePdfBytes = Buffer.from("%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n", "utf8");
 // A deterministic 160×90 one-second H.264 MP4 is generated in the fixture
 // temp directory so the browser test exercises a real metadata load.
@@ -271,17 +271,17 @@ async function main() {
   if (pathname === "/api/creation-download") {
     // Fixture-only bytes exercise the browser download handoff; production
     // owner authorization remains covered by the protected Next route tests.
-    if (url.searchParams.get("id") !== "fixture-pdf") {
+    if (url.searchParams.get("id") !== "fixture-mindmap") {
       response.writeHead(404, { "Content-Security-Policy": csp });
       response.end();
       return;
     }
     response.writeHead(200, {
       "Cache-Control": "no-store",
-      "Content-Disposition": 'attachment; filename="fixture-report.pdf"',
+      "Content-Disposition": 'attachment; filename="seville-days-mind-map.svg"',
       "Content-Length": String(fixtureArtifactBytes.byteLength),
       "Content-Security-Policy": csp,
-      "Content-Type": "application/pdf",
+      "Content-Type": "image/svg+xml",
     });
     response.end(method === "HEAD" ? undefined : fixtureArtifactBytes);
     return;
