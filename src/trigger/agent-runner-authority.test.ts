@@ -14,6 +14,8 @@ import type { CloudWorkspaceCleanupProvider } from "./cloud-workspace-providers"
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- the Trigger task registration and convex-test bridge expose dynamic production handler boundaries */
 
+vi.mock("server-only", () => ({}));
+
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
 }
@@ -205,13 +207,19 @@ function bridgeProductionRunnerToConvex(
   return { trace, fetchMock };
 }
 
-async function reservedWritableJob(t: HarnessConvex, key: string, reasoningEffort?: string) {
+async function reservedWritableJob(
+  t: HarnessConvex,
+  key: string,
+  reasoningEffort?: string,
+  options: Readonly<{ task?: string; model?: "luna" | "terra" | "sol" }> = {},
+) {
   const mission = await testMissionAdmission(t, { key, workerToken: WORKER, repository: REPO });
   const jobId = await t.mutation(api.jobs.enqueueV2, {
-    task: "Implement the exact production runner authority fixture and stop before any untrusted checkout.",
+    task: options.task ?? "Implement the exact production runner authority fixture and stop before any untrusted checkout.",
     repo: REPO,
     readonly: false,
     reasoningEffort,
+    ...(options.model ? { model: options.model } : {}),
     missionId: String(mission.missionId),
     label: "identical mutable runner label",
     workerToken: WORKER,
@@ -945,6 +953,80 @@ describe("production Trigger worker authority harness", () => {
     }));
     expect(state.job).toMatchObject({ status: "pending", attempt: 2 });
     expect(state.attempt).toMatchObject({ status: "checkpointed", workerRunId: "trigger-source-head-race" });
+  });
+
+  it("uses only the immutable Terra/Codex route when a delivery forges a model or provider", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-forged-routing-payload",
+      undefined,
+      {
+        task: "Implement a small typed fixture in the admitted repository.",
+        model: "terra",
+      },
+    );
+    const sealedBeforeRun = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      order: await ctx.db.query("workOrderRevisions")
+        .withIndex("by_job_revision", (q) => q.eq("jobId", jobId).eq("revision", 1))
+        .unique(),
+    }));
+    expect(sealedBeforeRun.job).toMatchObject({ model: "terra", reasoningEffort: "medium" });
+    expect(sealedBeforeRun.order).toMatchObject({
+      minimumModel: "terra",
+      minimumReasoningEffort: "medium",
+      backgroundExecutionProfile: {
+        provider: "codex-subscription",
+        modelTier: "terra",
+      },
+    });
+
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const trace: BoundaryTrace[] = [];
+    const dependencies = injectedRunnerDependencies({ boundaries: trace });
+    // Trigger payloads are transport metadata, not routing authority. Simulate
+    // a malformed/redelivered payload that attempts to spend a higher tier or
+    // switch the runner to an arbitrary provider; neither field exists in the
+    // admitted AgentWorkerPayload contract.
+    const forgedReservation = {
+      ...reservation,
+      model: "sol",
+      reasoningEffort: "max",
+      backgroundExecutionProfile: {
+        version: 2,
+        provider: "untrusted-provider",
+        modelTier: "sol",
+        readonly: false,
+        authority: { external: true, apps: true, secrets: true, network: true },
+        repositoryCapabilities: ["repository_exec"],
+      },
+    } as any;
+
+    expect(await invokeHarness(
+      forgedReservation,
+      "forged-routing-authority-run",
+      dependencies,
+    )).toEqual({ processed: 1 });
+    expect(dependencies.runCloudWorkspaceAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "terra", reasoningEffort: "medium" }),
+    );
+    const executionBoundaries = trace.filter((item) => [
+      "source_checkout",
+      "provider_create",
+      "codex_process",
+      "review_receipt",
+    ].includes(item.effect));
+    expect(executionBoundaries).not.toHaveLength(0);
+    expect(executionBoundaries.every(({ authority }) =>
+      authority.backgroundExecutionProfile?.provider === "codex-subscription"
+      && authority.backgroundExecutionProfile.modelTier === "terra"
+    )).toBe(true);
+    // The post-specialist review is separately authority-fenced, so an
+    // untrusted specialist/Novita response cannot promote itself to delivery.
+    expect(trace.map((item) => item.effect)).toContain("review_receipt");
+    expect(bridge.trace.filter((call) => call.path === "jobs:markVerifiedForDelivery")).toHaveLength(1);
   });
 
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {
