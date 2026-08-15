@@ -31,6 +31,10 @@ const lifecycle = {
   healthPath: "/healthz",
 };
 
+// Produced by `novitaPatchProposerRuntimeConfigDigest` over the reordered
+// fixture below. Python uses this exact cross-language fixture too.
+const REORDERED_TRAILING_SLASH_DIGEST = "308647ce6fb91d0d59f9b1947156afd7c00281db1681604e691b21b252e173b2";
+
 function matchingEnvironment() {
   const raw = { endpointUrl: "https://qwen.endpoint.novita.ai/qwen", lifecycle, ...baseAttestation };
   const parsed = configuredNovitaPatchProposer({ JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify(raw) });
@@ -66,5 +70,35 @@ describe("Novita patch-proposer configuration readiness", () => {
       configured: false,
       code: "runtime_config_digest_mismatch",
     });
+  });
+
+  it("reconstructs nested fields and normalizes the endpoint URL before hashing", () => {
+    const reordered = {
+      requestLimits: { timeoutMs: 30_000, maxTurns: 1, maxOutputTokens: 800, maxInputBytes: 12_000 },
+      endpointAuth: "hmac-sha256-v1",
+      api: "openai-chat-completions",
+      quantization: "gptq-int4",
+      imageDigest: "sha256:c2f3b1b964e47809b722b5e75b61b1e7b39a50f70388cf2bf2418f16a9f31da2",
+      modelRevision: "16e3d0e4df2aa0a4d819c2d6846df4a452e42d83",
+      modelId: "Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4",
+      endpointId: "endpoint_123456",
+      configDigest: "a".repeat(64),
+      adapterId: "novita-qwen-patch-proposer-v1",
+      lifecycle: {
+        healthPath: "/healthz",
+        startupCommand: "python -m adapter.app",
+        gpuNum: 1,
+        maxConcurrent: 1,
+        port: 8080,
+        idleTimeoutSeconds: 600,
+        maxWorkers: 1,
+        minWorkers: 0,
+        provider: "novita-serverless-v1",
+      },
+      endpointUrl: "https://QWEN.ENDPOINT.NOVITA.AI/private-endpoint/",
+    };
+    const parsed = configuredNovitaPatchProposer({ JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify(reordered) });
+    expect(parsed?.endpointUrl).toBe("https://qwen.endpoint.novita.ai/private-endpoint");
+    expect(parsed && novitaPatchProposerRuntimeConfigDigest(parsed)).toBe(REORDERED_TRAILING_SLASH_DIGEST);
   });
 });
