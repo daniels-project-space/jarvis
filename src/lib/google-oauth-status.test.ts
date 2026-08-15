@@ -22,6 +22,15 @@ describe("Google OAuth readiness presentation", () => {
     });
   });
 
+  it("offers a direct recovery path when the saved encrypted connection is unreadable", () => {
+    expect(googleOAuthStatusPresentation("needs_reconnect", "connected")).toMatchObject({
+      label: "reconnect",
+      tone: "attention",
+      action: "reconnect",
+      hint: expect.stringMatching(/cannot read the saved Google connection/i),
+    });
+  });
+
   it("only calls Gmail and Calendar ready after both server and account checks pass", () => {
     expect(googleOAuthStatusPresentation("configured", "connected")).toMatchObject({
       label: "connected ✓",

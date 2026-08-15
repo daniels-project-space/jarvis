@@ -24,6 +24,18 @@ import { hasGoogleScopes } from "./google-scopes";
 
 export class GoogleOAuthError extends Error {}
 
+/**
+ * A non-secret diagnostic of the persisted OAuth connection. This deliberately
+ * decrypts only enough to prove that the current server can read the stored
+ * envelope; it never refreshes a Google access token or contacts Google.
+ */
+export type GoogleOAuthStoredConnectionReadiness =
+  | "not_configured"
+  | "missing"
+  | "readable"
+  | "needs_reconnect"
+  | "unavailable";
+
 const TOKEN_ENVELOPE_SCHEMA = 1 as const;
 const ENVELOPE_AAD = "jarvis/google-oauth-refresh/v1";
 const NONCE_BYTES = 12;
@@ -107,6 +119,39 @@ function isEncryptedConnection(value: unknown): value is { encryptedRefreshToken
     typeof (value as { encryptedRefreshToken?: unknown }).encryptedRefreshToken === "string" &&
     typeof (value as { scope?: unknown }).scope === "string"
   );
+}
+
+/**
+ * Checks whether the server can still read the saved OAuth connection without
+ * exposing its envelope or spending a Google API request. A stored connection
+ * can become unreadable when an operator rotates or mistypes the token
+ * encryption key; surfacing that state in Options is safer than claiming the
+ * account is ready until the next Gmail/Calendar action fails.
+ */
+export async function googleOAuthStoredConnectionReadiness(): Promise<GoogleOAuthStoredConnectionReadiness> {
+  if (!isGoogleOAuthConfigurationReady()) return "not_configured";
+
+  let raw: unknown;
+  try {
+    raw = await controlQuery("googleAuth:getEncryptedConnection", {
+      workerToken: process.env.JARVIS_WORKER_TOKEN,
+    });
+  } catch {
+    // A Convex outage or unavailable worker capability is not evidence that
+    // Daniel needs to reconnect. Keep the recovery affordance disabled until
+    // the trusted store can be checked again.
+    return "unavailable";
+  }
+
+  if (raw == null) return "missing";
+  if (!isEncryptedConnection(raw)) return "needs_reconnect";
+
+  try {
+    decryptGoogleRefreshToken(raw.encryptedRefreshToken);
+    return "readable";
+  } catch {
+    return "needs_reconnect";
+  }
 }
 
 type Credentials = { clientId: string; clientSecret: string; refreshToken: string; scope?: string };

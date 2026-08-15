@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 
-import { isGoogleOAuthConfigurationReady } from "@/lib/google-oauth";
+import { googleOAuthStoredConnectionReadiness, isGoogleOAuthConfigurationReady } from "@/lib/google-oauth";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
 
 export const runtime = "nodejs";
@@ -21,5 +21,10 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (!actor) return noStore({ ok: false }, 401);
   if (!isOwnerActor(actor)) return noStore({ ok: false, error: "owner enrollment required" }, 403);
 
-  return noStore({ ok: true, configured: isGoogleOAuthConfigurationReady() });
+  // This is intentionally a local encrypted-envelope check only. Opening
+  // Options must not refresh a bearer token or contact Google, but it should
+  // not claim an account is usable when the current server cannot decrypt it.
+  const configured = isGoogleOAuthConfigurationReady();
+  const storedConnection = await googleOAuthStoredConnectionReadiness();
+  return noStore({ ok: true, configured, storedConnection });
 }

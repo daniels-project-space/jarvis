@@ -1,4 +1,4 @@
-export type GoogleOAuthServerStatus = "checking" | "configured" | "needs_setup" | "unavailable";
+export type GoogleOAuthServerStatus = "checking" | "configured" | "needs_setup" | "needs_reconnect" | "unavailable";
 
 export type GoogleOAuthConnectionStatus = "checking" | "disconnected" | "connected" | "needs_reconnect";
 
@@ -22,6 +22,13 @@ export function googleOAuthStatusPresentation(
         hint: "Google OAuth needs its production client, secret, and token-encryption key before Gmail or Google Calendar can run.",
         tone: "attention",
         action: "none",
+      };
+    case "needs_reconnect":
+      return {
+        label: "reconnect",
+        hint: "Jarvis cannot read the saved Google connection with the current secure settings. Reconnect Google to restore Gmail and Google Calendar access.",
+        tone: "attention",
+        action: "reconnect",
       };
     case "unavailable":
       return {

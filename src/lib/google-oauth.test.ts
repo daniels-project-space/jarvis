@@ -72,4 +72,37 @@ describe("Google OAuth access-token cache", () => {
     await expect(getGoogleAccessTokenForScopes(["https://www.googleapis.com/auth/calendar.events.owned"])).rejects.toThrow(/Calendar access/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("reports an unreadable saved envelope as reconnectable without refreshing a Google token", async () => {
+    process.env.GOOGLE_CLIENT_ID = "client";
+    process.env.GOOGLE_CLIENT_SECRET = "secret";
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    const { encryptGoogleRefreshToken, googleOAuthStoredConnectionReadiness } = await import("./google-oauth");
+    const encryptedRefreshToken = encryptGoogleRefreshToken("refresh-token");
+    mock.controlQuery.mockResolvedValueOnce({
+      encryptedRefreshToken,
+      scope: "https://www.googleapis.com/auth/gmail.readonly",
+    });
+
+    // Model a safe key rotation/configuration mismatch after the connection
+    // was saved. The readiness probe may inspect the envelope but must not
+    // contact Google or emit an access token.
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 8).toString("base64");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(googleOAuthStoredConnectionReadiness()).resolves.toBe("needs_reconnect");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a transient trusted-store failure distinct from reconnectable credentials", async () => {
+    process.env.GOOGLE_CLIENT_ID = "client";
+    process.env.GOOGLE_CLIENT_SECRET = "secret";
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    mock.controlQuery.mockRejectedValueOnce(new Error("Convex unavailable"));
+
+    const { googleOAuthStoredConnectionReadiness } = await import("./google-oauth");
+
+    await expect(googleOAuthStoredConnectionReadiness()).resolves.toBe("unavailable");
+  });
 });
