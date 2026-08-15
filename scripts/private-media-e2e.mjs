@@ -173,7 +173,7 @@ const videoResult = await uploadAndVerify({
   mimeType: "video/mp4",
   bytes: video,
   assertManifest: (file) => {
-    if (file?.status !== "ready" || !/representative frame ready for visual analysis in chat/i.test(String(file.summary ?? ""))) {
+    if (file?.status !== "ready" || !/(?:representative frame|\d+ timestamped frames) ready for visual analysis in chat/i.test(String(file.summary ?? ""))) {
       throw new Error(`Video did not reach visual-ready ingestion: ${JSON.stringify({ status: file?.status, summary: file?.summary, errorCode: file?.errorCode })}`);
     }
   },
