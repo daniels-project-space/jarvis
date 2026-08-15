@@ -2,6 +2,30 @@ export type GoogleOAuthServerStatus = "checking" | "configured" | "needs_setup" 
 
 export type GoogleOAuthConnectionStatus = "checking" | "disconnected" | "connected" | "needs_reconnect";
 
+/**
+ * Converts the deliberately non-secret server readiness response into the
+ * state consumed by Options. Unknown values fail closed: a temporary server
+ * outage must never make an otherwise stale client connection look ready.
+ */
+export function googleOAuthServerStatusFromReadiness(
+  configured: boolean,
+  storedConnection: unknown,
+): GoogleOAuthServerStatus {
+  if (!configured) return "needs_setup";
+  switch (storedConnection) {
+    case "needs_reconnect":
+      return "needs_reconnect";
+    case "unavailable":
+      return "unavailable";
+    case "readable":
+    case "missing":
+    case "not_configured":
+      return "configured";
+    default:
+      return "unavailable";
+  }
+}
+
 export function googleOAuthStatusPresentation(
   server: GoogleOAuthServerStatus,
   connection: GoogleOAuthConnectionStatus,

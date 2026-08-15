@@ -79,6 +79,7 @@ import { FleetCommandCenter } from "./CompactWorkBar";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { googleOAuthReturnNotice, type GoogleOAuthReturnNotice } from "@/lib/google-oauth-return";
 import {
+  googleOAuthServerStatusFromReadiness,
   googleOAuthStatusPresentation,
   type GoogleOAuthConnectionStatus,
   type GoogleOAuthServerStatus,
@@ -603,11 +604,7 @@ function OptionsPanel({
       .then(async (response) => {
         const body = await response.json().catch(() => null) as { configured?: unknown; storedConnection?: unknown } | null;
         if (!response.ok || typeof body?.configured !== "boolean") throw new Error("Google OAuth status unavailable");
-        setGoogleServerStatus(
-          body.storedConnection === "needs_reconnect"
-            ? "needs_reconnect"
-            : body.configured ? "configured" : "needs_setup",
-        );
+        setGoogleServerStatus(googleOAuthServerStatusFromReadiness(body.configured, body.storedConnection));
       })
       .catch((error) => {
         if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;

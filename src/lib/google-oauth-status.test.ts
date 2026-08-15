@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { googleOAuthStatusPresentation } from "./google-oauth-status";
+import { googleOAuthServerStatusFromReadiness, googleOAuthStatusPresentation } from "./google-oauth-status";
 
 describe("Google OAuth readiness presentation", () => {
   it("does not offer a broken connection flow when server OAuth setup is absent", () => {
@@ -28,6 +28,16 @@ describe("Google OAuth readiness presentation", () => {
       tone: "attention",
       action: "reconnect",
       hint: expect.stringMatching(/cannot read the saved Google connection/i),
+    });
+  });
+
+  it("fails closed when the secure server cannot read stored connection readiness", () => {
+    const server = googleOAuthServerStatusFromReadiness(true, "unavailable");
+    expect(server).toBe("unavailable");
+    expect(googleOAuthStatusPresentation(server, "connected")).toMatchObject({
+      label: "check later",
+      tone: "attention",
+      action: "none",
     });
   });
 
