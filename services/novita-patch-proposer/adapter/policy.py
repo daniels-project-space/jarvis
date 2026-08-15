@@ -12,7 +12,7 @@ import hmac
 import json
 import re
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import quote, urlsplit
 
 
 ADAPTER_ID = "novita-qwen-patch-proposer-v1"
@@ -87,11 +87,25 @@ def _integer(value: object, minimum: int, maximum: int) -> int | None:
     return value if minimum <= value <= maximum else None
 
 
-def _canonical_runtime_config(raw: Mapping[str, Any]) -> str:
-    """Match the explicit insertion order of the TypeScript config digest."""
+def _canonical_runtime_config(raw: Mapping[str, Any], endpoint_url: str) -> str:
+    """Match the reconstructed object and field order of the TypeScript digest."""
+    lifecycle = raw["lifecycle"]
+    limits = raw["requestLimits"]
+    assert isinstance(lifecycle, dict)
+    assert isinstance(limits, dict)
     return json.dumps({
-        "endpointUrl": raw["endpointUrl"],
-        "lifecycle": raw["lifecycle"],
+        "endpointUrl": endpoint_url,
+        "lifecycle": {
+            "provider": lifecycle["provider"],
+            "minWorkers": lifecycle["minWorkers"],
+            "maxWorkers": lifecycle["maxWorkers"],
+            "idleTimeoutSeconds": lifecycle["idleTimeoutSeconds"],
+            "port": lifecycle["port"],
+            "maxConcurrent": lifecycle["maxConcurrent"],
+            "gpuNum": lifecycle["gpuNum"],
+            "startupCommand": lifecycle["startupCommand"],
+            "healthPath": lifecycle["healthPath"],
+        },
         "adapterId": raw["adapterId"],
         "endpointId": raw["endpointId"],
         "modelId": raw["modelId"],
@@ -100,24 +114,42 @@ def _canonical_runtime_config(raw: Mapping[str, Any]) -> str:
         "quantization": raw["quantization"],
         "api": raw["api"],
         "endpointAuth": raw["endpointAuth"],
-        "requestLimits": raw["requestLimits"],
+        "requestLimits": {
+            "maxInputBytes": limits["maxInputBytes"],
+            "maxOutputTokens": limits["maxOutputTokens"],
+            "maxTurns": limits["maxTurns"],
+            "timeoutMs": limits["timeoutMs"],
+        },
     }, separators=(",", ":"), ensure_ascii=False)
 
 
-def _valid_endpoint_url(value: object) -> bool:
+def _normalized_endpoint_url(value: object) -> str | None:
+    """Mirror `new URL(value).toString().replace(/\\/$/, "")` for this sealed URL shape."""
     if not isinstance(value, str) or len(value) > 2_048:
-        return False
-    parsed = urlparse(value)
-    return (
-        parsed.scheme == "https"
-        and bool(parsed.netloc)
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
-        and parsed.path.startswith("/")
-        and (parsed.hostname == "api.novita.ai" or bool(parsed.hostname and parsed.hostname.endswith(".novita.ai")))
-    )
+        return None
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname.lower() if parsed.hostname else ""
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (host != "api.novita.ai" and not host.endswith(".novita.ai"))
+    ):
+        return None
+    # The accepted endpoint format has no authority decoration. Keep the URL
+    # serializer's single trailing-slash removal, rather than `rstrip`, so
+    # paths ending in multiple slashes bind exactly as they do in TypeScript.
+    authority = host if port in (None, 443) else f"{host}:{port}"
+    path = quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+    normalized = f"https://{authority}{path}"
+    return normalized[:-1] if normalized.endswith("/") else normalized
 
 
 def _parse_limits(value: object) -> RequestLimits | None:
@@ -164,8 +196,7 @@ def load_config(environment: Mapping[str, str]) -> AdapterConfig:
     lifecycle = raw["lifecycle"]
     limits = _parse_limits(raw["requestLimits"])
     if (
-        not _valid_endpoint_url(raw["endpointUrl"])
-        or not _exact_keys(lifecycle, _LIFECYCLE_KEYS)
+        not _exact_keys(lifecycle, _LIFECYCLE_KEYS)
         or limits is None
         or raw["adapterId"] != ADAPTER_ID
         or raw["quantization"] != "gptq-int4"
@@ -179,6 +210,9 @@ def load_config(environment: Mapping[str, str]) -> AdapterConfig:
     ):
         raise PolicyViolation("invalid_attestation")
     assert isinstance(lifecycle, dict)
+    endpoint_url = _normalized_endpoint_url(raw["endpointUrl"])
+    if endpoint_url is None:
+        raise PolicyViolation("invalid_attestation")
     if (
         lifecycle["provider"] != "novita-serverless-v1"
         or type(lifecycle["minWorkers"]) is not int or lifecycle["minWorkers"] != 0
@@ -193,7 +227,7 @@ def load_config(environment: Mapping[str, str]) -> AdapterConfig:
         or "//" in lifecycle["healthPath"]
     ):
         raise PolicyViolation("invalid_lifecycle")
-    digest = sha256(_canonical_runtime_config(raw).encode("utf-8")).hexdigest()
+    digest = sha256(_canonical_runtime_config(raw, endpoint_url).encode("utf-8")).hexdigest()
     if not hmac.compare_digest(digest, raw["configDigest"]):
         raise PolicyViolation("attestation_digest_mismatch")
     image_digest = environment.get("JARVIS_NOVITA_ADAPTER_IMAGE_DIGEST", "")
