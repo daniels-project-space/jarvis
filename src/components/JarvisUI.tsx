@@ -83,6 +83,7 @@ import {
   type GoogleOAuthConnectionStatus,
   type GoogleOAuthServerStatus,
 } from "@/lib/google-oauth-status";
+import { hubActionsStatusPresentation, type HubActionsStatus } from "@/lib/hub-actions-status";
 import { hubContextStatusPresentation, type HubContextStatus } from "@/lib/hub-context-status";
 import {
   controllerSessionStatusPresentation,
@@ -619,21 +620,31 @@ function OptionsPanel({
         : "needs_reconnect";
   const googleConnection = googleOAuthStatusPresentation(googleServerStatus, googleConnectionStatus);
   const [hubContextStatus, setHubContextStatus] = useState<HubContextStatus>("checking");
+  const [hubActionsStatus, setHubActionsStatus] = useState<HubActionsStatus>("checking");
   useEffect(() => {
     const controller = new AbortController();
     void viewerFetch("/api/hub-context/status", { cache: "no-store", signal: controller.signal })
       .then(async (response) => {
-        const body = await response.json().catch(() => null) as { configured?: unknown } | null;
+        const body = await response.json().catch(() => null) as { configured?: unknown; actionsConfigured?: unknown } | null;
         if (!response.ok || typeof body?.configured !== "boolean") throw new Error("Hub context status unavailable");
         setHubContextStatus(body.configured ? "configured" : "needs_setup");
+        // Keep context truthful while a rolling server release briefly lacks
+        // the newer field. Never infer action access from context access.
+        setHubActionsStatus(
+          typeof body.actionsConfigured === "boolean"
+            ? body.actionsConfigured ? "configured" : "needs_setup"
+            : "unavailable",
+        );
       })
       .catch((error) => {
         if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
         setHubContextStatus("unavailable");
+        setHubActionsStatus("unavailable");
       });
     return () => controller.abort();
   }, []);
   const hubContext = hubContextStatusPresentation(hubContextStatus);
+  const hubActions = hubActionsStatusPresentation(hubActionsStatus);
   const controllerSession = controllerSessionStatusPresentation(
     controllerSessionReadiness?.state === "repair_required"
       ? "repair_required"
@@ -743,6 +754,11 @@ function OptionsPanel({
           <Row label="Project Hub context" hint={hubContext.hint}>
             <span className={`rounded-lg border px-3 py-1 text-[11px] ${hubContext.tone === "ready" ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : hubContext.tone === "attention" ? "border-amber-300/30 bg-amber-300/10 text-amber-100" : "border-white/10 bg-black/20 text-slate"}`}>
               {hubContext.label}
+            </span>
+          </Row>
+          <Row label="Project Hub to-dos" hint={hubActions.hint}>
+            <span className={`rounded-lg border px-3 py-1 text-[11px] ${hubActions.tone === "ready" ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : hubActions.tone === "attention" ? "border-amber-300/30 bg-amber-300/10 text-amber-100" : "border-white/10 bg-black/20 text-slate"}`}>
+              {hubActions.label}
             </span>
           </Row>
           <Row label="Novita code drafts" hint={novitaPatchProposer.hint}>

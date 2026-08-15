@@ -22,24 +22,36 @@ describe("Project Hub context status API", () => {
   });
   afterEach(() => vi.unstubAllEnvs());
 
-  it("returns only the dedicated-capability readiness to the owner", async () => {
+  it("returns separate dedicated context and action capability readiness to the owner", async () => {
     vi.stubEnv("JARVIS_HUB_CONTEXT_TOKEN", "dedicated-jarvis-context-token");
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
 
     const response = await GET(request());
 
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("private, no-store");
-    expect(await response.json()).toEqual({ ok: true, configured: true });
+    expect(await response.json()).toEqual({ ok: true, configured: true, actionsConfigured: true });
   });
 
-  it("reports setup is needed without falling back to the broad vault credential", async () => {
+  it("reports each missing scoped capability without falling back to the broad vault credential", async () => {
     vi.stubEnv("JARVIS_HUB_CONTEXT_TOKEN", "");
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "");
     vi.stubEnv("VAULT_ACCESS_TOKEN", "broad-vault-token-must-not-be-used");
 
     const response = await GET(request());
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, configured: false });
+    expect(await response.json()).toEqual({ ok: true, configured: false, actionsConfigured: false });
+  });
+
+  it("never infers action access from an independent context capability", async () => {
+    vi.stubEnv("JARVIS_HUB_CONTEXT_TOKEN", "dedicated-jarvis-context-token");
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "");
+    vi.stubEnv("VAULT_ACCESS_TOKEN", "broad-vault-token-must-not-be-used");
+
+    const response = await GET(request());
+
+    expect(await response.json()).toEqual({ ok: true, configured: true, actionsConfigured: false });
   });
 
   it("refuses unauthenticated and guest status reads", async () => {

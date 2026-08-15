@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import { hubActionsReadiness } from "@/lib/hub-actions";
 import { hubContextReadiness } from "@/lib/hub-context";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
 
@@ -21,5 +22,12 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (!actor) return noStore({ ok: false }, 401);
   if (!isOwnerActor(actor)) return noStore({ ok: false, error: "owner enrollment required" }, 403);
 
-  return noStore({ ok: true, ...hubContextReadiness() });
+  // Context and actions deliberately use separate capabilities. Report each
+  // presence independently so the owner never mistakes read-only context for
+  // permission to mirror reminders or change a Hub to-do.
+  return noStore({
+    ok: true,
+    ...hubContextReadiness(),
+    actionsConfigured: hubActionsReadiness().configured,
+  });
 }
