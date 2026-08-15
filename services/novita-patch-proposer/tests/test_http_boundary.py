@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adapter import app as adapter_app  # noqa: E402
 from adapter.runtime import ModelRuntime  # noqa: E402
-from test_policy import environment, request_body  # noqa: E402
+from test_policy import endpoint_bearer, environment, request_body  # noqa: E402
 
 
 class HttpBoundaryTests(unittest.TestCase):
@@ -31,7 +31,7 @@ class HttpBoundaryTests(unittest.TestCase):
                     "/v1/chat/completions",
                     content=request_body(tools=[]),
                     headers={
-                        "authorization": "Bearer " + "A" * 43,
+                        "authorization": "Bearer " + endpoint_bearer(),
                         "content-type": "application/json",
                     },
                 )

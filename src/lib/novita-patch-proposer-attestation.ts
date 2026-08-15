@@ -6,6 +6,10 @@ import { isOwnedRepositoryScope } from "./workflow-contract";
  * The URL is deployment configuration, never part of a work-order record.
  */
 export const NOVITA_PATCH_PROPOSER_ADAPTER_ID = "novita-qwen-patch-proposer-v1" as const;
+export const NOVITA_PATCH_PROPOSER_PORT = 8080 as const;
+export const NOVITA_PATCH_PROPOSER_MAX_CONCURRENT = 1 as const;
+export const NOVITA_PATCH_PROPOSER_GPU_NUM = 1 as const;
+export const NOVITA_PATCH_PROPOSER_STARTUP_COMMAND = "python -m adapter.app" as const;
 
 export type NovitaPatchProposerLimits = Readonly<{
   maxInputBytes: number;
@@ -24,6 +28,10 @@ export type NovitaPatchProposerLifecycle = Readonly<{
   minWorkers: 0;
   maxWorkers: 1;
   idleTimeoutSeconds: number;
+  port: typeof NOVITA_PATCH_PROPOSER_PORT;
+  maxConcurrent: typeof NOVITA_PATCH_PROPOSER_MAX_CONCURRENT;
+  gpuNum: typeof NOVITA_PATCH_PROPOSER_GPU_NUM;
+  startupCommand: typeof NOVITA_PATCH_PROPOSER_STARTUP_COMMAND;
   healthPath: string;
 }>;
 
@@ -63,7 +71,17 @@ const ATTESTATION_KEYS = new Set([
 
 const RUNTIME_CONFIG_KEYS = new Set(["endpointUrl", "lifecycle", ...ATTESTATION_KEYS]);
 const LIMIT_KEYS = new Set(["maxInputBytes", "maxOutputTokens", "maxTurns", "timeoutMs"]);
-const LIFECYCLE_KEYS = new Set(["provider", "minWorkers", "maxWorkers", "idleTimeoutSeconds", "healthPath"]);
+const LIFECYCLE_KEYS = new Set([
+  "provider",
+  "minWorkers",
+  "maxWorkers",
+  "idleTimeoutSeconds",
+  "port",
+  "maxConcurrent",
+  "gpuNum",
+  "startupCommand",
+  "healthPath",
+]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const MODEL_REVISION = /^[a-f0-9]{40,64}$/;
 const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -103,6 +121,10 @@ function resolvedLifecycle(value: unknown): NovitaPatchProposerLifecycle | null 
     || value.minWorkers !== 0
     || value.maxWorkers !== 1
     || !idleTimeoutSeconds
+    || value.port !== NOVITA_PATCH_PROPOSER_PORT
+    || value.maxConcurrent !== NOVITA_PATCH_PROPOSER_MAX_CONCURRENT
+    || value.gpuNum !== NOVITA_PATCH_PROPOSER_GPU_NUM
+    || value.startupCommand !== NOVITA_PATCH_PROPOSER_STARTUP_COMMAND
     || typeof value.healthPath !== "string"
     || !/^\/[A-Za-z0-9._~!$&'()*+,;=:@/%-]{0,255}$/.test(value.healthPath)
     || value.healthPath.includes("//")) return null;
@@ -111,6 +133,10 @@ function resolvedLifecycle(value: unknown): NovitaPatchProposerLifecycle | null 
     minWorkers: 0,
     maxWorkers: 1,
     idleTimeoutSeconds,
+    port: NOVITA_PATCH_PROPOSER_PORT,
+    maxConcurrent: NOVITA_PATCH_PROPOSER_MAX_CONCURRENT,
+    gpuNum: NOVITA_PATCH_PROPOSER_GPU_NUM,
+    startupCommand: NOVITA_PATCH_PROPOSER_STARTUP_COMMAND,
     healthPath: value.healthPath,
   });
 }

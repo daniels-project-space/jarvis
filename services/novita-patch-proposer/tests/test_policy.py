@@ -27,6 +27,10 @@ def runtime_config() -> dict[str, object]:
             "minWorkers": 0,
             "maxWorkers": 1,
             "idleTimeoutSeconds": 600,
+            "port": 8080,
+            "maxConcurrent": 1,
+            "gpuNum": 1,
+            "startupCommand": "python -m adapter.app",
             "healthPath": "/healthz",
         },
         "adapterId": "novita-qwen-patch-proposer-v1",
@@ -43,12 +47,18 @@ def runtime_config() -> dict[str, object]:
     return value
 
 
+def endpoint_bearer(config: object | None = None) -> str:
+    value = runtime_config() if config is None else config
+    assert isinstance(value, dict)
+    return "jnpb1." + str(value["endpointId"]) + "." + "A" * 43
+
+
 def environment() -> dict[str, str]:
     config = runtime_config()
     return {
         "JARVIS_NOVITA_QWEN_ATTESTATION": json.dumps(config),
         "JARVIS_NOVITA_ADAPTER_IMAGE_DIGEST": str(config["imageDigest"]),
-        "JARVIS_NOVITA_ENDPOINT_BEARER": "A" * 43,
+        "JARVIS_NOVITA_ENDPOINT_BEARER": endpoint_bearer(config),
     }
 
 
@@ -89,8 +99,18 @@ class PolicyTests(unittest.TestCase):
     def test_loads_same_digest_as_typescript_runtime_config(self) -> None:
         config = load_config(environment())
         self.assertEqual(config.model_id, runtime_config()["modelId"])
-        self.assertTrue(authorizes("Bearer " + "A" * 43, config))
-        self.assertFalse(authorizes("Bearer " + "B" * 43, config))
+        self.assertTrue(authorizes("Bearer " + endpoint_bearer(), config))
+        self.assertFalse(authorizes("Bearer jnpb1.endpoint_123456." + "B" * 43, config))
+
+    def test_refuses_raw_provider_key_as_an_endpoint_bearer(self) -> None:
+        raw_key = environment()
+        raw_key["JARVIS_NOVITA_ENDPOINT_BEARER"] = "nvapi-this-is-a-provider-account-key"
+        with self.assertRaisesRegex(PolicyViolation, "invalid_endpoint_bearer"):
+            load_config(raw_key)
+        wrong_endpoint = environment()
+        wrong_endpoint["JARVIS_NOVITA_ENDPOINT_BEARER"] = "jnpb1.endpoint_other." + "A" * 43
+        with self.assertRaisesRegex(PolicyViolation, "invalid_endpoint_bearer"):
+            load_config(wrong_endpoint)
 
     def test_fails_closed_on_digest_or_image_identity_drift(self) -> None:
         bad_digest = environment()
@@ -116,6 +136,17 @@ class PolicyTests(unittest.TestCase):
         bad_lifecycle["JARVIS_NOVITA_QWEN_ATTESTATION"] = json.dumps(raw)
         with self.assertRaisesRegex(PolicyViolation, "invalid_lifecycle"):
             load_config(bad_lifecycle)
+        bad_startup = environment()
+        raw = json.loads(bad_startup["JARVIS_NOVITA_QWEN_ATTESTATION"])
+        raw["lifecycle"]["startupCommand"] = "bash -c unsafe"
+        digest_input = {key: raw[key] for key in (
+            "endpointUrl", "lifecycle", "adapterId", "endpointId", "modelId", "modelRevision",
+            "imageDigest", "quantization", "api", "endpointAuth", "requestLimits",
+        )}
+        raw["configDigest"] = hashlib.sha256(json.dumps(digest_input, separators=(",", ":")).encode()).hexdigest()
+        bad_startup["JARVIS_NOVITA_QWEN_ATTESTATION"] = json.dumps(raw)
+        with self.assertRaisesRegex(PolicyViolation, "invalid_lifecycle"):
+            load_config(bad_startup)
 
     def test_rejects_tool_shell_and_secret_request_surfaces(self) -> None:
         config = load_config(environment())

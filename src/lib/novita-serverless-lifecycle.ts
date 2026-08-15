@@ -51,6 +51,11 @@ function sameEndpointUrl(left: string, right: string): boolean {
   }
 }
 
+function endpointPort(value: unknown): number | null {
+  if (!Array.isArray(value) || value.length !== 1 || !isRecord(value[0])) return null;
+  return positiveInteger(value[0].port);
+}
+
 async function boundedJson(response: Response): Promise<unknown | "too_large" | null> {
   const declaredLength = Number(response.headers.get("content-length") ?? "");
   if (Number.isFinite(declaredLength) && declaredLength > RESPONSE_MAX_BYTES) return "too_large";
@@ -133,8 +138,8 @@ export async function verifyNovitaServerlessLifecycle(input: Readonly<{
   if (typeof endpoint.url !== "string" || !sameEndpointUrl(endpoint.url, input.config.endpointUrl)) {
     return Object.freeze({ status: "unavailable" as const, reason: "endpoint_url_mismatch" });
   }
-  const image = isRecord(endpoint.image) ? endpoint.image.image : undefined;
-  if (typeof image !== "string" || !image.includes(input.config.attestation.imageDigest)) {
+  const image = isRecord(endpoint.image) ? endpoint.image : null;
+  if (!image || typeof image.image !== "string" || !image.image.includes(input.config.attestation.imageDigest)) {
     return Object.freeze({ status: "unavailable" as const, reason: "image_digest_mismatch" });
   }
   const workerConfig = isRecord(endpoint.workerConfig) ? endpoint.workerConfig : null;
@@ -144,6 +149,10 @@ export async function verifyNovitaServerlessLifecycle(input: Readonly<{
     || positiveInteger(workerConfig.minNum) !== lifecycle.minWorkers
     || positiveInteger(workerConfig.maxNum) !== lifecycle.maxWorkers
     || positiveInteger(workerConfig.freeTimeout) !== lifecycle.idleTimeoutSeconds
+    || positiveInteger(workerConfig.maxConcurrent) !== lifecycle.maxConcurrent
+    || positiveInteger(workerConfig.gpuNum) !== lifecycle.gpuNum
+    || endpointPort(endpoint.ports) !== lifecycle.port
+    || image.command !== lifecycle.startupCommand
     || !health || health.path !== lifecycle.healthPath) {
     return Object.freeze({ status: "unavailable" as const, reason: "lifecycle_config_mismatch" });
   }

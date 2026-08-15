@@ -12,6 +12,10 @@ function config() {
       minWorkers: 0,
       maxWorkers: 1,
       idleTimeoutSeconds: 600,
+      port: 8080,
+      maxConcurrent: 1,
+      gpuNum: 1,
+      startupCommand: "python -m adapter.app",
       healthPath: "/healthz",
     },
     adapterId: "novita-qwen-patch-proposer-v1",
@@ -35,8 +39,18 @@ function endpoint(overrides: Record<string, unknown> = {}) {
   return {
     id: runtime.attestation.endpointId,
     url: runtime.endpointUrl,
-    image: { image: `registry.example/jarvis-qwen@${runtime.attestation.imageDigest}` },
-    workerConfig: { minNum: "0", maxNum: 1, freeTimeout: "600" },
+    image: {
+      image: `registry.example/jarvis-qwen@${runtime.attestation.imageDigest}`,
+      command: runtime.lifecycle.startupCommand,
+    },
+    ports: [{ port: String(runtime.lifecycle.port) }],
+    workerConfig: {
+      minNum: "0",
+      maxNum: 1,
+      freeTimeout: "600",
+      maxConcurrent: "1",
+      gpuNum: 1,
+    },
     healthy: { path: runtime.lifecycle.healthPath },
     state: { state: "running" },
     workers: [],
@@ -70,6 +84,24 @@ describe("Novita serverless lifecycle verifier", () => {
 
     const scaleDrift = vi.fn().mockResolvedValue(Response.json({ endpoints: [endpoint({ workerConfig: { minNum: 1, maxNum: 2, freeTimeout: 900 } })] }));
     await expect(verifyNovitaServerlessLifecycle({ config: config(), apiKey: "key", fetchImpl: scaleDrift }))
+      .resolves.toEqual({ status: "unavailable", reason: "lifecycle_config_mismatch" });
+  });
+
+  it("fails closed before model egress when startup command, port, or worker capacity drifts", async () => {
+    const commandDrift = vi.fn().mockResolvedValue(Response.json({ endpoints: [endpoint({
+      image: { image: `registry.example/jarvis-qwen@${config().attestation.imageDigest}`, command: "python -m other.app" },
+    })] }));
+    await expect(verifyNovitaServerlessLifecycle({ config: config(), apiKey: "key", fetchImpl: commandDrift }))
+      .resolves.toEqual({ status: "unavailable", reason: "lifecycle_config_mismatch" });
+
+    const portDrift = vi.fn().mockResolvedValue(Response.json({ endpoints: [endpoint({ ports: [{ port: "9090" }] })] }));
+    await expect(verifyNovitaServerlessLifecycle({ config: config(), apiKey: "key", fetchImpl: portDrift }))
+      .resolves.toEqual({ status: "unavailable", reason: "lifecycle_config_mismatch" });
+
+    const capacityDrift = vi.fn().mockResolvedValue(Response.json({ endpoints: [endpoint({
+      workerConfig: { minNum: 0, maxNum: 1, freeTimeout: 600, maxConcurrent: 2, gpuNum: 2 },
+    })] }));
+    await expect(verifyNovitaServerlessLifecycle({ config: config(), apiKey: "key", fetchImpl: capacityDrift }))
       .resolves.toEqual({ status: "unavailable", reason: "lifecycle_config_mismatch" });
   });
 

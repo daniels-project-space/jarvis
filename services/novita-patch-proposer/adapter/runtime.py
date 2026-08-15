@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import subprocess
 from typing import Final
@@ -22,6 +21,19 @@ from .policy import AdapterConfig
 UPSTREAM_BASE: Final = "http://127.0.0.1:8001"
 UPSTREAM_HEALTH: Final = f"{UPSTREAM_BASE}/health"
 UPSTREAM_COMPLETIONS: Final = f"{UPSTREAM_BASE}/v1/chat/completions"
+VLLM_PROCESS_ENVIRONMENT: Final = {
+    "HOME": "/home/jarvis",
+    "PATH": "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1",
+}
+
+
+def vllm_environment() -> dict[str, str]:
+    """Return the complete child environment; never inherit adapter secrets."""
+    return dict(VLLM_PROCESS_ENVIRONMENT)
 
 
 def vllm_command(config: AdapterConfig) -> list[str]:
@@ -52,8 +64,9 @@ class ModelRuntime:
         if self.process is not None:
             return
         Path("/models").mkdir(parents=True, exist_ok=True)
-        # Environment is inherited to permit a read-only Hugging Face token for
-        # model download when needed; it is never inserted into argv or output.
+        # Never inherit the adapter environment. In particular, the endpoint
+        # bearer, full attestation, account credential, and any HF/token value
+        # are unavailable to the model subprocess.
         self.process = subprocess.Popen(
             vllm_command(self.config),
             stdin=subprocess.DEVNULL,
@@ -61,7 +74,7 @@ class ModelRuntime:
             stderr=None,
             close_fds=True,
             shell=False,
-            env=dict(os.environ),
+            env=vllm_environment(),
         )
 
     def running(self) -> bool:

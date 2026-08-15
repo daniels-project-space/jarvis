@@ -24,6 +24,10 @@ const lifecycle = {
   minWorkers: 0 as const,
   maxWorkers: 1 as const,
   idleTimeoutSeconds: 600,
+  port: 8080 as const,
+  maxConcurrent: 1 as const,
+  gpuNum: 1 as const,
+  startupCommand: "python -m adapter.app" as const,
   healthPath: "/healthz",
 };
 

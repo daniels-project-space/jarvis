@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { NovitaPatchProposerAttestation } from "../lib/novita-patch-proposer-attestation";
 import {
   derivedNovitaEndpointBearer,
+  isDerivedNovitaEndpointBearer,
+  NOVITA_DERIVED_ENDPOINT_BEARER_PREFIX,
   parseNovitaPatchProposal,
   requestNovitaPatchProposal,
 } from "./novita-qwen-patch-proposer";
@@ -16,6 +18,10 @@ function runtimeConfig() {
       minWorkers: 0,
       maxWorkers: 1,
       idleTimeoutSeconds: 600,
+      port: 8080,
+      maxConcurrent: 1,
+      gpuNum: 1,
+      startupCommand: "python -m adapter.app",
       healthPath: "/healthz",
     },
     adapterId: "novita-qwen-patch-proposer-v1",
@@ -50,8 +56,12 @@ function sealedEndpointList() {
     endpoints: [{
       id: config.endpointId,
       url: config.endpointUrl,
-      image: { image: `registry.example/jarvis-qwen@${config.imageDigest}` },
-      workerConfig: { minNum: 0, maxNum: "1", freeTimeout: 600 },
+      image: {
+        image: `registry.example/jarvis-qwen@${config.imageDigest}`,
+        command: config.lifecycle.startupCommand,
+      },
+      ports: [{ port: String(config.lifecycle.port) }],
+      workerConfig: { minNum: 0, maxNum: "1", freeTimeout: 600, maxConcurrent: 1, gpuNum: 1 },
       healthy: { path: config.lifecycle.healthPath },
       state: { state: "running" },
       workers: [],
@@ -95,6 +105,10 @@ describe("Novita Qwen patch proposer", () => {
     expect(init).toMatchObject({ method: "POST", redirect: "error" });
     expect(init.headers.authorization).toBe(`Bearer ${derivedNovitaEndpointBearer("secret-not-in-result", attestation())}`);
     expect(init.headers.authorization).not.toContain("secret-not-in-result");
+    const derived = derivedNovitaEndpointBearer("secret-not-in-result", attestation());
+    expect(derived).toMatch(new RegExp(`^${NOVITA_DERIVED_ENDPOINT_BEARER_PREFIX}\\.${attestation().endpointId}\\.[A-Za-z0-9_-]{43}$`));
+    expect(isDerivedNovitaEndpointBearer(derived, attestation())).toBe(true);
+    expect(isDerivedNovitaEndpointBearer("nvapi-raw-provider-account-key", attestation())).toBe(false);
     expect(JSON.parse(init.body)).toMatchObject({
       model: "Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4",
       max_tokens: 800,
@@ -167,8 +181,12 @@ describe("Novita Qwen patch proposer", () => {
       endpoints: [{
         id: attestation().endpointId,
         url: "https://qwen.endpoint.novita.ai/other-path",
-        image: { image: `registry.example/jarvis-qwen@${attestation().imageDigest}` },
-        workerConfig: { minNum: 0, maxNum: 1, freeTimeout: 600 },
+        image: {
+          image: `registry.example/jarvis-qwen@${attestation().imageDigest}`,
+          command: "python -m adapter.app",
+        },
+        ports: [{ port: "8080" }],
+        workerConfig: { minNum: 0, maxNum: 1, freeTimeout: 600, maxConcurrent: 1, gpuNum: 1 },
         healthy: { path: "/healthz" },
         workers: [],
       }],
@@ -183,6 +201,36 @@ describe("Novita Qwen patch proposer", () => {
     });
 
     expect(result).toEqual({ status: "unavailable", reason: "lifecycle_endpoint_url_mismatch" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(String(fetchImpl.mock.calls[0][0])).toBe("https://api.novita.ai/gpu-instance/openapi/v1/endpoints");
+  });
+
+  it("fails closed before the custom model request when sealed startup metadata drifts", async () => {
+    const config = runtimeConfig();
+    const fetchImpl = vi.fn().mockResolvedValue(Response.json({
+      endpoints: [{
+        id: config.endpointId,
+        url: config.endpointUrl,
+        image: {
+          image: `registry.example/jarvis-qwen@${config.imageDigest}`,
+          command: "python -m other.app",
+        },
+        ports: [{ port: "8080" }],
+        workerConfig: { minNum: 0, maxNum: 1, freeTimeout: 600, maxConcurrent: 1, gpuNum: 1 },
+        healthy: { path: "/healthz" },
+        workers: [],
+      }],
+    }));
+    const result = await requestNovitaPatchProposal({
+      attestation: attestation(),
+      task: "Fix src/example.ts.",
+      files: [{ path: "src/example.ts", content: "export const value = 1;\n" }],
+      getApiKey: vi.fn().mockResolvedValue("control-key"),
+      environment: environment(),
+      fetchImpl,
+    });
+
+    expect(result).toEqual({ status: "unavailable", reason: "lifecycle_lifecycle_config_mismatch" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(String(fetchImpl.mock.calls[0][0])).toBe("https://api.novita.ai/gpu-instance/openapi/v1/endpoints");
   });
