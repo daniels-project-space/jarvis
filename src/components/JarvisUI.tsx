@@ -601,9 +601,13 @@ function OptionsPanel({
     const controller = new AbortController();
     void viewerFetch("/api/google/status", { cache: "no-store", signal: controller.signal })
       .then(async (response) => {
-        const body = await response.json().catch(() => null) as { configured?: unknown } | null;
+        const body = await response.json().catch(() => null) as { configured?: unknown; storedConnection?: unknown } | null;
         if (!response.ok || typeof body?.configured !== "boolean") throw new Error("Google OAuth status unavailable");
-        setGoogleServerStatus(body.configured ? "configured" : "needs_setup");
+        setGoogleServerStatus(
+          body.storedConnection === "needs_reconnect"
+            ? "needs_reconnect"
+            : body.configured ? "configured" : "needs_setup",
+        );
       })
       .catch((error) => {
         if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;

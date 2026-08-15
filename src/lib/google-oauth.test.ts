@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mock = vi.hoisted(() => ({
-  controlQuery: vi.fn(async () => {
+  controlQuery: vi.fn(async (): Promise<unknown> => {
     throw new Error("no stored connection in this test");
   }),
 }));
