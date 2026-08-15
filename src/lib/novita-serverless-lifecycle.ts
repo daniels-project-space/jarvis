@@ -7,6 +7,10 @@ const NOVITA_ENDPOINTS_URL = "https://api.novita.ai/gpu-instance/openapi/v1/endp
 const RESPONSE_MAX_BYTES = 1_000_000;
 const CONTROL_PLANE_TIMEOUT_MS = 12_000;
 const NOVITA_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
+// A digest pin is only meaningful when it is the terminal identity of an
+// untagged OCI-style image reference. In particular, do not accept an
+// attested digest merely occurring inside a mutable tag or another suffix.
+const CONTENT_ADDRESSED_IMAGE_REFERENCE = /^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@(?<digest>sha256:[a-f0-9]{64})$/;
 
 export type NovitaServerlessLifecycleCheck = Readonly<{
   status: "ready" | "idle";
@@ -54,6 +58,11 @@ function sameEndpointUrl(left: string, right: string): boolean {
 function endpointPort(value: unknown): number | null {
   if (!Array.isArray(value) || value.length !== 1 || !isRecord(value[0])) return null;
   return positiveInteger(value[0].port);
+}
+
+function isExactAttestedImageReference(value: unknown, expectedDigest: string): boolean {
+  if (typeof value !== "string") return false;
+  return CONTENT_ADDRESSED_IMAGE_REFERENCE.exec(value)?.groups?.digest === expectedDigest;
 }
 
 async function boundedJson(response: Response): Promise<unknown | "too_large" | null> {
@@ -139,7 +148,7 @@ export async function verifyNovitaServerlessLifecycle(input: Readonly<{
     return Object.freeze({ status: "unavailable" as const, reason: "endpoint_url_mismatch" });
   }
   const image = isRecord(endpoint.image) ? endpoint.image : null;
-  if (!image || typeof image.image !== "string" || !image.image.includes(input.config.attestation.imageDigest)) {
+  if (!image || !isExactAttestedImageReference(image.image, input.config.attestation.imageDigest)) {
     return Object.freeze({ status: "unavailable" as const, reason: "image_digest_mismatch" });
   }
   const workerConfig = isRecord(endpoint.workerConfig) ? endpoint.workerConfig : null;

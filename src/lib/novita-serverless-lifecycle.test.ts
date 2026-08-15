@@ -87,6 +87,24 @@ describe("Novita serverless lifecycle verifier", () => {
       .resolves.toEqual({ status: "unavailable", reason: "lifecycle_config_mismatch" });
   });
 
+  it("rejects tags, lookalikes, and suffixes around an otherwise attested image digest", async () => {
+    const runtime = config();
+    const digest = runtime.attestation.imageDigest;
+    const invalidReferences = [
+      `registry.example/jarvis-qwen:latest-${digest}`,
+      `registry.example/jarvis-qwen:latest@${digest}`,
+      `registry.example/jarvis-qwen@${digest}:previous`,
+    ];
+
+    for (const imageReference of invalidReferences) {
+      const fetchImpl = vi.fn().mockResolvedValue(Response.json({ endpoints: [endpoint({
+        image: { image: imageReference, command: runtime.lifecycle.startupCommand },
+      })] }));
+      await expect(verifyNovitaServerlessLifecycle({ config: runtime, apiKey: "key", fetchImpl }))
+        .resolves.toEqual({ status: "unavailable", reason: "image_digest_mismatch" });
+    }
+  });
+
   it("fails closed before model egress when startup command, port, or worker capacity drifts", async () => {
     const commandDrift = vi.fn().mockResolvedValue(Response.json({ endpoints: [endpoint({
       image: { image: `registry.example/jarvis-qwen@${config().attestation.imageDigest}`, command: "python -m other.app" },
