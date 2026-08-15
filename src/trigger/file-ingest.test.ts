@@ -88,6 +88,23 @@ function storedVideo() {
   };
 }
 
+function readySpreadsheet() {
+  return {
+    sha256: SHA256,
+    detectedMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    status: "ready" as const,
+    summary: "Excel workbook · 2 sheets · 5 cells indexed",
+    text: "[Booked stay · A1:B2]\nA1: City | B1: Venice\nA2: Cost | B2: 2645",
+    chunks: [{
+      ordinal: 0,
+      text: "A1: City | B1: Venice\nA2: Cost | B2: 2645",
+      sheet: "Booked stay",
+      cellRange: "A1:B2",
+    }],
+    sheetNames: ["Booked stay", "Flights"],
+  };
+}
+
 function analyzedMedia(source: ReturnType<typeof storedVideo>, analysis: {
   preview?: { bytes: Uint8Array; contentType: "image/webp" };
   transcription?: { provider: "local-faster-whisper"; text: string };
@@ -172,6 +189,27 @@ describe("private media file ingest", () => {
         preview: expect.objectContaining({ timestamps: [0.1, 0.4, 0.7, 0.9] }),
       }),
     );
+  });
+
+  it("persists an XLSX's private extracted text and sheet/cell provenance for chat context", async () => {
+    const { calls } = configureConvex();
+    mocks.extractPrivateFile.mockResolvedValue(readySpreadsheet());
+
+    await expect(runFileIngest({ fileId: "file-1", ingestVersion: 1 })).resolves.toMatchObject({ status: "ready" });
+
+    expect(mocks.privateR2Put).toHaveBeenCalledWith(
+      "owners/daniel/files/file-1/v1/extracted.txt",
+      "[Booked stay · A1:B2]\nA1: City | B1: Venice\nA2: Cost | B2: 2645",
+      "text/plain",
+    );
+    const completion = calls.find((call) => call.path === "files:completeIngest");
+    expect(completion?.args).toMatchObject({
+      detectedMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      sheetNames: ["Booked stay", "Flights"],
+      chunks: [expect.objectContaining({ sheet: "Booked stay", cellRange: "A1:B2" })],
+    });
+    expect(mocks.extractVideoPreview).not.toHaveBeenCalled();
+    expect(mocks.transcribePrivateMedia).not.toHaveBeenCalled();
   });
 
   it("removes every derived media object when completion loses its claim", async () => {

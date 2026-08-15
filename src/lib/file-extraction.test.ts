@@ -25,6 +25,50 @@ async function realDocxFixture(): Promise<Uint8Array> {
   return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
 }
 
+async function realXlsxFixture(): Promise<Uint8Array> {
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+      <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+      <Default Extension="xml" ContentType="application/xml"/>
+      <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+      <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+      <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+      <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+    </Types>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+    </Relationships>`);
+  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+      <sheets>
+        <sheet name="Booked stay" sheetId="1" r:id="rId1"/>
+        <sheet name="Flights" sheetId="2" r:id="rId2"/>
+      </sheets>
+    </workbook>`);
+  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+      <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+    </Relationships>`);
+  zip.file("xl/sharedStrings.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">
+      <si><t>City</t></si><si><t>Revenue</t></si><si><r><t>Ven</t></r><r><t>ice</t></r></si>
+    </sst>`);
+  zip.file("xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+      <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+      <row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>2645</v></c></row>
+      <row r="3"><c r="A3" t="b"><v>1</v></c><c r="B3"><f>SUM(B2:B2)</f><v>2645</v></c></row>
+    </sheetData></worksheet>`);
+  zip.file("xl/worksheets/sheet2.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+      <row r="1"><c r="A1" t="inlineStr"><is><t>Flight leaves 10:30</t></is></c></row>
+    </sheetData></worksheet>`);
+  return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+
 describe("deterministic private file extraction", () => {
   it("indexes a real CSV fixture with bounded row citations", async () => {
     const bytes = await readFile(join(process.cwd(), "src/lib/__fixtures__/rental-revenue.csv"));
@@ -59,6 +103,38 @@ describe("deterministic private file extraction", () => {
     expect(result.detectedMimeType).toContain("wordprocessingml.document");
     expect(result.text).toContain("Venice to London");
     expect(result.text).toContain("2645 euros");
+  });
+
+  it("extracts a real XLSX workbook with sheet and cell provenance without evaluating formulas", async () => {
+    const result = await extractPrivateFile({
+      bytes: await realXlsxFixture(),
+      name: "travel-budget.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    expect(result).toMatchObject({
+      status: "ready",
+      detectedMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      sheetNames: ["Booked stay", "Flights"],
+    });
+    expect(result.text).toContain("Venice");
+    expect(result.text).toContain("formula: =SUM(B2:B2)");
+    expect(result.chunks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sheet: "Booked stay", cellRange: "A1:B3" }),
+      expect.objectContaining({ sheet: "Flights", cellRange: "A1" }),
+    ]));
+  });
+
+  it("recognizes a verified .xlsx when the browser supplies only a generic ZIP MIME type", async () => {
+    const result = await extractPrivateFile({
+      bytes: await realXlsxFixture(),
+      name: "travel-budget.xlsx",
+      mimeType: "application/octet-stream",
+    });
+    expect(result).toMatchObject({
+      status: "ready",
+      detectedMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      sheetNames: ["Booked stay", "Flights"],
+    });
   });
 
   it("decodes and previews a real PNG", async () => {
@@ -108,5 +184,15 @@ describe("deterministic private file extraction", () => {
       name: "fake.pdf",
       mimeType: "application/pdf",
     })).rejects.toMatchObject({ code: "pdf_signature_mismatch", quarantined: true } satisfies Partial<FileExtractionError>);
+  });
+
+  it("fails closed when a declared XLSX is a ZIP without required workbook parts", async () => {
+    const zip = new JSZip();
+    zip.file("unrelated.txt", "not a workbook");
+    await expect(extractPrivateFile({
+      bytes: await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" }),
+      name: "fake.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_structure_invalid", quarantined: true } satisfies Partial<FileExtractionError>);
   });
 });
