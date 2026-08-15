@@ -53,6 +53,10 @@ const pdfAsset = {
   key: "owners/daniel/creations/570df4a2-8870-4fe1-a4cf-6d32ccf758e1/asset",
   contentType: "application/pdf",
 };
+const mindMapAsset = {
+  key: "owners/daniel/creations/e01d4985-5aa4-4caa-b460-842871de3f84/asset",
+  contentType: "image/svg+xml",
+};
 
 function mockNovitaSuccess() {
   vi.stubGlobal("fetch", vi.fn()
@@ -190,6 +194,84 @@ describe("created artifact download cards", () => {
       title: "Travel plan.pdf",
       downloadUrl: "/api/creation-download?id=pdf%2Fcreation%201",
     });
+  });
+
+  it("posts a private mind-map image snapshot with a separate authenticated download", async () => {
+    let creationCount = 0;
+    mock.putPrivateCreationAsset.mockResolvedValue(mindMapAsset);
+    mock.convexMutation.mockImplementation(async (name: string) => {
+      if (name !== "creations:create") return undefined;
+      creationCount += 1;
+      return creationCount === 1 ? "mind-map/canvas 1" : "mind-map/image 1";
+    });
+
+    await expect(executeTool("mind_map", {
+      action: "create",
+      title: "Seville days",
+      nodes: [{ id: "base", label: "Booked stay", color: "blue" }, { id: "food", label: "Tapas", parent: "base" }],
+      edges: [{ from: "base", to: "food" }],
+    })).resolves.toContain("secure download card");
+
+    expect(mock.putPrivateCreationAsset).toHaveBeenCalledWith(expect.stringContaining("<svg"), "image/svg+xml");
+    const creationCalls = mock.convexMutation.mock.calls.filter(([path]) => path === "creations:create");
+    expect(creationCalls[0]?.[1]).toMatchObject({ kind: "canvas", title: "Seville days" });
+    expect(creationCalls[1]?.[1]).toMatchObject({
+      kind: "image",
+      title: "Seville days · mind map",
+      assetR2Key: mindMapAsset.key,
+      assetContentType: "image/svg+xml",
+      data: JSON.stringify({ sourceCreationId: "mind-map/canvas 1", format: "svg", type: "mind_map_snapshot" }),
+    });
+    expect(creationCalls[1]?.[1]).not.toHaveProperty("url");
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", {
+      threadId: "main",
+      type: "image",
+      value: "/api/creation-media?id=mind-map%2Fimage%201&variant=asset",
+      title: "Seville days · mind map.svg",
+      downloadUrl: "/api/creation-download?id=mind-map%2Fimage%201",
+    });
+  });
+
+  it("cleans up a mind-map snapshot and withholds its card when artifact persistence fails", async () => {
+    let creationCount = 0;
+    mock.putPrivateCreationAsset.mockResolvedValue(mindMapAsset);
+    mock.convexMutation.mockImplementation(async (name: string) => {
+      if (name !== "creations:create") return undefined;
+      creationCount += 1;
+      if (creationCount === 1) return "mind-map/canvas 1";
+      throw new Error("Convex unavailable");
+    });
+
+    await expect(executeTool("mind_map", {
+      action: "create",
+      title: "Seville days",
+      nodes: [{ id: "base", label: "Booked stay" }],
+    })).resolves.toContain("fresh private image was cleaned up");
+
+    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith(mindMapAsset);
+    expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
+  });
+
+  it("still creates and posts the mind-map snapshot if the live canvas panel is temporarily unavailable", async () => {
+    let creationCount = 0;
+    mock.putPrivateCreationAsset.mockResolvedValue(mindMapAsset);
+    mock.convexMutation.mockImplementation(async (name: string) => {
+      if (name === "ui:setPanel") throw new Error("panel unavailable");
+      if (name !== "creations:create") return undefined;
+      creationCount += 1;
+      return creationCount === 1 ? "mind-map/canvas 1" : "mind-map/image 1";
+    });
+
+    await expect(executeTool("mind_map", {
+      action: "create",
+      title: "Seville days",
+      nodes: [{ id: "base", label: "Booked stay" }],
+    })).resolves.toContain("live panel could not be shown");
+
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", expect.objectContaining({
+      value: "/api/creation-media?id=mind-map%2Fimage%201&variant=asset",
+      downloadUrl: "/api/creation-download?id=mind-map%2Fimage%201",
+    }));
   });
 
   it("cleans up a rendered PDF and withholds its card when creation persistence fails", async () => {

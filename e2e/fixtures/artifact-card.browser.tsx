@@ -3,10 +3,10 @@ import { useState } from "react";
 import { MediaCard, type Attachment } from "../../src/components/MediaCard";
 
 const fixtureArtifact: Attachment = {
-  type: "pdf",
-  value: "/api/creation-media?id=fixture-pdf&variant=asset",
-  title: "Fixture report.pdf",
-  downloadUrl: "/api/creation-download?id=fixture-pdf",
+  type: "image",
+  value: "/api/creation-media?id=fixture-mindmap&variant=asset",
+  title: "Seville days · mind map.svg",
+  downloadUrl: "/api/creation-download?id=fixture-mindmap",
 };
 
 function ArtifactCardFixture() {
