@@ -3,7 +3,7 @@ const TOOL_BELT_REGISTRY = {
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_view",
     "google_calendar_list", "google_calendar_create", "google_calendar_update", "google_calendar_delete",
-    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image", "review_uploaded_file",
+    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image", "show_uploaded_file", "open_uploaded_transcript", "review_uploaded_file",
   ]),
   work: new Set([
     "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "show", "net_worth", "memory_map",
@@ -18,7 +18,7 @@ const TOOL_BELT_REGISTRY = {
   ]),
   travel: new Set([
     "trip_open", "trip_plan", "trip_update", "trip_finalize", "bookings_check", "bookings_lookup", "flight_search", "open_travel_site", "places_near",
-    "transport_route", "travel_map",
+    "transport_route", "travel_map", "travel_offline_maps_prepare",
   ]),
   business: new Set([
     "market", "price_chart", "market_analysis", "price_watch", "price_alert", "watch_list", "watch_cancel", "shop_search", "news_today",
@@ -71,8 +71,14 @@ for (const name of [
   "gmail_draft_reply",
   "gmail_list_subscriptions",
   // Uploaded files are private owner data. The foreground owner lane may show
-  // a selected image; background subscription workers must never browse it.
+  // a selected visual file or its already-indexed transcript; background
+  // subscription workers must never browse them.
   "show_uploaded_image",
+  "show_uploaded_file",
+  "open_uploaded_transcript",
+  // This schedules an owner-visible reminder and Hub to-do. It must never be
+  // inferred or executed by an unattended subscription worker.
+  "travel_offline_maps_prepare",
   // Google Calendar is foreground-only. It must never become an implicit
   // side effect of a subscription worker, and its iCloud counterpart remains
   // the default calendar lane.

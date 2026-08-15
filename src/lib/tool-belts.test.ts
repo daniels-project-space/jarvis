@@ -115,10 +115,17 @@ describe("tool belt registry", () => {
     )).toEqual(["gmail_draft_reply"]);
   });
 
-  it("keeps image display foreground-only but permits exact message-scoped file review", () => {
-    expect(TOOL_BELTS.core.has("show_uploaded_image")).toBe(true);
-    expect(SUBSCRIPTION_TOOL_NAMES.has("show_uploaded_image")).toBe(false);
+  it("keeps private visual and transcript display foreground-only but permits exact message-scoped file review", () => {
+    for (const name of ["show_uploaded_image", "show_uploaded_file", "open_uploaded_transcript"]) {
+      expect(TOOL_BELTS.core.has(name)).toBe(true);
+      expect(SUBSCRIPTION_TOOL_NAMES.has(name)).toBe(false);
+    }
     expect(TOOL_BELTS.core.has("review_uploaded_file")).toBe(true);
     expect(SUBSCRIPTION_TOOL_NAMES.has("review_uploaded_file")).toBe(true);
+  });
+
+  it("keeps offline-map preparation in the discoverable owner travel lane", () => {
+    expect(TOOL_BELTS.travel.has("travel_offline_maps_prepare")).toBe(true);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("travel_offline_maps_prepare")).toBe(false);
   });
 });

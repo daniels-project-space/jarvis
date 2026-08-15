@@ -1030,6 +1030,7 @@ export const authorizeFileTool = query({
       [/^self_improve$/, /\b(?:improve|upgrade|optimi[sz]e)\b.{0,24}\b(?:jarvis|yourself|your system|the system)\b/],
       [/^web_search$/, /\b(?:search|find|look up|research)\b.{0,36}\b(?:web|online|internet)\b|\b(?:web|online|internet)\b.{0,24}\bsearch\b/],
       [/^read_url$/, /\b(?:read|open|inspect|analy[sz]e|summari[sz]e)\b.{0,30}\b(?:url|link|website|web page)\b/],
+      [/^open_uploaded_transcript$/, /\b(?:open|show|display|read|view)\b.{0,36}\b(?:transcript|captions?|audio|video|recording|voice(?:\s+note)?)\b|\b(?:transcript|captions?|audio|video|recording|voice(?:\s+note)?)\b.{0,36}\b(?:open|show|display|read|view)\b/],
       [/^(?:youtube_search|youtube_transcript)$/, /\b(?:search|find|read|get|show)\b.{0,36}\b(?:youtube|video transcript|transcript)\b/],
       [/^flight_search$/, /\b(?:search|find|show|look up)\b.{0,30}\bflights?\b/],
       [/^memory_search$/, /\b(?:search|find|recall|look up)\b.{0,30}\b(?:memory|memories|what you remember)\b/],

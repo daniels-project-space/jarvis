@@ -16,6 +16,7 @@ import {
 } from "./creation-assets";
 import { privateR2Get } from "./private-r2";
 import { readyPrivateFilePanel } from "./private-file-panel";
+import { transcribableMediaKind } from "./media-types";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
@@ -1242,6 +1243,19 @@ export const TOOL_DEFS = [
       properties: {
         file_id: { type: "string", description: "the file's id from a recent upload/attachment" },
         title: { type: "string", description: "optional title for the doc; defaults to the file's original name" },
+      },
+      required: ["file_id"],
+    },
+  },
+  {
+    name: "open_uploaded_transcript",
+    description:
+      "Open the already-indexed private speech transcript for one exact uploaded audio or video file as a linked document on screen. Use only when Daniel explicitly asks to open, show, read, or view that file's transcript/captions. This never starts transcription or claims to analyse media: it works only when the ready, safely detected media file already has non-empty private transcript text. It refuses processing, stored-only, silent, untranscribed, and non-media files.",
+    parameters: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "the exact id of the ready uploaded audio or video file" },
+        title: { type: "string", description: "optional short title for the private transcript document" },
       },
       required: ["file_id"],
     },
@@ -4597,6 +4611,68 @@ async function openFileAsDoc(args: any): Promise<string> {
   return `Opened "${title}" as an editable doc (${words} words, creation_id ${id}) from ${file.originalName}. It updates LIVE on screen — discuss it briefly, don't read it out. To revise it, call draft with creation_id "${id}" and the full new text.`;
 }
 
+type PrivateUploadedTranscriptRecord = {
+  _id?: string;
+  originalName?: string;
+  relativePath?: string;
+  status?: string;
+  detectedMimeType?: string;
+  extractedTextR2Key?: string;
+  extractedChars?: number;
+  summary?: string;
+};
+
+/**
+ * The transcript view has a deliberately narrower contract than a generic
+ * document opener: media must already have passed ingestion, and this only
+ * reads the derived text object. Original media bytes and R2 keys never reach
+ * the panel, creation metadata, chat card, or model-facing response.
+ */
+async function openUploadedTranscript(args: Record<string, unknown>): Promise<string> {
+  const fileId = String(args.file_id ?? "").trim();
+  if (!fileId) return "TOOL DID NOTHING: no file_id passed.";
+  const file = await convexQuery("files:getForOwner", { fileId }).catch(() => null) as PrivateUploadedTranscriptRecord | null;
+  if (!file || file.status === "deleted") return "TOOL DID NOTHING: the selected file is not available.";
+  if (file.status !== "ready") {
+    return `TOOL DID NOTHING: the selected file is not ready for a private transcript yet (status: ${String(file.status ?? "unknown").slice(0, 40)}).`;
+  }
+
+  const mediaKind = transcribableMediaKind(file.detectedMimeType ?? "");
+  if (!mediaKind) {
+    return "TOOL DID NOTHING: the selected ready file is not a safely detected supported audio or video upload.";
+  }
+  const sourceName = String(file.relativePath || file.originalName || "Uploaded media").trim().slice(0, 160) || "Uploaded media";
+  if (!file.extractedTextR2Key) {
+    const noSpeechDetected = /\bno speech was detected\b/i.test(String(file.summary ?? ""));
+    return noSpeechDetected
+      ? `TOOL DID NOTHING: "${sourceName}" was processed but no speech transcript was indexed. Jarvis will not pretend it can inspect the ${mediaKind} contents.`
+      : `TOOL DID NOTHING: "${sourceName}" does not have an indexed private transcript available. Jarvis will not pretend it can inspect the ${mediaKind} contents.`;
+  }
+
+  const upstream = await privateR2Get(file.extractedTextR2Key).catch(() => null);
+  if (!upstream || !upstream.ok) return "TOOL DID NOTHING: couldn't read the private transcript for that file.";
+  const MAX_TRANSCRIPT_BYTES = 1_500_000;
+  const raw = new Uint8Array(await upstream.arrayBuffer());
+  const bounded = raw.byteLength > MAX_TRANSCRIPT_BYTES ? raw.slice(0, MAX_TRANSCRIPT_BYTES) : raw;
+  const transcript = new TextDecoder("utf-8", { fatal: false }).decode(bounded).trim();
+  if (!transcript) {
+    return `TOOL DID NOTHING: the private transcript for "${sourceName}" is empty, so Jarvis will not pretend it can inspect the ${mediaKind} contents.`;
+  }
+
+  const requestedTitle = String(args.title ?? "").trim().replace(/\s+/g, " ").slice(0, 100);
+  const title = requestedTitle || `Transcript · ${sourceName}`.slice(0, 120);
+  const filing = await creationFiling(args, "transcripts");
+  const id = await convexMutation("creations:create", {
+    kind: "doc",
+    title,
+    data: transcript,
+    sourceFiles: [{ fileId: String(file._id ?? fileId), name: String(file.originalName ?? sourceName) }],
+    ...filing,
+  });
+  await convexMutation("ui:setPanel", { type: "doc", value: JSON.stringify({ creationId: id }), title: `transcript · ${sourceName}`.slice(0, 120) });
+  return `Opened the already-indexed private ${mediaKind} transcript for "${sourceName}" (${transcript.length.toLocaleString("en-US")} characters). It is linked to the original upload; this did not start a new transcription or claim any unprocessed media analysis.`;
+}
+
 const READY_UPLOADED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 async function showUploadedImage(args: any): Promise<string> {
@@ -5598,6 +5674,8 @@ export async function executeTool(
     }
     case "open_file_as_doc":
       return await openFileAsDoc(args);
+    case "open_uploaded_transcript":
+      return await openUploadedTranscript(args);
     case "show_uploaded_image":
       return await showUploadedImage(args);
     case "show_uploaded_file":
