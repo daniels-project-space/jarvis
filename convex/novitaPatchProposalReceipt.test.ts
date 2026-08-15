@@ -23,6 +23,13 @@ const priorWorkerToken = process.env.JARVIS_WORKER_TOKEN;
 
 const runtimeConfig = {
   endpointUrl: "https://qwen.endpoint.novita.ai/patch-proposer",
+  lifecycle: {
+    provider: "novita-serverless-v1",
+    minWorkers: 0,
+    maxWorkers: 1,
+    idleTimeoutSeconds: 300,
+    healthPath: "/health",
+  },
   adapterId: "novita-qwen-patch-proposer-v1",
   configDigest: "a".repeat(64),
   endpointId: "endpoint_123456",

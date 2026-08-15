@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IdempotencyKey } from "@trigger.dev/sdk/v3";
 
+vi.mock("server-only", () => ({}));
+
 const trigger = vi.hoisted(() => {
   const metadata = {
     set: vi.fn(),
