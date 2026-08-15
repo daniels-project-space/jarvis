@@ -10,11 +10,15 @@ same canonical digest used by Jarvis. It requires all of the following:
 - `adapterId=novita-qwen-patch-proposer-v1`, Qwen GPTQ-Int4 model and immutable revision;
 - the attested scale-to-zero policy (`minWorkers=0`, `maxWorkers=1`);
 - `JARVIS_NOVITA_ADAPTER_IMAGE_DIGEST` exactly matching the attested final adapter image digest;
-- `JARVIS_NOVITA_ENDPOINT_BEARER`, the *derived* purpose-bound bearer from
-  `derivedNovitaEndpointBearer` — never a Novita account or billing key.
+- `JARVIS_NOVITA_ENDPOINT_BEARER`, the *derived*, versioned
+  `jnpb1.<endpoint-id>.<base64url-hmac>` bearer from
+  `derivedNovitaEndpointBearer` — raw Novita account or billing keys are not
+  a valid wire format.
 
 The adapter starts vLLM only on `127.0.0.1:8001`, with the attested model ID,
 revision, GPTQ mode, one concurrent sequence, and request logging disabled.
+Its subprocess receives a fixed minimal environment only; the endpoint bearer,
+attestation, provider key, and every token/secret are deliberately absent.
 It exposes only port `8080`; `/healthz` reports ready only after the loopback
 model server is healthy. Requests with tools, function calls, shell commands,
 credential-shaped content, alternate models, streaming, unsupported fields, or
@@ -36,9 +40,10 @@ docker build services/novita-patch-proposer \
 After pushing the final image by digest, prepare the existing attestation with
 that final digest and configure the Novita serverless endpoint manually:
 
-- HTTP port `8080`, health path `/healthz`;
+- HTTP port `8080`, health path `/healthz`, and startup command exactly
+  `python -m adapter.app`;
 - `minNum: 0`, `maxNum: 1`, `freeTimeout` equal to the attestation;
-- one GPU and `maxConcurrent: 1`;
+- `gpuNum: 1` and `maxConcurrent: 1`;
 - final adapter image referenced by `@sha256:...` and the same digest in the
   attestation and `JARVIS_NOVITA_ADAPTER_IMAGE_DIGEST`;
 - the full non-secret attestation in `JARVIS_NOVITA_QWEN_ATTESTATION`;
@@ -46,8 +51,9 @@ that final digest and configure the Novita serverless endpoint manually:
 
 Do not put `NOVITA_API_KEY`, any vault credential, a shell command, or a general
 model API key in this image or endpoint environment. Existing Jarvis lifecycle
-verification will refuse any endpoint whose final image digest, URL, health
-path, worker bounds, or idle timeout drift from that attestation.
+verification will refuse any endpoint whose final image digest, URL, startup
+command, port, health path, worker bounds, concurrency, GPU count, or idle
+timeout drift from that attestation.
 
 Run the policy tests without a GPU or container build:
 

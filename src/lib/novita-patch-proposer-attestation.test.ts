@@ -24,6 +24,10 @@ const lifecycle = {
   minWorkers: 0,
   maxWorkers: 1,
   idleTimeoutSeconds: 600,
+  port: 8080,
+  maxConcurrent: 1,
+  gpuNum: 1,
+  startupCommand: "python -m adapter.app",
   healthPath: "/healthz",
 } as const;
 
@@ -51,6 +55,13 @@ describe("Novita patch-proposer attestation", () => {
       JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({
         endpointUrl: "https://qwen.endpoint.novita.ai/qwen",
         lifecycle: { ...lifecycle, minWorkers: 1 },
+        ...attestation,
+      }),
+    })).toBeNull();
+    expect(configuredNovitaPatchProposer({
+      JARVIS_NOVITA_QWEN_ATTESTATION: JSON.stringify({
+        endpointUrl: "https://qwen.endpoint.novita.ai/qwen",
+        lifecycle: { ...lifecycle, port: 9090, maxConcurrent: 2, gpuNum: 2, startupCommand: "python -m other.app" },
         ...attestation,
       }),
     })).toBeNull();

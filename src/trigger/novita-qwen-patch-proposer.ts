@@ -37,6 +37,9 @@ type RecordValue = Record<string, unknown>;
 const SAFE_SOURCE_PATH = /^(?:src|app|convex|scripts)\/[A-Za-z0-9_./-]+\.(?:[cm]?[jt]sx?)$/i;
 const DIFF_PATH = /^(?:---|\+\+\+) [ab]\/([^\t\n\r]+)(?:\t.*)?$/gm;
 const NO_SECRET = "The proposal must never request, expose, or rely on credentials, network access, shell commands, tools, or external actions.";
+export const NOVITA_DERIVED_ENDPOINT_BEARER_PREFIX = "jnpb1" as const;
+const DERIVED_ENDPOINT_BEARER_MAC = /^[A-Za-z0-9_-]{43}$/;
+export type NovitaDerivedEndpointBearer = `${typeof NOVITA_DERIVED_ENDPOINT_BEARER_PREFIX}.${string}.${string}`;
 
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -207,17 +210,30 @@ function completionModel(value: unknown): string | null {
 }
 
 /**
- * The GPU gets this purpose-bound bearer, never the Novita account/billing
- * credential. Rotating the account key invalidates the derived bearer until
- * the endpoint is re-attested, which fails closed instead of leaking access.
+ * The GPU gets a purpose-bound, versioned wire token, never the raw Novita
+ * account/billing credential. The explicit prefix and endpoint segment mean
+ * raw provider keys are not a valid endpoint credential format at all.
  */
 export function derivedNovitaEndpointBearer(
   controlKey: string,
   attestation: NovitaPatchProposerAttestation,
-): string {
-  return createHmac("sha256", controlKey)
+): NovitaDerivedEndpointBearer {
+  const mac = createHmac("sha256", controlKey)
     .update(`jarvis:novita-qwen-patch-proposer:v1:${attestation.endpointId}:${attestation.configDigest}`)
     .digest("base64url");
+  return `${NOVITA_DERIVED_ENDPOINT_BEARER_PREFIX}.${attestation.endpointId}.${mac}` as NovitaDerivedEndpointBearer;
+}
+
+/** A structural check for the credential transported to the custom endpoint. */
+export function isDerivedNovitaEndpointBearer(
+  value: string,
+  attestation: NovitaPatchProposerAttestation,
+): boolean {
+  const [prefix, endpointId, mac, ...rest] = value.split(".");
+  return rest.length === 0
+    && prefix === NOVITA_DERIVED_ENDPOINT_BEARER_PREFIX
+    && endpointId === attestation.endpointId
+    && DERIVED_ENDPOINT_BEARER_MAC.test(mac ?? "");
 }
 
 /**
