@@ -139,6 +139,15 @@ export function isDocxMime(mimeType: string): boolean {
   return normalizeUploadMime(mimeType) === "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 }
 
+/** Only the OOXML workbook container is admitted here. Legacy .xls and macro
+ * enabled formats need separate, format-specific parsers rather than being
+ * treated as compatible spreadsheet text. */
+export function isXlsxMime(mimeType: string, name = ""): boolean {
+  const mime = normalizeUploadMime(mimeType);
+  return mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    || ((mime === "application/octet-stream" || mime === "application/zip") && name.toLowerCase().endsWith(".xlsx"));
+}
+
 export function isCsvMime(mimeType: string, name = ""): boolean {
   const mime = normalizeUploadMime(mimeType);
   return mime === "text/csv" || mime === "application/csv" || name.toLowerCase().endsWith(".csv");

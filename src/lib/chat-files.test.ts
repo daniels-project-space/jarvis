@@ -55,6 +55,27 @@ describe("private chat file boundaries", () => {
     expect(catalog).not.toContain("<system>");
   });
 
+  it("keeps private spreadsheet sheet and cell provenance in the bounded chat context", () => {
+    const context = buildBoundedFileContext([{
+      fileId: "file-xlsx",
+      name: "travel-budget.xlsx",
+      relativePath: "travel/travel-budget.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      sizeBytes: 4_096,
+      status: "ready",
+      summary: "Excel workbook · 2 sheets · 5 cells indexed",
+      excerpts: [{
+        ordinal: 0,
+        sheet: "Booked stay",
+        cellRange: "A1:B2",
+        text: "A1: City | B1: Venice\nA2: Cost | B2: 2645",
+      }],
+    }]);
+    expect(context).toContain('sheet="Booked stay" cells="A1:B2"');
+    expect(context).toContain("A1: City");
+    expect(context).toContain("Cite file ids and page/sheet locations");
+  });
+
   it("resolves only explicit deterministic follow-up wording", () => {
     expect(isDeterministicFileFollowUp("make a chart from that document")).toBe(true);
     expect(isDeterministicFileFollowUp("summarize the previous PDF")).toBe(true);
