@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { extractCodexThreadUserPrompts } from "../src/lib/local-handover-codex-prompts";
 import {
+  captureClaudeUserPrompt,
   createClaudePromptBinding,
   readClaudeLatestUserPrompt,
 } from "../src/lib/local-handover-claude-prompt-capture";
@@ -143,6 +144,7 @@ function usage(): never {
     "  tsx scripts/local-handover-supervisor.ts probe",
     "  tsx scripts/local-handover-supervisor.ts start --id <id> --cwd <dir> --task <task> [--provider codex|claude] [--checkpoint <file>]",
     "  tsx scripts/local-handover-supervisor.ts adopt --id <id> --cwd <dir> --task <task> --provider codex|claude [--tmux-session <name>] [--checkpoint <file>] [--codex-thread-id <uuid>]",
+    "  tsx scripts/local-handover-supervisor.ts record-claude-prompt --session-id <uuid> --cwd <dir> < hook-input.json",
     "  tsx scripts/local-handover-supervisor.ts sync [--reason manual]",
     "  tsx scripts/local-handover-supervisor.ts run",
     "  tsx scripts/local-handover-supervisor.ts list",
@@ -418,6 +420,43 @@ async function tmuxSessionExists(tmuxSession: string | undefined): Promise<boole
   } catch {
     return false;
   }
+}
+
+/**
+ * A Claude Code session launched outside this supervisor has no tmux name, but
+ * it is still unsafe to start its replacement while the native CLI is alive.
+ * UserPromptSubmit gives us the exact session UUID, so inspect only process
+ * command lines for that UUID; never infer ownership from a checkout alone.
+ */
+async function claudeSessionProcessExists(sessionId: string | undefined): Promise<boolean> {
+  if (!sessionId || !UUID.test(sessionId)) return false;
+  let entries: string[];
+  try {
+    entries = await fs.readdir("/proc");
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+    try {
+      const command = await fs.readFile(join("/proc", entry, "cmdline"), "utf8");
+      const args = command.split("\0");
+      if (args.includes(`--resume=${sessionId}`)
+        || args.includes(`--session-id=${sessionId}`)
+        || args.some((arg, index) => (arg === "--resume" || arg === "--session-id") && args[index + 1] === sessionId)) {
+        return true;
+      }
+    } catch {
+      // Processes may exit while their /proc entry is being inspected.
+    }
+  }
+  return false;
+}
+
+async function sourceSessionIsRunning(session: ManagedSession, tmuxSession?: string): Promise<boolean> {
+  if (await tmuxSessionExists(tmuxSession ?? session.tmuxSession)) return true;
+  return session.provider === "claude"
+    && await claudeSessionProcessExists(session.nativePrompt?.claudeSessionId);
 }
 
 async function readCheckpoint(session: ManagedSession): Promise<string> {
@@ -717,6 +756,9 @@ async function launchTmuxSession(
       // bypassPermissions default. Load the project/local policy only and use
       // Claude's supported automatic approvals for this managed session.
       "--setting-sources",
+      // Do not load user-level hooks into a managed continuation: a global
+      // Claude hook can observe unrelated sessions and must never enroll or
+      // reroute work outside this supervisor's explicit registry.
       "project,local",
       "--permission-mode",
       "auto",
@@ -915,7 +957,7 @@ async function handoverSessions(
     // original managed tmux session is alive, durable context is prepared but
     // the replacement waits for it to exit. A quota-exhausted CLI normally
     // exits itself; otherwise the owner can finish/close it deliberately.
-    if (await tmuxSessionExists(pending?.fromTmuxSession ?? session.tmuxSession)) {
+    if (await sourceSessionIsRunning(session, pending?.fromTmuxSession)) {
       const promptCapture = await promptCaptureFor(stateDir, session);
       session = { ...session, nativePrompt: promptCapture.nativePrompt };
       const pendingMatchesPolicy = pending
@@ -1112,6 +1154,75 @@ async function startOrAdopt(
   process.stdout.write(`${JSON.stringify({ ok: true, id, kind, provider: session.provider, tmuxSession: session.tmuxSession ?? null })}\n`);
 }
 
+async function readHookInput(): Promise<Record<string, unknown> | null> {
+  let raw = "";
+  for await (const chunk of process.stdin) {
+    raw += String(chunk);
+    if (Buffer.byteLength(raw, "utf8") > 96 * 1024) return null;
+  }
+  try {
+    return asRecord(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Register a specifically opted-in Claude task at first user prompt. It is
+ * anchored to the policy revision observed at registration, so the current
+ * target can never cause an immediate provider switch; only a later policy
+ * change can be applied to that explicitly enrolled session.
+ */
+async function recordClaudePrompt(stateDir: string, flags: ReadonlyMap<string, string>): Promise<void> {
+  const sessionId = flag(flags, "session-id", true)!;
+  const cwd = normalisedCwd(flag(flags, "cwd", true)!);
+  const input = await readHookInput();
+  if (!UUID.test(sessionId) || !input
+    || input.hook_event_name !== "UserPromptSubmit"
+    || input.session_id !== sessionId
+    || input.cwd !== cwd
+    || typeof input.prompt !== "string") return;
+  const stat = await fs.stat(cwd).catch(() => null);
+  if (!stat?.isDirectory()) return;
+  const policy = await remoteGetPolicy().catch(() => null);
+  if (!policy) return;
+  const prompt = normaliseLocalHandoverPrompt(input.prompt, process.env, MAX_TASK_CHARS);
+  if (!prompt) return;
+  const id = `claude-${sessionId}`;
+  const registry = await readRegistry(stateDir);
+  const existing = registry.sessions[id];
+  if (existing) {
+    if (existing.provider !== "claude"
+      || existing.cwd !== cwd
+      || existing.nativePrompt?.claudeSessionId !== sessionId) return;
+    await captureClaudeUserPrompt(stateDir, sessionId, input, process.env);
+    return;
+  }
+  const now = Date.now();
+  const session: ManagedSession = {
+    id,
+    kind: "adopted",
+    cwd,
+    task: prompt,
+    nativePrompt: { provider: "claude", claudeSessionId: sessionId },
+    provider: "claude",
+    policyRevision: policy.handoverRevision,
+    createdAt: now,
+    updatedAt: now,
+    deferredOldSession: false,
+    handovers: [],
+  };
+  await createClaudePromptBinding({
+    stateDir,
+    managedSessionId: id,
+    sessionId,
+    cwd,
+    bootstrapPrompt: prompt,
+    environment: process.env,
+  });
+  await writeRegistry(stateDir, { version: 1, sessions: { ...registry.sessions, [id]: session } });
+}
+
 async function sync(stateDir: string, reason: HandoverReason): Promise<void> {
   let registry = await readRegistry(stateDir);
   const quota = await probeCodexWeeklyQuota();
@@ -1173,6 +1284,7 @@ async function main(): Promise<void> {
   }
   if (command === "start") return withStateLock(stateDir, () => startOrAdopt(stateDir, flags, "managed"));
   if (command === "adopt") return withStateLock(stateDir, () => startOrAdopt(stateDir, flags, "adopted"));
+  if (command === "record-claude-prompt") return withStateLock(stateDir, () => recordClaudePrompt(stateDir, flags));
   if (command === "sync") {
     const reason = flag(flags, "reason") ?? "manual";
     if (reason !== "manual" && reason !== "quota") throw new Error("--reason must be manual or quota");

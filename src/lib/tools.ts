@@ -1072,7 +1072,7 @@ export const TOOL_DEFS = [
   {
     name: "shop_search",
     description:
-      "SHOPPING CONCIERGE: find real products for Daniel (UK — pounds, UK retailers, fast delivery prioritised) with prices, merchant links and product images cut out onto presentation frames — shows THREE at a time. Use for any 'find/buy me X' (gifts, clothes, gear). After showing: ask which fits or what to change, refine with another search, and when he picks one OFFER to run the checkout agent (dispatch_agent with mcp:[\"browserbase\"] task: add the exact product to cart on the merchant site and return the checkout/payment link).",
+      "SHOPPING CONCIERGE: find real products for Daniel (UK — pounds, UK retailers, fast delivery prioritised) with prices, merchant links and product images cut out onto presentation frames — shows THREE at a time. Use for any 'find/buy me X' (gifts, clothes, gear). After showing: ask which fits or what to change, refine with another search, and when he picks one OFFER to run the checkout agent (dispatch_agent with mcp:[\"playwright\"] task: add the exact product to cart on the merchant site and return the checkout/payment link).",
     parameters: {
       type: "object",
       properties: {
@@ -3936,7 +3936,7 @@ async function shopSearch(args: any): Promise<string> {
   return (
     `SHOP FRAMES on screen, numbered 1-${items.length} (three per page, arrows to page). FULL LIST: ` +
     items.map((i: any, n: number) => `${n + 1}. ${i.title} — ${i.price} at ${i.merchant}`).join(" | ") +
-    ` — ask Daniel which fits or what to change. If he says "more like number N": read item N's title above, pull out its defining attributes (brand/style/colour/cut) and run a fresh shop_search built from them — tell him what you noticed about N. If he picks one: offer the checkout agent (dispatch_agent, mcp browserbase, task: open the merchant page, add EXACTLY that item to the cart, fill the order details, proceed to checkout and return the payment-page link - NEVER pay).`
+    ` — ask Daniel which fits or what to change. If he says "more like number N": read item N's title above, pull out its defining attributes (brand/style/colour/cut) and run a fresh shop_search built from them — tell him what you noticed about N. If he picks one: offer the checkout agent (dispatch_agent, mcp playwright, task: open the merchant page, add EXACTLY that item to the cart, fill the order details, proceed to checkout and return the payment-page link - NEVER pay).`
   );
 }
 

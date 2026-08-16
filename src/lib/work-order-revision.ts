@@ -21,7 +21,7 @@ export const WORK_ORDER_MACHINE_RUNTIME = "node-22:codex-0.144.5";
 export const WORK_ORDER_MACHINE_TEMPLATE = "node22-codex-0.144.5";
 export const WORK_ORDER_MACHINE_CLASS = `${WORK_ORDER_MACHINE_RUNTIME}/${WORK_ORDER_MACHINE_TEMPLATE}/2cpu-4096mb`;
 
-export const WORK_ORDER_MCP_ALLOWLIST = Object.freeze(["browserbase", "context7", "playwright"] as const);
+export const WORK_ORDER_MCP_ALLOWLIST = Object.freeze(["context7", "playwright"] as const);
 export const WORK_ORDER_READ_TOOLS = Object.freeze([
   "repository_read_file",
   "repository_list_files",
