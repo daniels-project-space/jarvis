@@ -1,4 +1,5 @@
 import "server-only";
+import { getVercelOidcToken } from "@vercel/oidc";
 import { convexMutation } from "./context";
 import { getSecret } from "./vault";
 
@@ -53,14 +54,23 @@ async function serviceConfig(): Promise<{ base: string; token: string }> {
     ?? await getSecret("jarvisbrowser", "JARVIS_BROWSER_URL").catch(() => null)
     ?? DEFAULT_BROWSER_URL).replace(/\/+$/, "");
 
+  // Preferred path: Vercel OIDC. The deployment already holds a short-lived,
+  // Vercel-signed JWT proving it is this project; jarvis-browser verifies it
+  // against Vercel's public JWKS. Nothing secret is stored, pasted or committed
+  // to make this work — which is the whole reason it is first in the chain.
+  const oidc = await getVercelOidcToken().catch(() => null);
+  if (oidc) return { base, token: oidc };
+
+  // Fallbacks for local dev and break-glass, in decreasing order of convenience.
   const token = process.env.JARVIS_BROWSER_TOKEN
     ?? await getSecret("jarvisbrowser", "JARVIS_BROWSER_TOKEN").catch(() => null);
 
   if (!token) {
     throw new BrowserServiceUnconfigured(
-      "JARVIS_BROWSER_TOKEN is not set. Add it as an environment variable on the Jarvis "
-      + "deployment (or as a jarvisbrowser vault row). The value is in /etc/jarvis-browser/env "
-      + "on the browser host — read it with: sudo jarvis-browser-token",
+      "No Vercel OIDC token and no JARVIS_BROWSER_TOKEN. In production this means OIDC is off — "
+      + "enable Settings → Security → Secure Backend Access with OIDC Federation on the jarvis "
+      + "project (it is on by default). Locally, set JARVIS_BROWSER_TOKEN; the value is in "
+      + "/etc/jarvis-browser/env on the browser host (sudo jarvis-browser-token).",
     );
   }
   return { base, token };
