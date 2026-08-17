@@ -38,12 +38,32 @@ export type ErrandOutcome = {
   escalation?: string;
 };
 
+// The service address is NOT a secret, so it does not need a vault row — it
+// defaults to the deployed route and is overridable by env. Only the bearer is
+// sensitive, and it resolves vault-first, env-fallback: the same shape
+// render-service uses (RENDER_URL/RENDER_TOKEN work as Convex env vars rather
+// than vault rows). That means bringing this online needs one pasted env var,
+// not a vault write — which requires the root token and is owner-only by design.
+const DEFAULT_BROWSER_URL = "https://87.106.233.113.nip.io/jarvis-browser";
+
+class BrowserServiceUnconfigured extends Error {}
+
 async function serviceConfig(): Promise<{ base: string; token: string }> {
-  const [base, token] = await Promise.all([
-    getSecret("jarvisbrowser", "JARVIS_BROWSER_URL"),
-    getSecret("jarvisbrowser", "JARVIS_BROWSER_TOKEN"),
-  ]);
-  return { base: base.replace(/\/+$/, ""), token };
+  const base = (process.env.JARVIS_BROWSER_URL
+    ?? await getSecret("jarvisbrowser", "JARVIS_BROWSER_URL").catch(() => null)
+    ?? DEFAULT_BROWSER_URL).replace(/\/+$/, "");
+
+  const token = process.env.JARVIS_BROWSER_TOKEN
+    ?? await getSecret("jarvisbrowser", "JARVIS_BROWSER_TOKEN").catch(() => null);
+
+  if (!token) {
+    throw new BrowserServiceUnconfigured(
+      "JARVIS_BROWSER_TOKEN is not set. Add it as an environment variable on the Jarvis "
+      + "deployment (or as a jarvisbrowser vault row). The value is in /etc/jarvis-browser/env "
+      + "on the browser host — read it with: sudo jarvis-browser-token",
+    );
+  }
+  return { base, token };
 }
 
 async function call(
