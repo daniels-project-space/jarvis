@@ -3508,10 +3508,10 @@ export const agentWorker = task({
 // runnable jobs into independent workers.
 export const agentFleetSupervisor = schedules.task({
   id: "jarvis-agent-fleet-supervisor",
-  // Stale leases expire after five minutes. A one-minute sweep bounds a lost
-  // worker's recovery delay to roughly one additional minute instead of the
-  // prior 5–20 minute blind spot.
-  cron: "*/1 * * * *",
+  // Stale leases expire after five minutes. A five-minute sweep bounds a lost
+  // worker's recovery delay to roughly one additional cycle instead of the
+  // prior 5–20 minute blind spot (cost opt: widened from 1min, 2026-08-17).
+  cron: "*/5 * * * *",
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,
