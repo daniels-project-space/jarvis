@@ -26,11 +26,6 @@
   var pendingCommands = [];
   var COMMAND_TTL_MS = 30000;
   var MAX_PENDING_COMMANDS = 4;
-  var pendingCodingProviderRequests = [];
-  var codingProviderWaiters = {};
-  var nextCodingProviderRequest = 0;
-  var CODING_PROVIDER_REQUEST_TTL_MS = 10000;
-  var MAX_PENDING_CODING_PROVIDER_REQUESTS = 4;
   var speechBlocked = false;
   var liveBlocked = false;
   // This is a deliberate privacy control, distinct from a temporary speech
@@ -259,103 +254,6 @@
     } catch {}
   }
 
-  function codingProviderStatus(data) {
-    if (!data || typeof data !== "object") return null;
-    var provider = data.provider;
-    if (provider !== "codex" && provider !== "claude") return null;
-    var updatedAt = Number(data.updatedAt);
-    var handoverRevision = Number(data.handoverRevision);
-    var automatic = data.automatic && typeof data.automatic === "object" ? data.automatic : null;
-    var threshold = automatic ? Number(automatic.codexWeeklyRemainingPercent) : 1;
-    var sourceRunner = data.runner && typeof data.runner === "object" ? data.runner : null;
-    var runner = { connected: Boolean(sourceRunner && sourceRunner.connected === true) };
-    if (sourceRunner) {
-      var lastHeartbeatAt = Number(sourceRunner.lastHeartbeatAt);
-      var policyRevision = Number(sourceRunner.policyRevision);
-      var managedSessions = Number(sourceRunner.managedSessions);
-      var deferredSessions = Number(sourceRunner.deferredSessions);
-      var remainingPercent = Number(sourceRunner.remainingPercent);
-      if (Number.isFinite(lastHeartbeatAt) && lastHeartbeatAt > 0) runner.lastHeartbeatAt = lastHeartbeatAt;
-      if (Number.isInteger(policyRevision) && policyRevision >= 0) runner.policyRevision = policyRevision;
-      if (Number.isInteger(managedSessions) && managedSessions >= 0) runner.managedSessions = managedSessions;
-      if (Number.isInteger(deferredSessions) && deferredSessions >= 0) runner.deferredSessions = deferredSessions;
-      if (sourceRunner.quotaState === "available" || sourceRunner.quotaState === "threshold" || sourceRunner.quotaState === "unavailable") runner.quotaState = sourceRunner.quotaState;
-      if (Number.isFinite(remainingPercent) && remainingPercent >= 0 && remainingPercent <= 100) runner.remainingPercent = remainingPercent;
-      if (typeof sourceRunner.version === "string" && sourceRunner.version.length <= 80) runner.version = sourceRunner.version;
-    }
-    var result = {
-      provider: provider,
-      targetRuntime: provider === "claude" ? "vps_claude" : "vps_codex",
-      updatedAt: Number.isFinite(updatedAt) && updatedAt >= 0 ? updatedAt : 0,
-    };
-    // Keep the original bridge result shape for older hosts. Newer Jarvis
-    // responses carry the following compact runner fields as an additive
-    // extension; no raw terminal/session data crosses the iframe boundary.
-    if (Number.isInteger(handoverRevision) && handoverRevision >= 0) result.handoverRevision = handoverRevision;
-    if (automatic && Number.isInteger(threshold) && threshold >= 1 && threshold <= 100) {
-      result.automatic = { codexWeeklyRemainingPercent: threshold };
-    }
-    if (sourceRunner) result.runner = runner;
-    return result;
-  }
-
-  function codingProviderRequestId() {
-    nextCodingProviderRequest += 1;
-    var random = window.crypto && typeof window.crypto.randomUUID === "function"
-      ? window.crypto.randomUUID().replace(/-/g, "")
-      : Math.random().toString(36).slice(2);
-    return "cp_" + Date.now().toString(36) + "_" + nextCodingProviderRequest.toString(36) + "_" + random.slice(0, 24);
-  }
-
-  function rejectCodingProviderWaiters(message, sentOnly) {
-    Object.keys(codingProviderWaiters).forEach(function (id) {
-      var waiter = codingProviderWaiters[id];
-      if (sentOnly && !waiter.sent) return;
-      delete codingProviderWaiters[id];
-      clearTimeout(waiter.timer);
-      waiter.reject(new Error(message));
-    });
-  }
-
-  function flushCodingProviderRequests() {
-    if (!ready || !f.contentWindow) return;
-    while (pendingCodingProviderRequests.length) {
-      var request = pendingCodingProviderRequests.shift();
-      var waiter = codingProviderWaiters[request.id];
-      if (!waiter) continue;
-      waiter.sent = true;
-      post(request.message);
-    }
-  }
-
-  function requestCodingProvider(message) {
-    if (!message || (message.provider !== undefined && message.provider !== "codex" && message.provider !== "claude")) {
-      return Promise.reject(new Error("Unsupported coding provider"));
-    }
-    return new Promise(function (resolve, reject) {
-      var id = codingProviderRequestId();
-      var timer = setTimeout(function () {
-        if (!codingProviderWaiters[id]) return;
-        delete codingProviderWaiters[id];
-        reject(new Error("Jarvis did not confirm the handover target"));
-      }, CODING_PROVIDER_REQUEST_TTL_MS);
-      codingProviderWaiters[id] = { resolve: resolve, reject: reject, timer: timer, sent: false };
-      pendingCodingProviderRequests.push({
-        id: id,
-        message: Object.assign({}, message, { id: id }),
-      });
-      while (pendingCodingProviderRequests.length > MAX_PENDING_CODING_PROVIDER_REQUESTS) {
-        var dropped = pendingCodingProviderRequests.shift();
-        var droppedWaiter = codingProviderWaiters[dropped.id];
-        if (!droppedWaiter) continue;
-        delete codingProviderWaiters[dropped.id];
-        clearTimeout(droppedWaiter.timer);
-        droppedWaiter.reject(new Error("Too many pending handover requests"));
-      }
-      flushCodingProviderRequests();
-    });
-  }
-
   function probeFreshReady(probe, attempt) {
     if (ready || requiredReadyProbe !== probe) return;
     post({ jarvis: "host-ready-probe", probe: probe });
@@ -366,7 +264,6 @@
 
   f.onload = function () {
     if (!frameIsAtJarvisOrigin()) return;
-    rejectCodingProviderWaiters("Jarvis reloaded before confirming the handover target", true);
     ready = false;
     requiredReadyProbe = ++readyProbe;
     if (readyProbeTimer) clearTimeout(readyProbeTimer);
@@ -1034,15 +931,6 @@
         mode: Date.now() < commandModeUntil ? "command" : "wake",
       };
     },
-    getCodingProviderStatus: function () {
-      return requestCodingProvider({ jarvis: "host-coding-provider-status" });
-    },
-    setCodingProvider: function (provider) {
-      if (provider !== "codex" && provider !== "claude") {
-        return Promise.reject(new Error("Unsupported coding provider"));
-      }
-      return requestCodingProvider({ jarvis: "host-coding-provider-set", provider: provider });
-    },
   };
 
   window.addEventListener("message", function (event) {
@@ -1059,7 +947,6 @@
       flushCommands();
       wakeState(Boolean(recognition), recognitionNeedsGesture ? "permission" : null);
       postHostContext();
-      flushCodingProviderRequests();
       dispatchEmbedEvent("jarvis:ready", { state: "online" });
       paintUniversalControls();
       if (recognitionWanted && !wakeMuted && !listenerLeaseGranted) {
@@ -1076,7 +963,6 @@
     } else if (data.jarvis === "unloading") {
       listenerLeaseGranted = false;
       pauseRecognition("frame-reloading");
-      rejectCodingProviderWaiters("Jarvis reloaded before confirming the handover target", true);
       ready = false;
       framePhase = "connecting";
       frameProgress = 0.08;
@@ -1085,18 +971,6 @@
       readyProbeTimer = null;
       dispatchEmbedEvent("jarvis:connection-state", { state: "connecting" });
       paintUniversalControls();
-    } else if (data.jarvis === "coding-provider-result") {
-      var resultId = typeof data.id === "string" ? data.id : "";
-      var waiter = codingProviderWaiters[resultId];
-      if (!waiter) return;
-      delete codingProviderWaiters[resultId];
-      clearTimeout(waiter.timer);
-      var providerStatus = data.ok === true ? codingProviderStatus(data.status) : null;
-      if (!providerStatus) {
-        waiter.reject(new Error("Jarvis could not confirm the handover target"));
-        return;
-      }
-      waiter.resolve(providerStatus);
     } else if (data.jarvis === "mute-state" && typeof data.muted === "boolean") {
       setWakeMuted(data.muted, false);
     } else if (data.jarvis === "status") {

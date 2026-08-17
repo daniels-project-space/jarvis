@@ -4,8 +4,5 @@ export function isJarvisPublicPath(pathname: string): boolean {
     || pathname === "/api/auth/viewer"
     || pathname === "/api/auth/pair"
     || pathname === "/api/agent-tool"
-    || pathname === "/api/health"
-    // The outbound VPS runner has its own mandatory, timing-safe bearer
-    // capability in the route handler. It cannot carry a browser session.
-    || pathname === "/api/local-handover/runner";
+    || pathname === "/api/health";
 }

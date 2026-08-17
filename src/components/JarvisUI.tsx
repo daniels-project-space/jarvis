@@ -255,89 +255,6 @@ type LiveResearchState = {
   phase: "idle" | "researching" | "ready";
   sourceCount: number;
 };
-type CodingProvider = "codex" | "claude";
-type LocalCodingRunnerStatus = {
-  connected: boolean;
-  lastHeartbeatAt?: number;
-  version?: string;
-  policyRevision?: number;
-  managedSessions?: number;
-  deferredSessions?: number;
-  quotaState?: "available" | "threshold" | "unavailable";
-  remainingPercent?: number;
-};
-type LocalCodingProviderStatus = {
-  provider: CodingProvider;
-  targetRuntime: "vps_codex" | "vps_claude";
-  updatedAt: number;
-  handoverRevision: number;
-  automatic: { codexWeeklyRemainingPercent: number };
-  runner: LocalCodingRunnerStatus;
-};
-
-function parseLocalCodingProviderStatus(value: unknown): LocalCodingProviderStatus | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  const provider = record.provider;
-  if (provider !== "codex" && provider !== "claude") return null;
-  const updatedAt = typeof record.updatedAt === "number" && Number.isFinite(record.updatedAt)
-    ? Math.max(0, record.updatedAt)
-    : 0;
-  const handoverRevision = typeof record.handoverRevision === "number"
-    && Number.isSafeInteger(record.handoverRevision)
-    && record.handoverRevision >= 0
-    ? record.handoverRevision
-    : 0;
-  const automaticRecord = record.automatic && typeof record.automatic === "object"
-    ? record.automatic as Record<string, unknown>
-    : null;
-  const threshold = typeof automaticRecord?.codexWeeklyRemainingPercent === "number"
-    && Number.isSafeInteger(automaticRecord.codexWeeklyRemainingPercent)
-    && automaticRecord.codexWeeklyRemainingPercent >= 1
-    && automaticRecord.codexWeeklyRemainingPercent <= 100
-    ? automaticRecord.codexWeeklyRemainingPercent
-    : 1;
-  const runnerRecord = record.runner && typeof record.runner === "object"
-    ? record.runner as Record<string, unknown>
-    : null;
-  const runner: LocalCodingRunnerStatus = {
-    connected: runnerRecord?.connected === true,
-    ...(typeof runnerRecord?.lastHeartbeatAt === "number" && Number.isFinite(runnerRecord.lastHeartbeatAt)
-      ? { lastHeartbeatAt: runnerRecord.lastHeartbeatAt }
-      : {}),
-    ...(typeof runnerRecord?.version === "string" && runnerRecord.version.length <= 80
-      ? { version: runnerRecord.version }
-      : {}),
-    ...(typeof runnerRecord?.policyRevision === "number" && Number.isSafeInteger(runnerRecord.policyRevision)
-      ? { policyRevision: runnerRecord.policyRevision }
-      : {}),
-    ...(typeof runnerRecord?.managedSessions === "number" && Number.isSafeInteger(runnerRecord.managedSessions)
-      ? { managedSessions: runnerRecord.managedSessions }
-      : {}),
-    ...(typeof runnerRecord?.deferredSessions === "number" && Number.isSafeInteger(runnerRecord.deferredSessions)
-      ? { deferredSessions: runnerRecord.deferredSessions }
-      : {}),
-    ...(runnerRecord?.quotaState === "available" || runnerRecord?.quotaState === "threshold" || runnerRecord?.quotaState === "unavailable"
-      ? { quotaState: runnerRecord.quotaState }
-      : {}),
-    ...(typeof runnerRecord?.remainingPercent === "number" && Number.isFinite(runnerRecord.remainingPercent)
-      ? { remainingPercent: runnerRecord.remainingPercent }
-      : {}),
-  };
-  return {
-    provider,
-    targetRuntime: provider === "claude" ? "vps_claude" : "vps_codex",
-    updatedAt,
-    handoverRevision,
-    automatic: { codexWeeklyRemainingPercent: threshold },
-    runner,
-  };
-}
-
-function validCodingProviderRequestId(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Za-z0-9_-]{8,160}$/.test(value);
-}
-
 const EMBEDDED_OPERATIONAL_LOG_LINE = /^\s*(?:```(?:json|text|log)?\s*)?(?:[⚠️🚨❌]\s*)?(?:error(?:\[[^\]]+\])?:|(?:type|reference|syntax|range|network|abort|tool)[_ ]?error\b|traceback\b|npm err!|(?:stdout|stderr)\s*:|at\s+\S.*\([^)]*:\d+:\d+\)|.*:\s*error\s+TS\d+\b|\{\s*["']?(?:error|stack|code)["']?\s*:|\{\s*["']?type["']?\s*:\s*["']error["']|\[(?:error|debug|warn|info|tool)\])/i;
 
 /** Keep implementation diagnostics in telemetry, never in the compact host UI. */
@@ -2710,42 +2627,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           hostActionWaiters.current.delete(message.id);
           finish({ ok: message.ok === true, detail: typeof message.detail === "string" ? message.detail : undefined });
         }
-      }
-      const handoverRequestId = validCodingProviderRequestId(message.id) ? message.id : null;
-      const relayCodingProviderStatus = (method: "GET" | "POST", provider?: CodingProvider) => {
-        if (!handoverRequestId) return;
-        const init: RequestInit = method === "POST"
-          ? {
-            method,
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ provider }),
-          }
-          : { method, cache: "no-store" };
-        void viewerFetch("/api/local-handover", init)
-          .then(async (response) => {
-            const payload = await response.json().catch(() => null) as { ok?: unknown; status?: unknown } | null;
-            const status = payload?.ok === true ? parseLocalCodingProviderStatus(payload.status) : null;
-            if (!response.ok || !status) throw new Error("local handover request rejected");
-            postToParent({ jarvis: "coding-provider-result", id: handoverRequestId, ok: true, status });
-          })
-          .catch(() => {
-            postToParent({
-              jarvis: "coding-provider-result",
-              id: handoverRequestId,
-              ok: false,
-              error: "The handover target could not be updated.",
-            });
-          });
-      };
-      if (message.jarvis === "host-coding-provider-status" && handoverRequestId) {
-        relayCodingProviderStatus("GET");
-      }
-      if (
-        message.jarvis === "host-coding-provider-set"
-        && handoverRequestId
-        && (message.provider === "codex" || message.provider === "claude")
-      ) {
-        relayCodingProviderStatus("POST", message.provider);
       }
       if (message.jarvis === "host-ready-probe" && typeof message.probe === "number") {
         postToParent({ jarvis: "ready", probe: message.probe });

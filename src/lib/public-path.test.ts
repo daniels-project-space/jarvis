@@ -13,11 +13,6 @@ describe("Jarvis proxy public-path contract", () => {
     expect(isJarvisPublicPath("/api/goal-mode")).toBe(false);
     expect(isJarvisPublicPath("/api/chat/cancel")).toBe(false);
     expect(isJarvisPublicPath("/api/auth/enroll")).toBe(false);
-  });
-
-  it("allows only the independently capability-protected VPS runner endpoint", () => {
-    expect(isJarvisPublicPath("/api/local-handover/runner")).toBe(true);
-    expect(isJarvisPublicPath("/api/local-handover")).toBe(false);
-    expect(isJarvisPublicPath("/api/local-handover/runner/other")).toBe(false);
+    expect(isJarvisPublicPath("/api/local-handover/runner")).toBe(false);
   });
 });
