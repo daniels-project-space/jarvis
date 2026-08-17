@@ -2423,4 +2423,36 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_provider", ["provider"]),
+
+  // Browser errands: JARVIS acting as Daniel in a real logged-in browser.
+  //
+  // Daniel approves the PLAN once, and the plan is the permission boundary —
+  // `envelope` pins the hosts, action types and send budget that jarvis-browser
+  // enforces on every step. Anything outside it escalates rather than
+  // proceeding. No credential material is ever stored here: `credentialId` is
+  // an opaque handle into the root-only sealed store on the browser host, and
+  // Convex (like the model) can never resolve it to a value.
+  browserErrands: defineTable({
+    objective: v.string(),
+    credentialId: v.optional(v.string()),
+    envelope: v.object({
+      allowedHosts: v.array(v.string()),
+      allowedActions: v.array(v.string()),
+      maxSends: v.number(),
+      maxSteps: v.number(),
+      ttlMs: v.number(),
+    }),
+    plan: v.array(v.string()), // human-readable steps, shown at approval time
+    status: v.string(), // proposed | approved | declined | running | done | failed | blocked | needs_step_approval
+    result: v.optional(v.string()),
+    escalation: v.optional(v.string()), // why it paused, when status = needs_step_approval
+    sends: v.optional(v.number()),
+    chatId: v.optional(v.string()),
+    requestedAt: v.number(),
+    resolvedAt: v.optional(v.number()),
+    startedAt: v.optional(v.number()),
+    finishedAt: v.optional(v.number()),
+  })
+    .index("by_status", ["status", "requestedAt"])
+    .index("by_chat", ["chatId", "requestedAt"]),
 });
