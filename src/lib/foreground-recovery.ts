@@ -67,6 +67,27 @@ export function authoritativeCancellationReceipt(
   return receipt.length >= 8 && receipt.length <= 512 ? receipt : null;
 }
 
+export type TerminalDurableRecoveryOutcome = {
+  clearActiveTurn: boolean;
+  sending: boolean;
+  durableRecovery: "idle" | "failed";
+};
+
+// Encodes the invariant that BOTH terminal phases ("done" and "error") must
+// release the composer (sending: false) and clear the tracked durable turn.
+// Regression: the "error" branch once diverged from "done" here, leaving
+// setSending(true) and the refs uncleared, so a backend-finalized failed
+// turn left the UI stuck showing "thinking" forever. See
+// foreground-recovery.test.ts for the covering regression test.
+export function terminalDurableRecoveryOutcome(
+  phase: ForegroundTurnPhase,
+): TerminalDurableRecoveryOutcome | null {
+  if (phase === "queued" || phase === "streaming") return null;
+  return phase === "done"
+    ? { clearActiveTurn: true, sending: false, durableRecovery: "idle" }
+    : { clearActiveTurn: true, sending: false, durableRecovery: "failed" };
+}
+
 export function foregroundTurnPhase(
   messages: ForegroundMessageState[],
   parentMessageId: string,

@@ -6,6 +6,7 @@ import {
   foregroundTurnPhase,
   latestRecoverableForegroundTurn,
   mergeRecoveredAssistant,
+  terminalDurableRecoveryOutcome,
 } from "./foreground-recovery";
 
 const userId = "user-1";
@@ -77,6 +78,32 @@ describe("mergeRecoveredAssistant", () => {
     expect(mergeRecoveredAssistant(initial, recovered)).toEqual([...initial, recovered]);
     const reactive = [...initial, { ...recovered, text: "authoritative" }];
     expect(mergeRecoveredAssistant(reactive, recovered)).toBe(reactive);
+  });
+});
+
+describe("terminalDurableRecoveryOutcome", () => {
+  it("does not resolve a transition while the turn is still in flight", () => {
+    expect(terminalDurableRecoveryOutcome("queued")).toBeNull();
+    expect(terminalDurableRecoveryOutcome("streaming")).toBeNull();
+  });
+
+  it("releases the composer and clears the tracked turn on a completed reply", () => {
+    expect(terminalDurableRecoveryOutcome("done")).toEqual({
+      clearActiveTurn: true,
+      sending: false,
+      durableRecovery: "idle",
+    });
+  });
+
+  it("regression: a backend-finalized failure also releases the composer instead of leaving it stuck on 'thinking'", () => {
+    // Before the fix, the error branch returned `sending: true` and never
+    // cleared the active turn, so the UI stayed on the busy/"thinking"
+    // indicator forever once chatQueue.ts finalized a turn as errored.
+    expect(terminalDurableRecoveryOutcome("error")).toEqual({
+      clearActiveTurn: true,
+      sending: false,
+      durableRecovery: "failed",
+    });
   });
 });
 

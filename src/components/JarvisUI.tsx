@@ -105,6 +105,7 @@ import {
   foregroundTurnPhase,
   latestRecoverableForegroundTurn,
   mergeRecoveredAssistant,
+  terminalDurableRecoveryOutcome,
 } from "@/lib/foreground-recovery";
 import {
   advanceFinalDelivery,
@@ -3191,15 +3192,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     durableStartedAt.current = null;
     if (durableRecoveryTimer.current) clearTimeout(durableRecoveryTimer.current);
     durableRecoveryTimer.current = null;
-    if (state.phase === "done") {
+    const outcome = terminalDurableRecoveryOutcome(state.phase);
+    if (!outcome) return;
+    if (outcome.clearActiveTurn) {
       activeDurableTurn.current = null;
       durableCancellationFence.current = null;
-      setDurableRecovery("idle");
-      setSending(false);
-      return;
     }
-    setSending(true);
-    setDurableRecovery("failed");
+    setDurableRecovery(outcome.durableRecovery);
+    setSending(outcome.sending);
+    if (outcome.durableRecovery === "idle") return;
     if (state.text) showCaption({
       who: "jarvis",
       text: embedded
