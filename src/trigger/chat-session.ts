@@ -765,8 +765,10 @@ export const chatHandoff = task({
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
   // A lost Trigger response remains ambiguous, so it is recovered durably
-  // rather than terminally failed. Keep that bounded wait to one minute.
-  cron: "*/1 * * * *",
+  // rather than terminally failed. Widened from 1min to 5min (cost opt,
+  // 2026-08-17): worst-case stuck-lease recovery latency goes from <=1min
+  // to <=5min, which is an acceptable tradeoff for cutting run-count 5x.
+  cron: "*/5 * * * *",
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,
   run: async () => {
