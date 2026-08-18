@@ -343,6 +343,26 @@ export async function gmailCreateDraft(input: GmailDraftInput): Promise<GmailDra
 }
 
 /**
+ * Send a draft that already exists.
+ *
+ * Deliberately send-a-draft rather than send-arbitrary-text: the draft is
+ * created first and sits in Daniel's own Gmail where he can read it, so what
+ * gets approved and what gets sent are provably the same bytes. There is no
+ * "compose and send in one call" entry point, because that is the one that
+ * lets a bad turn put words in his name with nothing to inspect first.
+ */
+export async function gmailSendDraft(draftId: string): Promise<{ messageId: string; threadId?: string }> {
+  const id = String(draftId ?? "").trim();
+  if (!id) throw new GmailError("gmailSendDraft requires a draft id.");
+  const sent = await gmailApi<{ id?: string; threadId?: string }>("drafts/send", {
+    method: "POST",
+    body: JSON.stringify({ id }),
+  });
+  if (!sent.id) throw new GmailError("Gmail did not confirm the send.");
+  return { messageId: sent.id, threadId: sent.threadId };
+}
+
+/**
  * Scans recent mail for a List-Unsubscribe header (RFC 2369/8058) and groups
  * hits by sender + frequency. Read-only — returns candidates for Jarvis to
  * present to Daniel; does not act on anything.

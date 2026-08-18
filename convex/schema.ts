@@ -507,6 +507,10 @@ export default defineSchema({
     failureCount: v.number(),
     lastError: v.optional(v.string()),
     originThreadId: v.optional(v.string()),
+    // Hunts that never find their price should stop on their own rather than
+    // run forever. Absent = open-ended, which keeps every pre-existing watch
+    // behaving exactly as before.
+    expiresAt: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -2303,6 +2307,29 @@ export default defineSchema({
     keys: v.object({ p256dh: v.string(), auth: v.string() }),
     createdAt: v.number(),
   }).index("by_endpoint", ["endpoint"]),
+
+  // Which categories are allowed to interrupt Daniel, and when.
+  //
+  // Single row (key "default"). Deliberately fail-OPEN on a missing row: a
+  // never-configured install should still deliver a price hit rather than
+  // silently swallow it. Only an explicit false suppresses a category, so
+  // silence is always something Daniel chose.
+  notificationPrefs: defineTable({
+    key: v.string(), // "default"
+    pushEnabled: v.boolean(), // master switch; false = in-app bell only
+    categories: v.object({
+      price_hunt: v.boolean(),
+      errand: v.boolean(),
+      work: v.boolean(),
+      reminder: v.boolean(),
+      incident: v.boolean(),
+    }),
+    // Local-time quiet window, e.g. 23 -> 7. Suppresses push only; the bell
+    // still fills up, so nothing is lost, just deferred.
+    quietHoursStart: v.optional(v.number()),
+    quietHoursEnd: v.optional(v.number()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
 
   // Live business intelligence: pollers pull real metrics (rentals, per-item
   // earnings, YouTube, music sales, wealth) into per-domain snapshots the brain

@@ -18,6 +18,9 @@ export const createProduct = mutation({
     targetPence: v.optional(v.number()),
     condition: v.optional(v.string()),
     cadenceMs: v.optional(v.number()),
+    // Absolute deadline for an unfulfilled hunt. Absent = open-ended, so every
+    // watch created before this existed keeps its old behaviour.
+    expiresAt: v.optional(v.number()),
     initialObservation: v.optional(v.any()),
     originThreadId: v.optional(v.string()),
     ...actorAuthArgs,
@@ -50,6 +53,9 @@ export const createProduct = mutation({
       await ctx.db.patch(existing._id, {
         definition,
         cadenceMs: clampCadence(a.cadenceMs, existing.cadenceMs),
+        // Re-asking for the same hunt restarts its clock rather than inheriting
+        // a deadline that may already be nearly spent.
+        expiresAt: a.expiresAt ?? existing.expiresAt,
         version: existing.version + 1,
         nextCheckAt: now,
         updatedAt: now,
@@ -71,9 +77,37 @@ export const createProduct = mutation({
       lastNotifiedValue: initialValue,
       failureCount: 0,
       originThreadId: a.originThreadId,
+      expiresAt: a.expiresAt,
       createdAt: now,
       updatedAt: now,
     });
+  },
+});
+
+/**
+ * Retire hunts whose window closed without the price ever being found.
+ *
+ * Completed rather than cancelled: the hunt ran its course, it was not called
+ * off. Called by the watch runtime before it claims work, so an expired rule
+ * cannot get one last check after its deadline.
+ */
+export const expireLapsed = mutation({
+  args: { now: v.optional(v.number()), workerToken: v.optional(v.string()), authTokenHash: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const now = a.now ?? Date.now();
+    const active = await ctx.db
+      .query("watchRules")
+      .withIndex("by_status_nextCheckAt", (q: any) => q.eq("status", "active"))
+      .take(200);
+    let expired = 0;
+    for (const rule of active) {
+      if (typeof rule.expiresAt === "number" && rule.expiresAt <= now) {
+        await ctx.db.patch(rule._id, { status: "completed", updatedAt: now });
+        expired += 1;
+      }
+    }
+    return { expired };
   },
 });
 
@@ -329,6 +363,44 @@ export const openEvents = query({
       .withIndex("by_status_createdAt", (q: any) => q.eq("status", "open"))
       .order("desc")
       .take(Math.min(40, a.limit ?? 20));
+  },
+});
+
+/**
+ * Mark signals as seen from the notification bell.
+ *
+ * "seen" rather than deleted: a price hit stays in history so Daniel can go
+ * back to it after the glow fades. Only the unread count clears.
+ */
+export const markEventsSeen = mutation({
+  args: { ids: v.optional(v.array(v.id("watchEvents"))), ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const targets = a.ids?.length
+      ? await Promise.all(a.ids.map((id) => ctx.db.get(id)))
+      : await ctx.db
+        .query("watchEvents")
+        .withIndex("by_status_createdAt", (q: any) => q.eq("status", "open"))
+        .take(40);
+    let seen = 0;
+    for (const event of targets) {
+      if (event && event.status === "open") {
+        await ctx.db.patch(event._id, { status: "seen" });
+        seen += 1;
+      }
+    }
+    return { seen };
+  },
+});
+
+export const dismissEvent = mutation({
+  args: { id: v.id("watchEvents"), ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const event = await ctx.db.get(a.id);
+    if (!event) return false;
+    await ctx.db.patch(a.id, { status: "dismissed" });
+    return true;
   },
 });
 

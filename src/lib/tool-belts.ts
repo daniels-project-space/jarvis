@@ -4,6 +4,10 @@ const TOOL_BELT_REGISTRY = {
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_view",
     "google_calendar_list", "google_calendar_create", "google_calendar_update", "google_calendar_delete",
     "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image", "show_uploaded_file", "open_uploaded_transcript", "review_uploaded_file",
+    // Errands Daniel starts by voice ("email Rakuten and ask about…"), so they
+    // belong in core: a tool absent from every belt is unreachable in the
+    // realtime lane no matter how good its description is.
+    "email_support", "browser_credentials", "browser_errand_propose", "browser_errand_run",
   ]),
   work: new Set([
     "orchestrate", "goal_mode", "self_repair", "self_improve", "research", "plan_my_day", "show", "net_worth", "memory_map",

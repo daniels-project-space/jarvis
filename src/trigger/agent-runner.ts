@@ -1066,7 +1066,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
           threadId: await chatThread(),
           text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
         });
-        await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/");
+        await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/", { category: "work" });
       }
     }
   } catch {

@@ -22,6 +22,11 @@ const ALLOWED = new Set([
   "ui:setMood",
   "ui:setVideoCmd",
   "watchRules:cancel",
+  // Notification bell. Read receipts and preferences only -- nothing here can
+  // create a watch, send anything, or reach outside the app.
+  "watchRules:markEventsSeen",
+  "watchRules:dismissEvent",
+  "notificationPrefs:update",
 ]);
 
 export async function POST(req: NextRequest) {

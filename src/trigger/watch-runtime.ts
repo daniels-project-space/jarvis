@@ -117,6 +117,9 @@ async function productSecrets() {
 export async function runWatchSweep() {
   const now = Date.now();
   const leaseToken = randomUUID();
+  // Retire lapsed hunts BEFORE claiming, so a rule past its deadline cannot get
+  // one final check (and a stale alert) on the sweep that expires it.
+  await convexMutation("watchRules:expireLapsed", { now }).catch(() => {});
   const claimed: any[] = (await convexMutation("watchRules:claimDue", { now, limit: 30, leaseMs: 120_000, leaseToken })) ?? [];
   if (!claimed.length) return { claimed: 0, checked: 0, triggered: 0, failed: 0 };
   const secrets = claimed.some((rule) => rule.kind === "product") ? await productSecrets() : {};
@@ -159,7 +162,7 @@ export async function runWatchSweep() {
           result.title || "JARVIS signal",
           result.spoken || "A watch condition was met.",
           "/",
-          { tag: signalTag, topic: signalTag, ttl: 24 * 3600, urgency: "high" },
+          { tag: signalTag, topic: signalTag, ttl: 24 * 3600, urgency: "high", category: "price_hunt" },
         ).then(() => true).catch(() => false);
         await convexMutation("watchRules:markPush", { id: result.eventId, status: sent ? "sent" : "failed" }).catch(() => {});
       }

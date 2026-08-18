@@ -40,6 +40,7 @@ import type * as missionSupervisorHandoff from "../missionSupervisorHandoff.js";
 import type * as missionSupervisorProtocol from "../missionSupervisorProtocol.js";
 import type * as missionSupervisorWake from "../missionSupervisorWake.js";
 import type * as missions from "../missions.js";
+import type * as notificationPrefs from "../notificationPrefs.js";
 import type * as proactive from "../proactive.js";
 import type * as proactivePolicy from "../proactivePolicy.js";
 import type * as projectIntelligence from "../projectIntelligence.js";
@@ -101,6 +102,7 @@ declare const fullApi: ApiFromModules<{
   missionSupervisorProtocol: typeof missionSupervisorProtocol;
   missionSupervisorWake: typeof missionSupervisorWake;
   missions: typeof missions;
+  notificationPrefs: typeof notificationPrefs;
   proactive: typeof proactive;
   proactivePolicy: typeof proactivePolicy;
   projectIntelligence: typeof projectIntelligence;

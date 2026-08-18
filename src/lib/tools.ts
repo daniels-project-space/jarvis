@@ -1040,6 +1040,8 @@ export const TOOL_DEFS = [
         query: { type: "string", description: "the specific brand/model/variant to track" },
         target_gbp: { type: "number", description: "optional: alert when it falls below this price" },
         condition: { type: "string", enum: ["new", "used", "any"], description: "required product condition if stated" },
+        every_days: { type: "number", description: "how often to re-check, in days (default 3, max 7)" },
+        for_months: { type: "number", description: "how long to keep hunting before giving up, in months (default 3, max 12). The hunt retires itself at the end." },
       },
       required: ["query"],
     },
@@ -1355,6 +1357,22 @@ export const TOOL_DEFS = [
       properties: {
         days: { type: "number", description: "optional lookback window in days, default 60" },
       },
+    },
+  },
+  {
+    name: "email_support",
+    description:
+      "Handle an errand by email end to end: work out the company's real support address, write the message as Daniel, create it as a genuine Gmail draft, and show him an approval card. Use for 'email Rakuten and ask about cashback claims in the EU' and anything of that shape. It does NOT send — Daniel taps approve on the card and the exact draft he read is what goes out. Say what you drafted and that it is waiting on him.",
+    parameters: {
+      type: "object",
+      properties: {
+        company: { type: "string", description: "who to contact, e.g. 'Rakuten'" },
+        ask: { type: "string", description: "what Daniel wants to know or have done, in his words" },
+        to: { type: "string", description: "support address if already known; omit and it will be looked up" },
+        subject: { type: "string", description: "optional subject; one is written if omitted" },
+        tone: { type: "string", enum: ["neutral", "friendly", "firm"], description: "default neutral" },
+      },
+      required: ["company", "ask"],
     },
   },
   {
@@ -5477,16 +5495,25 @@ export async function executeTool(
         requestedCondition,
       ).catch(() => null);
       const tgt = Number(args.target_gbp) || 0;
+      // Default shape of a hunt Daniel asks for out loud: look every few days,
+      // keep at it for a season, then stop on its own rather than lingering.
+      const everyDays = Math.min(7, Math.max(0.25, Number(args.every_days) || 3));
+      const forMonths = Math.min(12, Math.max(1, Number(args.for_months) || 3));
+      const cadenceMs = Math.round(everyDays * 86_400_000);
+      const expiresAt = Date.now() + Math.round(forMonths * 30 * 86_400_000);
       const watchId = await convexMutation("watchRules:createProduct", {
         query: q,
         targetPence: tgt ? Math.round(tgt * 100) : undefined,
         condition: requestedCondition,
+        cadenceMs,
+        expiresAt,
         initialObservation: now ?? undefined,
         originThreadId: await activeThread(),
       });
+      const window = `Checking every ${everyDays === 1 ? "day" : `${everyDays} days`} for ${forMonths} month${forMonths === 1 ? "" : "s"}, then it retires itself.`;
       return now
-        ? `Durable hunt ${watchId} is active for "${q}". Best verified match is £${(now.landedPence / 100).toFixed(2)} ${now.deliveryKnown ? "landed" : "listed (delivery still unverified)"} via ${now.source.provider}${tgt ? `; I'll alert only on a verified landed-price crossing below £${tgt}` : "; I'll alert after a verified meaningful new landed-price low"}. Never buys automatically.`
-        : `Durable hunt ${watchId} is active for "${q}"${tgt ? ` below £${tgt}` : ""}. No trustworthy identity match was available this second, so the scheduler will retry without fabricating a baseline.`;
+        ? `Durable hunt ${watchId} is active for "${q}". Best verified match is £${(now.landedPence / 100).toFixed(2)} ${now.deliveryKnown ? "landed" : "listed (delivery still unverified)"} via ${now.source.provider}${tgt ? `; I'll alert only on a verified landed-price crossing below £${tgt}` : "; I'll alert after a verified meaningful new landed-price low"}. ${window} Never buys automatically.`
+        : `Durable hunt ${watchId} is active for "${q}"${tgt ? ` below £${tgt}` : ""}. No trustworthy identity match was available this second, so the scheduler will retry without fabricating a baseline. ${window}`;
     }
     case "price_alert": {
       const asset = String(args.asset ?? "").trim();
@@ -5835,6 +5862,62 @@ export async function executeTool(
     }
     case "gmail_mark_spam": {
       return "Gmail spam marking is unavailable until Jarvis has a host-mediated owner-approval receipt. No inbox change was made.";
+    }
+    case "email_support": {
+      const company = String(args.company ?? "").trim();
+      const ask = String(args.ask ?? "").trim();
+      if (!company || !ask) return "TOOL DID NOTHING: I need the company and what you want to ask them.";
+
+      // Resolve the support address. A caller-supplied one wins; otherwise look
+      // it up and require it to sit on a domain plausibly belonging to the
+      // company, so a scraped address from an unrelated page is not used.
+      let to = String(args.to ?? "").trim();
+      let addressNote = "you gave me the address";
+      if (!to) {
+        const { searchWeb } = await import("./search");
+        const found = await searchWeb(`${company} customer support contact email address`, 8).catch(() => null);
+        const haystack = [found?.answer ?? "", ...(found?.results ?? []).map((r: any) => `${r.title ?? ""} ${r.snippet ?? ""} ${r.link ?? ""}`)].join(" ");
+        const candidates = [...haystack.matchAll(/\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/g)];
+        const token = company.toLowerCase().replace(/[^a-z0-9]/g, "");
+        const onBrand = candidates.find(([, domain]) => domain.toLowerCase().replace(/[^a-z0-9]/g, "").includes(token));
+        if (onBrand) {
+          to = onBrand[0];
+          addressNote = "I found this address online — check it looks right before approving";
+        }
+      }
+      if (!to) {
+        return `I couldn't find a support address for ${company} I'd trust. Tell me the address and I'll draft it, or ask me to open their contact page in the browser and read it.`;
+      }
+
+      const tone = ["neutral", "friendly", "firm"].includes(String(args.tone)) ? String(args.tone) : "neutral";
+      const subject = String(args.subject ?? "").trim() || `Question about ${ask.slice(0, 60)}`;
+      const opening = tone === "friendly" ? "Hi," : tone === "firm" ? "Hello," : "Hello,";
+      const closing = tone === "firm"
+        ? "Please confirm in writing.\n\nRegards,\nDaniel Mabro"
+        : "Thanks in advance for your help.\n\nBest,\nDaniel Mabro";
+      const body = `${opening}\n\n${ask}\n\n${closing}`;
+
+      const { gmailCreateDraft } = await import("./gmail");
+      const { issueGmailSendApproval, gmailSendApprovalMarker } = await import("./gmail-send-approval.server");
+      const draft = await gmailCreateDraft({ to, subject, body }).catch((error: unknown) => {
+        throw new Error(`Could not create the draft: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      const marker = gmailSendApprovalMarker(issueGmailSendApproval({
+        draftId: draft.draftId,
+        to,
+        subject,
+        preview: body.slice(0, 400),
+      }));
+
+      return [
+        `Drafted to ${to} (${addressNote}).`,
+        `Subject: ${subject}`,
+        "",
+        body,
+        "",
+        "It's saved in your Gmail drafts and nothing has been sent. Approve the card and exactly this goes out; I'll confirm once it has.",
+        marker,
+      ].join("\n");
     }
     case "browser_credentials": {
       try {

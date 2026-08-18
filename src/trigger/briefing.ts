@@ -54,7 +54,7 @@ export const morningBriefing = schedules.task({
       `${live}/${stack.length} deploys healthy${doneJobs ? ` · ${doneJobs} background job${doneJobs > 1 ? "s" : ""} completed` : ""}.`,
     ];
     await convexMutation("chatQueue:postAssistant", { threadId: "main", text: lines.join("\n") });
-    await sendPush("☀️ Morning briefing", lines.slice(1).join(" "), "/");
+    await sendPush("☀️ Morning briefing", lines.slice(1).join(" "), "/", { category: "reminder" });
     return { posted: true, broken };
   },
 });

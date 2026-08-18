@@ -96,6 +96,7 @@ import {
   type NovitaPatchProposerStatus,
 } from "@/lib/novita-patch-proposer-status";
 import { BackgroundReadinessControl } from "./BackgroundReadinessControl";
+import NotificationBell from "./NotificationBell";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
 import {
   authoritativeCancellationReceipt,
@@ -5498,6 +5499,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           <span className="hud-label hidden sm:inline">personal ai · online</span>
         </div>
         <div className="flex min-w-0 items-center gap-2 sm:gap-4">
+          <NotificationBell />
           <span className="flex items-center gap-1.5">
             <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan" : "bg-emerald-400"} breathe`} />
             <span className="hud-label">{status}</span>
