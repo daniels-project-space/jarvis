@@ -1,5 +1,6 @@
 import "server-only";
 import { getVercelOidcToken } from "@vercel/oidc";
+import { gmailSearch, gmailReadMessage } from "./gmail";
 import { convexMutation } from "./context";
 import { getSecret } from "./vault";
 
@@ -93,6 +94,32 @@ async function call(
   return { status: response.status, body };
 }
 
+/**
+ * Fetch a login code from Daniel's mailbox for an email-code site.
+ *
+ * Bounded deliberately: scoped to the credential's configured sender, to mail
+ * newer than the login attempt, and returns ONLY a short code. It never returns
+ * message bodies or links, so this cannot become a general inbox read, and an
+ * emailed link cannot steer the browser off the approved hosts.
+ */
+async function fetchLoginCode(senderHint: string | null, since: number): Promise<string | null> {
+  const sender = (senderHint ?? "").trim();
+  if (!sender) return null;
+  const afterSeconds = Math.floor(since / 1000) - 60;
+  const messages = await gmailSearch(`from:${sender} after:${afterSeconds}`, 5).catch(() => []);
+  for (const message of messages) {
+    const detail = await gmailReadMessage(message.id).catch(() => null);
+    if (!detail) continue;
+    const haystack = `${detail.subject ?? ""} ${detail.snippet ?? ""} ${detail.bodyText ?? ""}`;
+    // Prefer a code adjacent to code-ish wording; fall back to a lone 6-digit run.
+    const labelled = haystack.match(/(?:code|passcode|pin|otp)\D{0,20}([A-Z0-9]{4,8})\b/i);
+    if (labelled) return labelled[1];
+    const bare = haystack.match(/\b(\d{6})\b/);
+    if (bare) return bare[1];
+  }
+  return null;
+}
+
 export async function listBrowserCredentials(): Promise<Array<{ id: string; label: string; host: string }>> {
   const { base, token } = await serviceConfig();
   const { status, body } = await call("/credentials", { method: "GET", base, token });
@@ -147,13 +174,42 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
     },
   });
 
-  if (opened.status !== 201) {
+  // Email-code sites: the site has mailed a code; collect it and finish signing in.
+  if (opened.status === 202 && opened.body?.status === "awaiting_email_code") {
+    const requestedAt = Date.now();
+    let code: string | null = null;
+    // Mail delivery is not instant; a few short waits beat one long one.
+    for (const waitMs of [4000, 6000, 10_000]) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      code = await fetchLoginCode(opened.body.codeSenderHint ?? null, requestedAt);
+      if (code) break;
+    }
+    if (!code) {
+      return await finish({
+        status: "failed",
+        summary: "Requested a login code but none arrived in the mailbox within ~20s. Check the credential's sender hint.",
+        sends: 0,
+        transcript,
+      });
+    }
+    const completed = await call(`/tasks/${taskId}/login-code`, { method: "POST", base, token, body: { code } });
+    if (completed.body?.status !== "logged_in") {
+      return await finish({
+        status: "failed",
+        summary: `Login code was rejected: ${completed.body?.detail ?? "unknown reason"}`,
+        sends: 0,
+        transcript,
+      });
+    }
+    transcript.push("signed in (email code)");
+  } else if (opened.status !== 201) {
     const reason = opened.body?.status === "needs_otp"
       ? "The site asked for a one-time code and none is stored. Add a TOTP secret with `jarvis-cred edit`, or log in once by hand."
       : opened.body?.reason ?? opened.body?.detail ?? `service returned ${opened.status}`;
     return await finish({ status: "failed", summary: `Could not start: ${reason}`, sends: 0, transcript });
+  } else {
+    transcript.push(`signed in (${opened.body.auth})`);
   }
-  transcript.push(`signed in (${opened.body.auth})`);
 
   for (const step of steps) {
     const { status, body } = await call(`/tasks/${taskId}/step`, { method: "POST", base, token, body: step });

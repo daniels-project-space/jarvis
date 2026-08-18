@@ -13,6 +13,7 @@ import type * as appleMapsOfflinePreflights from "../appleMapsOfflinePreflights.
 import type * as approvals from "../approvals.js";
 import type * as attention from "../attention.js";
 import type * as brainContext from "../brainContext.js";
+import type * as browserErrands from "../browserErrands.js";
 import type * as business from "../business.js";
 import type * as chatQueue from "../chatQueue.js";
 import type * as commandCenter from "../commandCenter.js";
@@ -73,6 +74,7 @@ declare const fullApi: ApiFromModules<{
   approvals: typeof approvals;
   attention: typeof attention;
   brainContext: typeof brainContext;
+  browserErrands: typeof browserErrands;
   business: typeof business;
   chatQueue: typeof chatQueue;
   commandCenter: typeof commandCenter;
