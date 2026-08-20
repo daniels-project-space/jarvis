@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
-import { CHAT_FILE_LIMITS } from "../src/lib/chat-files";
+import { CHAT_FILE_LIMITS, privateFileSourceKey } from "../src/lib/chat-files";
+import { TURN_FILE_LEASE_MS } from "./files";
 import { linkFilesToMessage } from "./fileHelpers";
-import { resolveReadyClaimAttachments } from "../src/trigger/private-attachment-fence";
+import { reconcileReadyClaimAttachments, resolveReadyClaimAttachments } from "../src/trigger/private-attachment-fence";
 
 declare global {
   interface ImportMeta {
@@ -14,6 +15,13 @@ declare global {
 
 const modules = import.meta.glob("./**/*.ts");
 const WORKER = "private-files-test-worker";
+
+function turnLeaseSources(attachments: Array<any>) {
+  return attachments.map((attachment) => ({
+    fileId: attachment.fileId,
+    sourceKey: privateFileSourceKey(attachment),
+  }));
+}
 
 beforeEach(() => {
   process.env.JARVIS_WORKER_TOKEN = WORKER;
@@ -1072,6 +1080,178 @@ describe("durable private chat files", () => {
 
     expect(current).toEqual([]);
     expect(turnAttachments).toEqual([]);
+    expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(true);
+  });
+
+  it("pins the exact final source until its admitting foreground turn releases it", async () => {
+    const t = convexTest(schema, modules);
+    const source = await makeReady(t, "main", "gate.png", "a1".repeat(32), "private final source", "image/png");
+    const messageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Inspect this private image.",
+      requestId: "turn-file-lease-admission",
+      fileIds: [source.fileId as any],
+      workerToken: WORKER,
+    });
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId,
+      claimToken: "turn-file-lease-admission-token",
+      workerToken: WORKER,
+    });
+    if (!claim) throw new Error("foreground claim missing");
+    const leaseId = "turn-file-lease-admission-0001";
+    const finalSources = await t.mutation(api.files.acquireTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      sources: turnLeaseSources(claim.attachments),
+      workerToken: WORKER,
+    });
+    expect(finalSources).toMatchObject({
+      leaseId,
+      leased: true,
+    });
+
+    // The owner deletes after the worker's final ready validation but before
+    // app-server admission. Cleanup must wait for this exact turn lease.
+    expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
+      .toMatchObject({ ok: true, deferred: true, retryAfterMs: expect.any(Number) });
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId: source.fileId as any, workerToken: WORKER }))
+      .toMatchObject({ ready: false, retryAfterMs: expect.any(Number) });
+    expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(false);
+    await expect(t.mutation(api.files.releaseTurnFileLeases, {
+      threadId: "other-thread",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      workerToken: WORKER,
+    })).resolves.toBe(false);
+    expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(false);
+    await expect(t.mutation(api.files.releaseTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: "a-different-claim-token",
+      leaseId,
+      workerToken: WORKER,
+    })).resolves.toBe(false);
+    await expect(t.mutation(api.files.releaseTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId: "turn-file-lease-admission-wrong-id",
+      workerToken: WORKER,
+    })).resolves.toBe(false);
+    expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(false);
+
+    expect(await t.mutation(api.files.releaseTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(true);
+  });
+
+  it("drops a source changed before the final fence and defers another changed after it", async () => {
+    const t = convexTest(schema, modules);
+    const first = await makeReady(t, "main", "first.png", "b1".repeat(32), "FIRST_PRIVATE_SOURCE", "image/png");
+    const second = await makeReady(t, "main", "second.png", "c1".repeat(32), "SECOND_PRIVATE_SOURCE", "image/png");
+    const messageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Compare both images.",
+      requestId: "turn-file-lease-double-change",
+      fileIds: [first.fileId as any, second.fileId as any],
+      workerToken: WORKER,
+    });
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId,
+      claimToken: "turn-file-lease-double-change-token",
+      workerToken: WORKER,
+    });
+    if (!claim) throw new Error("foreground claim missing");
+
+    // First change: source two is gone before the durable final validation.
+    expect(await t.mutation(api.files.beginDelete, { fileId: second.fileId as any, workerToken: WORKER }))
+      .toMatchObject({ ok: true, deferred: false });
+    expect(await t.mutation(api.files.finishDelete, { fileId: second.fileId as any, workerToken: WORKER })).toBe(true);
+    const leaseId = "turn-file-lease-double-change-0001";
+    const staleAttempt = await t.mutation(api.files.acquireTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      sources: turnLeaseSources(claim.attachments),
+      workerToken: WORKER,
+    });
+    expect(staleAttempt).toMatchObject({ leaseId, leased: false });
+    expect(await t.run(async (ctx) => await ctx.db.query("chatTurnFileLeases").collect())).toEqual([]);
+    const refreshed = await t.query(api.files.contextForMessage, { messageId, workerToken: WORKER });
+    const turnInputs = reconcileReadyClaimAttachments(claim.attachments as any, refreshed);
+    expect(turnInputs).toEqual([expect.objectContaining({ fileId: String(first.fileId) })]);
+    expect(JSON.stringify(turnInputs)).not.toContain("SECOND_PRIVATE_SOURCE");
+
+    const leased = await t.mutation(api.files.acquireTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      sources: turnLeaseSources(turnInputs),
+      workerToken: WORKER,
+    });
+    expect(leased).toMatchObject({ leaseId, leased: true });
+
+    // Second change: the remaining source is deleted after the fence exists.
+    expect(await t.mutation(api.files.beginDelete, { fileId: first.fileId as any, workerToken: WORKER }))
+      .toMatchObject({ ok: true, deferred: true });
+    expect(await t.mutation(api.files.finishDelete, { fileId: first.fileId as any, workerToken: WORKER })).toBe(false);
+    expect(await t.mutation(api.files.releaseTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.mutation(api.files.finishDelete, { fileId: first.fileId as any, workerToken: WORKER })).toBe(true);
+  });
+
+  it("allows a deferred delete to finish after an unreported foreground lease expires", async () => {
+    const t = convexTest(schema, modules);
+    const source = await makeReady(t, "main", "expired.png", "d1".repeat(32), "private expiring source", "image/png");
+    const messageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Inspect this source.",
+      requestId: "turn-file-lease-expiry",
+      fileIds: [source.fileId as any],
+      workerToken: WORKER,
+    });
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId,
+      claimToken: "turn-file-lease-expiry-token",
+      workerToken: WORKER,
+    });
+    if (!claim) throw new Error("foreground claim missing");
+    await t.mutation(api.files.acquireTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId: "turn-file-lease-expiry-0001",
+      sources: turnLeaseSources(claim.attachments),
+      workerToken: WORKER,
+    });
+    expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
+      .toMatchObject({ ok: true, deferred: true });
+    await vi.advanceTimersByTimeAsync(TURN_FILE_LEASE_MS + 1);
     expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(true);
   });
 

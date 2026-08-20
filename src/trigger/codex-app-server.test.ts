@@ -551,6 +551,41 @@ describe("Codex app-server dynamic tools", () => {
     await expect(turn).resolves.toMatchObject({ code: 0 });
   });
 
+  it("runs the private-source fence immediately before turn/start and releases after admission", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const events: string[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: {
+        writable: true,
+        write: (chunk) => { writes.push(JSON.parse(chunk) as WrittenMessage); return true; },
+      },
+    };
+    internals.ready = Promise.resolve();
+
+    const turn = server.runTurn({
+      conversationId: "private-fence", userText: "inspect", history: [], contextBlock: "",
+      preamble: "test", modelTier: "luna", onDelta: () => {},
+      beforeTurn: async () => { events.push("before"); },
+      onTurnRequestWritten: () => { events.push("written"); },
+      onTurnAccepted: async () => { events.push("accepted"); },
+    });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(events).toEqual([]);
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "private-fence-thread" } } }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].method).toBe("turn/start");
+    expect(events).toEqual(["before", "written"]);
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "private-fence-turn" } } }));
+    await vi.waitFor(() => expect(events).toEqual(["before", "written", "accepted"]));
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "private-fence-turn", turn: { id: "private-fence-turn", status: "completed" } },
+    }));
+    await expect(turn).resolves.toMatchObject({ code: 0 });
+  });
+
   it.each([
     ["missing profile", { thread: { id: "cloud-thread" }, sandbox: { type: "readOnly", networkAccess: false } }],
     ["wrong profile", { thread: { id: "cloud-thread" }, activePermissionProfile: { id: "other" }, sandbox: { type: "readOnly", networkAccess: false } }],

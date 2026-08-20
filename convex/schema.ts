@@ -438,6 +438,25 @@ export default defineSchema({
     .index("by_thread_created", ["threadId", "createdAt"])
     .index("by_file", ["fileId", "createdAt"]),
 
+  // A short-lived, worker-only source fence. It is created only after the
+  // exact claimed user/assistant pair is still streaming and its attached
+  // source file is ready. Deletion leaves the row durable but must defer byte
+  // cleanup until this lease is released or expires, so a source cannot flip
+  // state between final validation and foreground model admission.
+  chatTurnFileLeases: defineTable({
+    fileId: v.id("files"),
+    threadId: v.string(),
+    messageId: v.id("chatMessages"),
+    assistantId: v.id("chatMessages"),
+    claimToken: v.string(),
+    leaseId: v.string(),
+    sourceKey: v.string(),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_file_expiry", ["fileId", "expiresAt"])
+    .index("by_assistant_claim_lease", ["assistantId", "claimToken", "leaseId"]),
+
   // Small search documents keep prompt retrieval bounded. Full deterministic
   // extraction remains in private R2 and is never placed in a chat row.
   fileChunks: defineTable({

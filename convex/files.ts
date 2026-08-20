@@ -9,6 +9,7 @@ import {
   normalizeUploadMime,
   normalizeUploadName,
   normalizeUploadSha256,
+  privateFileSourceKey,
 } from "../src/lib/chat-files";
 import { visibleTurnText } from "../src/lib/host-context";
 import { messageFileManifests } from "./fileHelpers";
@@ -42,6 +43,12 @@ const extractedChunk = v.object({
 });
 
 const INGEST_CLAIM_STALE_MS = 90_000;
+// This fence only covers the final source validation through app-server model
+// admission. It is deliberately much shorter than a foreground turn and is
+// normally released as soon as `turn/start` is accepted.
+export const TURN_FILE_LEASE_MS = 120_000;
+const TURN_FILE_LEASE_ID = /^[a-zA-Z0-9_-]{16,120}$/;
+const TURN_FILE_SOURCE_KEY_MAX_CHARS = 1_024;
 
 function ownerThread(value: string | undefined): string {
   const threadId = value?.trim() || "main";
@@ -57,6 +64,21 @@ function boundedRequestId(value: string): string {
     throw new ConvexError({ code: "INVALID_UPLOAD_REQUEST", message: "Upload request identity is invalid" });
   }
   return requestId;
+}
+
+function boundedTurnLeaseId(value: string): string {
+  const leaseId = value.trim();
+  if (!TURN_FILE_LEASE_ID.test(leaseId)) {
+    throw new ConvexError({ code: "INVALID_FILE_LEASE", message: "Private file lease identity is invalid" });
+  }
+  return leaseId;
+}
+
+function boundedTurnSourceKey(value: string): string {
+  if (!value || value.length > TURN_FILE_SOURCE_KEY_MAX_CHARS) {
+    throw new ConvexError({ code: "INVALID_FILE_LEASE", message: "Private file source identity is invalid" });
+  }
+  return value;
 }
 
 function validatedDescriptor(input: {
@@ -129,6 +151,27 @@ function activeIngestCleanupRetryAfter(file: any, now: number): number | null {
   if (!Number.isFinite(lastProgressAt)) return null;
   const retryAfterMs = lastProgressAt + INGEST_CLAIM_STALE_MS - now;
   return retryAfterMs > 0 ? retryAfterMs : null;
+}
+
+function earliestRetryAfter(...values: Array<number | null>): number | null {
+  const candidates = values.filter((value): value is number => value !== null && value > 0);
+  return candidates.length ? Math.min(...candidates) : null;
+}
+
+/** Expired leases are harmless to deletion, but remove a bounded set on the
+ * file's normal lifecycle path so crashed workers cannot accumulate rows. */
+async function activeTurnFileLeaseRetryAfter(ctx: { db: any }, fileId: any, now: number): Promise<number | null> {
+  const expired = await ctx.db
+    .query("chatTurnFileLeases")
+    .withIndex("by_file_expiry", (q: any) => q.eq("fileId", fileId).lte("expiresAt", now))
+    .take(CHAT_FILE_LIMITS.maxFilesPerMessage + 1);
+  for (const lease of expired) await ctx.db.delete(lease._id);
+  const active = await ctx.db
+    .query("chatTurnFileLeases")
+    .withIndex("by_file_expiry", (q: any) => q.eq("fileId", fileId).gt("expiresAt", now))
+    .first();
+  if (!active) return null;
+  return Math.max(1, Number(active.expiresAt) - now);
 }
 
 async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired" | "cancelled") {
@@ -392,7 +435,10 @@ export const claimCancelledUploadCleanup = mutation({
     if (!file || file.status === "deleted") return null;
     const now = Date.now();
     if (file.status === "deleting") {
-      const retryAfterMs = activeIngestCleanupRetryAfter(file, now);
+      const retryAfterMs = earliestRetryAfter(
+        activeIngestCleanupRetryAfter(file, now),
+        await activeTurnFileLeaseRetryAfter(ctx, file._id, now),
+      );
       return retryAfterMs === null
         ? { ready: true as const, r2Keys: cleanupKeysForFile(file) }
         : { ready: false as const, retryAfterMs };
@@ -905,6 +951,177 @@ export const contextForMessage = query({
   },
 });
 
+/**
+ * Atomically refreshes the exact claimed source set and creates the short
+ * deletion fence consumed by the foreground worker. The assistant row, its
+ * parent user message, the message-file link, and every ready file are checked
+ * in this mutation so a delete racing this final validation serializes on the
+ * file row rather than leaving a stale R2 key in the model payload.
+ */
+export const acquireTurnFileLeases = mutation({
+  args: {
+    threadId: v.string(),
+    messageId: v.id("chatMessages"),
+    assistantId: v.id("chatMessages"),
+    claimToken: v.string(),
+    leaseId: v.string(),
+    sources: v.array(v.object({
+      fileId: v.id("files"),
+      sourceKey: v.string(),
+    })),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const threadId = ownerThread(args.threadId);
+    const leaseId = boundedTurnLeaseId(args.leaseId);
+    if (args.sources.length > CHAT_FILE_LIMITS.maxFilesPerMessage) {
+      throw new ConvexError({ code: "INVALID_FILE_LEASE", message: "Private file lease source bound exceeded" });
+    }
+    const requested = new Map<string, { fileId: any; sourceKey: string }>();
+    for (const source of args.sources) {
+      requested.set(String(source.fileId), {
+        fileId: source.fileId,
+        sourceKey: boundedTurnSourceKey(source.sourceKey),
+      });
+    }
+    if (requested.size !== args.sources.length) {
+      throw new ConvexError({ code: "INVALID_FILE_LEASE", message: "Private file lease sources must be unique" });
+    }
+    if (!requested.size) return { leaseId, leased: true as const };
+
+    const [message, assistant] = await Promise.all([ctx.db.get(args.messageId), ctx.db.get(args.assistantId)]);
+    if (
+      !message
+      || message.role !== "user"
+      || message.threadId !== threadId
+      || !assistant
+      || assistant.role !== "assistant"
+      || assistant.threadId !== threadId
+      || assistant.parentMessageId !== message._id
+      || assistant.status !== "streaming"
+      || assistant.claimToken !== args.claimToken
+    ) return { leaseId, leased: false as const };
+
+    const now = Date.now();
+    const expiresAt = now + TURN_FILE_LEASE_MS;
+    const [links, existingLeases] = await Promise.all([
+      ctx.db
+        .query("messageFiles")
+        .withIndex("by_message", (q: any) => q.eq("messageId", message._id))
+        .take(CHAT_FILE_LIMITS.maxFilesPerMessage + 1),
+      ctx.db
+        .query("chatTurnFileLeases")
+        .withIndex("by_assistant_claim_lease", (q: any) => q
+          .eq("assistantId", assistant._id)
+          .eq("claimToken", args.claimToken)
+          .eq("leaseId", leaseId))
+        .take(CHAT_FILE_LIMITS.maxFilesPerMessage + 1),
+    ]);
+    if (links.length > CHAT_FILE_LIMITS.maxFilesPerMessage) return { leaseId, leased: false as const };
+    const attachedFileIds = new Set(
+      links.filter((link: any) => link.threadId === threadId).map((link: any) => String(link.fileId)),
+    );
+
+    // Validate every source before creating any row. A two-file turn must
+    // never pin A while B changed between the last refresh and model send.
+    const validated = await Promise.all([...requested.entries()].map(async ([fileKey, source]) => {
+      if (!attachedFileIds.has(fileKey)) return null;
+      const file = await ctx.db.get(source.fileId) as any;
+      if (!file || !FILE_READY_STATUSES.has(String(file.status))) return null;
+      const liveSourceKey = privateFileSourceKey({
+        status: String(file.status),
+        mimeType: String(file.detectedMimeType ?? file.mimeType),
+        sizeBytes: Number(file.sizeBytes),
+        r2Key: String(file.r2Key),
+        previewR2Key: file.previewR2Key ? String(file.previewR2Key) : undefined,
+      });
+      return liveSourceKey === source.sourceKey ? { file, source } : null;
+    }));
+    if (validated.some((source) => source === null)) return { leaseId, leased: false as const };
+    const exactSources = validated as Array<{ file: any; source: { fileId: any; sourceKey: string } }>;
+
+    const expiredLeases = existingLeases.filter((lease: any) => Number(lease.expiresAt) <= now);
+    const activeLeases = existingLeases.filter((lease: any) => Number(lease.expiresAt) > now);
+    const expectedByFileId = new Map(exactSources.map(({ file, source }) => [String(file._id), source.sourceKey]));
+    const existingLeaseSetMatches = activeLeases.length === exactSources.length
+      && new Set(activeLeases.map((lease: any) => String(lease.fileId))).size === exactSources.length
+      && activeLeases.every((lease: any) =>
+        lease.threadId === threadId
+        && String(lease.messageId) === String(message._id)
+        && expectedByFileId.get(String(lease.fileId)) === lease.sourceKey,
+      );
+    for (const lease of expiredLeases) await ctx.db.delete(lease._id);
+    if (activeLeases.length && !existingLeaseSetMatches) return { leaseId, leased: false as const };
+
+    if (existingLeaseSetMatches) {
+      for (const lease of activeLeases) await ctx.db.patch(lease._id, { expiresAt });
+    } else {
+      for (const { file, source } of exactSources) {
+        await ctx.db.insert("chatTurnFileLeases", {
+          fileId: file._id,
+          threadId,
+          messageId: message._id,
+          assistantId: assistant._id,
+          claimToken: args.claimToken,
+          leaseId,
+          sourceKey: source.sourceKey,
+          expiresAt,
+          createdAt: now,
+        });
+      }
+    }
+    // This write makes final source validation and a deletion transition
+    // conflict even when their index reads race on an otherwise empty lease.
+    for (const { file } of exactSources) await ctx.db.patch(file._id, { updatedAt: now });
+    return { leaseId, leased: true as const, expiresAt };
+  },
+});
+
+/** Release only the source pins owned by the exact still-fenced foreground
+ * turn. A retry or a different message/claim cannot release another turn's
+ * private source lease. */
+export const releaseTurnFileLeases = mutation({
+  args: {
+    threadId: v.string(),
+    messageId: v.id("chatMessages"),
+    assistantId: v.id("chatMessages"),
+    claimToken: v.string(),
+    leaseId: v.string(),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const threadId = ownerThread(args.threadId);
+    const leaseId = boundedTurnLeaseId(args.leaseId);
+    const [message, assistant] = await Promise.all([ctx.db.get(args.messageId), ctx.db.get(args.assistantId)]);
+    if (
+      !message
+      || message.role !== "user"
+      || message.threadId !== threadId
+      || !assistant
+      || assistant.role !== "assistant"
+      || assistant.threadId !== threadId
+      || assistant.parentMessageId !== message._id
+      || assistant.claimToken !== args.claimToken
+    ) return false;
+    const leases = await ctx.db
+      .query("chatTurnFileLeases")
+      .withIndex("by_assistant_claim_lease", (q: any) => q
+        .eq("assistantId", assistant._id)
+        .eq("claimToken", args.claimToken)
+        .eq("leaseId", leaseId))
+      .take(CHAT_FILE_LIMITS.maxFilesPerMessage + 1);
+    let released = false;
+    for (const lease of leases) {
+      if (lease.threadId !== threadId || String(lease.messageId) !== String(message._id)) continue;
+      await ctx.db.delete(lease._id);
+      released = true;
+    }
+    return released;
+  },
+});
+
 export const searchAttachedFiles = query({
   args: {
     messageId: v.id("chatMessages"),
@@ -1124,7 +1341,10 @@ export const beginDelete = mutation({
     if (!file || file.status === "deleted") return null;
     const now = Date.now();
     if (file.status === "deleting") {
-      const retryAfterMs = activeIngestCleanupRetryAfter(file, now);
+      const retryAfterMs = earliestRetryAfter(
+        activeIngestCleanupRetryAfter(file, now),
+        await activeTurnFileLeaseRetryAfter(ctx, file._id, now),
+      );
       return {
         ok: true as const,
         deferred: retryAfterMs !== null,
@@ -1135,6 +1355,22 @@ export const beginDelete = mutation({
     }
     const reference = await ctx.db.query("creationFileRefs").withIndex("by_file", (q) => q.eq("fileId", file._id)).first();
     if (reference) return { ok: false as const, reason: "creation_reference" as const };
+    const turnLeaseRetryAfterMs = await activeTurnFileLeaseRetryAfter(ctx, file._id, now);
+    if (turnLeaseRetryAfterMs !== null) {
+      await ctx.db.patch(file._id, {
+        status: "deleting",
+        deletePreviousStatus: file.status,
+        libraryVisible: false,
+        updatedAt: now,
+      });
+      return {
+        ok: true as const,
+        deferred: true as const,
+        retryAfterMs: turnLeaseRetryAfterMs,
+        r2Keys: cleanupKeysForFile(file),
+        idempotent: false as const,
+      };
+    }
     if (file.status === "uploading" && Number(file.uploadClaimExpiresAt ?? 0) > now) {
       await ctx.db.patch(file._id, {
         cancelRequestedAt: now,
@@ -1194,7 +1430,11 @@ export const finishDelete = mutation({
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status !== "deleting") return false;
-    if (activeIngestCleanupRetryAfter(file, Date.now()) !== null) return false;
+    const now = Date.now();
+    if (earliestRetryAfter(
+      activeIngestCleanupRetryAfter(file, now),
+      await activeTurnFileLeaseRetryAfter(ctx, file._id, now),
+    ) !== null) return false;
     const [chunks, threadLinks] = await Promise.all([
       ctx.db.query("fileChunks").withIndex("by_file_ordinal", (q) => q.eq("fileId", file._id)).collect(),
       ctx.db.query("threadFiles").withIndex("by_file", (q) => q.eq("fileId", file._id)).collect(),
@@ -1215,7 +1455,7 @@ export const finishDelete = mutation({
       extractedChars: 0,
       chunkCount: 0,
       libraryVisible: false,
-      updatedAt: Date.now(),
+      updatedAt: now,
     });
     return true;
   },
