@@ -124,6 +124,9 @@ function bridgeProductionRunnerToConvex(
       case "jobs:checkpointAndRequeue":
         value = await t.mutation(api.jobs.checkpointAndRequeue, body.args as any);
         break;
+      case "jobs:rejectDispatch":
+        value = await t.mutation(api.jobs.rejectDispatch, body.args as any);
+        break;
       case "jobs:noteCloudWorkspaceBlock":
         value = await t.mutation(api.jobs.noteCloudWorkspaceBlock, body.args as any);
         break;
@@ -823,6 +826,79 @@ describe("production Trigger worker authority harness", () => {
     expect(boundaries.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
     expect(boundaries.configuredCloudWorkspaceProvider).not.toHaveBeenCalled();
     expect(trigger.batchTrigger).not.toHaveBeenCalled();
+  });
+
+  it("releases an unclaimed reservation when its durable claim transport fails", async () => {
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-claim-transport-failure");
+    let failedFirstClaim = false;
+    const bridge = bridgeProductionRunnerToConvex(t, async (call) => {
+      if (call.path === "jobs:claimDispatched" && !failedFirstClaim) {
+        failedFirstClaim = true;
+        throw new Error("temporary Convex transport failure");
+      }
+    });
+    const dependencies = injectedRunnerDependencies();
+
+    expect(await invokeHarness(
+      reservation,
+      "trigger-claim-transport-failure",
+      dependencies,
+    )).toEqual({ processed: 0, stale: true });
+    expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:claimDispatched",
+      "jobs:rejectDispatch",
+    ]);
+    expect((dependencies.resolveSubscriptionAgentBin as any)).not.toHaveBeenCalled();
+    expect((dependencies.configuredCloudWorkspaceProvider as any)).not.toHaveBeenCalled();
+
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      receipt: (await ctx.db.get(jobId))?.dispatchReceiptId
+        ? await ctx.db.get((await ctx.db.get(jobId))!.dispatchReceiptId!)
+        : null,
+    }));
+    expect(state.job).toMatchObject({
+      status: "pending",
+      stage: "queued",
+    });
+    expect(state.job?.dispatchId).toBeUndefined();
+    expect(state.job?.workerRunId).toBeUndefined();
+    expect(state.receipt).toMatchObject({
+      status: "superseded",
+      closeReason: expect.stringContaining("worker could not confirm durable claim"),
+    });
+  });
+
+  it("replays a claim whose durable response was lost instead of releasing its running worker", async () => {
+    const t = convexTest(schema, modules);
+    const { reservation } = await reservedWritableJob(t, "runner-claim-response-lost");
+    let lostFirstResponse = false;
+    const bridge = bridgeProductionRunnerToConvex(
+      t,
+      undefined,
+      async (call) => {
+        if (call.path === "jobs:claimDispatched" && !lostFirstResponse) {
+          lostFirstResponse = true;
+          throw new Error("claim response lost after durable commit");
+        }
+      },
+    );
+    const dependencies = injectedRunnerDependencies();
+    (dependencies.resolveSubscriptionAgentBin as any).mockReturnValue(undefined);
+
+    expect(await invokeHarness(
+      reservation,
+      "trigger-claim-response-lost",
+      dependencies,
+    )).toMatchObject({ processed: 1, error: "no codex binary" });
+    expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:claimDispatched",
+      "jobs:rejectDispatch",
+      "jobs:claimDispatched",
+      "jobs:checkpointAndRequeue",
+    ]);
+    expect((dependencies.configuredCloudWorkspaceProvider as any)).not.toHaveBeenCalled();
   });
 
   it("ignores forged payload authority and binds the actual Trigger run to the immutable claim", async () => {
