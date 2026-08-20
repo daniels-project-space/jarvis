@@ -1203,7 +1203,15 @@ function WidgetView({ value }: { value: string }) {
               <div className="truncate text-xl font-semibold text-ice md:text-2xl xl:text-3xl" title={`${k.prefix ?? ""}${k.value}${k.suffix ?? ""}`}>
                 <CountUp value={k.value} prefix={k.prefix ?? ""} suffix={k.suffix ?? ""} />
               </div>
-              <div className="hud-label mt-1">{k.label}</div>
+              <div className="hud-label mt-1">
+                {k.label}
+                {["r2", "project coverage"].includes(String(k.label ?? "").trim().toLowerCase()) && (
+                  <span
+                    aria-hidden="true"
+                    className="ml-1.5 inline-block h-1.5 w-1.5 rounded-full bg-amber align-middle shadow-[0_0_6px_rgba(255,180,84,0.55)]"
+                  />
+                )}
+              </div>
             </div>
           ))}
         </div>
