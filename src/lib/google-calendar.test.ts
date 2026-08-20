@@ -203,7 +203,7 @@ describe("Google Calendar primary-calendar boundary", () => {
   it("finds the managed event reserved for an exact source key", async () => {
     const sourceDedupeKey = "a".repeat(64);
     const eventId = `jarvis${sourceDedupeKey}`;
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify(remoteEvent({
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify(remoteEvent({
       id: eventId,
       etag: "\"revision-7\"",
       extendedProperties: {
