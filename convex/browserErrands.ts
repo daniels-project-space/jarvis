@@ -486,9 +486,12 @@ export const expireStale = mutation({
   args: {
     limit: v.optional(v.number()),
     authTokenHash: v.optional(v.string()),
+    // The minute fleet supervisor needs the same narrow terminal-only
+    // authority as the owner UI. It cannot propose, approve, or run errands.
+    workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
-    await requireAdmin(ctx, a.authTokenHash);
+    await requireActor(ctx, a);
     const now = Date.now();
     const limit = Math.min(MAX_REAP_BATCH, Math.max(1, Math.trunc(a.limit ?? MAX_REAP_BATCH)));
     const expired = await ctx.db.query("browserErrands")
