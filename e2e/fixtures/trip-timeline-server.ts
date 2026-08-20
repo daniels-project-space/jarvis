@@ -35,6 +35,8 @@ const contentTypes: Record<string, string> = {
   "/booking-marker.js": "text/javascript; charset=utf-8",
   "/offline-map": "text/html; charset=utf-8",
   "/offline-map.js": "text/javascript; charset=utf-8",
+  "/city-itinerary": "text/html; charset=utf-8",
+  "/city-itinerary.js": "text/javascript; charset=utf-8",
 };
 
 const csp = [
@@ -190,6 +192,20 @@ const offlineMapFixtureHtml = `<!doctype html>
   </body>
 </html>`;
 
+const cityItineraryFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>City-scoped itinerary fixture</title>
+    <link rel="stylesheet" href="/fixture.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/city-itinerary.js" defer></script>
+  </body>
+</html>`;
+
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
   const fixtureVideoPath = join(outputDir, "fixture-video.mp4");
@@ -219,6 +235,7 @@ async function main() {
     location: join(projectRoot, "e2e/fixtures/trip-location-follow.browser.tsx"),
     "booking-marker": join(projectRoot, "e2e/fixtures/trip-booked-stay-marker.browser.tsx"),
     "offline-map": join(projectRoot, "e2e/fixtures/apple-maps-offline.browser.tsx"),
+    "city-itinerary": join(projectRoot, "e2e/fixtures/trip-city-itinerary-scope.browser.tsx"),
   },
   format: "iife",
   jsx: "automatic",
@@ -243,6 +260,7 @@ async function main() {
   const locationJsPath = join(outputDir, "location.js");
   const bookingMarkerJsPath = join(outputDir, "booking-marker.js");
   const offlineMapJsPath = join(outputDir, "offline-map.js");
+  const cityItineraryJsPath = join(outputDir, "city-itinerary.js");
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
@@ -255,6 +273,7 @@ async function main() {
     access(locationJsPath),
     access(bookingMarkerJsPath),
     access(offlineMapJsPath),
+    access(cityItineraryJsPath),
   ]);
 
   const server = createServer(async (request, response) => {
@@ -382,6 +401,11 @@ async function main() {
     response.end(offlineMapFixtureHtml);
     return;
   }
+  if (pathname === "/city-itinerary") {
+    response.writeHead(200);
+    response.end(cityItineraryFixtureHtml);
+    return;
+  }
 
   response.writeHead(200);
   response.end(await readFile(
@@ -405,6 +429,8 @@ async function main() {
                 ? bookingMarkerJsPath
                 : pathname === "/offline-map.js"
                   ? offlineMapJsPath
+                  : pathname === "/city-itinerary.js"
+                    ? cityItineraryJsPath
                   : voiceJsPath,
   ));
   });
