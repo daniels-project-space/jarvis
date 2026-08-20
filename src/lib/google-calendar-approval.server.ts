@@ -30,7 +30,13 @@ export type GoogleCalendarApprovalProposal =
     event: GoogleCalendarCreateInput;
     appleMapsOfflinePreflight?: AppleMapsOfflinePreflightApprovalBinding;
   }
-  | { action: "update"; eventId: string; expectedEtag: string; event: GoogleCalendarCreateInput }
+  | {
+    action: "update";
+    eventId: string;
+    expectedEtag: string;
+    event: GoogleCalendarCreateInput;
+    appleMapsOfflinePreflight?: AppleMapsOfflinePreflightApprovalBinding;
+  }
   | { action: "delete"; eventId: string; expectedEtag: string };
 
 export type VerifiedGoogleCalendarApproval = {
@@ -175,11 +181,15 @@ function normalizedProposal(value: unknown): GoogleCalendarApprovalProposal {
     };
   }
   if (input.action === "update") {
+    const appleMapsOfflinePreflight = Object.hasOwn(input, "appleMapsOfflinePreflight")
+      ? normalizedAppleMapsOfflinePreflightApprovalBinding(input.appleMapsOfflinePreflight)
+      : undefined;
     return {
       action: "update",
       eventId: normalizedManagedEventId(input.eventId),
       expectedEtag: normalizedEtag(input.expectedEtag),
       event: normalizedEvent(input.event),
+      ...(appleMapsOfflinePreflight ? { appleMapsOfflinePreflight } : {}),
     };
   }
   if (input.action === "delete") {

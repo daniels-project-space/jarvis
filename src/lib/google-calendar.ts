@@ -202,10 +202,14 @@ function eventIdentity(input: {
   const { sourceDedupeKey, ...canonicalInput } = input;
   const canonical = JSON.stringify(canonicalInput);
   const dedupeKey = sourceDedupeKey ?? createHash("sha256").update(canonical).digest("hex");
+  return { eventId: managedEventId(dedupeKey), dedupeKey };
+}
+
+function managedEventId(dedupeKey: string): string {
   // Google's allowed event-id alphabet is base32hex (a-v, 0-9). A SHA-256
   // hex digest is a valid subset, and the stable ID lets a retry resolve a
   // completed insert without creating a duplicate event.
-  return { eventId: `jarvis${dedupeKey}`, dedupeKey };
+  return `jarvis${dedupeKey}`;
 }
 
 function normalizedEventInput(input: GoogleCalendarCreateInput): GoogleCalendarCreateInput {
@@ -302,6 +306,24 @@ export async function getManagedGooglePrimaryCalendarEvent(eventId: string): Pro
   const existing = await currentManagedEvent(eventId);
   if (!existing || !existing.etag) {
     throw new GoogleCalendarError("That managed Google Calendar event is no longer available.");
+  }
+  return { event: publicEvent(existing), etag: existing.etag };
+}
+
+/**
+ * Looks up the one managed event reserved for a stable server-derived source
+ * key. A matching private key is required before a caller can turn a fresh
+ * owner approval into an ETag-fenced update instead of another create.
+ */
+export async function getManagedGooglePrimaryCalendarEventForSourceKey(
+  sourceDedupeKey: string,
+): Promise<{ event: GoogleCalendarEvent; etag: string } | null> {
+  const dedupeKey = normalizedSourceDedupeKey(sourceDedupeKey);
+  if (!dedupeKey) throw new GoogleCalendarError("Source dedupe key must be an opaque SHA-256 digest.");
+  const existing = await currentManagedEvent(managedEventId(dedupeKey));
+  if (!existing) return null;
+  if (existing.privateProperties.jarvisDedupeKey !== dedupeKey || !existing.etag) {
+    throw new GoogleCalendarError("That managed Google Calendar event does not match this source.");
   }
   return { event: publicEvent(existing), etag: existing.etag };
 }

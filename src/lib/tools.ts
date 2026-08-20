@@ -30,7 +30,12 @@ import { resolveHostProjectContext } from "./host-project-context";
 import { withHostContext } from "./host-context";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import { listICloudEvents } from "./icloud-calendar";
-import { getManagedGooglePrimaryCalendarEvent, listGooglePrimaryCalendarEvents, type GoogleCalendarCreateInput } from "./google-calendar";
+import {
+  getManagedGooglePrimaryCalendarEvent,
+  getManagedGooglePrimaryCalendarEventForSourceKey,
+  listGooglePrimaryCalendarEvents,
+  type GoogleCalendarCreateInput,
+} from "./google-calendar";
 import { googleCalendarApprovalMarker, issueGoogleCalendarApproval, issueGoogleCalendarApprovalProposal } from "./google-calendar-approval.server";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
 import {
@@ -2804,26 +2809,41 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   };
   if (calendarStatus === "approval_required") {
     try {
-      const approval = issueGoogleCalendarApprovalProposal({
-        action: "create",
-        event: {
-          title: `Apple Maps offline · ${preflight.city}`,
-          start: preflight.at,
-          end: preflight.at + 30 * 60_000,
-          allDay: false,
-          timeZone: preflight.timeZone,
-          location: preflight.city,
-          notes: `Before ${preflight.flightTitle}: open the Apple Maps handoff, download ${preflight.city} for offline use, then remove an old unused map in Maps > Offline Maps. Jarvis cannot download or delete Apple offline maps.`,
-          reminderMinutesBefore: 5,
-          sourceDedupeKey: preflight.sourceKey,
-        },
-        appleMapsOfflinePreflight: {
-          tripId: trip.id,
-          storage: trip.storage,
-          updatedAt: trip.doc.offlineMapPreflight.updatedAt,
-          sourceKey: preflight.sourceKey,
-        },
-      });
+      const event: GoogleCalendarCreateInput = {
+        title: `Apple Maps offline · ${preflight.city}`,
+        start: preflight.at,
+        end: preflight.at + 30 * 60_000,
+        allDay: false,
+        timeZone: preflight.timeZone,
+        location: preflight.city,
+        notes: `Before ${preflight.flightTitle}: open the Apple Maps handoff, download ${preflight.city} for offline use, then remove an old unused map in Maps > Offline Maps. Jarvis cannot download or delete Apple offline maps.`,
+        reminderMinutesBefore: 5,
+        sourceDedupeKey: preflight.sourceKey,
+      };
+      const appleMapsOfflinePreflight = {
+        tripId: trip.id,
+        storage: trip.storage,
+        updatedAt: trip.doc.offlineMapPreflight.updatedAt,
+        sourceKey: preflight.sourceKey,
+      };
+      // The source key gives this handoff one stable managed event ID. When a
+      // refreshed itinerary is prepared again, seal an update to the current
+      // provider revision rather than relying on idempotent create to return
+      // the earlier event at its old time.
+      const existing = await getManagedGooglePrimaryCalendarEventForSourceKey(preflight.sourceKey);
+      const approval = existing
+        ? issueGoogleCalendarApprovalProposal({
+          action: "update",
+          eventId: existing.event.id,
+          expectedEtag: existing.etag,
+          event,
+          appleMapsOfflinePreflight,
+        })
+        : issueGoogleCalendarApprovalProposal({
+          action: "create",
+          event,
+          appleMapsOfflinePreflight,
+        });
       calendarApprovalMarker = googleCalendarApprovalMarker(approval);
     } catch {
       calendarStatus = "needs_connection";

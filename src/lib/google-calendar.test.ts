@@ -11,6 +11,7 @@ import {
   createGooglePrimaryCalendarEvent,
   deleteManagedGooglePrimaryCalendarEvent,
   getManagedGooglePrimaryCalendarEvent,
+  getManagedGooglePrimaryCalendarEventForSourceKey,
   listGooglePrimaryCalendarEvents,
   updateManagedGooglePrimaryCalendarEvent,
 } from "./google-calendar";
@@ -197,6 +198,45 @@ describe("Google Calendar primary-calendar boundary", () => {
       event: { id: eventId, title: "Planning session" },
       etag: "\"revision-1\"",
     });
+  });
+
+  it("finds the managed event reserved for an exact source key", async () => {
+    const sourceDedupeKey = "a".repeat(64);
+    const eventId = `jarvis${sourceDedupeKey}`;
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(remoteEvent({
+      id: eventId,
+      etag: "\"revision-7\"",
+      extendedProperties: {
+        private: {
+          jarvisManaged: "jarvis-google-calendar-v1",
+          jarvisDedupeKey: sourceDedupeKey,
+        },
+      },
+    })), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getManagedGooglePrimaryCalendarEventForSourceKey(sourceDedupeKey)).resolves.toMatchObject({
+      event: { id: eventId, title: "Planning session" },
+      etag: "\"revision-7\"",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(`/events/${eventId}`);
+  });
+
+  it("refuses a source-key lookup when the reserved event marker belongs to another source", async () => {
+    const sourceDedupeKey = "a".repeat(64);
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(remoteEvent({
+      id: `jarvis${sourceDedupeKey}`,
+      etag: "\"revision-7\"",
+      extendedProperties: {
+        private: {
+          jarvisManaged: "jarvis-google-calendar-v1",
+          jarvisDedupeKey: "b".repeat(64),
+        },
+      },
+    })), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getManagedGooglePrimaryCalendarEventForSourceKey(sourceDedupeKey)).rejects.toThrow(/does not match this source/i);
   });
 
   it("updates only a revision-matched managed event without sending invitations", async () => {

@@ -159,6 +159,86 @@ describe("Google Calendar owner approval route", () => {
     expect(mock.create).not.toHaveBeenCalled();
   });
 
+  it("updates a current Apple Maps event only with its sealed revision", async () => {
+    const binding = {
+      tripId: "creation-apple",
+      storage: "creation" as const,
+      updatedAt: 1_000,
+      sourceKey: "a".repeat(64),
+    };
+    const proposal = {
+      action: "update" as const,
+      eventId: `jarvis${binding.sourceKey}`,
+      expectedEtag: "\"revision-7\"",
+      event: {
+        title: "Apple Maps offline · Seville",
+        start: 3,
+        end: 4,
+        allDay: false,
+        sourceDedupeKey: binding.sourceKey,
+      },
+      appleMapsOfflinePreflight: binding,
+    };
+    mock.verify.mockReturnValue({ proposal });
+    mock.getTrip.mockResolvedValue({
+      id: binding.tripId,
+      storage: binding.storage,
+      doc: {
+        offlineMapPreflight: {
+          sourceKey: binding.sourceKey,
+          updatedAt: binding.updatedAt,
+          calendarRefreshRequired: false,
+        },
+      },
+    });
+
+    const response = await POST(request({ token: "current-apple-maps-update" }));
+
+    await expect(response.json()).resolves.toMatchObject({ ok: true, action: "update" });
+    expect(mock.withAdminSession).toHaveBeenCalledWith("owner", expect.any(Function));
+    expect(mock.update).toHaveBeenCalledWith({
+      eventId: proposal.eventId,
+      expectedEtag: proposal.expectedEtag,
+      event: proposal.event,
+    });
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+
+  it("does not update a refreshed Apple Maps event before its preflight is re-approved", async () => {
+    const binding = {
+      tripId: "creation-apple",
+      storage: "creation" as const,
+      updatedAt: 1_000,
+      sourceKey: "a".repeat(64),
+    };
+    mock.verify.mockReturnValue({
+      proposal: {
+        action: "update",
+        eventId: `jarvis${binding.sourceKey}`,
+        expectedEtag: "\"revision-7\"",
+        event: { title: "Apple Maps offline · Seville", start: 3, end: 4, allDay: false },
+        appleMapsOfflinePreflight: binding,
+      },
+    });
+    mock.getTrip.mockResolvedValue({
+      id: binding.tripId,
+      storage: binding.storage,
+      doc: {
+        offlineMapPreflight: {
+          sourceKey: binding.sourceKey,
+          updatedAt: binding.updatedAt + 1,
+          calendarRefreshRequired: true,
+        },
+      },
+    });
+
+    const response = await POST(request({ token: "stale-apple-maps-update" }));
+
+    expect(response.status).toBe(409);
+    expect(mock.update).not.toHaveBeenCalled();
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+
   it("dispatches only the revision-sealed managed update", async () => {
     const proposal = {
       action: "update" as const,

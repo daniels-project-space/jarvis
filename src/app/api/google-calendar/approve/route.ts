@@ -38,32 +38,35 @@ export async function POST(req: NextRequest) {
     return Response.json({ ok: false, error: "calendar approval is invalid or expired" }, { status: 400 });
   }
 
+  const binding = approval.proposal.action === "delete"
+    ? undefined
+    : approval.proposal.appleMapsOfflinePreflight;
+  if (binding) {
+    // Draft reads deliberately require the originating worker message when
+    // made with worker authority. This is an owner-approved browser action,
+    // so carry its verified owner session into the exact-ID read instead of
+    // weakening the draft worker boundary.
+    const trip = await withAdminSession(
+      actor.authTokenHash,
+      () => getTrip(binding.tripId, { storage: binding.storage }),
+    ).catch(() => null);
+    const preflight = trip?.doc.offlineMapPreflight;
+    if (
+      trip?.storage !== binding.storage ||
+      preflight?.sourceKey !== binding.sourceKey ||
+      preflight?.updatedAt !== binding.updatedAt ||
+      preflight.calendarRefreshRequired === true
+    ) {
+      return Response.json({
+        ok: false,
+        error: "That Apple Maps itinerary changed before approval. Prepare a fresh protected Calendar approval.",
+      }, { status: 409, headers: PRIVATE_HEADERS });
+    }
+  }
+
   try {
     switch (approval.proposal.action) {
       case "create": {
-        const binding = approval.proposal.appleMapsOfflinePreflight;
-        if (binding) {
-          // Draft reads deliberately require the originating worker message when
-          // made with worker authority. This is an owner-approved browser
-          // action, so carry its verified owner session into the exact-ID read
-          // instead of weakening the draft worker boundary.
-          const trip = await withAdminSession(
-            actor.authTokenHash,
-            () => getTrip(binding.tripId, { storage: binding.storage }),
-          ).catch(() => null);
-          const preflight = trip?.doc.offlineMapPreflight;
-          if (
-            trip?.storage !== binding.storage ||
-            preflight?.sourceKey !== binding.sourceKey ||
-            preflight?.updatedAt !== binding.updatedAt ||
-            preflight.calendarRefreshRequired === true
-          ) {
-            return Response.json({
-              ok: false,
-              error: "That Apple Maps itinerary changed before approval. Prepare a fresh protected Calendar approval.",
-            }, { status: 409, headers: PRIVATE_HEADERS });
-          }
-        }
         const result = await createGooglePrimaryCalendarEvent(approval.proposal.event);
         return Response.json({
           ok: true,
