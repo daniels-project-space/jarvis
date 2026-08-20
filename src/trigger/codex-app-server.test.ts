@@ -137,6 +137,8 @@ describe("Codex app-server dynamic tools", () => {
           messageId: "message-1",
           assistantId: "assistant-1",
           claimToken: "claim-1",
+          toolNames: ["google_calendar_list", "google_calendar_create"],
+          calendarAndHubTodo: true,
         },
       },
       onDelta: () => {},
@@ -151,6 +153,7 @@ describe("Codex app-server dynamic tools", () => {
     expect(writes[1].method).toBe("turn/start");
     expect(writes[1].params).toMatchObject({ model: "gpt-5.6-luna", effort: "high" });
     expect(JSON.stringify(writes)).not.toContain("claim-1");
+    expect(JSON.stringify(writes)).not.toContain("google_calendar_create");
     internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "turn-1" } } }));
     await Promise.resolve();
 
@@ -181,6 +184,8 @@ describe("Codex app-server dynamic tools", () => {
           messageId: "message-1",
           assistantId: "assistant-1",
           claimToken: "claim-1",
+          toolNames: ["google_calendar_list", "google_calendar_create"],
+          calendarAndHubTodo: true,
         },
       },
       signal: expect.any(AbortSignal),

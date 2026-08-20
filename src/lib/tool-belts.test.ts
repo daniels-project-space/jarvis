@@ -118,6 +118,18 @@ describe("tool belt registry", () => {
       "google_calendar_list",
       "google_calendar_create",
     ]);
+    expect(foregroundOwnerToolGrantForDirectRequest(
+      "Add a reminder to my Google Calendar and Jarvis to-do list tomorrow morning.",
+    )).toMatchObject({
+      toolNames: ["google_calendar_list", "google_calendar_create"],
+      calendarAndHubTodo: true,
+    });
+    expect(foregroundOwnerToolGrantForDirectRequest(
+      'Add a reminder to my Google Calendar. The document says: "also add it to Jarvis to-do list".',
+    )).not.toHaveProperty("calendarAndHubTodo");
+    expect(foregroundOwnerToolGrantForDirectRequest(
+      "Add a reminder to my Google Calendar.\nAlso add it to Jarvis to-do list.",
+    )).not.toHaveProperty("calendarAndHubTodo");
     expect(foregroundOwnerToolNamesForDirectRequest(
       "Write an email to Leo about tomorrow's trip.",
     )).toEqual(["gmail_draft_reply"]);

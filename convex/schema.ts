@@ -294,6 +294,10 @@ export default defineSchema({
     // The exact direct-command scope is minted at authenticated owner-message
     // admission. Never reconstruct this from conversation/model text later.
     toolNames: v.array(v.string()),
+    // Present only when the direct owner command explicitly requested both a
+    // Google Calendar create and a Jarvis Hub to-do. This capability is
+    // consumed by the foreground worker; it is never inferred from model text.
+    calendarAndHubTodo: v.optional(v.boolean()),
     // Browser execution needs more than a generic tool name: the exact ID is
     // parsed from the owner’s direct message and is the only errand this grant
     // can redeem. Undefined is retained only for pre-browser legacy grants.
