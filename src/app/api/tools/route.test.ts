@@ -15,14 +15,19 @@ vi.mock("@/lib/request-auth", () => ({
 vi.mock("@/lib/context", () => ({ reportIncident: mock.reportIncident }));
 vi.mock("@/lib/tools", () => ({
   executeTool: mock.executeTool,
-  TOOL_DEFS: [{ name: "show" }],
+  TOOL_DEFS: [
+    { name: "show" },
+    { name: "email_support" },
+    { name: "google_calendar_create" },
+  ],
 }));
 vi.mock("@/lib/tool-belts", () => ({
-  TOOL_BELTS: { core: new Set(["show"]) },
+  TOOL_BELTS: { core: new Set(["show", "email_support", "google_calendar_create"]) },
+  isForegroundOwnerToolName: (name: unknown) => name === "email_support" || name === "google_calendar_create" || name === "browser_errand_run",
   slimToolDefinition: (value: unknown) => value,
 }));
 
-import { POST } from "./route";
+import { GET, POST } from "./route";
 
 function request(body: Record<string, unknown>) {
   return new Request("https://jarvis.test/api/tools", {
@@ -32,11 +37,22 @@ function request(body: Record<string, unknown>) {
   }) as unknown as NextRequest;
 }
 
+function getRequest(path = "/api/tools?live=1") {
+  return new Request(`https://jarvis.test${path}`) as unknown as NextRequest;
+}
+
 describe("owner direct-tool invocation context", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mock.controlActor.mockResolvedValue({ kind: "owner" });
     mock.executeTool.mockResolvedValue("shown");
+  });
+
+  it("does not expose foreground-only Gmail or Calendar tools through the live browser catalogue", async () => {
+    const response = await GET(getRequest());
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual([{ name: "show" }]);
   });
 
   it("accepts a bounded request id but ignores unproven chat-message provenance", async () => {
@@ -86,4 +102,17 @@ describe("owner direct-tool invocation context", () => {
     });
     expect(mock.executeTool).not.toHaveBeenCalled();
   });
+
+  it.each(["email_support", "google_calendar_create"]) (
+    "does not let an owner-session browser route invoke foreground-only %s without its verified turn",
+    async (name) => {
+      const response = await POST(request({ name, args: {} }));
+
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({
+        result: "This owner-only tool requires a verified foreground owner turn.",
+      });
+      expect(mock.executeTool).not.toHaveBeenCalled();
+    },
+  );
 });

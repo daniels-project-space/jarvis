@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { reportIncident } from "@/lib/context";
 import { actorAdminHash, controlActor, isOwnerActor } from "@/lib/request-auth";
 import { TOOL_DEFS, executeTool } from "@/lib/tools";
-import { TOOL_BELTS, slimToolDefinition } from "@/lib/tool-belts";
+import { TOOL_BELTS, isForegroundOwnerToolName, slimToolDefinition } from "@/lib/tool-belts";
 import { normalizeToolInvocationContext } from "@/lib/tool-invocation-context";
 
 // The realtime client fetches tool definitions here to register them on the
@@ -19,13 +19,18 @@ export async function GET(req: NextRequest) {
   // actions). Guests use the isolated chat lane and must not receive that
   // capability catalogue merely by opening the conversation surface.
   if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
+  // This browser route has no persisted foreground-turn grant or signed
+  // owner-tool receipt. Keep the full foreground-only surface on its separate
+  // endpoint so an owner session cannot turn arbitrary realtime tool calls
+  // into Gmail/Calendar writes or reads.
+  const directToolDefs = TOOL_DEFS.filter((tool) => !isForegroundOwnerToolName(tool.name));
   const live = new URL(req.url).searchParams.get("live");
   if (live) {
     const belt = TOOL_BELTS[live === "1" ? "core" : live] ?? TOOL_BELTS.core;
-    const slim = TOOL_DEFS.filter((t) => belt.has(t.name)).map(slimToolDefinition);
+    const slim = directToolDefs.filter((tool) => belt.has(tool.name)).map(slimToolDefinition);
     return Response.json(slim);
   }
-  return Response.json(TOOL_DEFS);
+  return Response.json(directToolDefs);
 }
 
 // Tool bridge for the realtime voice session: the browser receives function
@@ -47,6 +52,9 @@ export async function POST(req: NextRequest) {
     // redeemed receipt is bound to a live owner turn and exact errand ID.
     if (toolName === "browser_errand_run") {
       return Response.json({ result: "Browser errands require a one-time foreground owner execution receipt." }, { status: 403 });
+    }
+    if (isForegroundOwnerToolName(toolName)) {
+      return Response.json({ result: "This owner-only tool requires a verified foreground owner turn." }, { status: 403 });
     }
     const invocationContext = normalizeToolInvocationContext(
       requestId === undefined ? undefined : { requestId },

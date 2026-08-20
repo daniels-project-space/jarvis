@@ -449,6 +449,62 @@ describe("foreground agent tool bridge", () => {
     expect(String(ownerRequests[1].init?.body)).not.toContain("claim-1");
   });
 
+  it("keeps an explicit owner email-support draft on the signed foreground lane", async () => {
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      ownerEndpoint: "https://jarvis.test/api/foreground-owner-tool",
+      ownerToolReceiptSecret: "w".repeat(48),
+      fetchImplementation: async (input, init) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/foreground-owner-tool")) {
+          return init?.method === "GET"
+            ? Response.json([{ name: "email_support", description: "Draft an owner-approved support email." }])
+            : Response.json({ result: "Drafted the support email." });
+        }
+        return Response.json([]);
+      },
+    });
+    const hostContext = {
+      foregroundOwnerToolTurn: {
+        messageId: "message-1",
+        assistantId: "assistant-1",
+        claimToken: "claim-1",
+      },
+    } as const;
+
+    const listed = await bridge.invoke(dynamicCall(
+      "jarvis_get_tools",
+      { intent: "Email Rakuten and ask about cashback claims in the EU" },
+      undefined,
+      undefined,
+      hostContext,
+    ));
+    const called = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "email_support", args: { company: "Rakuten", ask: "Please explain EU cashback claims." } },
+      { userMessageId: "message-1" },
+      undefined,
+      hostContext,
+    ));
+
+    expect(listed.success).toBe(true);
+    expect(called.success).toBe(true);
+    const ownerRequests = requests.filter(({ url }) => url.pathname.endsWith("/foreground-owner-tool"));
+    expect(ownerRequests).toHaveLength(2);
+    expect(ownerRequests[0].url.searchParams.get("belt")).toBe("core");
+    expect(ownerRequests[0].init?.headers).toMatchObject({
+      authorization: "Bearer dispatch-token",
+      "x-jarvis-owner-tool-receipt": expect.any(String),
+    });
+    expect(JSON.parse(String(ownerRequests[1].init?.body))).toEqual({
+      name: "email_support",
+      args: { company: "Rakuten", ask: "Please explain EU cashback claims." },
+    });
+    expect(requests.filter(({ url, init }) => url.pathname.endsWith("/agent-tool") && init?.method === "POST")).toEqual([]);
+  });
+
   it("binds a foreground browser run receipt to its exact errand and rejects injected steps before any request", async () => {
     const secret = "w".repeat(48);
     const requests: Array<{ url: URL; init?: RequestInit }> = [];
