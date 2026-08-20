@@ -46,6 +46,9 @@ const MAX_SELECT_VALUE_CHARS = 500;
 const MAX_NAVIGATE_URL_CHARS = 2_048;
 const MAX_READ_LIMIT = 2_000;
 const BROWSER_ERRAND_RECEIPT_KEY = /^[A-Za-z0-9_.:-]{1,512}$/;
+const UNKNOWN_OUTCOME_RESULT = "The execution lease expired before a final receipt arrived. Its outcome is unknown, so JARVIS did not retry it automatically.";
+const MAX_UNKNOWN_OUTCOME_NOTICES = 3;
+const MAX_UNKNOWN_OUTCOME_SCAN = 48;
 const HOST_RE = /^(?:\*\.)?(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
 type BrowserAction = (typeof ACTIONS)[number];
@@ -227,7 +230,7 @@ function stepSummary(step: BrowserStep): string {
 function terminalLeaseFailure(now: number) {
   return {
     status: "failed",
-    result: "The execution lease expired before a final receipt arrived. Its outcome is unknown, so JARVIS did not retry it automatically.",
+    result: UNKNOWN_OUTCOME_RESULT,
     finishedAt: now,
     leaseToken: undefined,
     leaseUntil: undefined,
@@ -273,6 +276,28 @@ export const pending = query({
     const escalated = await ctx.db.query("browserErrands")
       .withIndex("by_status", (q: any) => q.eq("status", "needs_step_approval")).order("desc").take(20);
     return [...proposed, ...escalated];
+  },
+});
+
+// This deliberately returns only the owner-safe recovery handoff. It never
+// sends a provider reason, selector, credential, or executable plan back to
+// the browser, and its fixed bound avoids turning the chat surface into an
+// errand-history feed.
+export const unknownOutcomes = query({
+  args: { ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const failed = await ctx.db.query("browserErrands")
+      .withIndex("by_status_finished", (q: any) => q.eq("status", "failed"))
+      .order("desc")
+      .take(MAX_UNKNOWN_OUTCOME_SCAN);
+    return failed
+      .filter((errand) => errand.result === UNKNOWN_OUTCOME_RESULT)
+      .slice(0, MAX_UNKNOWN_OUTCOME_NOTICES)
+      .map((errand) => ({
+        _id: errand._id,
+        objective: errand.objective,
+      }));
   },
 });
 

@@ -3,16 +3,22 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mock = vi.hoisted(() => ({
   rows: undefined as unknown,
+  recoveries: undefined as unknown,
   calls: [] as Array<{ name?: string; args: unknown }>,
 }));
 
 vi.mock("../../convex/_generated/api", () => ({
-  api: { browserErrands: { pending: { _name: "browserErrands:pending" } } },
+  api: {
+    browserErrands: {
+      pending: { _name: "browserErrands:pending" },
+      unknownOutcomes: { _name: "browserErrands:unknownOutcomes" },
+    },
+  },
 }));
 vi.mock("@/lib/secure-convex", () => ({
   useJarvisQuery: (query: { _name?: string }, args: unknown) => {
     mock.calls.push({ name: query?._name, args });
-    return mock.rows;
+    return query?._name === "browserErrands:unknownOutcomes" ? mock.recoveries : mock.rows;
   },
 }));
 vi.mock("@/lib/client-mutation", () => ({ clientMutation: vi.fn() }));
@@ -39,6 +45,7 @@ const proposed = {
 
 beforeEach(() => {
   mock.rows = [proposed];
+  mock.recoveries = [];
   mock.calls = [];
 });
 
@@ -55,6 +62,24 @@ describe("BrowserErrandApprovals", () => {
     expect(markup).toContain("Decline");
     expect(markup).toContain("does not start the browser by itself");
     expect(mock.calls).toContainEqual({ name: "browserErrands:pending", args: {} });
+    expect(mock.calls).toContainEqual({ name: "browserErrands:unknownOutcomes", args: {} });
+  });
+
+  it("renders an owner-only unknown-outcome handoff with no retry or approval control", () => {
+    mock.rows = [];
+    mock.recoveries = [{
+      _id: "errand-recovery-1",
+      objective: "Follow up on the delayed refund",
+    }];
+
+    const markup = renderToStaticMarkup(<BrowserErrandApprovals owner />);
+
+    expect(markup).toContain("browser errand outcome unknown");
+    expect(markup).toContain("Follow up on the delayed refund");
+    expect(markup).toContain("Its outcome is unknown. JARVIS did not retry it automatically.");
+    expect(markup).toContain("Request a fresh exact plan if you still want to proceed.");
+    expect(markup).not.toContain("Approve exact plan");
+    expect(markup).not.toContain("Decline");
   });
 
   it("does not expose an approval affordance for a paused, unsealed step", () => {
@@ -78,5 +103,6 @@ describe("BrowserErrandApprovals", () => {
 
     expect(markup).toBe("");
     expect(mock.calls).toContainEqual({ name: "browserErrands:pending", args: "skip" });
+    expect(mock.calls).toContainEqual({ name: "browserErrands:unknownOutcomes", args: "skip" });
   });
 });

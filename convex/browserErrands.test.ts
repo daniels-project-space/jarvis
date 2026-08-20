@@ -227,6 +227,15 @@ describe("browser errand owner gate and sealed execution lifecycle", () => {
     expect(recovered?.leaseToken).toBeUndefined();
     expect(recovered?.leaseUntil).toBeUndefined();
     expect(recovered?.browserDeadlineAt).toBeUndefined();
+    const ownerNotices = await t.query(api.browserErrands.unknownOutcomes, { authTokenHash: OWNER });
+    expect(ownerNotices).toEqual([expect.objectContaining({
+      _id: errandId,
+      objective: proposal.objective,
+    })]);
+    expect(ownerNotices[0]).not.toHaveProperty("result");
+    expect(ownerNotices[0]).not.toHaveProperty("finishedAt");
+    expect(ownerNotices[0]).not.toHaveProperty("executionSteps");
+    expect(ownerNotices[0]).not.toHaveProperty("credentialId");
     expect(await t.run(async (ctx) => await ctx.db
       .query("chatTurnOwnerToolUses")
       .withIndex("by_receipt", (q: any) => q.eq("receiptKey", receipt))
