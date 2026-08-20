@@ -5,6 +5,7 @@ vi.mock("server-only", () => ({}));
 const mock = vi.hoisted(() => ({
   convexMutation: vi.fn(),
   convexQuery: vi.fn(),
+  googleOAuthReadiness: vi.fn(),
   issueCalendarApproval: vi.fn(() => "signed-calendar-receipt"),
   issueCalendarProposal: vi.fn(() => "signed-calendar-change-receipt"),
   googleCalendarCreate: vi.fn(),
@@ -30,6 +31,9 @@ vi.mock("./google-calendar-approval.server", () => ({
   issueGoogleCalendarApproval: mock.issueCalendarApproval,
   issueGoogleCalendarApprovalProposal: mock.issueCalendarProposal,
   googleCalendarApprovalMarker: (token: string) => `[JARVIS_GOOGLE_CALENDAR_APPROVAL:${token}]`,
+}));
+vi.mock("./google-oauth", () => ({
+  googleOAuthStoredConnectionReadiness: mock.googleOAuthReadiness,
 }));
 
 import { executeTool } from "./tools";
@@ -86,6 +90,8 @@ describe("YouTube transcript handoff", () => {
 describe("Google Calendar creation approval boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mock.googleOAuthReadiness.mockResolvedValue("readable");
+    mock.convexQuery.mockResolvedValue({ connected: true, capabilities: { calendar: true } });
     mock.issueCalendarApproval.mockReturnValue("signed-calendar-receipt");
     mock.issueCalendarProposal.mockReturnValue("signed-calendar-change-receipt");
     mock.googleCalendarGetManaged.mockResolvedValue({
@@ -107,6 +113,47 @@ describe("Google Calendar creation approval boundary", () => {
     expect(mock.issueCalendarApproval).toHaveBeenCalledWith(expect.objectContaining({
       title: "Planning session", allDay: false, reminderMinutesBefore: 15,
     }));
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not issue a receipt when Google OAuth runtime configuration is absent", async () => {
+    mock.googleOAuthReadiness.mockResolvedValueOnce("not_configured");
+
+    await expect(executeTool("google_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+    })).resolves.toMatch(/not configured.*no approval receipt was created/i);
+
+    expect(mock.convexQuery).not.toHaveBeenCalled();
+    expect(mock.issueCalendarApproval).not.toHaveBeenCalled();
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not issue a receipt when the saved Google connection needs reconnecting", async () => {
+    mock.googleOAuthReadiness.mockResolvedValueOnce("needs_reconnect");
+
+    await expect(executeTool("google_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+    })).resolves.toMatch(/needs a reconnect.*no approval receipt was created/i);
+
+    expect(mock.convexQuery).not.toHaveBeenCalled();
+    expect(mock.issueCalendarApproval).not.toHaveBeenCalled();
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not issue a receipt when the saved account lacks the limited Calendar scope", async () => {
+    mock.convexQuery.mockResolvedValueOnce({ connected: true, capabilities: { calendar: false } });
+
+    await expect(executeTool("google_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+    })).resolves.toMatch(/needs a reconnect.*no approval receipt was created/i);
+
+    expect(mock.issueCalendarApproval).not.toHaveBeenCalled();
     expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
   });
 
