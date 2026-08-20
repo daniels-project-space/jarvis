@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { callForegroundConvex } from "./foreground-convex-call";
+import {
+  callForegroundConvex,
+  ForegroundConvexCallDeadlineError,
+  settleAmbiguousForegroundFinalize,
+} from "./foreground-convex-call";
 
 describe("foreground Convex call deadline", () => {
   beforeEach(() => {
@@ -32,5 +36,30 @@ describe("foreground Convex call deadline", () => {
     await timedOut;
     expect(fetcher).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+  });
+
+  it("retries an exact finalize payload after a deadline instead of replacing it with an error", async () => {
+    const finalize = vi.fn()
+      .mockRejectedValueOnce(new ForegroundConvexCallDeadlineError("mutation", "chatQueue:finalize"))
+      .mockResolvedValueOnce(true);
+
+    await expect(settleAmbiguousForegroundFinalize(finalize)).resolves.toBe("finalized");
+    expect(finalize).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves a second timeout ambiguous rather than attempting a terminal error", async () => {
+    const finalize = vi.fn().mockRejectedValue(
+      new ForegroundConvexCallDeadlineError("mutation", "chatQueue:finalize"),
+    );
+
+    await expect(settleAmbiguousForegroundFinalize(finalize)).resolves.toBe("ambiguous");
+    expect(finalize).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not call a fenced rejection a delivered completion", async () => {
+    const finalize = vi.fn().mockResolvedValue(false);
+
+    await expect(settleAmbiguousForegroundFinalize(finalize)).resolves.toBe("ambiguous");
+    expect(finalize).toHaveBeenCalledOnce();
   });
 });

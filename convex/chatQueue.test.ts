@@ -3,6 +3,10 @@ import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import { CHAT_PENDING_EXPIRY_MS, CHAT_TURN_STALE_MS, MAX_CHAT_RECOVERY_WAKES, MAX_CHAT_TURN_ATTEMPTS } from "./chatQueue";
+import {
+  ForegroundConvexCallDeadlineError,
+  settleAmbiguousForegroundFinalize,
+} from "../src/trigger/foreground-convex-call";
 
 declare global {
   interface ImportMeta {
@@ -458,6 +462,72 @@ describe("durable foreground chat recovery", () => {
       finalText: "recovered answer",
       workerToken: WORKER,
     })).resolves.toBe(true);
+  });
+
+  it("never overwrites an ambiguous done finalization and fences its late old result after recovery", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await createTurn(t, "ambiguous-done-finalize");
+    const first = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "old-claim",
+      workerToken: WORKER,
+    });
+    expect(first).not.toBeNull();
+    const oldDone = {
+      messageId: first!.assistantId,
+      threadId: "main",
+      claimToken: "old-claim",
+      status: "done" as const,
+      finalText: "original generated answer",
+      workerToken: WORKER,
+    };
+
+    let attempts = 0;
+    let deliverLateOldRequest: (() => Promise<boolean>) | undefined;
+    // Both requests have unknown transport outcomes. The first HTTP request
+    // remains in flight and arrives only after recovery, exactly where the old
+    // generic catch would have otherwise won with an error finalization.
+    const ambiguous = await settleAmbiguousForegroundFinalize(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        deliverLateOldRequest = async () => await t.mutation(api.chatQueue.finalize, oldDone);
+      }
+      throw new ForegroundConvexCallDeadlineError("mutation", "chatQueue:finalize");
+    });
+    expect(ambiguous).toBe("ambiguous");
+    expect(attempts).toBe(2);
+    let rows = await t.query(api.chatQueue.listMessages, { threadId: "main", workerToken: WORKER });
+    expect(rows.find((row) => row._id === first!.assistantId)).toMatchObject({
+      status: "streaming",
+      text: "",
+    });
+
+    vi.advanceTimersByTime(CHAT_TURN_STALE_MS + 1);
+    await expect(t.mutation(api.chatQueue.reapStuck, { workerToken: WORKER }))
+      .resolves.toMatchObject({ requeued: 1, failed: 0 });
+    const replacement = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "replacement-claim",
+      workerToken: WORKER,
+    });
+    await expect(t.mutation(api.chatQueue.finalize, {
+      messageId: replacement!.assistantId,
+      threadId: "main",
+      claimToken: "replacement-claim",
+      status: "done",
+      finalText: "recovered answer",
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+    // The late completion from the old transport request cannot alter the
+    // replacement answer because its original claim token is fenced out.
+    await expect(deliverLateOldRequest!()).resolves.toBe(false);
+
+    rows = await t.query(api.chatQueue.listMessages, { threadId: "main", workerToken: WORKER });
+    const assistants = rows.filter((row) => row.role === "assistant");
+    expect(assistants.map((row) => [row.status, row.text])).toEqual([
+      ["superseded", ""],
+      ["done", "recovered answer"],
+    ]);
   });
 
   it("ends visibly after the bounded attempt budget instead of losing the turn", async () => {

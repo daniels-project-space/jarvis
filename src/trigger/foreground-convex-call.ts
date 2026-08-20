@@ -7,6 +7,40 @@ type ForegroundConvexCallDependencies = {
   timeoutMs?: number;
 };
 
+export class ForegroundConvexCallDeadlineError extends Error {
+  constructor(kind: ForegroundConvexCallKind, path: string) {
+    super(`Convex ${kind} ${path} exceeded its foreground call deadline`);
+    this.name = "ForegroundConvexCallDeadlineError";
+  }
+}
+
+/**
+ * A terminal `done` write may already be accepted when its response times
+ * out. Retry the exact, claim-token-fenced payload once; if that is still
+ * ambiguous, let durable recovery decide rather than replacing an answer with
+ * an error.
+ */
+export async function settleAmbiguousForegroundFinalize(
+  finalize: () => Promise<unknown>,
+): Promise<"finalized" | "ambiguous"> {
+  try {
+    // `false` is Convex's fenced rejection result. It is definitive evidence
+    // that this worker no longer owns the turn, but it must not become an
+    // error write against whatever recovered it.
+    if (await finalize() !== false) return "finalized";
+    return "ambiguous";
+  } catch (error) {
+    if (!(error instanceof ForegroundConvexCallDeadlineError)) throw error;
+  }
+  try {
+    if (await finalize() !== false) return "finalized";
+  } catch {
+    // The first request may already have reached Convex; durable recovery is
+    // safer than a competing terminal error write.
+  }
+  return "ambiguous";
+}
+
 /**
  * Keep a foreground queue claim from looking live forever when the Convex
  * transport loses its response. The caller's claim/finalize fences remain the
@@ -28,7 +62,7 @@ export async function callForegroundConvex(
   const controller = new AbortController();
   const fetcher = dependencies.fetcher ?? fetch;
   let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timeoutError = new Error(`Convex ${kind} ${path} exceeded its foreground call deadline`);
+  const timeoutError = new ForegroundConvexCallDeadlineError(kind, path);
   const deadline = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
       controller.abort(timeoutError);
@@ -60,6 +94,9 @@ export async function callForegroundConvex(
   })();
   try {
     return await Promise.race([request, deadline]);
+  } catch (error) {
+    if (controller.signal.aborted && controller.signal.reason === timeoutError) throw timeoutError;
+    throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
   }
