@@ -57,13 +57,18 @@ async function upsertTodo(
 ): Promise<"created" | "existing" | "needs_retry"> {
   const tags = ["jarvis", "travel", "apple-maps", appleMapsOfflineHubTodoTag(preflight.sourceKey)];
   const options = { fetchImpl };
+  const findExisting = (todos: unknown): any | undefined => Array.isArray(todos)
+    ? todos.find((todo: any) => !todo?.done
+      && Array.isArray(todo?.tags)
+      && todo.tags.some((tag: unknown) => matchesAppleMapsOfflineHubTodoTag(tag, preflight.sourceKey)))
+    : undefined;
+  const reflectsPreflight = (todo: any): boolean => Boolean(todo)
+    && String(todo.text ?? "") === preflight.todoText
+    && Number(todo.dueDate) === preflight.at
+    && Array.isArray(todo.tags)
+    && todo.tags.some((tag: unknown) => matchesAppleMapsOfflineHubTodoTag(tag, preflight.sourceKey));
   try {
-    const todos = await listHubTodos(options);
-    const existing = Array.isArray(todos)
-      ? todos.find((todo: any) => !todo?.done
-        && Array.isArray(todo?.tags)
-        && todo.tags.some((tag: unknown) => matchesAppleMapsOfflineHubTodoTag(tag, preflight.sourceKey)))
-      : undefined;
+    const existing = findExisting(await listHubTodos(options));
     if (existing?.id) {
       await updateHubTodo({ id: existing.id, text: preflight.todoText, dueDate: preflight.at }, options);
       return "existing";
@@ -71,9 +76,16 @@ async function upsertTodo(
     await createHubTodo({ text: preflight.todoText, dueDate: preflight.at, tags }, options);
     return "created";
   } catch {
-    // The scoped adapter rejects a missing capability before any network call.
-    // The durable Jarvis reminder remains saved and the TripDoc exposes this
-    // retry state instead of falling back to the old unauthenticated route.
+    // A response can be lost after the scoped facade accepts a create. Re-list
+    // by the deterministic source tag before exposing a retry, so the next
+    // scheduled pass cannot create a duplicate travel task. Missing Hub
+    // capability still fails before either network request.
+    try {
+      const existing = findExisting(await listHubTodos(options));
+      if (reflectsPreflight(existing)) return "existing";
+    } catch {
+      // The durable Jarvis reminder remains saved; surface an honest retry.
+    }
     return "needs_retry";
   }
 }
