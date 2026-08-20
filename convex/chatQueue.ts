@@ -11,6 +11,7 @@ import {
   isToolBeltName,
   TOOL_BELTS,
 } from "../src/lib/tool-belts";
+import { stripAssistantApprovals } from "../src/lib/sanitize";
 import {
   actorAuthArgs,
   conversationIdentity,
@@ -1061,7 +1062,10 @@ async function claimPending(
     .slice(-12)
     .map((m: any) => ({
       role: m.role,
-      text: m.role === "user" ? visibleTurnText(m.text) : m.text,
+      // Approval markers are bearer receipts. Keep the source row intact so
+      // the owner can still redeem its dedicated card, but never put a live
+      // receipt into another model turn's context.
+      text: m.role === "user" ? visibleTurnText(m.text) : stripAssistantApprovals(m.text),
     }));
   const prefetchRow =
     pending.hasResearchPrefetch === false
