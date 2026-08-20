@@ -15,11 +15,15 @@ import { isSpeculativeResearchApplicable } from "../lib/speculative-research";
 import {
   buildBoundedFileContext,
   buildBoundedThreadFileCatalog,
-  type ChatFileManifest,
   type ChatThreadFileCatalogItem,
 } from "../lib/chat-files";
 import { codexModelFor, codexReviewExecPrefix, pickConversationTier } from "./model-policy";
 import { materializeCodexChatImages } from "./chat-image-input";
+import {
+  resolveReadyClaimAttachments,
+  samePrivateAttachmentSources,
+  type PrivateClaimAttachment,
+} from "./private-attachment-fence";
 import {
   cleanupSubscriptionHome,
   consumeSubscriptionAuth,
@@ -172,9 +176,17 @@ type QueueClaim = {
   attemptCount: number;
   history: Array<{ role: string; text: string }>;
   researchPrefetch?: { basis: string; context: string; expiresAt: number };
-  attachments: Array<ChatFileManifest & { r2Key: string; previewR2Key?: string }>;
+  attachments: PrivateClaimAttachment[];
   fileCatalog: ChatThreadFileCatalogItem[];
 };
+
+async function refreshClaimAttachments(claim: Pick<QueueClaim, "userMessageId" | "attachments">) {
+  return await resolveReadyClaimAttachments(claim.attachments, async () => await convexCall(
+    "query",
+    "files:contextForMessage",
+    { messageId: claim.userMessageId },
+  ));
+}
 
 function conversationPreamble() {
   return PERSONA +
@@ -545,14 +557,29 @@ async function processChatQueue(
     try {
       const visibleUserText = visibleTurnText(claim.userText);
       const contextStarted = Date.now();
+      // A queue claim may wait behind another foreground turn. Do not reuse
+      // its private-object snapshot: deletion changes the durable file state
+      // after claim, so an unavailable source is omitted while the user's
+      // claimed text still receives a normal answer.
+      const attachmentsBeforeMaterialization = await refreshClaimAttachments(claim);
       const contextPromise = buildContext(visibleUserText);
-      const imageInputsPromise = materializeCodexChatImages(claim.userText, claim.attachments, {
+      const imageInputsPromise = materializeCodexChatImages(claim.userText, attachmentsBeforeMaterialization, {
         signal: cancellationAbort.signal,
       });
       // Context snapshots and private image reads are independent. Image turns
       // should pay the slower branch, not the sum of both branches.
-      const [baseContext, imageInputs] = await Promise.all([contextPromise, imageInputsPromise]);
-      const fileContext = buildBoundedFileContext(claim.attachments);
+      const [baseContext, initialImageInputs] = await Promise.all([contextPromise, imageInputsPromise]);
+      // Recheck at the model-send boundary too. If a deletion landed while
+      // image bytes were materializing, discard those bytes and rematerialize
+      // only the still-ready sources. A failed recheck intentionally yields no
+      // private input rather than falling back to the stale claim snapshot.
+      const attachments = await refreshClaimAttachments(claim);
+      const imageInputs = samePrivateAttachmentSources(attachmentsBeforeMaterialization, attachments)
+        ? initialImageInputs
+        : await materializeCodexChatImages(claim.userText, attachments, {
+          signal: cancellationAbort.signal,
+        });
+      const fileContext = buildBoundedFileContext(attachments);
       const fileCatalog = buildBoundedThreadFileCatalog(claim.fileCatalog);
       const researchContext = claim.researchPrefetch
         && claim.researchPrefetch.expiresAt > Date.now()
@@ -569,7 +596,7 @@ async function processChatQueue(
       // on the richer main thread unconditionally — those never come from a
       // trivial greeting in practice, and this leaves their existing behavior
       // (including the private-file thread-forgetting below) untouched.
-      const lunaFastLane = model === "luna" && claim.attachments.length === 0 && !claim.ownerToolAccess;
+      const lunaFastLane = model === "luna" && attachments.length === 0 && !claim.ownerToolAccess;
       const codexConversationId = lunaFastLane ? `${claim.threadId}::luna-fast` : claim.threadId;
       const turn = await session.runTurn((activeServer, onStarted) => runTurn(
         activeServer,
@@ -581,7 +608,7 @@ async function processChatQueue(
         context,
         imageInputs,
         model,
-        claim.attachments.length > 0,
+        attachments.length > 0,
         {
           requestId: claim.requestId,
           userMessageId: claim.userMessageId,

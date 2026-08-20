@@ -4,6 +4,7 @@ import { api } from "./_generated/api";
 import schema from "./schema";
 import { CHAT_FILE_LIMITS } from "../src/lib/chat-files";
 import { linkFilesToMessage } from "./fileHelpers";
+import { resolveReadyClaimAttachments } from "../src/trigger/private-attachment-fence";
 
 declare global {
   interface ImportMeta {
@@ -1040,6 +1041,38 @@ describe("durable private chat files", () => {
     })).rejects.toThrow(/Creation source file is no longer ready/);
 
     expect(await t.run(async (ctx) => await ctx.db.query("creations").collect())).toEqual([]);
+  });
+
+  it("removes a deleted source from a claimed foreground turn before it can be materialized", async () => {
+    const t = convexTest(schema, modules);
+    const source = await makeReady(t, "main", "arrival.png", "f".repeat(64), "private arrival image", "image/png");
+    const messageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Inspect this arrival image.",
+      requestId: "claimed-then-deleted-source",
+      fileIds: [source.fileId as any],
+      workerToken: WORKER,
+    });
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId,
+      claimToken: "claimed-then-deleted-source-token",
+      workerToken: WORKER,
+    });
+    if (!claim) throw new Error("foreground claim missing");
+    expect(claim.attachments).toEqual([
+      expect.objectContaining({ fileId: String(source.fileId), r2Key: expect.any(String), status: "ready" }),
+    ]);
+
+    // This models the owner deleting after the queue snapshot but before the
+    // Trigger worker reaches private image/file materialization.
+    expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
+      .toEqual(expect.objectContaining({ ok: true }));
+    const current = await t.query(api.files.contextForMessage, { messageId, workerToken: WORKER });
+    const turnAttachments = await resolveReadyClaimAttachments(claim.attachments as any, async () => current);
+
+    expect(current).toEqual([]);
+    expect(turnAttachments).toEqual([]);
+    expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(true);
   });
 
   it("pins an explicitly selected private source file for transcript and document creations", async () => {
