@@ -2,11 +2,16 @@ import "server-only";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 
-import { getGoogleAccessToken } from "./google-oauth";
+import { getGoogleAccessTokenForGmail } from "./google-oauth";
+import {
+  GOOGLE_GMAIL_COMPOSE_SCOPE,
+  GOOGLE_GMAIL_MODIFY_SCOPE,
+  GOOGLE_GMAIL_READONLY_SCOPE,
+} from "./google-scopes";
 import { parseIcsVevents, type ParsedIcsEvent } from "./ics";
 
 // Feature 4b: Gmail capability — read / search / draft / unsubscribe / mark
-// spam. Built on top of Feature 4a's getGoogleAccessToken() (src/lib/
+// spam. Built on top of Feature 4a's scoped Google OAuth helper (src/lib/
 // google-oauth.ts) for the bearer token, and on the shared ICS parser
 // (src/lib/ics.ts, extracted from icloud-calendar.ts) for genuine
 // .ics/text-calendar attachment detection.
@@ -110,8 +115,12 @@ function buildQuery(params: Record<string, string | string[] | undefined>): stri
   return usp.toString();
 }
 
-async function gmailApi<T = unknown>(path: string, init: { method?: string; body?: string } = {}): Promise<T> {
-  const token = await getGoogleAccessToken();
+async function gmailApi<T = unknown>(
+  path: string,
+  init: { method?: string; body?: string } = {},
+  requiredScopes: readonly string[] = [GOOGLE_GMAIL_READONLY_SCOPE],
+): Promise<T> {
+  const token = await getGoogleAccessTokenForGmail(requiredScopes);
   const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
   if (init.body) headers["content-type"] = "application/json";
   const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${path}`, {
@@ -122,8 +131,10 @@ async function gmailApi<T = unknown>(path: string, init: { method?: string; body
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new GmailError(`Gmail API ${path} returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}.`);
+    // Provider errors can reflect private mailbox/query data. The caller can
+    // already recover from the stable status without exposing any of it to a
+    // chat turn or speech transcript.
+    throw new GmailError(`Gmail request failed (HTTP ${response.status}). Reconnect Google in Options if its permission changed.`);
   }
   return (await response.json()) as T;
 }
@@ -337,7 +348,7 @@ export async function gmailCreateDraft(input: GmailDraftInput): Promise<GmailDra
   const created = await gmailApi<{ id?: string; message?: { id?: string; threadId?: string } }>("drafts", {
     method: "POST",
     body: JSON.stringify({ message: { ...(threadId ? { threadId } : {}), raw } }),
-  });
+  }, [GOOGLE_GMAIL_COMPOSE_SCOPE]);
   if (!created.id) throw new GmailError("Gmail did not return a draft id.");
   return { draftId: created.id, messageId: created.message?.id, threadId: created.message?.threadId };
 }
@@ -357,7 +368,7 @@ export async function gmailSendDraft(draftId: string): Promise<{ messageId: stri
   const sent = await gmailApi<{ id?: string; threadId?: string }>("drafts/send", {
     method: "POST",
     body: JSON.stringify({ id }),
-  });
+  }, [GOOGLE_GMAIL_COMPOSE_SCOPE]);
   if (!sent.id) throw new GmailError("Gmail did not confirm the send.");
   return { messageId: sent.id, threadId: sent.threadId };
 }
@@ -578,7 +589,7 @@ export async function gmailModifyLabels(
   const result = await gmailApi<{ id?: string; labelIds?: string[] }>(`messages/${encodeURIComponent(id)}/modify`, {
     method: "POST",
     body: JSON.stringify({ addLabelIds, removeLabelIds }),
-  });
+  }, [GOOGLE_GMAIL_MODIFY_SCOPE]);
   return { id: String(result.id ?? id), labelIds: result.labelIds ?? [] };
 }
 

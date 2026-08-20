@@ -6,10 +6,11 @@ const mock = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("./google-oauth", () => ({ getGoogleAccessToken: mock.accessToken }));
+vi.mock("./google-oauth", () => ({ getGoogleAccessTokenForGmail: mock.accessToken }));
 vi.mock("node:dns/promises", () => ({ lookup: mock.lookup }));
 
 import { gmailCreateDraft, gmailUnsubscribe } from "./gmail";
+import { GOOGLE_GMAIL_COMPOSE_SCOPE, GOOGLE_GMAIL_READONLY_SCOPE } from "./google-scopes";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -39,6 +40,7 @@ describe("Gmail one-click unsubscribe boundary", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(gmailUnsubscribe("message-1")).resolves.toEqual({ method: "one-click-post" });
+    expect(mock.accessToken).toHaveBeenCalledWith([GOOGLE_GMAIL_READONLY_SCOPE]);
     expect(mock.lookup).toHaveBeenCalledWith("unsubscribe.example", { all: true, verbatim: true });
     const [, request] = fetchMock.mock.calls[1] as unknown as [URL, RequestInit];
     expect(request).toMatchObject({ method: "POST", redirect: "manual" });
@@ -114,5 +116,19 @@ describe("Gmail draft MIME boundary", () => {
     expect(raw).toContain("To: Daniel Example <daniel@example.com>, alex@example.org\r\n");
     expect(raw).toContain("Subject: A safe subject\r\n");
     expect(raw).not.toContain("\r\nBcc:");
+    expect(mock.accessToken).toHaveBeenCalledWith([GOOGLE_GMAIL_COMPOSE_SCOPE]);
+  });
+
+  it("does not reflect a Gmail provider error body into the chat-visible failure", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: { message: "private mailbox detail" } }), { status: 403 })));
+
+    const error = await gmailCreateDraft({
+      to: "daniel@example.com",
+      subject: "A safe subject",
+      body: "Hello from Jarvis.",
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String((error as Error).message)).toContain("Gmail request failed (HTTP 403)");
+    expect(String((error as Error).message)).not.toContain("private mailbox detail");
   });
 });

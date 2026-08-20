@@ -2,7 +2,7 @@ import "server-only";
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { controlQuery } from "./control-session";
-import { hasGoogleScopes } from "./google-scopes";
+import { GOOGLE_GMAIL_MODIFY_SCOPE, hasGoogleScopes } from "./google-scopes";
 
 // Google OAuth connect infrastructure — shared access-token helper. This file
 // owns:
@@ -253,6 +253,39 @@ export async function getGoogleAccessToken(): Promise<string> {
   const credentials = await loadCredentials();
   const key = credentialCacheKey(credentials);
   if (tokenCache && tokenCache.expiresAt > Date.now() && tokenCache.credentialKey === key) return tokenCache.value;
+  return await refreshGoogleAccessToken(credentials);
+}
+
+/**
+ * Returns a Gmail token only when a stored connection explicitly has the
+ * capability needed for the requested Gmail operation. Older
+ * `GMAIL_BOOKINGS_*` credentials have no durable scope record, so preserve
+ * their read-only booking compatibility and let Google enforce their actual
+ * grant at the provider boundary.
+ *
+ * `gmail.modify` is a historical broader grant and remains sufficient for
+ * every Gmail operation. New OAuth consent never requests it.
+ */
+export async function getGoogleAccessTokenForGmail(requiredScopes: readonly string[]): Promise<string> {
+  const credentials = await loadCredentials();
+  if (
+    credentials.scope
+    && !hasGoogleScopes(credentials.scope, requiredScopes)
+    && !hasGoogleScopes(credentials.scope, [GOOGLE_GMAIL_MODIFY_SCOPE])
+  ) {
+    throw new GoogleOAuthError(
+      "Google Gmail is not connected with the required limited Gmail permission. Reconnect Google from Options to grant Gmail access.",
+    );
+  }
+  const key = credentialCacheKey(credentials);
+  if (
+    tokenCache
+    && tokenCache.expiresAt > Date.now()
+    && tokenCache.credentialKey === key
+    && tokenCache.scope === credentials.scope
+  ) {
+    return tokenCache.value;
+  }
   return await refreshGoogleAccessToken(credentials);
 }
 
