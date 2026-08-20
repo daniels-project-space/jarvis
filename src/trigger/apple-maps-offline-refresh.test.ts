@@ -66,12 +66,54 @@ describe("saved Apple Maps preflight maintenance", () => {
         path: "jarvisActions:createTodo",
         args: expect.objectContaining({
           vaultToken: "dedicated-jarvis-actions-token",
-          tags: expect.arrayContaining([expect.stringMatching(/^src-[a-f0-9]{36}$/)]),
+          tags: ["jarvis", "travel", "apple-maps", expect.stringMatching(/^src-[a-f0-9]{36}$/)],
         }),
       }),
     ]);
+    const createdTags = payloads[1]?.args.tags as string[];
+    expect(createdTags.every((tag) => /^[a-z0-9 -]+$/i.test(tag) && tag.length <= 40)).toBe(true);
+    expect(createdTags).not.toContain(`source:${row.sourceKey}`);
     expect(payloads.map((payload) => payload.path)).not.toContain("todos:add");
     expect(payloads.map((payload) => payload.path)).not.toContain("todos:list");
+  });
+
+  it("reconciles an ambiguous Hub create by its stable tag before a scheduled retry can duplicate it", async () => {
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    let listAttempts = 0;
+    let acceptedCreate: Record<string, unknown> | undefined;
+    const fetch = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { path?: string; args?: Record<string, unknown> };
+      if (body.path === "jarvisActions:listTodos") {
+        const value = listAttempts++ === 0 ? [] : [{
+          id: "todo-1", text: acceptedCreate?.text, dueDate: acceptedCreate?.dueDate, done: false,
+          // Old rows remain identifiable so this migration never duplicates
+          // them, but no invalid tag is included in a new Hub action payload.
+          tags: [`source:${row.sourceKey}`],
+        }];
+        return new Response(JSON.stringify({ value }), { headers: { "content-type": "application/json" } });
+      }
+      if (body.path === "jarvisActions:createTodo") {
+        // The facade may have accepted the request before a network reset.
+        acceptedCreate = body.args;
+        throw new Error("connection reset after create");
+      }
+      throw new Error(`unexpected Hub path ${body.path}`);
+    });
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([row]), mutation, fetch: fetch as typeof globalThis.fetch, now: () => now,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? flight : stay),
+    })).resolves.toEqual({ due: 1, refreshed: 1, pending: 0, skipped: 0 });
+
+    const payloads = fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as { path: string; args: Record<string, unknown> });
+    expect(payloads.map((payload) => payload.path)).toEqual([
+      "jarvisActions:listTodos", "jarvisActions:createTodo", "jarvisActions:listTodos",
+    ]);
+    expect(payloads.map((payload) => payload.path)).not.toContain("todos:add");
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.objectContaining({
+      todoStatus: "existing",
+    }));
   });
 
   it("fails closed when the dedicated Hub capability is absent and never calls legacy Hub todos", async () => {
