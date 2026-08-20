@@ -1179,7 +1179,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     // Claim first. No provider selection, checkout, Codex binary invocation,
     // or controller filesystem is allowed to precede the immutable attempt
     // fence returned by Convex.
-    const job: any = await convexMutation("jobs:claimDispatched", {
+    const claimInput = {
       jobId: options.reservation.jobId,
       dispatchId: options.reservation.dispatchId,
       workerRunId: options.reservation.workerRunId,
@@ -1194,7 +1194,28 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       triggerMachineReason: options.reservation.triggerMachineReason,
       triggerObservedMachinePreset: options.reservation.triggerObservedMachinePreset,
       triggerPlatformAttempt: options.reservation.triggerPlatformAttempt,
-    }).catch(() => null);
+    };
+    let job: any;
+    try {
+      job = await convexMutation("jobs:claimDispatched", claimInput);
+    } catch {
+      // Do not convert an unavailable durable claim into a successful stale
+      // Trigger run. A successful run retains its global idempotency key for
+      // 30 days, so the fleet would only receive that dead run on every
+      // reconciliation and the reservation would occupy capacity forever.
+      // If the claim did not commit, release this exact pre-claim receipt so
+      // the next wake creates a fresh fenced dispatch. If its response was
+      // lost after commit, rejectDispatch is fenced by `running`; replay the
+      // immutable claim instead and continue with the original worker binding.
+      const released = await convexMutation("jobs:rejectDispatch", {
+        jobId: options.reservation.jobId,
+        dispatchId: options.reservation.dispatchId,
+        reason: "worker could not confirm durable claim; fresh fenced launch required",
+        delayMs: 30_000,
+      }).catch(() => false);
+      if (released) return { processed: 0, stale: true };
+      job = await convexMutation("jobs:claimDispatched", claimInput);
+    }
     if (!job) return { processed: 0, stale: true };
     if (job.executable === false || job.held === true) return {
       processed: 0,
