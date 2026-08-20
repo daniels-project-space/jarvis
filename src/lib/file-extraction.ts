@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { promisify } from "node:util";
+import { inflateRaw as inflateRawCallback } from "node:zlib";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
-import JSZip from "jszip";
 import mammoth from "mammoth";
 import sharp from "sharp";
 import {
@@ -21,11 +22,21 @@ import { hasExpectedMediaSignature, transcribableMediaKind, type TranscribableMe
 const MAX_PDF_PAGES = 200;
 const MAX_OFFICE_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
 const MAX_OFFICE_ENTRIES = 2_000;
+const MAX_OFFICE_COMPRESSION_RATIO = 100;
 const MAX_XLSX_SHEETS = 50;
 const MAX_XLSX_ROWS_PER_SHEET = 10_000;
 const MAX_XLSX_CELLS = 50_000;
 const MAX_XLSX_XML_BYTES = 4 * 1024 * 1024;
 const MAX_XLSX_CELL_CHARS = 640;
+
+const ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
+const ZIP_CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE = 0x02014b50;
+const ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06054b50;
+const ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE = 0x07064b50;
+const ZIP64_UINT16_SENTINEL = 0xffff;
+const ZIP64_UINT32_SENTINEL = 0xffffffff;
+const ZIP_UTF8_FLAG = 0x0800;
+const inflateRaw = promisify(inflateRawCallback);
 
 export type FileExtractionResult = {
   sha256: string;
@@ -85,23 +96,224 @@ function decodeText(bytes: Uint8Array): string {
   }
 }
 
-function assertOfficeArchiveBounds(bytes: Uint8Array, format: "docx" | "xlsx"): void {
-  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let entries = 0;
-  let uncompressedBytes = 0;
-  for (let offset = 0; offset + 46 <= buffer.length; offset += 1) {
-    if (buffer.readUInt32LE(offset) !== 0x02014b50) continue;
-    entries += 1;
-    uncompressedBytes += buffer.readUInt32LE(offset + 24);
-    if (entries > MAX_OFFICE_ENTRIES || uncompressedBytes > MAX_OFFICE_UNCOMPRESSED_BYTES) {
-      throw new FileExtractionError(`${format}_archive_limit`, true);
-    }
-    const nameLength = buffer.readUInt16LE(offset + 28);
-    const extraLength = buffer.readUInt16LE(offset + 30);
-    const commentLength = buffer.readUInt16LE(offset + 32);
-    offset += 45 + nameLength + extraLength + commentLength;
+type OfficeArchiveEntry = {
+  path: string;
+  rawName: Uint8Array;
+  compressedSize: number;
+  uncompressedSize: number;
+  localHeaderOffset: number;
+  flags: number;
+  compressionMethod: number;
+  crc32: number;
+  directory: boolean;
+  dataOffset: number;
+};
+
+type OfficeArchive = {
+  bytes: Buffer;
+  entries: Map<string, OfficeArchiveEntry>;
+};
+
+function officeArchiveError(format: "docx" | "xlsx", code: string): never {
+  throw new FileExtractionError(`${format}_${code}`, true);
+}
+
+function archiveRangeEnd(start: number, length: number, limit: number, format: "docx" | "xlsx"): number {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(length) || start < 0 || length < 0 || start > limit || length > limit - start) {
+    officeArchiveError(format, "archive_invalid");
   }
-  if (!entries) throw new FileExtractionError(`${format}_directory_missing`, true);
+  return start + length;
+}
+
+function archiveUInt16(buffer: Buffer, offset: number, format: "docx" | "xlsx"): number {
+  archiveRangeEnd(offset, 2, buffer.length, format);
+  return buffer.readUInt16LE(offset);
+}
+
+function archiveUInt32(buffer: Buffer, offset: number, format: "docx" | "xlsx"): number {
+  archiveRangeEnd(offset, 4, buffer.length, format);
+  return buffer.readUInt32LE(offset);
+}
+
+function archiveEntryName(buffer: Buffer, start: number, length: number, format: "docx" | "xlsx"): { path: string; rawName: Uint8Array; directory: boolean } {
+  const end = archiveRangeEnd(start, length, buffer.length, format);
+  const rawName = buffer.subarray(start, end);
+  let path: string;
+  try {
+    path = new TextDecoder("utf-8", { fatal: true }).decode(rawName);
+  } catch {
+    officeArchiveError(format, "archive_invalid");
+  }
+  const directory = path.endsWith("/");
+  const parts = path.split("/");
+  const safeParts = directory ? parts.slice(0, -1) : parts;
+  if (!path || path.startsWith("/") || path.includes("\\") || path.includes("\u0000") || safeParts.some((part) => !part || part === "." || part === "..")) {
+    officeArchiveError(format, "archive_invalid");
+  }
+  return { path, rawName, directory };
+}
+
+function assertNoZip64ExtraField(buffer: Buffer, start: number, length: number, format: "docx" | "xlsx"): void {
+  const end = archiveRangeEnd(start, length, buffer.length, format);
+  let offset = start;
+  while (offset < end) {
+    if (end - offset < 4) officeArchiveError(format, "archive_invalid");
+    const fieldId = archiveUInt16(buffer, offset, format);
+    const fieldLength = archiveUInt16(buffer, offset + 2, format);
+    offset = archiveRangeEnd(offset + 4, fieldLength, end, format);
+    if (fieldId === 0x0001) officeArchiveError(format, "archive_zip64");
+  }
+}
+
+/**
+ * Validate a canonical, non-ZIP64 single-disk archive before handing it to an
+ * inflater. OOXML does not need self-extracting prefixes, data descriptors,
+ * archive comments, encrypted entries, or extra data between local entries
+ * and the central directory. Rejecting those forms gives the declared sizes
+ * an unambiguous authority for the allocation limits below.
+ */
+function assertOfficeArchiveBounds(bytes: Uint8Array, format: "docx" | "xlsx"): OfficeArchive {
+  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (buffer.length < 22) officeArchiveError(format, "directory_missing");
+  const eocdOffset = buffer.length - 22;
+  if (archiveUInt32(buffer, eocdOffset, format) !== ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE) {
+    officeArchiveError(format, "directory_missing");
+  }
+  if (archiveUInt16(buffer, eocdOffset + 20, format) !== 0) officeArchiveError(format, "archive_invalid");
+  if (eocdOffset >= 20 && archiveUInt32(buffer, eocdOffset - 20, format) === ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE) {
+    officeArchiveError(format, "archive_zip64");
+  }
+
+  const diskNumber = archiveUInt16(buffer, eocdOffset + 4, format);
+  const centralDirectoryDisk = archiveUInt16(buffer, eocdOffset + 6, format);
+  const entriesOnDisk = archiveUInt16(buffer, eocdOffset + 8, format);
+  const entryCount = archiveUInt16(buffer, eocdOffset + 10, format);
+  const centralDirectorySize = archiveUInt32(buffer, eocdOffset + 12, format);
+  const centralDirectoryOffset = archiveUInt32(buffer, eocdOffset + 16, format);
+  if (
+    entriesOnDisk === ZIP64_UINT16_SENTINEL
+    || entryCount === ZIP64_UINT16_SENTINEL
+    || centralDirectorySize === ZIP64_UINT32_SENTINEL
+    || centralDirectoryOffset === ZIP64_UINT32_SENTINEL
+  ) {
+    officeArchiveError(format, "archive_zip64");
+  }
+  if (
+    diskNumber !== 0
+    || centralDirectoryDisk !== 0
+    || entriesOnDisk !== entryCount
+  ) {
+    officeArchiveError(format, "archive_invalid");
+  }
+  if (!entryCount) officeArchiveError(format, "directory_missing");
+  if (entryCount > MAX_OFFICE_ENTRIES) officeArchiveError(format, "archive_limit");
+
+  const centralDirectoryEnd = archiveRangeEnd(centralDirectoryOffset, centralDirectorySize, buffer.length, format);
+  if (centralDirectoryEnd !== eocdOffset) officeArchiveError(format, "archive_invalid");
+
+  const entries = new Map<string, OfficeArchiveEntry>();
+  const orderedEntries: OfficeArchiveEntry[] = [];
+  let uncompressedBytes = 0;
+  let offset = centralDirectoryOffset;
+  for (let index = 0; index < entryCount; index += 1) {
+    if (archiveRangeEnd(offset, 46, centralDirectoryEnd, format) > centralDirectoryEnd || archiveUInt32(buffer, offset, format) !== ZIP_CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE) {
+      officeArchiveError(format, "archive_invalid");
+    }
+    const flags = archiveUInt16(buffer, offset + 8, format);
+    const compressionMethod = archiveUInt16(buffer, offset + 10, format);
+    const crc32 = archiveUInt32(buffer, offset + 16, format);
+    const compressedSize = archiveUInt32(buffer, offset + 20, format);
+    const uncompressedSize = archiveUInt32(buffer, offset + 24, format);
+    const nameLength = archiveUInt16(buffer, offset + 28, format);
+    const extraLength = archiveUInt16(buffer, offset + 30, format);
+    const commentLength = archiveUInt16(buffer, offset + 32, format);
+    const diskStart = archiveUInt16(buffer, offset + 34, format);
+    const localHeaderOffset = archiveUInt32(buffer, offset + 42, format);
+    if (
+      compressedSize === ZIP64_UINT32_SENTINEL
+      || uncompressedSize === ZIP64_UINT32_SENTINEL
+      || localHeaderOffset === ZIP64_UINT32_SENTINEL
+      || diskStart === ZIP64_UINT16_SENTINEL
+    ) {
+      officeArchiveError(format, "archive_zip64");
+    }
+    if ((flags & ~ZIP_UTF8_FLAG) !== 0 || (compressionMethod !== 0 && compressionMethod !== 8) || diskStart !== 0) {
+      officeArchiveError(format, "archive_invalid");
+    }
+    const nameStart = offset + 46;
+    const extraStart = archiveRangeEnd(nameStart, nameLength, centralDirectoryEnd, format);
+    const commentStart = archiveRangeEnd(extraStart, extraLength, centralDirectoryEnd, format);
+    const recordEnd = archiveRangeEnd(commentStart, commentLength, centralDirectoryEnd, format);
+    const { path, rawName, directory } = archiveEntryName(buffer, nameStart, nameLength, format);
+    assertNoZip64ExtraField(buffer, extraStart, extraLength, format);
+    if (entries.has(path) || (directory && (compressedSize !== 0 || uncompressedSize !== 0))) {
+      officeArchiveError(format, "archive_invalid");
+    }
+    if (!directory && !compressedSize && uncompressedSize) officeArchiveError(format, "archive_invalid");
+    if (uncompressedSize > MAX_OFFICE_UNCOMPRESSED_BYTES || uncompressedSize > compressedSize * MAX_OFFICE_COMPRESSION_RATIO) {
+      officeArchiveError(format, uncompressedSize > MAX_OFFICE_UNCOMPRESSED_BYTES ? "archive_limit" : "archive_ratio_limit");
+    }
+    uncompressedBytes += uncompressedSize;
+    if (uncompressedBytes > MAX_OFFICE_UNCOMPRESSED_BYTES) officeArchiveError(format, "archive_limit");
+    const entry: OfficeArchiveEntry = {
+      path,
+      rawName,
+      compressedSize,
+      uncompressedSize,
+      localHeaderOffset,
+      flags,
+      compressionMethod,
+      crc32,
+      directory,
+      dataOffset: 0,
+    };
+    entries.set(path, entry);
+    orderedEntries.push(entry);
+    offset = recordEnd;
+  }
+  if (offset !== centralDirectoryEnd || entries.size !== entryCount) officeArchiveError(format, "archive_invalid");
+
+  orderedEntries.sort((left, right) => left.localHeaderOffset - right.localHeaderOffset);
+  for (let index = 0; index < orderedEntries.length; index += 1) {
+    const entry = orderedEntries[index];
+    const nextOffset = index + 1 < orderedEntries.length ? orderedEntries[index + 1].localHeaderOffset : centralDirectoryOffset;
+    if (entry.localHeaderOffset < 0 || entry.localHeaderOffset >= centralDirectoryOffset || (index > 0 && entry.localHeaderOffset === orderedEntries[index - 1].localHeaderOffset)) {
+      officeArchiveError(format, "archive_invalid");
+    }
+    if (archiveRangeEnd(entry.localHeaderOffset, 30, centralDirectoryOffset, format) > centralDirectoryOffset || archiveUInt32(buffer, entry.localHeaderOffset, format) !== ZIP_LOCAL_FILE_HEADER_SIGNATURE) {
+      officeArchiveError(format, "archive_invalid");
+    }
+    const localFlags = archiveUInt16(buffer, entry.localHeaderOffset + 6, format);
+    const localCompressionMethod = archiveUInt16(buffer, entry.localHeaderOffset + 8, format);
+    const localCrc32 = archiveUInt32(buffer, entry.localHeaderOffset + 14, format);
+    const localCompressedSize = archiveUInt32(buffer, entry.localHeaderOffset + 18, format);
+    const localUncompressedSize = archiveUInt32(buffer, entry.localHeaderOffset + 22, format);
+    const localNameLength = archiveUInt16(buffer, entry.localHeaderOffset + 26, format);
+    const localExtraLength = archiveUInt16(buffer, entry.localHeaderOffset + 28, format);
+    if (
+      localCompressedSize === ZIP64_UINT32_SENTINEL
+      || localUncompressedSize === ZIP64_UINT32_SENTINEL
+      || localFlags !== entry.flags
+      || localCompressionMethod !== entry.compressionMethod
+      || localCrc32 !== entry.crc32
+      || localCompressedSize !== entry.compressedSize
+      || localUncompressedSize !== entry.uncompressedSize
+    ) {
+      officeArchiveError(format, "archive_invalid");
+    }
+    const localNameStart = entry.localHeaderOffset + 30;
+    const localExtraStart = archiveRangeEnd(localNameStart, localNameLength, centralDirectoryOffset, format);
+    const localDataStart = archiveRangeEnd(localExtraStart, localExtraLength, centralDirectoryOffset, format);
+    if (localNameLength !== entry.rawName.byteLength || !buffer.subarray(localNameStart, localExtraStart).equals(entry.rawName)) {
+      officeArchiveError(format, "archive_invalid");
+    }
+    assertNoZip64ExtraField(buffer, localExtraStart, localExtraLength, format);
+    const localDataEnd = archiveRangeEnd(localDataStart, entry.compressedSize, centralDirectoryOffset, format);
+    if (localDataEnd !== nextOffset) officeArchiveError(format, "archive_invalid");
+    entry.dataOffset = localDataStart;
+  }
+  if (orderedEntries[0]?.localHeaderOffset !== 0) officeArchiveError(format, "archive_invalid");
+  return { bytes: buffer, entries };
 }
 
 type XmlRecord = Record<string, unknown>;
@@ -176,17 +388,39 @@ function parseXlsxXml(value: string): XmlRecord {
   }
 }
 
-async function xlsxEntryText(zip: JSZip, path: string, required?: true): Promise<string>;
-async function xlsxEntryText(zip: JSZip, path: string, required: false): Promise<string | null>;
-async function xlsxEntryText(zip: JSZip, path: string, required = true): Promise<string | null> {
-  const entry = zip.file(path);
-  if (!entry || entry.dir) {
+type XlsxInflationBudget = { remainingBytes: number };
+
+async function xlsxEntryBytes(archive: OfficeArchive, entry: OfficeArchiveEntry, maxOutputBytes: number): Promise<Uint8Array> {
+  const compressed = archive.bytes.subarray(entry.dataOffset, entry.dataOffset + entry.compressedSize);
+  if (entry.compressionMethod === 0) return compressed;
+  try {
+    return await inflateRaw(compressed, { maxOutputLength: maxOutputBytes });
+  } catch (error) {
+    if (isXmlRecord(error) && error.code === "ERR_BUFFER_TOO_LARGE") {
+      throw new FileExtractionError("xlsx_xml_size_limit", true);
+    }
+    throw new FileExtractionError("xlsx_zip_invalid", true);
+  }
+}
+
+async function xlsxEntryText(archive: OfficeArchive, inflationBudget: XlsxInflationBudget, path: string, required?: true): Promise<string>;
+async function xlsxEntryText(archive: OfficeArchive, inflationBudget: XlsxInflationBudget, path: string, required: false): Promise<string | null>;
+async function xlsxEntryText(archive: OfficeArchive, inflationBudget: XlsxInflationBudget, path: string, required = true): Promise<string | null> {
+  const archiveEntry = archive.entries.get(path);
+  if (archiveEntry && archiveEntry.uncompressedSize > MAX_XLSX_XML_BYTES) {
+    throw new FileExtractionError("xlsx_xml_size_limit", true);
+  }
+  if (!archiveEntry || archiveEntry.directory) {
     if (required) throw new FileExtractionError("xlsx_structure_invalid", true);
     return null;
   }
+  const maxOutputBytes = Math.min(MAX_XLSX_XML_BYTES, inflationBudget.remainingBytes);
+  if (maxOutputBytes <= 0) throw new FileExtractionError("xlsx_archive_limit", true);
   try {
-    const bytes = await entry.async("uint8array");
-    if (bytes.byteLength > MAX_XLSX_XML_BYTES) throw new FileExtractionError("xlsx_xml_size_limit", true);
+    const bytes = await xlsxEntryBytes(archive, archiveEntry, maxOutputBytes);
+    if (bytes.byteLength !== archiveEntry.uncompressedSize) throw new FileExtractionError("xlsx_archive_invalid", true);
+    if (bytes.byteLength > maxOutputBytes) throw new FileExtractionError("xlsx_xml_size_limit", true);
+    inflationBudget.remainingBytes -= bytes.byteLength;
     return decodeText(bytes);
   } catch (error) {
     if (error instanceof FileExtractionError) throw error;
@@ -300,18 +534,13 @@ function appendXlsxRow(builder: XlsxChunkBuilder, chunks: ExtractedChunk[], row:
 }
 
 async function extractXlsx(bytes: Uint8Array, sha256: string): Promise<FileExtractionResult> {
-  assertOfficeArchiveBounds(bytes, "xlsx");
-  let zip: JSZip;
-  try {
-    zip = await JSZip.loadAsync(bytes, { checkCRC32: false, createFolders: false });
-  } catch {
-    throw new FileExtractionError("xlsx_zip_invalid", true);
-  }
+  const archive = assertOfficeArchiveBounds(bytes, "xlsx");
+  const inflationBudget: XlsxInflationBudget = { remainingBytes: MAX_OFFICE_UNCOMPRESSED_BYTES };
 
-  const contentTypes = parseXlsxXml(await xlsxEntryText(zip, "[Content_Types].xml"));
+  const contentTypes = parseXlsxXml(await xlsxEntryText(archive, inflationBudget, "[Content_Types].xml"));
   if (!isXmlRecord(contentTypes.Types)) throw new FileExtractionError("xlsx_structure_invalid", true);
-  const workbook = parseXlsxXml(await xlsxEntryText(zip, "xl/workbook.xml"));
-  const relationships = parseXlsxXml(await xlsxEntryText(zip, "xl/_rels/workbook.xml.rels"));
+  const workbook = parseXlsxXml(await xlsxEntryText(archive, inflationBudget, "xl/workbook.xml"));
+  const relationships = parseXlsxXml(await xlsxEntryText(archive, inflationBudget, "xl/_rels/workbook.xml.rels"));
   const relationshipRoot = isXmlRecord(relationships.Relationships) ? relationships.Relationships : null;
   if (!relationshipRoot) throw new FileExtractionError("xlsx_structure_invalid", true);
   const relationshipPaths = new Map<string, string>();
@@ -334,14 +563,14 @@ async function extractXlsx(bytes: Uint8Array, sha256: string): Promise<FileExtra
   if (!allSheets.length) throw new FileExtractionError("xlsx_structure_invalid", true);
   const sheets = allSheets.slice(0, MAX_XLSX_SHEETS);
 
-  const sharedStringsXml = await xlsxEntryText(zip, "xl/sharedStrings.xml", false);
+  const sharedStringsXml = await xlsxEntryText(archive, inflationBudget, "xl/sharedStrings.xml", false);
   const sharedStrings = sharedStringsXml ? xlsxSharedStrings(parseXlsxXml(sharedStringsXml)) : [];
   const chunks: ExtractedChunk[] = [];
   let indexedCells = 0;
   let truncated = allSheets.length > sheets.length;
 
   sheetLoop: for (const sheet of sheets) {
-    const parsed = parseXlsxXml(await xlsxEntryText(zip, sheet.path));
+    const parsed = parseXlsxXml(await xlsxEntryText(archive, inflationBudget, sheet.path));
     const worksheet = isXmlRecord(parsed.worksheet) ? parsed.worksheet : null;
     // Chartsheets do not contain cell data; retain their names without making
     // a malformed-data claim about an otherwise valid workbook.
@@ -358,7 +587,14 @@ async function extractXlsx(bytes: Uint8Array, sha256: string): Promise<FileExtra
       if (!isXmlRecord(row)) throw new FileExtractionError("xlsx_structure_invalid", true);
       const rowNumber = Number(row["@_r"]);
       const effectiveRow = Number.isSafeInteger(rowNumber) && rowNumber > 0 ? rowNumber : rowIndex + 1;
-      const cells = xmlArray(row.c).map((cell, ordinal) => {
+      const rawCells = xmlArray(row.c);
+      const remainingCells = MAX_XLSX_CELLS - indexedCells;
+      const boundedRawCells = rawCells.slice(0, remainingCells);
+      const cellLimitReached = boundedRawCells.length < rawCells.length;
+      // Count every raw <c> before formatting. Blank cells and cells omitted
+      // from a clipped row still consume the workbook processing budget.
+      indexedCells += boundedRawCells.length;
+      const cells = boundedRawCells.map((cell, ordinal) => {
         if (!isXmlRecord(cell)) throw new FileExtractionError("xlsx_structure_invalid", true);
         return {
           ref: xlsxCellRef(cell["@_r"], effectiveRow, ordinal),
@@ -366,13 +602,22 @@ async function extractXlsx(bytes: Uint8Array, sha256: string): Promise<FileExtra
         };
       });
       const formatted = xlsxRow(cells);
-      if (!formatted) continue;
+      if (!formatted) {
+        if (cellLimitReached) {
+          truncated = true;
+          break;
+        }
+        continue;
+      }
       if (!appendXlsxRow(builder, chunks, formatted)) {
         truncated = true;
         break sheetLoop;
       }
-      indexedCells += formatted.cellCount;
       if (formatted.clipped) truncated = true;
+      if (cellLimitReached) {
+        truncated = true;
+        break;
+      }
     }
     flushXlsxChunk(builder, chunks);
     if (chunks.length >= CHAT_FILE_LIMITS.maxChunks) {

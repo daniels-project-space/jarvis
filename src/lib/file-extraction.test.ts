@@ -69,6 +69,77 @@ async function realXlsxFixture(): Promise<Uint8Array> {
   return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
 }
 
+async function xlsxWithWorksheetXml(sheetXml: string): Promise<Uint8Array> {
+  const zip = await JSZip.loadAsync(await realXlsxFixture());
+  zip.file("xl/worksheets/sheet1.xml", sheetXml);
+  // The raw-cell cap tests exercise parser bounds, not compression bounds.
+  return await zip.generateAsync({ type: "uint8array", compression: "STORE" });
+}
+
+async function xlsxWithDeflatedWorksheetXml(sheetXml: string): Promise<Uint8Array> {
+  const zip = await JSZip.loadAsync(await realXlsxFixture());
+  zip.file("xl/worksheets/sheet1.xml", sheetXml);
+  return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+
+async function xlsxWithWorkbookPart(path: "xl/workbook.xml" | "xl/_rels/workbook.xml.rels", xml: string): Promise<Uint8Array> {
+  const zip = await JSZip.loadAsync(await realXlsxFixture());
+  zip.file(path, xml);
+  return await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+
+function centralDirectoryOffset(bytes: Uint8Array): number {
+  const buffer = Buffer.from(bytes);
+  const eocdOffset = buffer.length - 22;
+  if (buffer.readUInt32LE(eocdOffset) !== 0x06054b50) throw new Error("fixture is missing EOCD");
+  return buffer.readUInt32LE(eocdOffset + 16);
+}
+
+function withForgedCentralUncompressedSize(bytes: Uint8Array): Uint8Array {
+  const buffer = Buffer.from(bytes);
+  buffer.writeUInt32LE(0, centralDirectoryOffset(buffer) + 24);
+  return new Uint8Array(buffer);
+}
+
+function withZip64EntryCount(bytes: Uint8Array): Uint8Array {
+  const buffer = Buffer.from(bytes);
+  const eocdOffset = buffer.length - 22;
+  buffer.writeUInt16LE(0xffff, eocdOffset + 10);
+  return new Uint8Array(buffer);
+}
+
+function centralDirectoryEntryOffset(bytes: Uint8Array, path: string): number {
+  const buffer = Buffer.from(bytes);
+  const eocdOffset = buffer.length - 22;
+  const count = buffer.readUInt16LE(eocdOffset + 10);
+  let offset = centralDirectoryOffset(buffer);
+  for (let index = 0; index < count; index += 1) {
+    if (buffer.readUInt32LE(offset) !== 0x02014b50) throw new Error("fixture central directory is malformed");
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    if (buffer.subarray(offset + 46, offset + 46 + nameLength).toString("utf8") === path) return offset;
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  throw new Error(`fixture is missing ${path}`);
+}
+
+function withForgedEntryUncompressedSize(bytes: Uint8Array, path: string, size: number): Uint8Array {
+  const buffer = Buffer.from(bytes);
+  const centralOffset = centralDirectoryEntryOffset(buffer, path);
+  const localOffset = buffer.readUInt32LE(centralOffset + 42);
+  buffer.writeUInt32LE(size, centralOffset + 24);
+  buffer.writeUInt32LE(size, localOffset + 22);
+  return new Uint8Array(buffer);
+}
+
+function worksheetWithCells(cells: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+      <row r="1">${cells}</row>
+    </sheetData></worksheet>`;
+}
+
 describe("deterministic private file extraction", () => {
   it("indexes a real CSV fixture with bounded row citations", async () => {
     const bytes = await readFile(join(process.cwd(), "src/lib/__fixtures__/rental-revenue.csv"));
@@ -135,6 +206,90 @@ describe("deterministic private file extraction", () => {
       detectedMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       sheetNames: ["Booked stay", "Flights"],
     });
+  });
+
+  it("rejects forged central-directory sizes before any XLSX entry can inflate", async () => {
+    await expect(extractPrivateFile({
+      bytes: withForgedCentralUncompressedSize(await realXlsxFixture()),
+      name: "forged.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_archive_invalid", quarantined: true } satisfies Partial<FileExtractionError>);
+  });
+
+  it("rejects ZIP64 and archive comments instead of accepting ambiguous OOXML ZIP metadata", async () => {
+    await expect(extractPrivateFile({
+      bytes: withZip64EntryCount(await realXlsxFixture()),
+      name: "zip64.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_archive_zip64", quarantined: true } satisfies Partial<FileExtractionError>);
+
+    const zip = await JSZip.loadAsync(await realXlsxFixture());
+    await expect(extractPrivateFile({
+      bytes: await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", comment: "ambiguous archive tail" }),
+      name: "commented.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_directory_missing", quarantined: true } satisfies Partial<FileExtractionError>);
+  });
+
+  it("rejects a high-ratio archive entry before any workbook XML is inflated", async () => {
+    const zip = await JSZip.loadAsync(await realXlsxFixture());
+    zip.file("xl/media/repetitive.bin", "x".repeat(256_000));
+    await expect(extractPrivateFile({
+      bytes: await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" }),
+      name: "ratio.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_archive_ratio_limit", quarantined: true } satisfies Partial<FileExtractionError>);
+  });
+
+  it("stops forged DEFLATE output at the XML ceiling instead of buffering a declared-small payload", async () => {
+    const oversizedWorksheet = worksheetWithCells(`<c><v>${"x".repeat(4 * 1024 * 1024 + 1)}</v></c>`);
+    await expect(extractPrivateFile({
+      bytes: withForgedEntryUncompressedSize(
+        await xlsxWithDeflatedWorksheetXml(oversizedWorksheet),
+        "xl/worksheets/sheet1.xml",
+        1,
+      ),
+      name: "forged-bomb.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_xml_size_limit", quarantined: true } satisfies Partial<FileExtractionError>);
+  });
+
+  it("charges blank raw cells to the XLSX processing cap before formatting", async () => {
+    const result = await extractPrivateFile({
+      bytes: await xlsxWithWorksheetXml(worksheetWithCells("<c><v/></c>".repeat(50_001))),
+      name: "blank-cells.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    expect(result.summary).toContain("50,000 cells indexed");
+    expect(result.summary).toContain("bounded extract");
+    expect(result.chunks).toEqual([]);
+  });
+
+  it("charges cells omitted by a clipped row to the XLSX processing cap", async () => {
+    const result = await extractPrivateFile({
+      bytes: await xlsxWithWorksheetXml(worksheetWithCells("<c><v>x</v></c>".repeat(50_001))),
+      name: "clipped-cells.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    expect(result.summary).toContain("50,000 cells indexed");
+    expect(result.summary).toContain("bounded extract");
+    expect(result.chunks[0]?.text).toContain("row 1 cell 1: x");
+  });
+
+  it("rejects XML declarations with entities and sheets routed through external relationships", async () => {
+    await expect(extractPrivateFile({
+      bytes: await xlsxWithWorkbookPart("xl/workbook.xml", `<!DOCTYPE workbook [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+        <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Unsafe" sheetId="1" r:id="rId1"/></sheets></workbook>`),
+      name: "entity.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_unsafe_xml", quarantined: true } satisfies Partial<FileExtractionError>);
+
+    await expect(extractPrivateFile({
+      bytes: await xlsxWithWorkbookPart("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="https://example.test/worksheet.xml" TargetMode="External"/></Relationships>`),
+      name: "external.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })).rejects.toMatchObject({ code: "xlsx_structure_invalid", quarantined: true } satisfies Partial<FileExtractionError>);
   });
 
   it("decodes and previews a real PNG", async () => {
