@@ -287,13 +287,17 @@ export default defineSchema({
   // A non-reactive proof that this exact user row was admitted through the
   // authenticated owner conversation. It never stores the browser session or
   // a portable bearer; a short per-call receipt is additionally fenced to the
-  // live assistant claim before Gmail/Google Calendar can run.
+  // live assistant claim before a foreground owner capability can run.
   chatTurnOwnerToolGrants: defineTable({
     messageId: v.id("chatMessages"),
     threadId: v.string(),
     // The exact direct-command scope is minted at authenticated owner-message
     // admission. Never reconstruct this from conversation/model text later.
     toolNames: v.array(v.string()),
+    // Browser execution needs more than a generic tool name: the exact ID is
+    // parsed from the owner’s direct message and is the only errand this grant
+    // can redeem. Undefined is retained only for pre-browser legacy grants.
+    browserErrandId: v.optional(v.string()),
     issuedAt: v.number(),
     expiresAt: v.number(),
   })

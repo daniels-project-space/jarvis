@@ -59,6 +59,7 @@ describe("Gmail destructive action boundary", () => {
     const definition = TOOL_DEFS.find((tool) => tool.name === "browser_errand_run");
     expect(definition?.parameters.required).toEqual(["errand_id"]);
     expect(definition?.parameters.properties).not.toHaveProperty("steps");
+    expect(definition?.description).toContain("Run approved browser errand ID: <id>");
 
     await expect(executeTool("browser_errand_run", {
       errand_id: "browserErrand123",

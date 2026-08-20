@@ -6,7 +6,7 @@ import { paginationOptsValidator } from "convex/server";
 import { CHAT_FILE_LIMITS, FILE_READY_STATUSES } from "../src/lib/chat-files";
 import {
   FOREGROUND_OWNER_TOOL_NAMES,
-  foregroundOwnerToolNamesForDirectRequest,
+  foregroundOwnerToolGrantForDirectRequest,
   isForegroundOwnerToolName,
   isToolBeltName,
   TOOL_BELTS,
@@ -323,11 +323,13 @@ async function admitMessage(
   });
   // This scope is minted only after conversationIdentity accepted the
   // authenticated owner and the submitted message starts with a direct,
-  // unquoted Gmail/Google Calendar/browser-errand command. No browser
-  // credential is retained: later tool calls are separately bound to the
-  // active assistant claim and a short receipt, and never rescan arbitrary
-  // conversation text for authority.
-  const ownerToolNames = foregroundOwnerToolNamesForDirectRequest(submittedText);
+  // unquoted Gmail/Google Calendar/browser-errand command. A browser command
+  // additionally has to contain exactly one durable errand ID, persisted
+  // below before the model can discover the run tool. No browser credential is
+  // retained: later calls are separately bound to the active assistant claim
+  // and a short receipt, and never rescan arbitrary conversation text.
+  const ownerToolGrant = foregroundOwnerToolGrantForDirectRequest(submittedText);
+  const ownerToolNames = ownerToolGrant.toolNames;
   if (
     ownerToolNames.length > 0
     && identity.kind === "owner"
@@ -337,6 +339,7 @@ async function admitMessage(
       messageId: id,
       threadId,
       toolNames: ownerToolNames,
+      ...(ownerToolGrant.browserErrandId ? { browserErrandId: ownerToolGrant.browserErrandId } : {}),
       issuedAt: createdAt,
       expiresAt: createdAt + FOREGROUND_OWNER_TOOL_GRANT_TTL_MS,
     });
@@ -1031,7 +1034,13 @@ async function claimPending(
       && ownerToolGrant.threadId === pending.threadId
       && ownerToolGrant.expiresAt > now
       && Array.isArray(ownerToolGrant.toolNames)
-      && ownerToolGrant.toolNames.some(isForegroundOwnerToolName),
+      && ownerToolGrant.toolNames.some((name: unknown) =>
+        isForegroundOwnerToolName(name)
+        && (name !== "browser_errand_run" || (
+          typeof ownerToolGrant.browserErrandId === "string"
+          && BROWSER_ERRAND_ID_RE.test(ownerToolGrant.browserErrandId)
+        )),
+      ),
   );
 
   const all = await ctx.db
@@ -1308,10 +1317,15 @@ export const turnCancellationForWorker = query({
   },
 });
 
-async function foregroundOwnerToolNamesForLiveClaim(
+type ForegroundOwnerToolLiveGrant = {
+  toolNames: string[];
+  browserErrandId?: string;
+};
+
+async function foregroundOwnerToolGrantForLiveClaim(
   ctx: { db: any },
   claim: { messageId: any; assistantId: any; claimToken: string },
-): Promise<string[]> {
+): Promise<ForegroundOwnerToolLiveGrant> {
   const [message, assistant, grant, cancellation] = await Promise.all([
     ctx.db.get(claim.messageId),
     ctx.db.get(claim.assistantId),
@@ -1337,12 +1351,24 @@ async function foregroundOwnerToolNamesForLiveClaim(
     || grant.threadId !== message.threadId
     || grant.expiresAt <= now
     || cancellation
-  ) return [];
+  ) return { toolNames: [] };
   // This is the exact authenticated admission scope. Do not rescan the user
   // row here: the model, quoted text, or attachments must never expand it.
-  return [...FOREGROUND_OWNER_TOOL_NAMES].filter((name) =>
-    Array.isArray(grant.toolNames) && grant.toolNames.includes(name),
+  // A legacy/generic browser grant is deliberately stripped: browser runs
+  // require the owner-message ID that was persisted at admission.
+  const browserErrandId = typeof grant.browserErrandId === "string"
+    && BROWSER_ERRAND_ID_RE.test(grant.browserErrandId)
+    ? grant.browserErrandId
+    : undefined;
+  const toolNames = [...FOREGROUND_OWNER_TOOL_NAMES].filter((name) =>
+    Array.isArray(grant.toolNames)
+    && grant.toolNames.includes(name)
+    && (name !== "browser_errand_run" || Boolean(browserErrandId)),
   );
+  return {
+    toolNames,
+    ...(toolNames.includes("browser_errand_run") && browserErrandId ? { browserErrandId } : {}),
+  };
 }
 
 // The Vercel foreground-owner endpoint is dispatch-authenticated, but this
@@ -1359,8 +1385,8 @@ export const foregroundOwnerToolDefinitionsForWorker = query({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     if (!isToolBeltName(a.belt)) return { allowed: false, toolNames: [] as string[] };
-    const allowedNames = await foregroundOwnerToolNamesForLiveClaim(ctx, a);
-    const toolNames = allowedNames.filter((name) => TOOL_BELTS[a.belt].has(name));
+    const grant = await foregroundOwnerToolGrantForLiveClaim(ctx, a);
+    const toolNames = grant.toolNames.filter((name) => TOOL_BELTS[a.belt].has(name));
     return { allowed: toolNames.length > 0, toolNames };
   },
 });
@@ -1390,8 +1416,11 @@ export const redeemForegroundOwnerToolForWorker = mutation({
       (toolName === "browser_errand_run" && (!browserErrandId || !BROWSER_ERRAND_ID_RE.test(browserErrandId)))
       || (toolName !== "browser_errand_run" && browserErrandId !== undefined)
     ) return { allowed: false };
-    const allowedNames = await foregroundOwnerToolNamesForLiveClaim(ctx, a);
-    if (!allowedNames.includes(toolName)) return { allowed: false };
+    const grant = await foregroundOwnerToolGrantForLiveClaim(ctx, a);
+    if (!grant.toolNames.includes(toolName)) return { allowed: false };
+    if (toolName === "browser_errand_run" && grant.browserErrandId !== browserErrandId) {
+      return { allowed: false };
+    }
     const receiptKey = `${String(a.assistantId)}:${callId}`;
     const [existing, uses] = await Promise.all([
       ctx.db
@@ -1403,7 +1432,9 @@ export const redeemForegroundOwnerToolForWorker = mutation({
         .withIndex("by_message", (q: any) => q.eq("messageId", a.messageId))
         .take(FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN + 1),
     ]);
-    if (existing || uses.length >= FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN) {
+    const browserRunAlreadyRedeemed = toolName === "browser_errand_run"
+      && uses.some((use: any) => use.toolName === "browser_errand_run");
+    if (existing || uses.length >= FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN || browserRunAlreadyRedeemed) {
       return { allowed: false };
     }
     // This insert is the irrevocable linearization point. Once it succeeds,

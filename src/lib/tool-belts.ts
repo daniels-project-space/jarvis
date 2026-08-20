@@ -117,7 +117,12 @@ const DIRECT_CALENDAR_LIST_RE = /^(?:(?:show|view|list|check|read|open)\b\s+|wha
 const DIRECT_CALENDAR_CREATE_RE = /^(?:(?:add|create|schedule|put|make|remind)\b[^\r\n\"`“”‘’]{0,160}\b(?:to|on|in)\s+my\s+(?:google\s*)?(?:calendar|gcal)\b|(?:add|create|schedule|put|make|remind)\s+(?:an?\s+)?(?:event|meeting|appointment|reminder)\b)/i;
 const DIRECT_CALENDAR_UPDATE_RE = /^(?:change|edit|update|move|reschedule)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
 const DIRECT_CALENDAR_DELETE_RE = /^(?:delete|remove|cancel)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
-const DIRECT_BROWSER_ERRAND_RUN_RE = /^(?:(?:run|execute|start)\s+(?:the\s+)?(?:(?:already\s+)?approved\s+)?browser\s+errand\b)/i;
+// A generic “run the browser errand” is not authorization. The owner must
+// name the exact durable errand ID in an unambiguous `ID:`/`ID #` field in
+// the direct, unquoted command that is admitted into chatQueue. A bare word
+// after "browser errand" is never authority: it could be prose such as
+// "now", "again", or "immediately" rather than the opaque durable ID.
+const DIRECT_BROWSER_ERRAND_RUN_RE = /^(?:(?:run|execute|start)\s+(?:the\s+)?(?:(?:already\s+)?approved\s+)?browser\s+errand\s+id\s*(?::|#)\s*([A-Za-z0-9_-]{1,128}))(?:\s+(?:now|please))?\s*[.!?]?\s*$/i;
 const BROWSER_ERRAND_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -168,9 +173,14 @@ function directOwnerCommand(lead: string): string {
  * the result is persisted; later worker/model wording never mints or expands
  * authority.
  */
-export function foregroundOwnerToolNamesForDirectRequest(userText: string): string[] {
+export type ForegroundOwnerDirectToolGrant = Readonly<{
+  toolNames: string[];
+  browserErrandId?: string;
+}>;
+
+export function foregroundOwnerToolGrantForDirectRequest(userText: string): ForegroundOwnerDirectToolGrant {
   const command = directOwnerCommand(directOwnerRequestLead(userText));
-  if (!command) return [];
+  if (!command) return Object.freeze({ toolNames: [] });
 
   const granted = new Set<string>();
   const gmailRead = DIRECT_GMAIL_READ_RE.test(command);
@@ -196,9 +206,20 @@ export function foregroundOwnerToolNamesForDirectRequest(userText: string): stri
   if (calendarCreate) granted.add("google_calendar_create");
   if (calendarUpdate) granted.add("google_calendar_update");
   if (calendarDelete) granted.add("google_calendar_delete");
-  if (DIRECT_BROWSER_ERRAND_RUN_RE.test(command)) granted.add("browser_errand_run");
+  const browserErrandMatch = command.match(DIRECT_BROWSER_ERRAND_RUN_RE);
+  const browserErrandId = browserErrandMatch?.[1];
+  if (browserErrandId && BROWSER_ERRAND_ID_RE.test(browserErrandId)) {
+    granted.add("browser_errand_run");
+  }
 
-  return [...FOREGROUND_OWNER_TOOL_NAMES].filter((toolName) => granted.has(toolName));
+  return Object.freeze({
+    toolNames: [...FOREGROUND_OWNER_TOOL_NAMES].filter((toolName) => granted.has(toolName)),
+    ...(browserErrandId ? { browserErrandId } : {}),
+  });
+}
+
+export function foregroundOwnerToolNamesForDirectRequest(userText: string): string[] {
+  return foregroundOwnerToolGrantForDirectRequest(userText).toolNames;
 }
 
 /** Backward-compatible single-tool check for the direct-command policy. */

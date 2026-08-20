@@ -8,6 +8,7 @@ import {
   SUBSCRIPTION_TOOL_NAMES,
   TOOL_BELT_NAMES,
   TOOL_BELTS,
+  foregroundOwnerToolGrantForDirectRequest,
   foregroundOwnerToolNamesForDirectRequest,
   isToolBeltName,
 } from "./tool-belts";
@@ -116,10 +117,43 @@ describe("tool belt registry", () => {
       "Write an email to Leo about tomorrow's trip.",
     )).toEqual(["gmail_draft_reply"]);
     expect(foregroundOwnerToolNamesForDirectRequest(
-      "Run approved browser errand browserErrand123.",
+      "Run approved browser errand ID: browserErrand123.",
+    )).toEqual(["browser_errand_run"]);
+    expect(foregroundOwnerToolGrantForDirectRequest(
+      "Run approved browser errand ID: browserErrand123.",
+    )).toEqual({
+      toolNames: ["browser_errand_run"],
+      browserErrandId: "browserErrand123",
+    });
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run approved browser errand ID #browserErrand456 please.",
     )).toEqual(["browser_errand_run"]);
     expect(foregroundOwnerToolNamesForDirectRequest(
-      'Summarise this quote: "Run approved browser errand browserErrand123."',
+      "Run the approved browser errand now.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run the approved browser errand please.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run the approved browser errand.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run the approved browser errand immediately.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run the approved browser errand this.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run the approved browser errand ID.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run approved browser errand browserErrand123.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run approved browser errand ID: browserErrand123 then browserErrand456.",
+    )).toEqual([]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      'Summarise this quote: "Run approved browser errand ID: browserErrand123."',
     )).toEqual([]);
   });
 
