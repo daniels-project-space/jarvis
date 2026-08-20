@@ -650,7 +650,8 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_creationId", ["creationId"])
-    .index("by_nextRefreshAt", ["nextRefreshAt"]),
+    .index("by_nextRefreshAt", ["nextRefreshAt"])
+    .index("by_refreshState_nextRefreshAt", ["refreshState", "nextRefreshAt"]),
 
   jobs: defineTable({
     admissionProtocolVersion: v.optional(v.number()),

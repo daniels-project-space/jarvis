@@ -3,6 +3,42 @@ import "server-only";
 import { createHash } from "node:crypto";
 
 const DAY_MS = 24 * 60 * 60_000;
+const MINUTE_MS = 60_000;
+const APPLE_MAPS_OFFLINE_REFRESH_SAFETY_WINDOW_MS = 5 * MINUTE_MS;
+export const APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS = 6 * 60 * 60_000;
+export const APPLE_MAPS_OFFLINE_RETRY_INTERVAL_MS = 10 * 60_000;
+
+/**
+ * The worker must never revise a preflight in its protected final five
+ * minutes. This check is repeated at execution time in case a scheduled run
+ * starts late.
+ */
+export function isAppleMapsOfflinePreflightRefreshWindowOpen(preflightAt: number, now: number): boolean {
+  return Number.isFinite(preflightAt)
+    && Number.isFinite(now)
+    && now < preflightAt - APPLE_MAPS_OFFLINE_REFRESH_SAFETY_WINDOW_MS;
+}
+
+/**
+ * Keep scheduled maintenance outside the owner-facing reminder window. A
+ * failed Hub handoff retries promptly, while healthy saved trips use the
+ * slower cadence. Leave one dispatcher minute before the protected window so
+ * a normally delayed scheduled run cannot cross into it.
+ */
+export function nextAppleMapsOfflinePreflightRefreshAt(
+  preflightAt: number,
+  now: number,
+  retry = false,
+): number | null {
+  if (!isAppleMapsOfflinePreflightRefreshWindowOpen(preflightAt, now)) return null;
+  const interval = retry
+    ? APPLE_MAPS_OFFLINE_RETRY_INTERVAL_MS
+    : APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS;
+  const earliestRun = now + MINUTE_MS;
+  const latestSafeRun = preflightAt - APPLE_MAPS_OFFLINE_REFRESH_SAFETY_WINDOW_MS - MINUTE_MS;
+  if (latestSafeRun < earliestRun) return null;
+  return Math.min(now + interval, latestSafeRun);
+}
 
 export type AppleMapsOfflineFlight = {
   id: string;

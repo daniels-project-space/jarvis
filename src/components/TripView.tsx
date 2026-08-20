@@ -412,6 +412,10 @@ export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPr
           ? "The booked stay changed; Jarvis needs an exact city confirmation before changing this reminder."
           : preflight?.refreshState === "pending_refresh"
             ? "Jarvis will retry the saved-trip refresh; the existing reminder stays unchanged."
+            : preflight?.refreshState === "too_late"
+              ? typeof preflight.refreshError === "string" && preflight.refreshError.trim()
+                ? preflight.refreshError
+                : "The safe window for automatic preflight refresh has closed; the durable reminder stays unchanged."
             : preflight?.refreshState === "draft_manual_only"
               ? "Save this trip to turn on exact Gmail itinerary refresh."
               : preflight?.refreshState === "pending_city_identity" || preflight?.refreshState === "pending_registry"

@@ -2,9 +2,28 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { appleMapsCitySearchUrl, buildAppleMapsOfflinePreflight } from "./apple-maps-offline";
+import {
+  APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS,
+  APPLE_MAPS_OFFLINE_RETRY_INTERVAL_MS,
+  appleMapsCitySearchUrl,
+  buildAppleMapsOfflinePreflight,
+  nextAppleMapsOfflinePreflightRefreshAt,
+} from "./apple-maps-offline";
 
 describe("Apple Maps offline preflight", () => {
+  it("retries a failed scoped to-do promptly without entering the protected reminder window", () => {
+    const now = Date.parse("2030-09-01T08:00:00Z");
+    const preflightAt = now + 2 * 86_400_000;
+    expect(nextAppleMapsOfflinePreflightRefreshAt(preflightAt, now)).toBe(
+      now + APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS,
+    );
+    expect(nextAppleMapsOfflinePreflightRefreshAt(preflightAt, now, true)).toBe(
+      now + APPLE_MAPS_OFFLINE_RETRY_INTERVAL_MS,
+    );
+    expect(nextAppleMapsOfflinePreflightRefreshAt(now + 7 * 60_000, now, true)).toBe(now + 60_000);
+    expect(nextAppleMapsOfflinePreflightRefreshAt(now + 3 * 60_000, now, true)).toBeNull();
+  });
+
   it("uses the next confirmed flight and schedules the preceding local calendar day", () => {
     const result = buildAppleMapsOfflinePreflight({
       city: "Seville, Spain",

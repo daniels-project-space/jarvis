@@ -224,6 +224,25 @@ describe("TripTimeline", () => {
     expect(markup).toContain("Gmail itinerary refresh is active for this exact saved trip.");
     expect(markup).toContain("Download and deletion remain in Maps");
   });
+
+  it("shows a recorded late reminder refresh without claiming the reminder stayed unchanged", () => {
+    const markup = renderToStaticMarkup(
+      <TripOfflineMapPreflight preflight={{
+        city: "Seville",
+        at: Date.parse("2026-09-02T09:15:00+02:00"),
+        timeZone: "Europe/Madrid",
+        mapUrl: "https://maps.apple.com/search?query=Seville",
+        todoStatus: "needs_retry",
+        reminderStatus: "scheduled",
+        calendarStatus: "needs_connection",
+        refreshState: "too_late",
+        refreshError: "The durable reminder was refreshed before the safe window closed; the Hub to-do was not changed.",
+      }} />,
+    );
+
+    expect(markup).toContain("The durable reminder was refreshed before the safe window closed; the Hub to-do was not changed.");
+    expect(markup).not.toContain("durable reminder stays unchanged");
+  });
 });
 
 describe("TripView city contexts", () => {

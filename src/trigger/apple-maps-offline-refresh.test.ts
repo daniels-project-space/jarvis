@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { refreshAppleMapsOfflinePreflights } from "./apple-maps-offline-refresh";
+import {
+  APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS,
+  refreshAppleMapsOfflinePreflights,
+} from "./apple-maps-offline-refresh";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -57,6 +60,8 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(mutation).toHaveBeenCalledWith("reminders:add", expect.objectContaining({ sourceKey: row.sourceKey }));
     expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.objectContaining({
       id: row._id, expectedUpdatedAt: row.updatedAt, calendarRefreshRequired: true,
+      nextRefreshAt: now + APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS,
+      refreshState: "scheduled",
       preflight: expect.objectContaining({ flightStart: flight.start, sourceKey: row.sourceKey }),
     }));
     const payloads = fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as { path: string; args: Record<string, unknown> });
@@ -129,7 +134,116 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(fetch).not.toHaveBeenCalled();
     expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.objectContaining({
       todoStatus: "needs_retry",
+      nextRefreshAt: now + 10 * 60_000,
+      refreshState: "scheduled",
     }));
+  });
+
+  it("does not revise a preflight after its protected five-minute window begins", async () => {
+    const lateNow = Date.parse("2030-01-01T07:00:00Z");
+    const lateFlight = {
+      ...flight,
+      start: Date.parse("2030-01-02T08:03:00+01:00"),
+      end: Date.parse("2030-01-02T11:03:00+01:00"),
+    };
+    const lateStay = {
+      ...stay,
+      start: Date.parse("2030-01-01T12:00:00+01:00"),
+      end: Date.parse("2030-01-03T12:00:00+01:00"),
+    };
+    const lateRow = {
+      ...row,
+      preflight: { ...preflight, at: lateNow + 3 * 60_000, flightStart: lateFlight.start },
+      cityProof: {
+        ...cityProof,
+        start: lateStay.start,
+        end: lateStay.end,
+        verifiedAt: lateNow - 1_000,
+      },
+    };
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    const fetch = vi.fn();
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([lateRow]),
+      mutation,
+      fetch: fetch as typeof globalThis.fetch,
+      now: () => lateNow,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? lateFlight : lateStay),
+    })).resolves.toEqual({ due: 1, refreshed: 0, pending: 0, skipped: 1 });
+
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
+      state: "too_late",
+      error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
+    }));
+    expect(mutation).not.toHaveBeenCalledWith("reminders:add", expect.anything());
+    expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the clock after Gmail lookup before it writes the durable reminder", async () => {
+    let clock = now;
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    const fetch = vi.fn();
+    const lookupBooking = vi.fn(async (identity) => {
+      if (identity.selectionId === "booking-flight") {
+        // Simulate a lookup that crosses the saved preflight's protected window.
+        clock = flight.start;
+        return flight;
+      }
+      return stay;
+    });
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([row]),
+      mutation,
+      fetch: fetch as typeof globalThis.fetch,
+      now: () => clock,
+      lookupBooking,
+    })).resolves.toEqual({ due: 1, refreshed: 0, pending: 0, skipped: 1 });
+
+    expect(lookupBooking).toHaveBeenCalledTimes(2);
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
+      state: "too_late",
+      error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
+    }));
+    expect(mutation).not.toHaveBeenCalledWith("reminders:add", expect.anything());
+    expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the clock after a Hub read before it mutates the to-do", async () => {
+    vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
+    let clock = now;
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    const fetch = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { path?: string };
+      if (body.path !== "jarvisActions:listTodos") throw new Error(`unexpected Hub mutation ${body.path}`);
+      // The read was slow; no later create/update is allowed to cross the window.
+      clock = flight.start;
+      return new Response(JSON.stringify({ value: [] }), { headers: { "content-type": "application/json" } });
+    });
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([row]),
+      mutation,
+      fetch: fetch as typeof globalThis.fetch,
+      now: () => clock,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? flight : stay),
+    })).resolves.toEqual({ due: 1, refreshed: 1, pending: 0, skipped: 0 });
+
+    expect(mutation).toHaveBeenCalledWith("reminders:add", expect.objectContaining({ sourceKey: row.sourceKey }));
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.objectContaining({
+      id: row._id,
+      expectedUpdatedAt: row.updatedAt,
+      preflight: expect.objectContaining({ flightStart: flight.start }),
+      cityProof: expect.objectContaining({ verifiedAt: flight.start }),
+      refreshState: "too_late",
+      refreshError: "The durable reminder was refreshed before the safe window closed; the Hub to-do was not changed.",
+      todoStatus: "needs_retry",
+    }));
+    expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.anything());
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed with a pending Google state and does not touch the reminder when Gmail is unavailable", async () => {
