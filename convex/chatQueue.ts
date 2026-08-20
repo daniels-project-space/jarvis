@@ -24,6 +24,7 @@ import {
 import {
   isDeterministicFileFollowUp,
   isLikelyFileReference,
+  requestedPrivateMediaKind,
   attachFileBadgesToMessages,
   linkFilesToMessage,
   messageFileManifests,
@@ -1076,6 +1077,7 @@ async function claimPending(
       : await messageFileManifests(ctx, pending._id, pending.text);
   const fileRelevant =
     messageAttachments.length > 0 || isLikelyFileReference(pending.text);
+  const requestedMediaKind = requestedPrivateMediaKind(pending.text);
   const namedReference =
     !messageAttachments.length && fileRelevant
       ? await namedThreadFileManifest(ctx, pending.threadId, pending.text)
@@ -1084,7 +1086,7 @@ async function claimPending(
     !messageAttachments.length &&
     !namedReference &&
     isDeterministicFileFollowUp(pending.text)
-      ? await recentThreadFileManifest(ctx, pending.threadId)
+      ? await recentThreadFileManifest(ctx, pending.threadId, requestedMediaKind)
       : null;
   const resolvedFallback = namedReference ?? recentFallback;
   if (resolvedFallback) {
@@ -1114,7 +1116,7 @@ async function claimPending(
       )
     : messageAttachments;
   const fileCatalog =
-    fileRelevant && !attachments.length
+    fileRelevant && !attachments.length && !requestedMediaKind
       ? await threadFileCatalog(ctx, pending.threadId)
       : [];
 

@@ -185,18 +185,48 @@ export async function linkMessageFilesToCreation(
   return linked;
 }
 
+const DETERMINISTIC_FILE_FOLLOW_UP =
+  /\b(?:that|this|the|last|previous|uploaded|attached|my|our)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo|video|audio|clip|recording)\b/;
+const DETERMINISTIC_FILE_SOURCE_REFERENCE =
+  /\b(?:from|using|with)\s+(?:that|this|the|last|previous|my|our)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo|video|audio|clip|recording)\b/;
+const LIKELY_FILE_NOUN =
+  /\b(?:file|files|folder|document|doc|pdf|spreadsheet|csv|image|photo|attachment|upload|library)\b/;
+// Keep this aligned with the private media containers admitted by
+// src/lib/media-types.ts. A filename only selects a catalog candidate; bytes
+// still enter a claim solely after exact thread-scoped resolution.
+const LIKELY_FILE_EXTENSION =
+  /\b[\w-]+\.(?:txt|md|csv|json|pdf|docx?|xlsx?|png|jpe?g|webp|mp3|m4a|ogg|wav|webm|mp4|mov)\b/;
+
+export type RequestedPrivateMediaKind = "audio" | "video" | "media" | "ambiguous" | null;
+
+/**
+ * A deictic media follow-up may resolve only a compatible private file. Do
+ * not treat a bare media noun as a file reference; it could be ordinary
+ * conversation such as a request for a video-game recommendation.
+ */
+export function requestedPrivateMediaKind(text: string): RequestedPrivateMediaKind {
+  const value = text.toLowerCase().slice(0, 2_000);
+  const wantsVideo = /\b(?:video|clip)\b/.test(value);
+  const wantsAudio = /\baudio\b/.test(value);
+  const wantsRecording = /\brecording\b/.test(value);
+  if (wantsVideo && wantsAudio) return "ambiguous";
+  if (wantsVideo) return "video";
+  if (wantsAudio) return "audio";
+  return wantsRecording ? "media" : null;
+}
+
 export function isDeterministicFileFollowUp(text: string): boolean {
   const value = text.toLowerCase().slice(0, 2_000);
-  return /\b(?:that|this|the|last|previous|uploaded|attached)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo)\b/.test(value)
-    || /\b(?:from|using|with)\s+(?:that|this|the|last|previous)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo)\b/.test(value)
+  return DETERMINISTIC_FILE_FOLLOW_UP.test(value)
+    || DETERMINISTIC_FILE_SOURCE_REFERENCE.test(value)
     || /\b(?:chart|map|summari[sz]e|analy[sz]e|read|use)\b.{0,36}\b(?:it|that)\b/.test(value);
 }
 
 export function isLikelyFileReference(text: string): boolean {
   const value = text.toLowerCase().slice(0, 2_000);
   return isDeterministicFileFollowUp(value)
-    || /\b(?:file|files|folder|document|doc|pdf|spreadsheet|csv|image|photo|attachment|upload|library)\b/.test(value)
-    || /\b[\w-]+\.(?:txt|md|csv|json|pdf|docx?|xlsx?|png|jpe?g|webp)\b/.test(value);
+    || LIKELY_FILE_NOUN.test(value)
+    || LIKELY_FILE_EXTENSION.test(value);
 }
 
 function boundedChunkSearch(text: string | undefined): string {
@@ -288,7 +318,19 @@ export async function threadFileCatalog(ctx: { db: any }, threadId: string) {
   }] : []).slice(0, 12);
 }
 
-export async function recentThreadFileManifest(ctx: { db: any }, threadId: string) {
+function mediaKindMatches(mimeType: unknown, requested: RequestedPrivateMediaKind): boolean {
+  if (!requested) return true;
+  if (requested === "ambiguous") return false;
+  const value = String(mimeType ?? "").toLowerCase();
+  if (requested === "media") return value.startsWith("audio/") || value.startsWith("video/");
+  return value.startsWith(`${requested}/`);
+}
+
+export async function recentThreadFileManifest(
+  ctx: { db: any },
+  threadId: string,
+  requestedMediaKind: RequestedPrivateMediaKind = null,
+) {
   const links = await ctx.db
     .query("threadFiles")
     .withIndex("by_thread_updated", (q: any) => q.eq("threadId", threadId))
@@ -297,6 +339,7 @@ export async function recentThreadFileManifest(ctx: { db: any }, threadId: strin
   for (const link of links) {
     const file = await ctx.db.get(link.fileId);
     if (!file || !FILE_READY_STATUSES.has(String(file.status))) continue;
+    if (!mediaKindMatches(file.detectedMimeType ?? file.mimeType, requestedMediaKind)) continue;
     const chunks = await ctx.db
       .query("fileChunks")
       .withIndex("by_file_ordinal", (q: any) => q.eq("fileId", link.fileId))
