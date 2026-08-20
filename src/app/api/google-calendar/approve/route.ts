@@ -8,6 +8,7 @@ import {
 } from "@/lib/google-calendar";
 import { verifyGoogleCalendarApprovalProposal } from "@/lib/google-calendar-approval.server";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
+import { getTrip } from "@/lib/travel";
 
 export const runtime = "nodejs";
 export const maxDuration = 15;
@@ -39,6 +40,22 @@ export async function POST(req: NextRequest) {
   try {
     switch (approval.proposal.action) {
       case "create": {
+        const binding = approval.proposal.appleMapsOfflinePreflight;
+        if (binding) {
+          const trip = await getTrip(binding.tripId, { storage: binding.storage }).catch(() => null);
+          const preflight = trip?.doc.offlineMapPreflight;
+          if (
+            trip?.storage !== binding.storage ||
+            preflight?.sourceKey !== binding.sourceKey ||
+            preflight?.updatedAt !== binding.updatedAt ||
+            preflight.calendarRefreshRequired === true
+          ) {
+            return Response.json({
+              ok: false,
+              error: "That Apple Maps itinerary changed before approval. Prepare a fresh protected Calendar approval.",
+            }, { status: 409, headers: PRIVATE_HEADERS });
+          }
+        }
         const result = await createGooglePrimaryCalendarEvent(approval.proposal.event);
         return Response.json({
           ok: true,

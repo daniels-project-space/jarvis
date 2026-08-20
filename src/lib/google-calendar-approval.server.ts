@@ -11,8 +11,25 @@ const MAX_TOKEN_BYTES = 4_096;
 
 export class GoogleCalendarApprovalError extends Error {}
 
+/**
+ * A short-lived Apple Maps Calendar approval must describe the exact saved
+ * preflight that produced it. The approval route re-checks this binding before
+ * it writes to Google, so a background itinerary refresh invalidates an older
+ * card instead of creating an event at the previous flight time.
+ */
+export type AppleMapsOfflinePreflightApprovalBinding = {
+  tripId: string;
+  storage: "draft" | "creation";
+  updatedAt: number;
+  sourceKey: string;
+};
+
 export type GoogleCalendarApprovalProposal =
-  | { action: "create"; event: GoogleCalendarCreateInput }
+  | {
+    action: "create";
+    event: GoogleCalendarCreateInput;
+    appleMapsOfflinePreflight?: AppleMapsOfflinePreflightApprovalBinding;
+  }
   | { action: "update"; eventId: string; expectedEtag: string; event: GoogleCalendarCreateInput }
   | { action: "delete"; eventId: string; expectedEtag: string };
 
@@ -125,12 +142,38 @@ function normalizedEtag(value: unknown): string {
   return etag;
 }
 
+function normalizedAppleMapsOfflinePreflightApprovalBinding(value: unknown): AppleMapsOfflinePreflightApprovalBinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
+  }
+  const input = value as Record<string, unknown>;
+  const tripId = boundedText(input.tripId, "Trip ID", 256, true)!;
+  const sourceKey = normalizedSourceDedupeKey(input.sourceKey);
+  if (!sourceKey) throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
+  if (input.storage !== "draft" && input.storage !== "creation") {
+    throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
+  }
+  if (typeof input.updatedAt !== "number" || !Number.isSafeInteger(input.updatedAt) || input.updatedAt < 0) {
+    throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
+  }
+  return { tripId, storage: input.storage, updatedAt: input.updatedAt, sourceKey };
+}
+
 function normalizedProposal(value: unknown): GoogleCalendarApprovalProposal {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new GoogleCalendarApprovalError("Calendar approval is invalid.");
   }
   const input = value as Record<string, unknown>;
-  if (input.action === "create") return { action: "create", event: normalizedEvent(input.event) };
+  if (input.action === "create") {
+    const appleMapsOfflinePreflight = Object.hasOwn(input, "appleMapsOfflinePreflight")
+      ? normalizedAppleMapsOfflinePreflightApprovalBinding(input.appleMapsOfflinePreflight)
+      : undefined;
+    return {
+      action: "create",
+      event: normalizedEvent(input.event),
+      ...(appleMapsOfflinePreflight ? { appleMapsOfflinePreflight } : {}),
+    };
+  }
   if (input.action === "update") {
     return {
       action: "update",

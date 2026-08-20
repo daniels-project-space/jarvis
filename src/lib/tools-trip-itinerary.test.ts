@@ -337,7 +337,18 @@ describe("trip itinerary tool actions", () => {
 
     expect(result).toContain("Apple Maps preflight is scheduled for Seville");
     expect(result).toContain("nothing has been written yet");
-    expect(extractGoogleCalendarApproval(result)).toBeTruthy();
+    const approvalToken = extractGoogleCalendarApproval(result);
+    expect(approvalToken).toBeTruthy();
+    const { verifyGoogleCalendarApprovalProposal } = await import("./google-calendar-approval.server");
+    expect(verifyGoogleCalendarApprovalProposal(approvalToken!).proposal).toMatchObject({
+      action: "create",
+      appleMapsOfflinePreflight: {
+        tripId: "draft-apple",
+        storage: "draft",
+        updatedAt: expect.any(Number),
+        sourceKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
     expect(mock.convexMutation).toHaveBeenCalledWith("reminders:add", expect.objectContaining({
       sourceKey: expect.stringMatching(/^[a-f0-9]{64}$/),
       originThreadId: "thread-apple",

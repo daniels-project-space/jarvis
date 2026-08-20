@@ -2739,24 +2739,6 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
 
   let calendarStatus = await offlineMapCalendarStatus();
   let calendarApprovalMarker = "";
-  if (calendarStatus === "approval_required") {
-    try {
-      const approval = issueGoogleCalendarApproval({
-        title: `Apple Maps offline · ${preflight.city}`,
-        start: preflight.at,
-        end: preflight.at + 30 * 60_000,
-        allDay: false,
-        timeZone: preflight.timeZone,
-        location: preflight.city,
-        notes: `Before ${preflight.flightTitle}: open the Apple Maps handoff, download ${preflight.city} for offline use, then remove an old unused map in Maps > Offline Maps. Jarvis cannot download or delete Apple offline maps.`,
-        reminderMinutesBefore: 5,
-        sourceDedupeKey: preflight.sourceKey,
-      });
-      calendarApprovalMarker = googleCalendarApprovalMarker(approval);
-    } catch {
-      calendarStatus = "needs_connection";
-    }
-  }
 
   // Background maintenance is opt-in and saved-trip only. It never lists the
   // travel library: each registry row contains the exact Gmail flight and stay
@@ -2820,6 +2802,34 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     } : {}),
     updatedAt: now,
   };
+  if (calendarStatus === "approval_required") {
+    try {
+      const approval = issueGoogleCalendarApprovalProposal({
+        action: "create",
+        event: {
+          title: `Apple Maps offline · ${preflight.city}`,
+          start: preflight.at,
+          end: preflight.at + 30 * 60_000,
+          allDay: false,
+          timeZone: preflight.timeZone,
+          location: preflight.city,
+          notes: `Before ${preflight.flightTitle}: open the Apple Maps handoff, download ${preflight.city} for offline use, then remove an old unused map in Maps > Offline Maps. Jarvis cannot download or delete Apple offline maps.`,
+          reminderMinutesBefore: 5,
+          sourceDedupeKey: preflight.sourceKey,
+        },
+        appleMapsOfflinePreflight: {
+          tripId: trip.id,
+          storage: trip.storage,
+          updatedAt: trip.doc.offlineMapPreflight.updatedAt,
+          sourceKey: preflight.sourceKey,
+        },
+      });
+      calendarApprovalMarker = googleCalendarApprovalMarker(approval);
+    } catch {
+      calendarStatus = "needs_connection";
+      trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
+    }
+  }
   await saveTrip(trip.id, trip.doc, true, tripContext);
   await convexMutation("chatQueue:postCard", {
     threadId: await activeThread(),

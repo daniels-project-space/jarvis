@@ -7,6 +7,7 @@ const mock = vi.hoisted(() => ({
   controlActor: vi.fn(async () => ({ kind: "owner", authTokenHash: "owner" })),
   isOwner: vi.fn(() => true),
   verify: vi.fn(),
+  getTrip: vi.fn(),
   create: vi.fn(async () => ({ event: { title: "Planning", start: "2026-08-20T09:00:00.000Z", end: "2026-08-20T10:00:00.000Z", allDay: false }, created: true })),
   update: vi.fn(async () => ({ event: { title: "Rescheduled", start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", allDay: false } })),
   remove: vi.fn(async () => ({ id: "jarvisabcdef0123456789", deleted: true })),
@@ -18,6 +19,7 @@ const createProposal = mock.createProposal;
 vi.mock("@/lib/control-session", () => ({ isSameOriginRequest: mock.sameOrigin }));
 vi.mock("@/lib/request-auth", () => ({ controlActor: mock.controlActor, isOwnerActor: mock.isOwner }));
 vi.mock("@/lib/google-calendar-approval.server", () => ({ verifyGoogleCalendarApprovalProposal: mock.verify }));
+vi.mock("@/lib/travel", () => ({ getTrip: mock.getTrip }));
 vi.mock("@/lib/google-calendar", () => ({
   createGooglePrimaryCalendarEvent: mock.create,
   updateManagedGooglePrimaryCalendarEvent: mock.update,
@@ -41,6 +43,7 @@ beforeEach(() => {
   mock.controlActor.mockResolvedValue({ kind: "owner", authTokenHash: "owner" });
   mock.isOwner.mockReturnValue(true);
   mock.verify.mockReturnValue({ proposal: createProposal });
+  mock.getTrip.mockResolvedValue(null);
   mock.create.mockResolvedValue({ event: { title: "Planning", start: "2026-08-20T09:00:00.000Z", end: "2026-08-20T10:00:00.000Z", allDay: false }, created: true });
   mock.update.mockResolvedValue({ event: { title: "Rescheduled", start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", allDay: false } });
   mock.remove.mockResolvedValue({ id: "jarvisabcdef0123456789", deleted: true });
@@ -63,6 +66,64 @@ describe("Google Calendar owner approval route", () => {
     await expect(response.json()).resolves.toMatchObject({ ok: true, action: "create", created: true, event: { title: "Planning" } });
     expect(mock.verify).toHaveBeenCalledWith("signed-receipt");
     expect(mock.create).toHaveBeenCalledWith(createProposal.event);
+  });
+
+  it("writes a current Apple Maps approval bound to its saved preflight", async () => {
+    const binding = {
+      tripId: "creation-apple",
+      storage: "creation" as const,
+      updatedAt: 1_000,
+      sourceKey: "a".repeat(64),
+    };
+    mock.verify.mockReturnValue({
+      proposal: { ...createProposal, appleMapsOfflinePreflight: binding },
+    });
+    mock.getTrip.mockResolvedValue({
+      id: binding.tripId,
+      storage: binding.storage,
+      doc: {
+        offlineMapPreflight: {
+          sourceKey: binding.sourceKey,
+          updatedAt: binding.updatedAt,
+          calendarRefreshRequired: false,
+        },
+      },
+    });
+
+    const response = await POST(request({ token: "current-apple-maps-receipt" }));
+
+    expect(response.status).toBe(200);
+    expect(mock.create).toHaveBeenCalledWith(createProposal.event);
+  });
+
+  it("rejects an Apple Maps approval once its saved preflight was refreshed", async () => {
+    const binding = {
+      tripId: "creation-apple",
+      storage: "creation" as const,
+      updatedAt: 1_000,
+      sourceKey: "a".repeat(64),
+    };
+    mock.verify.mockReturnValue({
+      proposal: { ...createProposal, appleMapsOfflinePreflight: binding },
+    });
+    mock.getTrip.mockResolvedValue({
+      id: binding.tripId,
+      storage: binding.storage,
+      doc: {
+        offlineMapPreflight: {
+          sourceKey: binding.sourceKey,
+          updatedAt: binding.updatedAt + 1,
+          calendarRefreshRequired: true,
+        },
+      },
+    });
+
+    const response = await POST(request({ token: "stale-apple-maps-receipt" }));
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/fresh protected Calendar approval/i) });
+    expect(mock.getTrip).toHaveBeenCalledWith(binding.tripId, { storage: "creation" });
+    expect(mock.create).not.toHaveBeenCalled();
   });
 
   it("dispatches only the revision-sealed managed update", async () => {
