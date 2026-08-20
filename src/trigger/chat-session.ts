@@ -31,6 +31,7 @@ import {
   FOREGROUND_CONCURRENCY,
   FOREGROUND_ADMISSION_RESERVE_MS,
   canClaimForegroundTurn,
+  FOREGROUND_DURABLE_RECOVERY_CRON,
   FOREGROUND_HANDOFF_OVERLAP_MS,
   FOREGROUND_IDLE_TIMEOUT_MS,
   FOREGROUND_LANE_MAX_DURATION_SECONDS,
@@ -764,11 +765,10 @@ export const chatHandoff = task({
 // Trigger, the next schedule drains the durable Convex queue.
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
-  // A lost Trigger response remains ambiguous, so it is recovered durably
-  // rather than terminally failed. Widened from 1min to 5min (cost opt,
-  // 2026-08-17): worst-case stuck-lease recovery latency goes from <=1min
-  // to <=5min, which is an acceptable tradeoff for cutting run-count 5x.
-  cron: "*/5 * * * *",
+  // A lost Trigger response remains ambiguous, so recover it durably rather
+  // than terminally failing the turn. This intentionally matches the
+  // foreground one-minute recovery boundary.
+  cron: FOREGROUND_DURABLE_RECOVERY_CRON,
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,
   run: async () => {

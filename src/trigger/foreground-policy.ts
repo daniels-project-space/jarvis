@@ -33,6 +33,11 @@ export const FOREGROUND_HANDOFF_OVERLAP_MS = 10 * 60_000;
 // Leave headroom below Trigger's hard max for cleanup and lease release.
 export const FOREGROUND_PROCESS_EXIT_RESERVE_MS = 60_000;
 export const FOREGROUND_RUNNER_LEASE_MS = 25_000;
+// Foreground admission is event-driven; this is only the durable escape hatch
+// for a lost wake after the browser has gone away. Keep recovery within the
+// one-minute foreground boundary rather than leaving a queued turn dormant
+// for several minutes.
+export const FOREGROUND_DURABLE_RECOVERY_CRON = "*/1 * * * *";
 // Keep the authenticated process warm only across an active conversation.
 // Event-driven wakes start the next session; an idle four-hour worker was
 // effectively permanent Trigger compute with no user-visible benefit.
