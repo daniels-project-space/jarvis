@@ -157,6 +157,19 @@ describe("Google Calendar creation approval boundary", () => {
     expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
   });
 
+  it("does not issue a receipt when the protected Calendar capability is malformed", async () => {
+    mock.convexQuery.mockResolvedValueOnce({ connected: true, capabilities: { calendar: "yes" } });
+
+    await expect(executeTool("google_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+    })).resolves.toMatch(/could not be verified right now.*no approval receipt was created/i);
+
+    expect(mock.issueCalendarApproval).not.toHaveBeenCalled();
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+
   it("does not issue a receipt when the protected connection-status read resolves unavailable", async () => {
     mock.convexQuery.mockResolvedValueOnce(null);
 
