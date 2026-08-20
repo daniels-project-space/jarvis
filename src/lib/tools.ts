@@ -2275,7 +2275,11 @@ async function googleCalendarApprovalReadiness(): Promise<GoogleCalendarApproval
       connected?: boolean;
       capabilities?: { calendar?: boolean };
     } | null;
-    if (!status?.connected) return "missing";
+    // `convexQuery` intentionally collapses transport and auth failures to
+    // null. This status query itself always returns an object, so a missing or
+    // malformed result is not evidence that Daniel disconnected Google.
+    if (status == null || typeof status.connected !== "boolean") return "unavailable";
+    if (!status.connected) return "missing";
     return status.capabilities?.calendar ? "ready" : "needs_reconnect";
   } catch {
     return "unavailable";
