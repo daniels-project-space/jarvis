@@ -63,7 +63,10 @@ import {
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
 import { StreamPublisher } from "./stream-publisher";
-import { callForegroundConvex } from "./foreground-convex-call";
+import {
+  callForegroundConvex,
+  settleAmbiguousForegroundFinalize,
+} from "./foreground-convex-call";
 
 // Subscription brain: each queued chat turn runs the Codex CLI headlessly,
 // with metered API keys blanked and only the subscription
@@ -764,14 +767,25 @@ async function processChatQueue(
           ? "(the agent finished without producing text)"
           : `⚠️ run failed (exit ${turn.code}). ${turn.stderr || ""}`.trim());
       const finalizeStarted = Date.now();
-      await convexMutation("chatQueue:finalize", {
+      const finalizeArgs = {
         messageId: claim.assistantId,
         threadId: claim.threadId,
-        status: turn.finalText.trim() ? "done" : "error",
+        status: turn.finalText.trim() ? "done" as const : "error" as const,
         finalText,
         model: `codex · ${codexModelFor(model).model}`,
         claimToken: claim.claimToken,
-      });
+      };
+      const finalization = finalizeArgs.status === "done"
+        ? await settleAmbiguousForegroundFinalize(() => convexMutation("chatQueue:finalize", finalizeArgs))
+        : (await convexMutation("chatQueue:finalize", finalizeArgs), "finalized" as const);
+      // A timeout after the answer crossed the transport is not evidence that
+      // Convex rejected it. Do not let the generic error path overwrite that
+      // answer; the exact retry above either confirms delivery or leaves the
+      // claim for its existing token-fenced recovery path.
+      if (finalization === "ambiguous") {
+        activeTurn = null;
+        return { processed, timings, finalization };
+      }
       const deliveredAt = Date.now();
       // Memory capture is a separate background task. It must never hold the
       // warm conversational worker hostage after Daniel already has a reply.
