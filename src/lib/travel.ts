@@ -1383,15 +1383,25 @@ export function buildItinerary(doc: TripDoc): TripItineraryDay[] {
             locked: true,
           });
         }
-        if (doc.transfer && stay && !items.some((item) => item.id === "arrival-transfer")) {
-          items.push({
-            id: "arrival-transfer",
-            date,
-            title: `Transfer to ${stay.name}`,
-            kind: "transfer",
-            note: `${doc.transfer.durationText} · ${doc.transfer.distanceText}`,
-            source: "generated",
-          });
+        if (doc.transfer && stay) {
+          const transfer = items.find((item) => item.id === "arrival-transfer");
+          if (transfer) {
+            // Transfers are calculated from the one locked hotel, so retain
+            // that hotel's city identity when a saved itinerary is rebuilt.
+            // Without it the multi-city timeline correctly rejects the tile
+            // as ambiguous and hides the real transfer timing everywhere.
+            if (!transfer.cityContextId) transfer.cityContextId = stay.cityContextId;
+          } else {
+            items.push({
+              id: "arrival-transfer",
+              date,
+              title: `Transfer to ${stay.name}`,
+              kind: "transfer",
+              cityContextId: stay.cityContextId,
+              note: `${doc.transfer.durationText} · ${doc.transfer.distanceText}`,
+              source: "generated",
+            });
+          }
         }
         if (stay && !items.some((item) => item.id === "check-in")) {
           items.push({
@@ -1423,15 +1433,21 @@ export function buildItinerary(doc: TripDoc): TripItineraryDay[] {
             locked: true,
           });
         }
-        if (doc.transfer && !items.some((item) => item.id === "departure-transfer")) {
-          items.push({
-            id: "departure-transfer",
-            date,
-            title: `Transfer to ${doc.airport?.name ?? doc.destIata}`,
-            kind: "transfer",
-            note: `${doc.transfer.durationText} · ${doc.transfer.distanceText}`,
-            source: "generated",
-          });
+        if (doc.transfer) {
+          const transfer = items.find((item) => item.id === "departure-transfer");
+          if (transfer) {
+            if (!transfer.cityContextId && stay?.cityContextId) transfer.cityContextId = stay.cityContextId;
+          } else {
+            items.push({
+              id: "departure-transfer",
+              date,
+              title: `Transfer to ${doc.airport?.name ?? doc.destIata}`,
+              kind: "transfer",
+              cityContextId: stay?.cityContextId,
+              note: `${doc.transfer.durationText} · ${doc.transfer.distanceText}`,
+              source: "generated",
+            });
+          }
         }
         if (returnFlight && !items.some((item) => item.id === "flight-home")) {
           items.push({

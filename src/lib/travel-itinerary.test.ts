@@ -115,6 +115,33 @@ describe("durable trip day scheduling", () => {
     ]));
   });
 
+  it("keeps airport-transfer tiles with the locked stay's city when a trip has several saved cities", () => {
+    const doc = trip();
+    doc.destinationCenter = { lat: 38.7223, lng: -9.1393 };
+    doc.cityContexts = [
+      { id: "lisbon", city: "Lisbon", center: { lat: 38.7223, lng: -9.1393 }, source: "destination", createdAt: 1, updatedAt: 1 },
+      { id: "porto", city: "Porto", center: { lat: 41.1579, lng: -8.6291 }, source: "explore", createdAt: 2, updatedAt: 2 },
+    ];
+    doc.activeCityContextId = "porto";
+    doc.locked.stay = { ...doc.locked.stay!, city: "Porto", cityContextId: "porto" };
+    doc.transfer = { durationText: "27 min", distanceText: "16 km", mode: "driving" };
+    // A prior finalized itinerary has the old unscoped arrival tile. Rebuilds
+    // must retain its real timing and attach it to the hotel city.
+    doc.itinerary = [{
+      date: "2026-09-01",
+      label: "Tue 1 Sep",
+      status: "draft",
+      items: [{ id: "arrival-transfer", date: "2026-09-01", title: "Transfer to Hotel Tejo", kind: "transfer", note: "27 min · 16 km", source: "generated" }],
+    }];
+
+    const itinerary = buildItinerary(doc);
+    const arrival = itinerary.find((day) => day.date === "2026-09-01")?.items.find((item) => item.id === "arrival-transfer");
+    const departure = itinerary.find((day) => day.date === "2026-09-04")?.items.find((item) => item.id === "departure-transfer");
+
+    expect(arrival).toMatchObject({ cityContextId: "porto", note: "27 min · 16 km" });
+    expect(departure).toMatchObject({ cityContextId: "porto", note: "27 min · 16 km" });
+  });
+
   it("persists real OSRM route geometry and per-stop legs atomically", async () => {
     const updated = await scheduleTripDay({
       id: "trip-1",

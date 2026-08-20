@@ -371,6 +371,29 @@ describe("TripView city contexts", () => {
     ]);
   });
 
+  it("keeps airport-transfer timing on the locked stay's selected city", () => {
+    const contexts = [
+      { id: "amsterdam", city: "Amsterdam", center: { lat: 52.3676, lng: 4.9041 } },
+      { id: "berlin", city: "Berlin", center: { lat: 52.52, lng: 13.405 } },
+    ];
+    const days = [{
+      date: "2026-09-12",
+      label: "Arrival",
+      items: [{
+        id: "arrival-transfer",
+        cityContextId: "berlin",
+        title: "Transfer to Berlin Courtyard Stay",
+        kind: "transfer",
+        note: "27 min · 16 km",
+      }],
+    }] satisfies Parameters<typeof cityScopedItineraryDays>[0];
+
+    expect(cityScopedItineraryDays(days, contexts[1], contexts)[0]?.items).toMatchObject([
+      { id: "arrival-transfer", note: "27 min · 16 km" },
+    ]);
+    expect(cityScopedItineraryDays(days, contexts[0], contexts)).toEqual([]);
+  });
+
   it("keeps the locked-plan summary scoped after switching cities and drops mixed-city timing", () => {
     const doc = {
       ...tripWithActiveCity("berlin"),
