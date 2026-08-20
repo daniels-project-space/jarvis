@@ -2260,6 +2260,12 @@ type GoogleCalendarApprovalReadiness =
   | "needs_reconnect"
   | "unavailable";
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value == null || typeof value !== "object") return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 /**
  * Checks only Jarvis's local Google connection state and the trusted Convex
  * record. Preparing an owner approval must not call Google's API, but it also
@@ -2271,16 +2277,14 @@ async function googleCalendarApprovalReadiness(): Promise<GoogleCalendarApproval
   if (storedConnection !== "readable") return storedConnection;
 
   try {
-    const status = await convexQuery("googleAuth:getConnectionStatus", {}) as {
-      connected?: boolean;
-      capabilities?: { calendar?: boolean };
-    } | null;
+    const status: unknown = await convexQuery("googleAuth:getConnectionStatus", {});
     // `convexQuery` intentionally collapses transport and auth failures to
     // null. This status query itself always returns an object, so a missing or
     // malformed result is not evidence that Daniel disconnected Google.
-    if (status == null || typeof status.connected !== "boolean") return "unavailable";
+    if (!isPlainObject(status) || typeof status.connected !== "boolean") return "unavailable";
     if (!status.connected) return "missing";
-    return status.capabilities?.calendar ? "ready" : "needs_reconnect";
+    if (!isPlainObject(status.capabilities) || typeof status.capabilities.calendar !== "boolean") return "unavailable";
+    return status.capabilities.calendar ? "ready" : "needs_reconnect";
   } catch {
     return "unavailable";
   }
