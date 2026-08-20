@@ -57,6 +57,7 @@ export const FOREGROUND_OWNER_TOOL_NAMES = new Set([
   "gmail_read",
   "gmail_draft_reply",
   "gmail_list_subscriptions",
+  "email_support",
   "google_calendar_list",
   "google_calendar_create",
   "google_calendar_update",
@@ -78,6 +79,10 @@ for (const name of [
   "gmail_read",
   "gmail_draft_reply",
   "gmail_list_subscriptions",
+  // `email_support` creates a real Gmail draft before the separately
+  // protected send click. Draft creation is still a Gmail write and must
+  // have the same owner-turn authority as the direct draft tool.
+  "email_support",
   // Uploaded files are private owner data. The foreground owner lane may show
   // a selected visual file or its already-indexed transcript; background
   // subscription workers must never browse them.
@@ -112,6 +117,7 @@ const OWNER_REQUEST_QUOTED_START_RE = /^(?:[\"'`“”‘’]|>)/;
 const DIRECT_GMAIL_READ_RE = /^(?:search|find|check|read|show|list|open)\b\s+(?:(?:through|in)\s+)?my\s+(?:gmail|google\s+mail|emails?|email|mailbox|inbox)\b/i;
 const DIRECT_GMAIL_DRAFT_RE = /^(?:(?:draft|compose)\s+(?:an?\s+)?(?:email|gmail|google\s+mail)\b|(?:reply|respond)\s+(?:to\s+)?(?:(?:the|this|that)\s+)?(?:email|gmail|google\s+mail)\b|write\s+(?:an?\s+)?(?:email|gmail|google\s+mail)\s+(?:to|about|saying|with)\b)/i;
 const DIRECT_GMAIL_DRAFT_FOLLOW_UP_RE = /\b(?:and\s+)?(?:(?:draft|compose)\s+(?:an?\s+)?(?:email|gmail|google\s+mail)\b|(?:reply|respond)\s+(?:to\s+)?(?:(?:the|this|that)\s+)?(?:email|gmail|google\s+mail)\b|write\s+(?:an?\s+)?(?:email|gmail|google\s+mail)\s+(?:to|about|saying|with)\b)/i;
+const DIRECT_EMAIL_SUPPORT_RE = /^(?:email|contact)\s+[A-Za-z0-9][A-Za-z0-9 .&'’-]{0,80}\s+(?:(?:and|to)\s+)?(?:ask|request|query|complain|chase|tell|say)\b/i;
 const DIRECT_GMAIL_SUBSCRIPTIONS_RE = /\b(?:subscriptions?|newsletters?)\b/i;
 const DIRECT_CALENDAR_LIST_RE = /^(?:(?:show|view|list|check|read|open)\b\s+|what(?:'s|\s+is)\s+on\s+)my\s+(?:google\s*)?(?:calendar|gcal|agenda|schedule)\b/i;
 const DIRECT_CALENDAR_CREATE_RE = /^(?:(?:add|create|schedule|put|make|remind)\b[^\r\n\"`“”‘’]{0,160}\b(?:to|on|in)\s+my\s+(?:google\s*)?(?:calendar|gcal)\b|(?:add|create|schedule|put|make|remind)\s+(?:an?\s+)?(?:event|meeting|appointment|reminder)\b)/i;
@@ -186,11 +192,13 @@ export function foregroundOwnerToolGrantForDirectRequest(userText: string): Fore
   const gmailRead = DIRECT_GMAIL_READ_RE.test(command);
   const gmailDraft = DIRECT_GMAIL_DRAFT_RE.test(command)
     || (gmailRead && DIRECT_GMAIL_DRAFT_FOLLOW_UP_RE.test(command));
+  const emailSupport = DIRECT_EMAIL_SUPPORT_RE.test(command);
   if (gmailRead) {
     granted.add("gmail_search");
     granted.add("gmail_read");
   }
   if (gmailDraft) granted.add("gmail_draft_reply");
+  if (emailSupport) granted.add("email_support");
   if (gmailRead && DIRECT_GMAIL_SUBSCRIPTIONS_RE.test(command)) {
     granted.add("gmail_list_subscriptions");
   }
