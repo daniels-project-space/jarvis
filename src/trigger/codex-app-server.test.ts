@@ -318,6 +318,51 @@ describe("Codex app-server dynamic tools", () => {
     await expect(turn).resolves.toMatchObject({ code: 0 });
   });
 
+  it("forgets a receipt-bearing warm thread when cancellation races turn completion", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const abort = new AbortController();
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: {
+        writable: true,
+        write: (chunk) => { writes.push(JSON.parse(chunk) as WrittenMessage); return true; },
+      },
+    };
+    internals.ready = Promise.resolve();
+    const receipt = `${"a".repeat(64)}.${"b".repeat(43)}`;
+
+    const first = await admitTurn(server, internals, writes, {
+      conversationId: "cancelled-approval-boundary",
+      threadId: "approval-thread-1",
+      turnId: "approval-turn-1",
+      signal: abort.signal,
+    });
+    internals.receive(JSON.stringify({
+      method: "item/agentMessage/delta",
+      params: { turnId: "approval-turn-1", delta: `Draft ready.\n[jarvis-gmail-send-approval:${receipt}]` },
+    }));
+    abort.abort();
+    await expect(first.completion).rejects.toThrow("turn was cancelled");
+
+    const nextStart = writes.length;
+    const second = await admitTurn(server, internals, writes, {
+      conversationId: "cancelled-approval-boundary",
+      threadId: "approval-thread-2",
+      turnId: "approval-turn-2",
+      userText: "What should I do next?",
+      history: [{ role: "assistant", text: "Draft ready." }],
+    });
+    expect(writes[nextStart].method).toBe("thread/start");
+    const reseededInput = JSON.stringify(writes[nextStart + 1].params?.input);
+    expect(reseededInput).not.toContain(receipt);
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "approval-turn-2", turn: { id: "approval-turn-2", status: "completed" } },
+    }));
+    await expect(second.completion).resolves.toMatchObject({ code: 0, threadId: "approval-thread-2" });
+  });
+
   it("forgets a receipt-bearing warm thread before sanitized history reseeds the next turn", async () => {
     const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
     const writes: WrittenMessage[] = [];

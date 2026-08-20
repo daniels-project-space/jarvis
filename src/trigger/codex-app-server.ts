@@ -629,7 +629,13 @@ export class CodexAppServer {
         this.notify("turn/interrupt", { threadId, turnId });
         const active = this.active.get(turnId);
         active?.toolAbortController.abort();
-        if (active) this.active.delete(turnId);
+        if (active) {
+          // An interrupted native turn can retain output that was never
+          // delivered through this client. Do not let a later foreground turn
+          // reuse that thread and inherit an unseen owner approval receipt.
+          this.forgetConversation(active.conversationId);
+          this.active.delete(turnId);
+        }
         reject(new Error("Codex conversation turn exceeded its foreground deadline"));
       }, this.turnTimeoutMs);
       this.active.set(turnId, {
@@ -657,6 +663,10 @@ export class CodexAppServer {
           clearTimeout(active.timer);
           active.abortCleanup?.();
           active.toolAbortController.abort();
+          // We cannot know whether the server completed more output after the
+          // interrupt was sent, so reset the warm route even if no receipt was
+          // observed in the locally streamed deltas.
+          this.forgetConversation(active.conversationId);
           this.active.delete(turnId);
           this.notify("turn/interrupt", { threadId, turnId });
           reject(new Error("Codex conversation turn was cancelled"));
@@ -673,6 +683,7 @@ export class CodexAppServer {
         clearTimeout(active.timer);
         active.abortCleanup?.();
         active.toolAbortController.abort();
+        this.forgetConversation(active.conversationId);
         this.active.delete(turnId);
         this.notify("turn/interrupt", { threadId, turnId });
       }
@@ -806,7 +817,7 @@ export class CodexAppServer {
       // retain their own unseen context, so forgetting only the durable chat
       // history is insufficient: reset this routing handle before any next
       // turn can reuse the receipt-bearing Codex thread.
-      if (hasAssistantApproval(active.text)) this.threads.delete(active.conversationId);
+      if (hasAssistantApproval(active.text)) this.forgetConversation(active.conversationId);
       active.resolve({ finalText: active.text, threadId: active.threadId, code: status === "completed" ? 0 : -1, stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status) });
     }
   }
@@ -940,6 +951,9 @@ export class CodexAppServer {
       clearTimeout(active.timer);
       active.abortCleanup?.();
       active.toolAbortController.abort();
+      // A protocol or child-process failure leaves the server's final unseen
+      // output unknowable. Never preserve its warm conversation handle.
+      this.forgetConversation(active.conversationId);
       active.reject(detail);
     }
     this.active.clear();
