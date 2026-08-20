@@ -132,6 +132,37 @@ describe("browser errand sealed execution and provider redaction", () => {
     expect(outcome.transcript.join(" ")).toContain("untrusted page evidence");
   });
 
+  it("does not accept a sealed step response that arrives after the browser deadline", async () => {
+    let now = 1_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    mock.convexMutation.mockImplementation(async (path: string) => {
+      if (path === "browserErrands:claim") return claimResult({ browserDeadlineAt: 2_000 });
+      return true;
+    });
+    mock.fetch
+      .mockResolvedValueOnce(Response.json({}, { status: 201 }))
+      .mockImplementationOnce(async () => {
+        now = 2_000;
+        return Response.json({ untrustedPageText: "too late" }, { status: 200 });
+      })
+      .mockResolvedValueOnce(Response.json({}, { status: 200 }));
+
+    try {
+      const outcome = await runApprovedErrand(ERRAND_ID, AUTHORIZATION);
+
+      expect(outcome).toMatchObject({
+        status: "failed",
+        summary: expect.stringMatching(/browser deadline elapsed before a final result/i),
+      });
+      const finish = mock.convexMutation.mock.calls.find(([path]) => path === "browserErrands:finish");
+      expect(finish?.[1]).toMatchObject({ status: "failed" });
+      // The final request is cleanup only; no later sealed step is issued.
+      expect(mock.fetch).toHaveBeenCalledTimes(3);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("never reflects provider reason or detail into chat or durable errand results", async () => {
     mock.fetch
       .mockResolvedValueOnce(Response.json({
