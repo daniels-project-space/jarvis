@@ -25,7 +25,14 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-async function reserve(t: ReturnType<typeof convexTest>, threadId: string, name: string, sha256: string, count = 1) {
+async function reserve(
+  t: ReturnType<typeof convexTest>,
+  threadId: string,
+  name: string,
+  sha256: string,
+  count = 1,
+  mimeType = "text/plain",
+) {
   return await t.mutation(api.files.reserveBatch, {
     requestId: `upload:${threadId}:${name}:${sha256.slice(0, 10)}`.replace(/[^a-zA-Z0-9:_-]/g, "-"),
     threadId,
@@ -33,7 +40,7 @@ async function reserve(t: ReturnType<typeof convexTest>, threadId: string, name:
       clientId: `client-${index}`,
       name: count === 1 ? name : `${index}-${name}`,
       relativePath: count === 1 ? name : `folder/${index}-${name}`,
-      mimeType: "text/plain",
+      mimeType,
       sizeBytes: 24 + index,
       sha256: index === 0 ? sha256 : `${String(index).padStart(2, "0")}${sha256.slice(2)}`,
     })),
@@ -41,8 +48,15 @@ async function reserve(t: ReturnType<typeof convexTest>, threadId: string, name:
   });
 }
 
-async function makeReady(t: ReturnType<typeof convexTest>, threadId: string, name: string, sha256: string, text: string | string[]) {
-  const batch = await reserve(t, threadId, name, sha256);
+async function makeReady(
+  t: ReturnType<typeof convexTest>,
+  threadId: string,
+  name: string,
+  sha256: string,
+  text: string | string[],
+  mimeType = "text/plain",
+) {
+  const batch = await reserve(t, threadId, name, sha256, 1, mimeType);
   const fileId = batch.files[0].fileId;
   const textChunks = Array.isArray(text) ? text : [text];
   const uploadClaimToken = `upload-claim-${sha256.slice(0, 20)}`;
@@ -50,7 +64,7 @@ async function makeReady(t: ReturnType<typeof convexTest>, threadId: string, nam
     batchId: batch.batchId as any,
     fileId: fileId as any,
     claimToken: uploadClaimToken,
-    contentType: "text/plain",
+    contentType: mimeType,
     sha256,
     workerToken: WORKER,
   });
@@ -58,7 +72,7 @@ async function makeReady(t: ReturnType<typeof convexTest>, threadId: string, nam
     batchId: batch.batchId as any,
     fileId: fileId as any,
     sizeBytes: 24,
-    contentType: "text/plain",
+    contentType: mimeType,
     sha256,
     claimToken: uploadClaimToken,
     workerToken: WORKER,
@@ -75,7 +89,7 @@ async function makeReady(t: ReturnType<typeof convexTest>, threadId: string, nam
     ingestVersion: 1,
     claimToken,
     sha256,
-    detectedMimeType: "text/plain",
+    detectedMimeType: mimeType,
     status: "ready",
     summary: `Indexed ${name}`,
     extractedTextR2Key: `files/${fileId}/v1/extracted.txt`,
@@ -395,6 +409,101 @@ describe("durable private chat files", () => {
     expect(persistedFollowUp.files).toEqual([
       expect.objectContaining({ fileId: String(selected.fileId), name: "selected.txt" }),
     ]);
+  });
+
+  it("retains a scoped private video or named audio file in follow-up claims", async () => {
+    const t = convexTest(schema, modules);
+    const threadId = "media-follow-up";
+    const video = await makeReady(
+      t,
+      threadId,
+      "arrival-reel.mp4",
+      "4".repeat(64),
+      "PRIVATE_VIDEO_TRANSCRIPT",
+      "video/mp4",
+    );
+    const sourceMessage = await t.mutation(api.chatQueue.sendMessage, {
+      threadId,
+      text: "I uploaded an arrival video.",
+      requestId: "media-source",
+      fileIds: [video.fileId as any],
+      workerToken: WORKER,
+    });
+    const sourceClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: sourceMessage,
+      claimToken: "media-source-claim",
+      workerToken: WORKER,
+    });
+    await t.mutation(api.chatQueue.finalize, {
+      messageId: sourceClaim!.assistantId,
+      threadId,
+      claimToken: "media-source-claim",
+      status: "done",
+      finalText: "Video indexed.",
+      workerToken: WORKER,
+    });
+
+    const videoFollowUp = await t.mutation(api.chatQueue.sendMessage, {
+      threadId,
+      text: "Summarize that video clip.",
+      requestId: "media-video-follow-up",
+      workerToken: WORKER,
+    });
+    const videoClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: videoFollowUp,
+      claimToken: "media-video-follow-up-claim",
+      workerToken: WORKER,
+    });
+    expect(videoClaim?.attachments).toEqual([
+      expect.objectContaining({
+        fileId: String(video.fileId),
+        mimeType: "video/mp4",
+        selection: "recent_followup",
+      }),
+    ]);
+    expect(JSON.stringify(videoClaim?.attachments)).toContain("PRIVATE_VIDEO_TRANSCRIPT");
+    expect(videoClaim?.fileCatalog).toEqual([]);
+
+    const videoRow = (await t.query(api.chatQueue.listMessages, { threadId, workerToken: WORKER }))
+      .find((row) => row._id === videoFollowUp) as any;
+    const privateVideo = await t.run(async (ctx) => await ctx.db.get(video.fileId as any));
+    if (!privateVideo) throw new Error("private video fixture missing");
+    expect(videoRow.files).toEqual([
+      expect.objectContaining({ fileId: String(video.fileId), name: "arrival-reel.mp4", mimeType: "video/mp4" }),
+    ]);
+    expect(JSON.stringify(videoRow)).not.toContain("PRIVATE_VIDEO_TRANSCRIPT");
+    expect(JSON.stringify(videoRow)).not.toContain(privateVideo.r2Key);
+    expect(JSON.stringify(videoRow)).not.toContain("r2Key");
+
+    const audio = await makeReady(
+      t,
+      threadId,
+      "arrival-note.m4a",
+      "5".repeat(64),
+      "PRIVATE_AUDIO_TRANSCRIPT",
+      "audio/mp4",
+    );
+    const namedAudio = await t.mutation(api.chatQueue.sendMessage, {
+      threadId,
+      text: "Use arrival-note.m4a for a concise summary.",
+      requestId: "media-audio-named-reference",
+      workerToken: WORKER,
+    });
+    const audioClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: namedAudio,
+      claimToken: "media-audio-named-reference-claim",
+      workerToken: WORKER,
+    });
+    expect(audioClaim?.attachments).toEqual([
+      expect.objectContaining({
+        fileId: String(audio.fileId),
+        mimeType: "audio/mp4",
+        selection: "named_reference",
+      }),
+    ]);
+    expect(JSON.stringify(audioClaim?.attachments)).toContain("PRIVATE_AUDIO_TRANSCRIPT");
+    expect(JSON.stringify(audioClaim?.attachments)).not.toContain("PRIVATE_VIDEO_TRANSCRIPT");
+    expect(audioClaim?.fileCatalog).toEqual([]);
   });
 
   it("keeps filenames as immutable turn provenance after private bytes are deleted", async () => {

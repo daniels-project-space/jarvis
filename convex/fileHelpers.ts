@@ -185,18 +185,30 @@ export async function linkMessageFilesToCreation(
   return linked;
 }
 
+const DETERMINISTIC_FILE_FOLLOW_UP =
+  /\b(?:that|this|the|last|previous|uploaded|attached)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo|video|audio|clip|recording)\b/;
+const DETERMINISTIC_FILE_SOURCE_REFERENCE =
+  /\b(?:from|using|with)\s+(?:that|this|the|last|previous)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo|video|audio|clip|recording)\b/;
+const LIKELY_FILE_NOUN =
+  /\b(?:file|files|folder|document|doc|pdf|spreadsheet|csv|image|photo|video|audio|clip|recording|attachment|upload|library)\b/;
+// Keep this aligned with the private media containers admitted by
+// src/lib/media-types.ts. A filename only selects a catalog candidate; bytes
+// still enter a claim solely after exact thread-scoped resolution.
+const LIKELY_FILE_EXTENSION =
+  /\b[\w-]+\.(?:txt|md|csv|json|pdf|docx?|xlsx?|png|jpe?g|webp|mp3|m4a|ogg|wav|webm|mp4|mov)\b/;
+
 export function isDeterministicFileFollowUp(text: string): boolean {
   const value = text.toLowerCase().slice(0, 2_000);
-  return /\b(?:that|this|the|last|previous|uploaded|attached)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo)\b/.test(value)
-    || /\b(?:from|using|with)\s+(?:that|this|the|last|previous)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo)\b/.test(value)
+  return DETERMINISTIC_FILE_FOLLOW_UP.test(value)
+    || DETERMINISTIC_FILE_SOURCE_REFERENCE.test(value)
     || /\b(?:chart|map|summari[sz]e|analy[sz]e|read|use)\b.{0,36}\b(?:it|that)\b/.test(value);
 }
 
 export function isLikelyFileReference(text: string): boolean {
   const value = text.toLowerCase().slice(0, 2_000);
   return isDeterministicFileFollowUp(value)
-    || /\b(?:file|files|folder|document|doc|pdf|spreadsheet|csv|image|photo|attachment|upload|library)\b/.test(value)
-    || /\b[\w-]+\.(?:txt|md|csv|json|pdf|docx?|xlsx?|png|jpe?g|webp)\b/.test(value);
+    || LIKELY_FILE_NOUN.test(value)
+    || LIKELY_FILE_EXTENSION.test(value);
 }
 
 function boundedChunkSearch(text: string | undefined): string {
