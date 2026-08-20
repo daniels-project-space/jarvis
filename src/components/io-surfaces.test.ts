@@ -41,7 +41,9 @@ describe("reactive IO surfaces", () => {
   it("uses the guest-safe attachment boundary for both live and paginated rows", () => {
     const jarvis = source("src/components/JarvisUI.tsx");
     expect(jarvis.match(/<GuestSafeAttachment/g)).toHaveLength(2);
-    expect(jarvis).toContain(".filter((m) => m.text || (!guest && m.attachment) || m.status === \"streaming\")");
+    expect(jarvis).toContain(
+      '.filter((m) => m.text || (!guest && (m.attachment || m.calendarApprovalToken || m.gmailSendApprovalToken)) || m.status === "streaming")',
+    );
   });
 
   it("loads exact job detail lazily without a second fleet subscription", () => {
