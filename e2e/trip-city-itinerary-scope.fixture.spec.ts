@@ -32,6 +32,10 @@ test("switching cities keeps itinerary tiles, markers, and routes in their own m
   await expect(page.getByLabel("Visible itinerary map markers")).toContainText("Amsterdam Museum");
   await expect(page.getByLabel("Visible itinerary map markers")).not.toContainText("Museum Island");
   await expect(page.getByLabel("Visible route geometry")).toHaveText("2 route geometry points");
+  await expect(page.getByLabel("Visible locked stay")).toHaveText("Amsterdam Canal Stay");
+  await expect(page.getByLabel("Visible airport transfer")).toHaveText("Airport transfer: 24 min · 18 km");
+  await expect(page.getByLabel("Visible locked activities")).toContainText("Amsterdam Museum");
+  await expect(page.getByLabel("Visible locked activities")).not.toContainText("Museum Island");
 
   await page.getByRole("tab", { name: /Cross-city discussion/ }).click();
   await expect(page.getByText("Canal walk", { exact: true })).toBeVisible();
@@ -47,6 +51,10 @@ test("switching cities keeps itinerary tiles, markers, and routes in their own m
   await expect(page.getByLabel("Visible itinerary map markers")).toContainText("Museum Island");
   await expect(page.getByLabel("Visible itinerary map markers")).not.toContainText("Amsterdam Museum");
   await expect(page.getByLabel("Visible route geometry")).toHaveText("2 route geometry points");
+  await expect(page.getByLabel("Visible locked stay")).toHaveText("No stay locked in Berlin");
+  await expect(page.getByLabel("Visible airport transfer")).toHaveText("No city-scoped airport transfer");
+  await expect(page.getByLabel("Visible locked activities")).toContainText("Museum Island");
+  await expect(page.getByLabel("Visible locked activities")).not.toContainText("Amsterdam Museum");
 
   await page.getByRole("tab", { name: /Cross-city discussion/ }).click();
   await expect(page.getByText("Brandenburg Gate", { exact: true })).toBeVisible();

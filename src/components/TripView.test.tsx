@@ -15,7 +15,7 @@ vi.mock("@/lib/secure-convex", () => ({
     args === "skip" || !tripViewFixture.doc ? undefined : { data: JSON.stringify(tripViewFixture.doc) },
 }));
 
-import TripView, { bookedStayMapMarker, cityScopedItineraryDays, isFreshTripBookedStayReference, itineraryMapMarkers, mergeTripMapMarker, TripBookedStayReference, TripDayControls, TripOfflineMapPreflight, TripTimeline } from "./TripView";
+import TripView, { bookedStayMapMarker, cityScopedItineraryDays, cityScopedLockedPlan, isFreshTripBookedStayReference, itineraryMapMarkers, mergeTripMapMarker, TripBookedStayReference, TripDayControls, TripOfflineMapPreflight, TripTimeline } from "./TripView";
 
 describe("TripTimeline", () => {
   it("keeps a time-valid Gmail stay visibly distinct from a hotel candidate", () => {
@@ -368,6 +368,56 @@ describe("TripView city contexts", () => {
       "Museum Island",
       "Tiergarten",
       "Brandenburg Gate",
+    ]);
+  });
+
+  it("keeps the locked-plan summary scoped after switching cities and drops mixed-city timing", () => {
+    const doc = {
+      ...tripWithActiveCity("berlin"),
+      locked: {
+        stay: {
+          id: "canal-house",
+          cityContextId: "amsterdam",
+          city: "Amsterdam",
+          name: "Amsterdam Canal Stay",
+          totalGbp: 540,
+        },
+        activities: ["ams-museum", "ber-island"],
+      },
+      transfer: { durationText: "24 min", distanceText: "18 km", mode: "driving" },
+      activities: [
+        { id: "ams-museum", cityContextId: "amsterdam", city: "Amsterdam", name: "Amsterdam Museum" },
+        { id: "ber-island", cityContextId: "berlin", city: "Berlin", name: "Museum Island" },
+      ],
+    };
+    const berlin = doc.cityContexts[1];
+    const mixedDay = [{
+      date: "2026-09-14",
+      label: "Mixed day",
+      items: [
+        { id: "ams-museum", cityContextId: "amsterdam", title: "Amsterdam Museum", kind: "activity" },
+        { id: "ber-island", cityContextId: "berlin", title: "Museum Island", kind: "activity" },
+      ],
+      route: { mode: "driving", status: "ready", coordinates: [[4.9, 52.36], [13.4, 52.52]], durationSeconds: 22_000, distanceMeters: 650_000 },
+    }] satisfies Parameters<typeof cityScopedItineraryDays>[0];
+
+    expect(cityScopedLockedPlan(doc, berlin, doc.cityContexts)).toEqual({
+      stay: undefined,
+      activities: [doc.activities[1]],
+      transfer: undefined,
+    });
+    expect(cityScopedItineraryDays(mixedDay, berlin, doc.cityContexts)).toMatchObject([
+      { items: [{ title: "Museum Island" }], route: undefined },
+    ]);
+
+    const amsterdam = doc.cityContexts[0];
+    expect(cityScopedLockedPlan(doc, amsterdam, doc.cityContexts)).toMatchObject({
+      stay: expect.objectContaining({ name: "Amsterdam Canal Stay" }),
+      activities: [expect.objectContaining({ name: "Amsterdam Museum" })],
+      transfer: expect.objectContaining({ durationText: "24 min" }),
+    });
+    expect(cityScopedItineraryDays(mixedDay, amsterdam, doc.cityContexts)).toMatchObject([
+      { items: [{ title: "Amsterdam Museum" }], route: undefined },
     ]);
   });
 

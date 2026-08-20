@@ -124,6 +124,40 @@ const belongsToCityContext = (
 };
 
 /**
+ * The map, candidate lists, and timeline are all projected onto one saved city
+ * context. Keep the persistent "locked in" summary on that same boundary: the
+ * transfer document is attached to the one globally locked stay, so it is only
+ * meaningful while that stay is visible in the selected city.
+ */
+export function cityScopedLockedPlan(
+  doc: TripDoc,
+  activeCityContext: CityContext | null,
+  cityContexts: CityContext[],
+) {
+  const stay = belongsToCityContext(doc.locked?.stay, activeCityContext, cityContexts)
+    ? doc.locked?.stay
+    : undefined;
+  const lockedActivityRefs = new Set(
+    Array.isArray(doc.locked?.activities)
+      ? doc.locked.activities.map((activity: unknown) => String(activity).trim()).filter(Boolean)
+      : [],
+  );
+  const activities = Array.isArray(doc.activities)
+    ? doc.activities.filter((activity: unknown) => {
+        const entry = activity as { id?: unknown; name?: unknown };
+        return belongsToCityContext(activity, activeCityContext, cityContexts)
+          && (lockedActivityRefs.has(String(entry.id ?? "")) || lockedActivityRefs.has(String(entry.name ?? "")));
+      })
+    : [];
+
+  return {
+    stay,
+    activities,
+    transfer: stay ? doc.transfer : undefined,
+  };
+}
+
+/**
  * Projects persisted multi-city itinerary data onto the active map base.
  *
  * A route stores geometry for the full original day rather than per-stop
@@ -1234,6 +1268,7 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
           : (b.rating ?? 3) ** 2 / (b.priceGbp ?? 200) - (a.rating ?? 3) ** 2 / (a.priceGbp ?? 200),
     );
   const activities = (doc.activities ?? []).filter((activity: unknown) => belongsToCityContext(activity, activeCityContext, cityContexts));
+  const lockedPlan = cityScopedLockedPlan(doc, activeCityContext, cityContexts);
   const activeExploreContextArgs = activeCityContext && (!cityName(exploreCity) || sameCity(exploreCity, activeCityContext.city))
     ? { city_context_id: activeCityContext.id }
     : {};
@@ -1781,11 +1816,11 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
                 <div className="hud-label mb-1.5">locked in</div>
                 <div className="space-y-1 text-ice">
                   <div>✈ {doc.locked?.flight ? `${doc.locked.flight.airline} ${gbp(doc.locked.flight.priceGbp)}/pp · ${doc.locked.flight.departTime}` : <span className="text-slate">no flight locked</span>}</div>
-                  <div>🏨 {doc.locked?.stay ? `${doc.locked.stay.name} · ${gbp(doc.locked.stay.totalGbp)} total` : <span className="text-slate">no stay locked</span>}</div>
-                  {doc.transfer && (
-                    <div>🚕 airport → hotel: {doc.transfer.durationText} · {doc.transfer.distanceText}{doc.transfer.fareText ? ` · ${doc.transfer.fareText}` : ""}</div>
+                  <div>🏨 {lockedPlan.stay ? `${lockedPlan.stay.name} · ${gbp(lockedPlan.stay.totalGbp)} total` : <span className="text-slate">no stay locked{activeCityContext ? ` in ${activeCityContext.city}` : ""}</span>}</div>
+                  {lockedPlan.transfer && (
+                    <div>🚕 airport → hotel: {lockedPlan.transfer.durationText} · {lockedPlan.transfer.distanceText}{lockedPlan.transfer.fareText ? ` · ${lockedPlan.transfer.fareText}` : ""}</div>
                   )}
-                  <div>📍 {(doc.locked?.activities ?? []).length ? doc.locked.activities.join(", ") : <span className="text-slate">no activities picked</span>}</div>
+                  <div>📍 {lockedPlan.activities.length ? lockedPlan.activities.map((activity: any) => activity.name).join(", ") : <span className="text-slate">no activities picked{activeCityContext ? ` in ${activeCityContext.city}` : ""}</span>}</div>
                 </div>
                 <div className="mt-2 grid grid-cols-4 gap-1.5 text-center text-[11px]">
                   <div className={glass + " py-1.5"}><div className="text-ice">{gbp(totals.flights)}</div><div className="text-slate">flights</div></div>

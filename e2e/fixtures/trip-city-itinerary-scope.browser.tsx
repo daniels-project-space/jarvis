@@ -1,6 +1,6 @@
 import { createRoot } from "react-dom/client";
 import { useMemo, useState } from "react";
-import { cityScopedItineraryDays, itineraryMapMarkers, TripTimeline } from "../../src/components/TripView";
+import { cityScopedItineraryDays, cityScopedLockedPlan, itineraryMapMarkers, TripTimeline } from "../../src/components/TripView";
 import "./trip-timeline.fixture.css";
 
 // Static, local-only input deliberately contains two valid city days plus one
@@ -65,6 +65,27 @@ const fixtureDays = [
   },
 ];
 
+// Mirrors a saved multi-city plan whose only locked stay and airport transfer
+// belong to Amsterdam. Berlin still has a separately locked activity. The
+// browser fixture verifies the visible plan panel changes with the city base.
+const lockedPlanDoc = {
+  locked: {
+    stay: {
+      id: "canal-house",
+      cityContextId: "amsterdam",
+      city: "Amsterdam",
+      name: "Amsterdam Canal Stay",
+      totalGbp: 540,
+    },
+    activities: ["ams-museum", "ber-island"],
+  },
+  transfer: { durationText: "24 min", distanceText: "18 km", mode: "driving" },
+  activities: [
+    { id: "ams-museum", cityContextId: "amsterdam", city: "Amsterdam", name: "Amsterdam Museum" },
+    { id: "ber-island", cityContextId: "berlin", city: "Berlin", name: "Museum Island" },
+  ],
+};
+
 function TripCityItineraryScopeFixture() {
   const [activeCityId, setActiveCityId] = useState("amsterdam");
   const [activeDate, setActiveDate] = useState("2026-09-12");
@@ -76,6 +97,10 @@ function TripCityItineraryScopeFixture() {
   const visibleDate = cityDays.some((day) => day.date === activeDate) ? activeDate : cityDays[0]?.date ?? null;
   const activeDay = cityDays.find((day) => day.date === visibleDate) ?? cityDays[0];
   const markers = useMemo(() => itineraryMapMarkers(cityDays, { status: "planned" }), [cityDays]);
+  const lockedPlan = useMemo(
+    () => cityScopedLockedPlan(lockedPlanDoc, activeCity, cityContexts),
+    [activeCity],
+  );
 
   const selectCity = (cityContextId: string) => {
     const nextContext = cityContexts.find((context) => context.id === cityContextId) ?? cityContexts[0];
@@ -109,6 +134,25 @@ function TripCityItineraryScopeFixture() {
           </output>
           <ul aria-label="Visible itinerary map markers" className="mt-3 grid gap-1 text-[12px] text-ice">
             {markers.map((marker) => <li key={marker.key}>Map marker: {marker.name}</li>)}
+          </ul>
+        </section>
+
+        <section className="fixture-controls" aria-label="City-scoped locked plan">
+          <h2>Locked plan projection</h2>
+          <div>
+            <output aria-label="Visible locked stay">
+              {lockedPlan.stay?.name ?? `No stay locked in ${activeCity.city}`}
+            </output>
+          </div>
+          <div className="mt-1">
+            <output aria-label="Visible airport transfer">
+              {lockedPlan.transfer
+                ? `Airport transfer: ${lockedPlan.transfer.durationText} · ${lockedPlan.transfer.distanceText}`
+                : "No city-scoped airport transfer"}
+            </output>
+          </div>
+          <ul aria-label="Visible locked activities" className="mt-3 grid gap-1 text-[12px] text-ice">
+            {lockedPlan.activities.map((activity: { id?: string; name: string }) => <li key={activity.id ?? activity.name}>Locked activity: {activity.name}</li>)}
           </ul>
         </section>
       </section>
