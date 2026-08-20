@@ -27,6 +27,11 @@ const ALLOWED = new Set([
   "watchRules:markEventsSeen",
   "watchRules:dismissEvent",
   "notificationPrefs:update",
+  // Browser errands remain owner decisions all the way down: this same-origin
+  // owner route is the only UI entry point, and Convex independently rejects
+  // worker/model credentials for both mutations.
+  "browserErrands:decide",
+  "browserErrands:expireStale",
 ]);
 
 export async function POST(req: NextRequest) {

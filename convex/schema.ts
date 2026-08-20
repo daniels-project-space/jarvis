@@ -2470,16 +2470,22 @@ export default defineSchema({
       ttlMs: v.number(),
     }),
     plan: v.array(v.string()), // human-readable steps, shown at approval time
-    status: v.string(), // proposed | approved | declined | running | done | failed | blocked | needs_step_approval
+    status: v.string(), // proposed | approved | declined | expired | running | done | failed | blocked | needs_step_approval
     result: v.optional(v.string()),
     escalation: v.optional(v.string()), // why it paused, when status = needs_step_approval
     sends: v.optional(v.number()),
     chatId: v.optional(v.string()),
     requestedAt: v.number(),
     resolvedAt: v.optional(v.number()),
+    approvalExpiresAt: v.optional(v.number()),
     startedAt: v.optional(v.number()),
+    // A random server-issued fence. It is never surfaced to the UI or model;
+    // only the claimant can finish the run it started.
+    leaseToken: v.optional(v.string()),
+    leaseUntil: v.optional(v.number()),
     finishedAt: v.optional(v.number()),
   })
     .index("by_status", ["status", "requestedAt"])
+    .index("by_status_lease", ["status", "leaseUntil"])
     .index("by_chat", ["chatId", "requestedAt"]),
 });

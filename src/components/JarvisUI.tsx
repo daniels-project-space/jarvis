@@ -102,6 +102,7 @@ import {
   type NovitaPatchProposerStatus,
 } from "@/lib/novita-patch-proposer-status";
 import { BackgroundReadinessControl } from "./BackgroundReadinessControl";
+import { BrowserErrandApprovals } from "./BrowserErrandApprovals";
 import NotificationBell from "./NotificationBell";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
 import {
@@ -5805,6 +5806,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             </button>
           </div>
           <div className="scrollbar-thin flex-1 space-y-3 overflow-y-auto p-4">
+            <BrowserErrandApprovals owner={Boolean(viewerToken) && !guest} />
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-slate">Say the word, sir.</p>
             )}

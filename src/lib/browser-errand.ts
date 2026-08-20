@@ -1,4 +1,5 @@
 import "server-only";
+import { randomUUID } from "node:crypto";
 import { getVercelOidcToken } from "@vercel/oidc";
 import { gmailSearch, gmailReadMessage } from "./gmail";
 import { convexMutation } from "./context";
@@ -132,7 +133,47 @@ export async function listBrowserCredentials(): Promise<Array<{ id: string; labe
  * `approved` state this refuses rather than proceeding.
  */
 export async function runApprovedErrand(errandId: string, steps: BrowserStep[]): Promise<ErrandOutcome> {
-  const claim = await convexMutation("browserErrands:claim", { errandId });
+  // Resolve configuration before claiming. A missing OIDC/browser credential
+  // is an ordinary availability problem, not a reason to consume Daniel's
+  // approval and leave an errand permanently `running`.
+  let service: { base: string; token: string };
+  try {
+    service = await serviceConfig();
+  } catch {
+    return {
+      status: "failed",
+      summary: "Browser service is unavailable. This approval was left intact and nothing was started.",
+      sends: 0,
+      transcript: [],
+    };
+  }
+
+  // This opaque fence is generated only in the trusted server runtime. Convex
+  // records it with the claim and accepts a final receipt only from this run;
+  // a late or replayed caller cannot overwrite its outcome.
+  const leaseToken = randomUUID().replaceAll("-", "");
+  let claim: any;
+  try {
+    claim = await convexMutation("browserErrands:claim", { errandId, leaseToken });
+  } catch {
+    // The mutation may have committed just before its response was lost. A
+    // best-effort matching receipt closes only that exact lease; if no claim
+    // committed it is a harmless no-op. A lease reaper remains the durable
+    // fallback if Convex itself is unavailable here.
+    await convexMutation("browserErrands:finish", {
+      errandId,
+      leaseToken,
+      status: "failed",
+      result: "The execution claim was interrupted before browser work began. Nothing was retried automatically.",
+      sends: 0,
+    }).catch(() => undefined);
+    return {
+      status: "failed",
+      summary: "Could not claim that errand. Nothing was retried automatically.",
+      sends: 0,
+      transcript: [],
+    };
+  }
   if (!claim?.ok) {
     return {
       status: "failed",
@@ -142,118 +183,137 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
     };
   }
 
-  const { base, token } = await serviceConfig();
+  const { base, token } = service;
   const taskId = `errand-${String(errandId).replace(/[^A-Za-z0-9_-]/g, "")}`.slice(0, 64);
   const transcript: string[] = [];
   let sends = 0;
+  let taskMayExist = false;
 
   const finish = async (outcome: ErrandOutcome): Promise<ErrandOutcome> => {
-    await call(`/tasks/${taskId}/close`, { method: "POST", base, token }).catch(() => undefined);
+    if (taskMayExist) {
+      await call(`/tasks/${taskId}/close`, { method: "POST", base, token }).catch(() => undefined);
+    }
     await convexMutation("browserErrands:finish", {
       errandId,
+      leaseToken,
       status: outcome.status,
       result: outcome.summary,
       escalation: outcome.escalation,
       sends: outcome.sends,
-    });
+    }).catch(() => undefined);
     return outcome;
   };
 
-  const opened = await call("/tasks", {
-    method: "POST",
-    base,
-    token,
-    body: {
-      taskId,
-      envelope: {
-        objective: claim.objective,
-        credentialId: claim.credentialId ?? undefined,
-        approvalRef: String(errandId),
-        ...claim.envelope,
+  try {
+    // Set this before the request: a network error can happen after the
+    // browser service accepted the task but before we received its response.
+    taskMayExist = true;
+    const opened = await call("/tasks", {
+      method: "POST",
+      base,
+      token,
+      body: {
+        taskId,
+        envelope: {
+          objective: claim.objective,
+          credentialId: claim.credentialId ?? undefined,
+          approvalRef: String(errandId),
+          ...claim.envelope,
+        },
       },
-    },
-  });
+    });
 
-  // Email-code sites: the site has mailed a code; collect it and finish signing in.
-  if (opened.status === 202 && opened.body?.status === "awaiting_email_code") {
-    const requestedAt = Date.now();
-    let code: string | null = null;
-    // Mail delivery is not instant; a few short waits beat one long one.
-    for (const waitMs of [4000, 6000, 10_000]) {
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-      code = await fetchLoginCode(opened.body.codeSenderHint ?? null, requestedAt);
-      if (code) break;
+    // Email-code sites: the site has mailed a code; collect it and finish signing in.
+    if (opened.status === 202 && opened.body?.status === "awaiting_email_code") {
+      const requestedAt = Date.now();
+      let code: string | null = null;
+      // Mail delivery is not instant; a few short waits beat one long one.
+      for (const waitMs of [4000, 6000, 10_000]) {
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        code = await fetchLoginCode(opened.body.codeSenderHint ?? null, requestedAt);
+        if (code) break;
+      }
+      if (!code) {
+        return await finish({
+          status: "failed",
+          summary: "Requested a login code but none arrived in the mailbox within ~20s. Check the credential's sender hint.",
+          sends: 0,
+          transcript,
+        });
+      }
+      const completed = await call(`/tasks/${taskId}/login-code`, { method: "POST", base, token, body: { code } });
+      if (completed.body?.status !== "logged_in") {
+        return await finish({
+          status: "failed",
+          summary: `Login code was rejected: ${completed.body?.detail ?? "unknown reason"}`,
+          sends: 0,
+          transcript,
+        });
+      }
+      transcript.push("signed in (email code)");
+    } else if (opened.status !== 201) {
+      const reason = opened.body?.status === "needs_otp"
+        ? "The site asked for a one-time code and none is stored. Add a TOTP secret with `jarvis-cred edit`, or log in once by hand."
+        : opened.body?.reason ?? opened.body?.detail ?? `service returned ${opened.status}`;
+      return await finish({ status: "failed", summary: `Could not start: ${reason}`, sends: 0, transcript });
+    } else {
+      transcript.push(`signed in (${opened.body.auth})`);
     }
-    if (!code) {
-      return await finish({
-        status: "failed",
-        summary: "Requested a login code but none arrived in the mailbox within ~20s. Check the credential's sender hint.",
-        sends: 0,
-        transcript,
-      });
+
+    for (const step of steps) {
+      const { status, body } = await call(`/tasks/${taskId}/step`, { method: "POST", base, token, body: step });
+
+      if (status === 403) {
+        return await finish({
+          status: "blocked",
+          summary: `Stopped — ${body.reason}. This class of action has no approval path; do it yourself.`,
+          sends,
+          transcript,
+        });
+      }
+      if (status === 409) {
+        return await finish({
+          status: "needs_step_approval",
+          summary: `Paused — ${body.reason}. Nothing further was done.`,
+          escalation: body.reason,
+          sends,
+          transcript,
+        });
+      }
+      if (status !== 200) {
+        return await finish({
+          status: "failed",
+          summary: `Step '${step.action}' failed: ${body.reason ?? status}`,
+          sends,
+          transcript,
+        });
+      }
+
+      if (step.action === "send") sends = body.sends ?? sends + 1;
+      transcript.push(
+        step.action === "read"
+          ? `read ${body.url}: ${String(body.untrustedPageText ?? "").slice(0, 600)}`
+          : `${step.action}${step.label ? ` — ${step.label}` : ""} → ${body.url ?? "ok"}`,
+      );
     }
-    const completed = await call(`/tasks/${taskId}/login-code`, { method: "POST", base, token, body: { code } });
-    if (completed.body?.status !== "logged_in") {
-      return await finish({
-        status: "failed",
-        summary: `Login code was rejected: ${completed.body?.detail ?? "unknown reason"}`,
-        sends: 0,
-        transcript,
-      });
-    }
-    transcript.push("signed in (email code)");
-  } else if (opened.status !== 201) {
-    const reason = opened.body?.status === "needs_otp"
-      ? "The site asked for a one-time code and none is stored. Add a TOTP secret with `jarvis-cred edit`, or log in once by hand."
-      : opened.body?.reason ?? opened.body?.detail ?? `service returned ${opened.status}`;
-    return await finish({ status: "failed", summary: `Could not start: ${reason}`, sends: 0, transcript });
-  } else {
-    transcript.push(`signed in (${opened.body.auth})`);
+
+    return await finish({
+      status: "done",
+      summary: `Completed "${claim.objective}" in ${steps.length} steps${sends ? `, ${sends} message(s) sent` : ""}.`,
+      sends,
+      transcript,
+    });
+  } catch {
+    // Do not reflect an upstream error into chat or durable state: provider
+    // messages can contain private data. The matching lease is terminalized
+    // when possible and never retried automatically.
+    return await finish({
+      status: "failed",
+      summary: "The browser errand stopped before a final result arrived. Its outcome may be unknown, so it was not retried automatically.",
+      sends,
+      transcript,
+    });
   }
-
-  for (const step of steps) {
-    const { status, body } = await call(`/tasks/${taskId}/step`, { method: "POST", base, token, body: step });
-
-    if (status === 403) {
-      return await finish({
-        status: "blocked",
-        summary: `Stopped — ${body.reason}. This class of action has no approval path; do it yourself.`,
-        sends,
-        transcript,
-      });
-    }
-    if (status === 409) {
-      return await finish({
-        status: "needs_step_approval",
-        summary: `Paused — ${body.reason}. Nothing further was done.`,
-        escalation: body.reason,
-        sends,
-        transcript,
-      });
-    }
-    if (status !== 200) {
-      return await finish({
-        status: "failed",
-        summary: `Step '${step.action}' failed: ${body.reason ?? status}`,
-        sends,
-        transcript,
-      });
-    }
-
-    if (step.action === "send") sends = body.sends ?? sends + 1;
-    transcript.push(
-      step.action === "read"
-        ? `read ${body.url}: ${String(body.untrustedPageText ?? "").slice(0, 600)}`
-        : `${step.action}${step.label ? ` — ${step.label}` : ""} → ${body.url ?? "ok"}`,
-    );
-  }
-
-  return await finish({
-    status: "done",
-    summary: `Completed "${claim.objective}" in ${steps.length} steps${sends ? `, ${sends} message(s) sent` : ""}.`,
-    sends,
-    transcript,
-  });
 }
 
 export async function readErrandAudit(errandId: string): Promise<unknown[]> {

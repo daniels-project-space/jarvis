@@ -30,6 +30,7 @@ vi.mock("../../convex/_generated/api", () => ({
     commandCenter: { snapshot: { _name: "commandCenter:snapshot" } },
     controllerSession: { status: { _name: "controllerSession:status" } },
     jobs: { detail: { _name: "jobs:detail" } },
+    browserErrands: { pending: { _name: "browserErrands:pending" } },
   },
 }));
 
