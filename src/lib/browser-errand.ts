@@ -100,6 +100,11 @@ async function call(
       signal: controller.signal,
     });
     const rawBody = await response.json().catch(() => ({}));
+    // A response observed after the sealed deadline cannot be treated as a
+    // valid final receipt: the browser host may have applied the request too
+    // late, and the client abort signal cannot retract an already-received
+    // provider action.
+    assertBeforeBrowserDeadline(init.deadlineAt);
     return {
       status: response.status,
       body: rawBody && typeof rawBody === "object" && !Array.isArray(rawBody)
