@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { GOOGLE_GMAIL_COMPOSE_SCOPE, GOOGLE_GMAIL_READONLY_SCOPE } from "./google-scopes";
 
 const mock = vi.hoisted(() => ({
   controlQuery: vi.fn(async (): Promise<unknown> => {
@@ -39,7 +40,7 @@ describe("Google OAuth access-token cache", () => {
     expect(isGoogleOAuthConfigurationReady()).toBe(true);
   });
 
-  it("does not reuse a warm bearer token after the connected credentials change", async () => {
+  it("does not reuse a warm bearer token after the legacy Gmail credentials change", async () => {
     process.env.GMAIL_BOOKINGS_CLIENT_ID = "client";
     process.env.GMAIL_BOOKINGS_CLIENT_SECRET = "secret";
     process.env.GMAIL_BOOKINGS_REFRESH_TOKEN = "refresh-a";
@@ -49,13 +50,13 @@ describe("Google OAuth access-token cache", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "token-b", expires_in: 3600 }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const { getGoogleAccessToken } = await import("./google-oauth");
-    await expect(getGoogleAccessToken()).resolves.toBe("token-a");
+    const { getGoogleAccessTokenForGmail } = await import("./google-oauth");
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_READONLY_SCOPE])).resolves.toBe("token-a");
 
     // A reconnect can happen while this Node process is still warm. The
     // cache must compare the current credential identity, not just expiry.
     process.env.GMAIL_BOOKINGS_REFRESH_TOKEN = "refresh-b";
-    await expect(getGoogleAccessToken()).resolves.toBe("token-b");
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_READONLY_SCOPE])).resolves.toBe("token-b");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(String(fetchMock.mock.calls[1][1]?.body)).toContain("refresh_token=refresh-b");
@@ -70,6 +71,22 @@ describe("Google OAuth access-token cache", () => {
 
     const { getGoogleAccessTokenForScopes } = await import("./google-oauth");
     await expect(getGoogleAccessTokenForScopes(["https://www.googleapis.com/auth/calendar.events.owned"])).rejects.toThrow(/Calendar access/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before contacting Google when a stored connection lacks the requested Gmail grant", async () => {
+    process.env.GOOGLE_CLIENT_ID = "client";
+    process.env.GOOGLE_CLIENT_SECRET = "secret";
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    const { encryptGoogleRefreshToken, getGoogleAccessTokenForGmail } = await import("./google-oauth");
+    mock.controlQuery.mockResolvedValueOnce({
+      encryptedRefreshToken: encryptGoogleRefreshToken("refresh-token"),
+      scope: GOOGLE_GMAIL_READONLY_SCOPE,
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_COMPOSE_SCOPE])).rejects.toThrow(/Gmail permission/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
-vi.mock("./google-oauth", () => ({ getGoogleAccessToken: vi.fn(async () => "access-token") }));
+vi.mock("./google-oauth", () => ({ getGoogleAccessTokenForGmail: vi.fn(async () => "access-token") }));
 
 import { lookupGmailBookingForAppleMapsPreflight } from "./booking-email";
 

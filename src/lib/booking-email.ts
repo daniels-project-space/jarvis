@@ -1,7 +1,8 @@
 import "server-only";
 
 import { createHash } from "node:crypto";
-import { getGoogleAccessToken } from "./google-oauth";
+import { getGoogleAccessTokenForGmail } from "./google-oauth";
+import { GOOGLE_GMAIL_READONLY_SCOPE } from "./google-scopes";
 import { matchesAppleMapsOfflineGmailIdentity, type AppleMapsOfflineGmailIdentity } from "./apple-maps-offline-refresh";
 
 export type BookingKind = "flight" | "stay" | "activity" | "transport" | "dining" | "reservation";
@@ -326,7 +327,7 @@ async function accessToken(): Promise<string> {
   // REFRESH_TOKEN env vars internally if no Convex connection exists yet —
   // see src/lib/google-oauth.ts. Its own token cache replaces the one that
   // used to live here.
-  return await getGoogleAccessToken();
+  return await getGoogleAccessTokenForGmail([GOOGLE_GMAIL_READONLY_SCOPE]);
 }
 
 async function gmail<T = JsonObject>(path: string): Promise<T> {
