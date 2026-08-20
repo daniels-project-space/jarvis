@@ -37,6 +37,7 @@ import {
   type GoogleCalendarCreateInput,
 } from "./google-calendar";
 import { googleCalendarApprovalMarker, issueGoogleCalendarApproval, issueGoogleCalendarApprovalProposal } from "./google-calendar-approval.server";
+import { googleOAuthStoredConnectionReadiness } from "./google-oauth";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
 import {
   buildAppleMapsOfflinePreflight,
@@ -2252,9 +2253,53 @@ function prepareGoogleCalendarEvent(args: any): PreparedGoogleCalendarEvent | st
   return { event, date, time: args.time ? String(args.time) : null };
 }
 
+type GoogleCalendarApprovalReadiness =
+  | "ready"
+  | "not_configured"
+  | "missing"
+  | "needs_reconnect"
+  | "unavailable";
+
+/**
+ * Checks only Jarvis's local Google connection state and the trusted Convex
+ * record. Preparing an owner approval must not call Google's API, but it also
+ * must not render a receipt that the approval endpoint is known to be unable
+ * to execute.
+ */
+async function googleCalendarApprovalReadiness(): Promise<GoogleCalendarApprovalReadiness> {
+  const storedConnection = await googleOAuthStoredConnectionReadiness();
+  if (storedConnection !== "readable") return storedConnection;
+
+  try {
+    const status = await convexQuery("googleAuth:getConnectionStatus", {}) as {
+      connected?: boolean;
+      capabilities?: { calendar?: boolean };
+    } | null;
+    if (!status?.connected) return "missing";
+    return status.capabilities?.calendar ? "ready" : "needs_reconnect";
+  } catch {
+    return "unavailable";
+  }
+}
+
+function googleCalendarApprovalUnavailableMessage(readiness: Exclude<GoogleCalendarApprovalReadiness, "ready">): string {
+  switch (readiness) {
+    case "not_configured":
+      return "Google Calendar is not configured in this Jarvis environment, so no approval receipt was created.";
+    case "missing":
+      return "Google Calendar is not connected yet. Connect it from Options with limited Calendar access, then ask again; no approval receipt was created.";
+    case "needs_reconnect":
+      return "Google Calendar needs a reconnect with limited Calendar access before an event can be prepared; no approval receipt was created.";
+    case "unavailable":
+      return "Google Calendar readiness could not be verified right now, so no approval receipt was created. Try again shortly.";
+  }
+}
+
 async function googleCalendarCreate(args: any): Promise<string> {
   const prepared = prepareGoogleCalendarEvent(args);
   if (typeof prepared === "string") return prepared;
+  const readiness = await googleCalendarApprovalReadiness();
+  if (readiness !== "ready") return googleCalendarApprovalUnavailableMessage(readiness);
   // A model can prepare an event, but cannot infer an owner click from a
   // page, email, or file. The route behind the rendered button verifies this
   // short-lived signed receipt before it writes to Google's API.
