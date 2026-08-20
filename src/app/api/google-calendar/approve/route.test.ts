@@ -8,6 +8,7 @@ const mock = vi.hoisted(() => ({
   isOwner: vi.fn(() => true),
   verify: vi.fn(),
   getTrip: vi.fn(),
+  withAdminSession: vi.fn((_: string | undefined, run: () => Promise<unknown>) => run()),
   create: vi.fn(async () => ({ event: { title: "Planning", start: "2026-08-20T09:00:00.000Z", end: "2026-08-20T10:00:00.000Z", allDay: false }, created: true })),
   update: vi.fn(async () => ({ event: { title: "Rescheduled", start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", allDay: false } })),
   remove: vi.fn(async () => ({ id: "jarvisabcdef0123456789", deleted: true })),
@@ -20,6 +21,7 @@ vi.mock("@/lib/control-session", () => ({ isSameOriginRequest: mock.sameOrigin }
 vi.mock("@/lib/request-auth", () => ({ controlActor: mock.controlActor, isOwnerActor: mock.isOwner }));
 vi.mock("@/lib/google-calendar-approval.server", () => ({ verifyGoogleCalendarApprovalProposal: mock.verify }));
 vi.mock("@/lib/travel", () => ({ getTrip: mock.getTrip }));
+vi.mock("@/lib/control-context", () => ({ withAdminSession: mock.withAdminSession }));
 vi.mock("@/lib/google-calendar", () => ({
   createGooglePrimaryCalendarEvent: mock.create,
   updateManagedGooglePrimaryCalendarEvent: mock.update,
@@ -44,6 +46,7 @@ beforeEach(() => {
   mock.isOwner.mockReturnValue(true);
   mock.verify.mockReturnValue({ proposal: createProposal });
   mock.getTrip.mockResolvedValue(null);
+  mock.withAdminSession.mockImplementation((_: string | undefined, run: () => Promise<unknown>) => run());
   mock.create.mockResolvedValue({ event: { title: "Planning", start: "2026-08-20T09:00:00.000Z", end: "2026-08-20T10:00:00.000Z", allDay: false }, created: true });
   mock.update.mockResolvedValue({ event: { title: "Rescheduled", start: "2026-08-20T10:00:00.000Z", end: "2026-08-20T11:00:00.000Z", allDay: false } });
   mock.remove.mockResolvedValue({ id: "jarvisabcdef0123456789", deleted: true });
@@ -93,6 +96,36 @@ describe("Google Calendar owner approval route", () => {
     const response = await POST(request({ token: "current-apple-maps-receipt" }));
 
     expect(response.status).toBe(200);
+    expect(mock.create).toHaveBeenCalledWith(createProposal.event);
+  });
+
+  it("uses the verified owner session to read a current draft Apple Maps preflight", async () => {
+    const binding = {
+      tripId: "draft-apple",
+      storage: "draft" as const,
+      updatedAt: 1_000,
+      sourceKey: "a".repeat(64),
+    };
+    mock.verify.mockReturnValue({
+      proposal: { ...createProposal, appleMapsOfflinePreflight: binding },
+    });
+    mock.getTrip.mockResolvedValue({
+      id: binding.tripId,
+      storage: binding.storage,
+      doc: {
+        offlineMapPreflight: {
+          sourceKey: binding.sourceKey,
+          updatedAt: binding.updatedAt,
+          calendarRefreshRequired: false,
+        },
+      },
+    });
+
+    const response = await POST(request({ token: "current-draft-apple-maps-receipt" }));
+
+    expect(response.status).toBe(200);
+    expect(mock.withAdminSession).toHaveBeenCalledWith("owner", expect.any(Function));
+    expect(mock.getTrip).toHaveBeenCalledWith(binding.tripId, { storage: "draft" });
     expect(mock.create).toHaveBeenCalledWith(createProposal.event);
   });
 

@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { isSameOriginRequest } from "@/lib/control-session";
+import { withAdminSession } from "@/lib/control-context";
 import {
   createGooglePrimaryCalendarEvent,
   deleteManagedGooglePrimaryCalendarEvent,
@@ -42,7 +43,14 @@ export async function POST(req: NextRequest) {
       case "create": {
         const binding = approval.proposal.appleMapsOfflinePreflight;
         if (binding) {
-          const trip = await getTrip(binding.tripId, { storage: binding.storage }).catch(() => null);
+          // Draft reads deliberately require the originating worker message when
+          // made with worker authority. This is an owner-approved browser
+          // action, so carry its verified owner session into the exact-ID read
+          // instead of weakening the draft worker boundary.
+          const trip = await withAdminSession(
+            actor.authTokenHash,
+            () => getTrip(binding.tripId, { storage: binding.storage }),
+          ).catch(() => null);
           const preflight = trip?.doc.offlineMapPreflight;
           if (
             trip?.storage !== binding.storage ||
