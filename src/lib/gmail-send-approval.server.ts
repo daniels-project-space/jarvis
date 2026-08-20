@@ -1,6 +1,7 @@
 import "server-only";
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { GMAIL_SEND_APPROVAL_MARKER } from "./gmail-send-approval-marker";
 
 // Approval receipts for sending mail as Daniel.
 //
@@ -16,8 +17,6 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 const APPROVAL_VERSION = 1;
 const APPROVAL_TTL_MS = 15 * 60_000;
 const MAX_TOKEN_BYTES = 2_048;
-
-export const GMAIL_SEND_APPROVAL_MARKER = "jarvis-gmail-send-approval";
 
 export class GmailSendApprovalError extends Error {}
 
@@ -54,6 +53,11 @@ function sign(encodedPayload: string): Buffer {
   return createHmac("sha256", approvalKey()).update(encodedPayload).digest();
 }
 
+function encodedApprovalToken(payload: ApprovalPayload): string {
+  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return `${encodedPayload}.${sign(encodedPayload).toString("base64url")}`;
+}
+
 function normalizedProposal(proposal: GmailSendProposal): GmailSendProposal {
   const draftId = String(proposal?.draftId ?? "").trim();
   if (!draftId || draftId.length > 256) throw new GmailSendApprovalError("A draft id is required.");
@@ -66,15 +70,26 @@ function normalizedProposal(proposal: GmailSendProposal): GmailSendProposal {
 }
 
 export function issueGmailSendApproval(proposal: GmailSendProposal, now = Date.now()): string {
-  const payload: ApprovalPayload = {
+  const base: ApprovalPayload = {
     version: APPROVAL_VERSION,
     issuedAt: now,
     expiresAt: now + APPROVAL_TTL_MS,
     nonce: randomBytes(16).toString("base64url"),
     proposal: normalizedProposal(proposal),
   };
-  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  return `${encodedPayload}.${sign(encodedPayload).toString("base64url")}`;
+  let preview = base.proposal.preview;
+  let token = encodedApprovalToken(base);
+  // The signed receipt is also parsed client-side before it reaches the
+  // owner-only send control. Trim only the non-authoritative preview until it
+  // fits the strict verifier cap; never issue a receipt that cannot redeem.
+  while (Buffer.byteLength(token, "utf8") > MAX_TOKEN_BYTES && preview) {
+    preview = preview.slice(0, -1);
+    token = encodedApprovalToken({ ...base, proposal: { ...base.proposal, preview } });
+  }
+  if (Buffer.byteLength(token, "utf8") > MAX_TOKEN_BYTES) {
+    throw new GmailSendApprovalError("Gmail send approval is too large.");
+  }
+  return token;
 }
 
 export function verifyGmailSendApproval(token: unknown, now = Date.now()): GmailSendProposal {

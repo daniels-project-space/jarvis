@@ -14,7 +14,13 @@ import {
   type JarvisPermissionState,
 } from "@/lib/permissions";
 import { registerSW, subscribePush } from "@/lib/push";
-import { extractGoogleCalendarApproval, isToolGarbage, sanitizeAssistantText, stripGoogleCalendarApproval } from "../lib/sanitize";
+import {
+  extractGmailSendApproval,
+  extractGoogleCalendarApproval,
+  isToolGarbage,
+  sanitizeAssistantText,
+  stripAssistantApprovals,
+} from "../lib/sanitize";
 import { createOrbMotionFrame, deriveOrbVisual, type OrbMotionFrame } from "@/lib/orb-motion";
 import {
   cacheCompactWorkSnapshot,
@@ -368,6 +374,55 @@ function GoogleCalendarApprovalCard({ token }: { token: string }) {
           </button>
           <span aria-live="polite" className={state === "error" ? "text-amber" : "text-slate"}>
             {state === "error" ? detail : "Nothing changes until you click."}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+function GmailSendApprovalCard({ token }: { token: string }) {
+  const [state, setState] = useState<"ready" | "sending" | "completed" | "error">("ready");
+  const [detail, setDetail] = useState("");
+
+  const approve = async () => {
+    if (state !== "ready") return;
+    setState("sending");
+    setDetail("");
+    try {
+      const response = await viewerFetch("/api/gmail-send", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ approval: token }),
+      });
+      const payload = await response.json().catch(() => ({})) as { ok?: unknown; status?: unknown; error?: unknown };
+      if (!response.ok || payload.ok !== true || payload.status !== "sent") {
+        throw new Error(String(payload.error ?? "Gmail send approval was rejected."));
+      }
+      setState("completed");
+      setDetail("Sent the approved Gmail draft.");
+    } catch (error) {
+      setState("error");
+      setDetail(String(error instanceof Error ? error.message : "Gmail send approval was rejected."));
+    }
+  };
+
+  return (
+    <div data-gmail-send-approval className="mt-1.5 inline-flex max-w-[88%] items-center gap-2 rounded-xl border border-amber/30 bg-amber/[0.06] px-3 py-2 text-xs text-ice">
+      {state === "completed" ? (
+        <span aria-live="polite">{detail}</span>
+      ) : (
+        <>
+          <button
+            type="button"
+            onClick={() => void approve()}
+            disabled={state === "sending"}
+            className="rounded-lg border border-amber/40 bg-amber/10 px-2 py-1 font-medium text-amber transition hover:bg-amber/20 disabled:opacity-50"
+          >
+            {state === "sending" ? "sending…" : "Send approved email"}
+          </button>
+          <span aria-live="polite" className={state === "error" ? "text-amber" : "text-slate"}>
+            {state === "error" ? detail : "This sends only the Gmail draft you reviewed."}
           </span>
         </>
       )}
@@ -2954,7 +3009,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       durableStartedAt.current = null;
       setSending(false);
     }
-    const visibleAssistantText = stripGoogleCalendarApproval(latestAssistant.text);
+    const visibleAssistantText = stripAssistantApprovals(latestAssistant.text);
     showCaption({ who: "jarvis", text: visibleAssistantText, phase: "streaming" });
     if (
       latestAssistant.parentMessageId &&
@@ -3123,7 +3178,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     };
     // Background findings never interrupt an active voice exchange. Normal
     // Codex replies do speak, then the turn-taking microphone re-arms.
-    const spokenText = stripGoogleCalendarApproval(isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text);
+    const spokenText = stripAssistantApprovals(isToolGarbage(last.text) ? sanitizeAssistantText(last.text) : last.text);
     // Streaming and finalization use the same stable caption node. Put the
     // finished text there before voice ownership/model generation, so it never
     // vanishes during the TTS handoff or when this tab is not the speaker.
@@ -5758,15 +5813,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               .map((m) => {
                 if (m.role === "assistant" && m.text) {
                   const calendarApprovalToken = extractGoogleCalendarApproval(m.text);
-                  const visibleText = isToolGarbage(m.text) ? sanitizeAssistantText(m.text) : stripGoogleCalendarApproval(m.text);
-                  return { ...m, text: visibleText, calendarApprovalToken };
+                  const gmailSendApprovalToken = extractGmailSendApproval(m.text);
+                  const visibleText = isToolGarbage(m.text)
+                    ? sanitizeAssistantText(m.text)
+                    : stripAssistantApprovals(m.text);
+                  return { ...m, text: visibleText, calendarApprovalToken, gmailSendApprovalToken };
                 }
-                if (m.role === "user" && m.text) return { ...m, text: visibleTurnText(m.text), calendarApprovalToken: null };
-                return { ...m, calendarApprovalToken: null };
+                if (m.role === "user" && m.text) {
+                  return { ...m, text: visibleTurnText(m.text), calendarApprovalToken: null, gmailSendApprovalToken: null };
+                }
+                return { ...m, calendarApprovalToken: null, gmailSendApprovalToken: null };
               })
               // A guest never receives a card through the normal worker path,
               // but do not materialize one if a legacy row is ever present.
-              .filter((m) => m.text || (!guest && m.attachment) || m.status === "streaming")
+              .filter((m) => m.text || (!guest && (m.attachment || m.calendarApprovalToken || m.gmailSendApprovalToken)) || m.status === "streaming")
               .map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
                 <GuestSafeAttachment
@@ -5803,6 +5863,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 </GuestSafeAttachment>
                 {m.role === "assistant" && !guest && m.calendarApprovalToken && (
                   <GoogleCalendarApprovalCard token={m.calendarApprovalToken} />
+                )}
+                {m.role === "assistant" && !guest && m.gmailSendApprovalToken && (
+                  <GmailSendApprovalCard token={m.gmailSendApprovalToken} />
                 )}
                 {m.role === "user" && <MessageFileBadges files={m.files} align="right" />}
                 {m.role === "assistant" && m.model && (
