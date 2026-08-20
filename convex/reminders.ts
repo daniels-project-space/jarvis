@@ -2,6 +2,10 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 
+const DUE_BATCH_SIZE = 50;
+const DUE_PENDING_RESERVE = 25;
+const DELIVERY_LEASE_MS = 5 * 60_000;
+
 // Timed reminders: "remind me at 7pm to call mum" → push + spoken weave when
 // due. The agent-runner cron (*/2) sweeps `due` and delivers.
 export const add = mutation({
@@ -75,17 +79,28 @@ export const due = mutation({
   args: { ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const now = Date.now();
     const pending = await ctx.db
       .query("reminders")
-      .withIndex("by_status", (q: any) => q.eq("status", "pending").lte("at", Date.now()))
-      .take(50);
-    const delivering = await ctx.db
+      .withIndex("by_status", (q: any) => q.eq("status", "pending").lte("at", now))
+      .take(DUE_BATCH_SIZE);
+    const stale = await ctx.db
       .query("reminders")
-      .withIndex("by_status", (q: any) => q.eq("status", "delivering"))
-      .take(50);
-    const now = Date.now();
-    const stale = delivering.filter((row: any) => (row.deliverStartedAt ?? 0) < now - 5 * 60_000);
-    const fire = [...pending, ...stale].slice(0, 50);
+      .withIndex("by_status_deliverStartedAt", (q: any) => q
+        .eq("status", "delivering")
+        .lt("deliverStartedAt", now - DELIVERY_LEASE_MS))
+      .take(DUE_BATCH_SIZE);
+    // Always reserve half the bounded batch for newly-due reminders. Reclaimed
+    // delivery leases fill unused capacity, then remaining pending work does;
+    // this keeps recovery moving without letting a stale backlog delay fresh
+    // owner-facing reminders forever.
+    const reservedPending = pending.slice(0, DUE_PENDING_RESERVE);
+    const reclaimed = stale.slice(0, DUE_BATCH_SIZE - reservedPending.length);
+    const pendingFill = pending.slice(
+      reservedPending.length,
+      reservedPending.length + DUE_BATCH_SIZE - reservedPending.length - reclaimed.length,
+    );
+    const fire = [...reservedPending, ...reclaimed, ...pendingFill];
     // Claim atomically. A Trigger container dying after this point is recovered
     // after the lease, rather than leaving the reminder stuck forever.
     for (const row of fire)

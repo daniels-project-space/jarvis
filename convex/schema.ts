@@ -603,6 +603,7 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_status", ["status", "at"])
+    .index("by_status_deliverStartedAt", ["status", "deliverStartedAt"])
     .index("by_sourceKey", ["sourceKey"]),
 
   // Explicit owner-created saved-trip preflights. This is intentionally not a
