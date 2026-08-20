@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractGmailSendApproval,
   extractGoogleCalendarApproval,
+  hasAssistantApproval,
   sanitizeAssistantText,
   stripAssistantApprovals,
   stripGmailSendApproval,
@@ -26,6 +27,8 @@ describe("assistant text sanitization", () => {
     const text = `Your Gmail draft is ready.\n${gmailMarker}`;
 
     expect(extractGmailSendApproval(text)).toBe(gmailToken);
+    expect(hasAssistantApproval(text)).toBe(true);
+    expect(hasAssistantApproval("No approval needed.")).toBe(false);
     expect(stripGmailSendApproval(text)).toBe("Your Gmail draft is ready.");
     expect(stripAssistantApprovals(`Ready to add the event.\n${marker}\n${gmailMarker}`)).toBe("Ready to add the event.");
     expect(sanitizeAssistantText(text)).toBe("Your Gmail draft is ready.");

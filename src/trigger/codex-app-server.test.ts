@@ -33,13 +33,20 @@ async function admitTurn(
   server: CodexAppServer,
   internals: AppServerInternals,
   writes: WrittenMessage[],
-  input: { conversationId: string; threadId: string; turnId: string; signal?: AbortSignal },
+  input: {
+    conversationId: string;
+    threadId: string;
+    turnId: string;
+    signal?: AbortSignal;
+    userText?: string;
+    history?: Array<{ role: string; text: string }>;
+  },
 ) {
   const startIndex = writes.length;
   const completion = server.runTurn({
     conversationId: input.conversationId,
-    userText: "work",
-    history: [],
+    userText: input.userText ?? "work",
+    history: input.history ?? [],
     contextBlock: "",
     preamble: "test",
     modelTier: "luna",
@@ -309,6 +316,49 @@ describe("Codex app-server dynamic tools", () => {
     await Promise.resolve();
     internals.receive(JSON.stringify({ method: "turn/completed", params: { turnId: "foreground-turn", turn: { id: "foreground-turn", status: "completed" } } }));
     await expect(turn).resolves.toMatchObject({ code: 0 });
+  });
+
+  it("forgets a receipt-bearing warm thread before sanitized history reseeds the next turn", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = { stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } } };
+    internals.ready = Promise.resolve();
+    const receipt = `${"a".repeat(64)}.${"b".repeat(43)}`;
+
+    const first = await admitTurn(server, internals, writes, {
+      conversationId: "approval-boundary",
+      threadId: "approval-thread-1",
+      turnId: "approval-turn-1",
+    });
+    internals.receive(JSON.stringify({
+      method: "item/agentMessage/delta",
+      params: { turnId: "approval-turn-1", delta: `Draft ready.\n[jarvis-gmail-send-approval:${receipt}]` },
+    }));
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "approval-turn-1", turn: { id: "approval-turn-1", status: "completed" } },
+    }));
+    await expect(first.completion).resolves.toMatchObject({ code: 0 });
+
+    const secondStart = writes.length;
+    const second = await admitTurn(server, internals, writes, {
+      conversationId: "approval-boundary",
+      threadId: "approval-thread-2",
+      turnId: "approval-turn-2",
+      userText: "What should I do next?",
+      history: [{ role: "assistant", text: "Draft ready." }],
+    });
+    expect(writes[secondStart].method).toBe("thread/start");
+    const reseededInput = JSON.stringify(writes[secondStart + 1].params?.input);
+    expect(reseededInput).toContain("Recent conversation:");
+    expect(reseededInput).toContain("Jarvis: Draft ready.");
+    expect(reseededInput).not.toContain(receipt);
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "approval-turn-2", turn: { id: "approval-turn-2", status: "completed" } },
+    }));
+    await expect(second.completion).resolves.toMatchObject({ code: 0, threadId: "approval-thread-2" });
   });
 
   it("sends bounded inline images and strips unsupported remote marker URLs", async () => {
