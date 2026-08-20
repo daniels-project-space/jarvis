@@ -166,7 +166,13 @@ export async function linkMessageFilesToCreation(
   );
   for (const link of links) {
     const file = await ctx.db.get(link.fileId);
-    if (!file || !FILE_READY_STATUSES.has(String(file.status))) continue;
+    // A message attachment is immutable provenance, but it is not a license
+    // to create a fresh private derivative after the owner has deleted its
+    // source bytes. Fail the whole creation transaction so it cannot persist
+    // without the creationFileRef that holds the source deletion fence.
+    if (!file || !FILE_READY_STATUSES.has(String(file.status))) {
+      throw new ConvexError({ code: "INVALID_CREATION_SOURCE", message: "Creation source file is no longer ready" });
+    }
     const existing = await ctx.db
       .query("creationFileRefs")
       .withIndex("by_creation_file", (q: any) => q.eq("creationId", creationId).eq("fileId", link.fileId))

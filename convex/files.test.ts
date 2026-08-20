@@ -1016,6 +1016,32 @@ describe("durable private chat files", () => {
     expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(true);
   });
 
+  it("refuses a derived creation after its message source has been deleted", async () => {
+    const t = convexTest(schema, modules);
+    const source = await makeReady(t, "main", "deleted-source.txt", "e".repeat(64), "private source that must not outlive deletion");
+    const messageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Make a document from this file.",
+      requestId: "deleted-source-creation",
+      fileIds: [source.fileId as any],
+      workerToken: WORKER,
+    });
+
+    expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
+      .toEqual(expect.objectContaining({ ok: true }));
+    expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(true);
+
+    await expect(t.mutation(api.creations.create, {
+      kind: "doc",
+      title: "Deleted source derivative",
+      data: "private source that must not outlive deletion",
+      sourceMessageId: messageId,
+      workerToken: WORKER,
+    })).rejects.toThrow(/Creation source file is no longer ready/);
+
+    expect(await t.run(async (ctx) => await ctx.db.query("creations").collect())).toEqual([]);
+  });
+
   it("pins an explicitly selected private source file for transcript and document creations", async () => {
     const t = convexTest(schema, modules);
     const source = await makeReady(t, "main", "arrival-note.m4a", "d".repeat(64), "private transcript text");

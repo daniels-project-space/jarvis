@@ -202,6 +202,65 @@ describe("show_uploaded_file tool", () => {
   });
 });
 
+describe("open_file_as_doc tool", () => {
+  const readyDocument = {
+    _id: "file/document",
+    originalName: "arrival-plan.txt",
+    relativePath: "travel/arrival-plan.txt",
+    status: "ready",
+    extractedTextR2Key: "owners/daniel/files/file-document/v1/extracted.txt",
+    r2Key: "owners/daniel/private/never-expose-me",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mock.convexQuery.mockImplementation(async (path: string) =>
+      path === "files:getForOwner" ? readyDocument : "thread-main",
+    );
+    mock.convexMutation.mockImplementation(async (path: string) =>
+      path === "creations:create" ? "creation/document-1" : undefined,
+    );
+    mock.privateR2Get.mockResolvedValue(new Response("Meet at the hotel lobby."));
+  });
+
+  it("opens a ready extracted document and pins its private source", async () => {
+    await expect(executeTool("open_file_as_doc", { file_id: "file/document" }))
+      .resolves.toContain("Opened \"arrival-plan.txt\" as an editable doc");
+
+    expect(mock.privateR2Get).toHaveBeenCalledWith(readyDocument.extractedTextR2Key);
+    expect(mock.convexMutation).toHaveBeenCalledWith("creations:create", {
+      kind: "doc",
+      title: "arrival-plan.txt",
+      data: "Meet at the hotel lobby.",
+      sourceFiles: [{ fileId: "file/document", name: "arrival-plan.txt" }],
+      category: "documents",
+      threadId: "thread-main",
+    });
+  });
+
+  it.each(["deleting", "processing", "stored_only"])("does not read %s source bytes into a new document", async (status) => {
+    mock.convexQuery.mockImplementation(async (path: string) =>
+      path === "files:getForOwner" ? { ...readyDocument, status } : "thread-main",
+    );
+
+    await expect(executeTool("open_file_as_doc", { file_id: "file/document" }))
+      .resolves.toContain("not ready for an editable document");
+    expect(mock.privateR2Get).not.toHaveBeenCalled();
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+  });
+
+  it("does not read deleted source bytes into a new document", async () => {
+    mock.convexQuery.mockImplementation(async (path: string) =>
+      path === "files:getForOwner" ? { ...readyDocument, status: "deleted" } : "thread-main",
+    );
+
+    await expect(executeTool("open_file_as_doc", { file_id: "file/document" }))
+      .resolves.toContain("file not found");
+    expect(mock.privateR2Get).not.toHaveBeenCalled();
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+  });
+});
+
 describe("open_uploaded_transcript tool", () => {
   const readyAudio = {
     _id: "file/audio",

@@ -4709,6 +4709,9 @@ async function openFileAsDoc(args: any): Promise<string> {
   if (!fileId) return "TOOL DID NOTHING: no file_id passed.";
   const file: any = await convexQuery("files:getForOwner", { fileId }).catch(() => null);
   if (!file || file.status === "deleted") return "TOOL DID NOTHING: file not found.";
+  if (file.status !== "ready") {
+    return `TOOL DID NOTHING: the selected file is not ready for an editable document (status: ${String(file.status ?? "unknown").slice(0, 40)}).`;
+  }
   if (!file.extractedTextR2Key) {
     return `TOOL DID NOTHING: "${file.originalName}" has no extracted text available (status: ${file.status}). Only text-bearing files (pdf, docx, csv, plain text) can open as a doc.`;
   }
