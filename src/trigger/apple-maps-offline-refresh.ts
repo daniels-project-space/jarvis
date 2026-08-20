@@ -1,6 +1,7 @@
 import {
   APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS,
   APPLE_MAPS_OFFLINE_RETRY_INTERVAL_MS,
+  APPLE_MAPS_OFFLINE_REFRESH_SAFETY_WINDOW_MS,
   buildAppleMapsOfflinePreflight,
   isAppleMapsOfflinePreflightRefreshWindowOpen,
   nextAppleMapsOfflinePreflightRefreshAt,
@@ -196,15 +197,29 @@ async function refreshOne(
   const protectedReminderAt = Math.min(row.preflight.at, built.preflight.at);
   const reminderAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now);
   if (reminderAt === undefined) return "skipped";
+  const sourceKeyUpdateCutoffAt = protectedReminderAt - APPLE_MAPS_OFFLINE_REFRESH_SAFETY_WINDOW_MS;
 
   try {
     // Reminders have the stable TripDoc source key, so Convex updates exactly
     // one pending reminder and retains an owner-cancelled one as cancelled.
-    await dependencies.mutation("reminders:add", {
+    const reminder = await dependencies.mutation("reminders:add", {
       text: built.preflight.reminderText,
       at: built.preflight.at,
       sourceKey: row.sourceKey,
+      sourceKeyUpdateCutoffAt,
     });
+    if (reminder?.ok === false && reminder.reason === "source_update_cutoff_passed") {
+      // The server mutation evaluates this cutoff atomically. Its refusal is
+      // definitive even if this Trigger worker began before the window did.
+      await markPending(
+        dependencies.mutation,
+        row,
+        "too_late",
+        SAFE_REFRESH_WINDOW_CLOSED_ERROR,
+        Math.max(dependencies.now(), sourceKeyUpdateCutoffAt),
+      );
+      return "skipped";
+    }
   } catch {
     const checkedAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now);
     if (checkedAt === undefined) return "skipped";

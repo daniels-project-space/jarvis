@@ -43,6 +43,28 @@ describe("retry-safe timed reminders", () => {
     ]);
   });
 
+  it("atomically refuses a protected source-key update after its cutoff", async () => {
+    const t = convexTest(schema, modules);
+    const initial = await t.mutation(api.reminders.add, {
+      text: "Download Seville map",
+      at: Date.now() + 60_000,
+      sourceKey: SOURCE_KEY,
+      workerToken: WORKER,
+    });
+
+    await expect(t.mutation(api.reminders.add, {
+      text: "Move the existing reminder after a delayed refresh",
+      at: Date.now() + 120_000,
+      sourceKey: SOURCE_KEY,
+      sourceKeyUpdateCutoffAt: Date.now() - 1,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: false, reason: "source_update_cutoff_passed" });
+
+    await expect(t.query(api.reminders.upcoming, { workerToken: WORKER })).resolves.toEqual([
+      expect.objectContaining({ _id: initial, text: "Download Seville map" }),
+    ]);
+  });
+
   it("rejects arbitrary caller-defined reminder identities", async () => {
     const t = convexTest(schema, modules);
     await expect(t.mutation(api.reminders.add, {

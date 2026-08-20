@@ -249,6 +249,37 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("honours the server-side cutoff if the final reminder mutation arrives late", async () => {
+    const mutation = vi.fn(async (path: string, args: Record<string, unknown>) => {
+      if (path === "reminders:add") {
+        expect(args).toMatchObject({
+          sourceKey: row.sourceKey,
+          sourceKeyUpdateCutoffAt: row.preflight.at - 5 * 60_000,
+        });
+        // Simulates Convex evaluating its own clock after this worker's
+        // caller-side preflight check already succeeded.
+        return { ok: false, reason: "source_update_cutoff_passed" };
+      }
+      return { ok: true };
+    });
+    const fetch = vi.fn();
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([row]),
+      mutation,
+      fetch: fetch as typeof globalThis.fetch,
+      now: () => now,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? flight : stay),
+    })).resolves.toEqual({ due: 1, refreshed: 0, pending: 0, skipped: 1 });
+
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
+      state: "too_late",
+      error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
+    }));
+    expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("rechecks the clock after a Hub read before it mutates the to-do", async () => {
     vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
     let clock = now;
