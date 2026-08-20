@@ -87,7 +87,7 @@ describe("Google OAuth access-token cache", () => {
     const { getGoogleAccessTokenForGmail } = await import("./google-oauth");
 
     await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_COMPOSE_SCOPE])).rejects.toThrow(/Reconnect Google/i);
-    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_MODIFY_SCOPE])).rejects.toThrow(/inbox modifications are unavailable/i);
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_MODIFY_SCOPE])).rejects.toThrow(/cannot verify a Gmail modify grant.*inbox modifications are unavailable/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -119,7 +119,7 @@ describe("Google OAuth access-token cache", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_MODIFY_SCOPE])).rejects.toThrow(/inbox modifications are unavailable/i);
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_MODIFY_SCOPE])).rejects.toThrow(/cannot verify a Gmail modify grant.*inbox modifications are unavailable/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -275,7 +275,7 @@ export async function getGoogleAccessTokenForGmail(requiredScopes: readonly stri
   const requiresModify = requiredScopes.includes(GOOGLE_GMAIL_MODIFY_SCOPE);
   const exactReadOnly = requiredScopes.length === 1 && requiredScopes[0] === GOOGLE_GMAIL_READONLY_SCOPE;
   const unavailable = () => new GoogleOAuthError(
-    "Gmail inbox modifications are unavailable because Jarvis's Google connection does not grant the historical Gmail modify permission. Nothing changed.",
+    "Jarvis cannot verify a Gmail modify grant for this connection, so inbox modifications are unavailable. Nothing changed.",
   );
   const reconnect = () => new GoogleOAuthError(
     "Google Gmail is not connected with the required limited Gmail permission. Reconnect Google from Options to grant Gmail access.",
