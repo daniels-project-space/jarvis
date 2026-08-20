@@ -212,6 +212,43 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("does not let a later moved flight bypass the stored reminder's protected window", async () => {
+    let clock = now;
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    const fetch = vi.fn();
+    // This row represents the old, already-scheduled reminder. Gmail has
+    // moved the exact selected flight later, so the rebuilt preflight is much
+    // later than the owner-visible one being replaced.
+    const imminentStoredReminder = {
+      ...row,
+      preflight: { ...preflight, at: now + 6 * 60_000 },
+    };
+    const lookupBooking = vi.fn(async (identity) => {
+      if (identity.selectionId === "booking-flight") {
+        // The old reminder's five-minute window begins while Gmail is read.
+        clock = now + 2 * 60_000;
+        return flight;
+      }
+      return stay;
+    });
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([imminentStoredReminder]),
+      mutation,
+      fetch: fetch as typeof globalThis.fetch,
+      now: () => clock,
+      lookupBooking,
+    })).resolves.toEqual({ due: 1, refreshed: 0, pending: 0, skipped: 1 });
+
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
+      state: "too_late",
+      error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
+    }));
+    expect(mutation).not.toHaveBeenCalledWith("reminders:add", expect.anything());
+    expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("rechecks the clock after a Hub read before it mutates the to-do", async () => {
     vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
     let clock = now;

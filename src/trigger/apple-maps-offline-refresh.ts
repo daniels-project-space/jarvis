@@ -189,9 +189,12 @@ async function refreshOne(
     await markPending(dependencies.mutation, row, "needs_flight_confirmation", "The selected Gmail flight needs confirmation", checkedAt, checkedAt + APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS);
     return "pending";
   }
-  // Re-read after Gmail so the mutation begins only while this exact, freshly
-  // rebuilt preflight is still outside its protected reminder window.
-  const reminderAt = await refreshWindowNow(dependencies.mutation, row, built.preflight.at, dependencies.now);
+  // The saved reminder remains owner-visible until this mutation succeeds. A
+  // Gmail itinerary may move its replacement later, but that must not let a
+  // slow lookup revise the existing reminder after *its* protected window has
+  // begun. Protect whichever reminder becomes due first.
+  const protectedReminderAt = Math.min(row.preflight.at, built.preflight.at);
+  const reminderAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now);
   if (reminderAt === undefined) return "skipped";
 
   try {
@@ -203,7 +206,7 @@ async function refreshOne(
       sourceKey: row.sourceKey,
     });
   } catch {
-    const checkedAt = await refreshWindowNow(dependencies.mutation, row, built.preflight.at, dependencies.now);
+    const checkedAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now);
     if (checkedAt === undefined) return "skipped";
     await markPending(dependencies.mutation, row, "pending_refresh", "Jarvis could not update the durable reminder", checkedAt, checkedAt + RETRY_AFTER_TRANSIENT_FAILURE_MS);
     return "pending";
