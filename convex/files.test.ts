@@ -897,9 +897,71 @@ describe("durable private chat files", () => {
       claimToken: ingestClaimToken,
       workerToken: WORKER,
     })).toBe(false);
-
     expect(await t.mutation(api.files.beginDelete, { fileId, workerToken: WORKER }))
       .toMatchObject({ ok: true, deferred: true, idempotent: true });
+
+    // Once the real worker reaches its terminal callback, it can no longer
+    // write derivatives. Do not retain the old ingest claim until its stale
+    // timeout merely because deletion changed the durable state first.
+    expect(await t.mutation(api.files.completeIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: ingestClaimToken,
+      sha256,
+      detectedMimeType: "video/mp4",
+      status: "stored_only",
+      extractedChars: 0,
+      chunks: [],
+      workerToken: WORKER,
+    })).toEqual({ ok: false, reason: "stale_claim" });
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ready: true });
+    expect(await t.mutation(api.files.finishDelete, { fileId, workerToken: WORKER })).toBe(true);
+  });
+
+  it("releases a delete-deferred ingest claim after its terminal failure callback", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "b".repeat(64);
+    const batch = await reserve(t, "main", "delete-during-failed-ingest.mp4", sha256, 1, "video/mp4");
+    const fileId = batch.files[0].fileId as any;
+    const uploadClaimToken = "upload-claim-delete-during-failed-ingest";
+    const ingestClaimToken = "ingest-claim-delete-during-failed-ingest";
+    await t.mutation(api.files.claimUpload, {
+      batchId: batch.batchId as any,
+      fileId,
+      claimToken: uploadClaimToken,
+      contentType: "video/mp4",
+      sha256,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.markUploaded, {
+      batchId: batch.batchId as any,
+      fileId,
+      sizeBytes: 24,
+      contentType: "video/mp4",
+      sha256,
+      claimToken: uploadClaimToken,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.claimIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: ingestClaimToken,
+      workerToken: WORKER,
+    });
+    expect(await t.mutation(api.files.beginDelete, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ok: true, deferred: true });
+
+    expect(await t.mutation(api.files.failIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: ingestClaimToken,
+      errorCode: "media_decode_validation_failed",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ready: true });
+    expect(await t.mutation(api.files.finishDelete, { fileId, workerToken: WORKER })).toBe(true);
   });
 
   it("defers batch cancellation when one file still owns an ingest claim", async () => {

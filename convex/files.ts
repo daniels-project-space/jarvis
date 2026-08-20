@@ -829,6 +829,25 @@ export const completeIngest = mutation({
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
+    // A deletion keeps the active claim only while the worker might still
+    // write a derived object. Once that exact worker has reached its terminal
+    // completion callback, clear the claim immediately so its already-durable
+    // cleanup can proceed instead of waiting for the stale-claim window.
+    if (
+      file
+      && file.status === "deleting"
+      && file.deletePreviousStatus === "processing"
+      && file.ingestVersion === args.ingestVersion
+      && file.ingestClaimToken === args.claimToken
+    ) {
+      const now = Date.now();
+      await ctx.db.patch(file._id, {
+        ingestClaimToken: undefined,
+        lastProgressAt: now,
+        updatedAt: now,
+      });
+      return { ok: false, reason: "stale_claim" as const };
+    }
     if (!file || file.status !== "processing" || file.ingestVersion !== args.ingestVersion || file.ingestClaimToken !== args.claimToken) {
       return { ok: false, reason: "stale_claim" as const };
     }
@@ -899,6 +918,24 @@ export const failIngest = mutation({
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
+    // See completeIngest above. A worker that has reached its terminal error
+    // path cannot write another derivative, so release only its exact
+    // delete-deferred claim rather than holding deletion for a stale timeout.
+    if (
+      file
+      && file.status === "deleting"
+      && file.deletePreviousStatus === "processing"
+      && file.ingestVersion === args.ingestVersion
+      && file.ingestClaimToken === args.claimToken
+    ) {
+      const now = Date.now();
+      await ctx.db.patch(file._id, {
+        ingestClaimToken: undefined,
+        lastProgressAt: now,
+        updatedAt: now,
+      });
+      return true;
+    }
     if (!file || file.status !== "processing" || file.ingestVersion !== args.ingestVersion || file.ingestClaimToken !== args.claimToken) return false;
     const now = Date.now();
     await ctx.db.patch(file._id, {
