@@ -5,11 +5,30 @@ import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./co
 // Timed reminders: "remind me at 7pm to call mum" → push + spoken weave when
 // due. The agent-runner cron (*/2) sweeps `due` and delivers.
 export const add = mutation({
-  args: { text: v.string(), at: v.number(), sourceKey: v.optional(v.string()), originThreadId: v.optional(v.string()), ...actorAuthArgs },
+  args: {
+    text: v.string(),
+    at: v.number(),
+    sourceKey: v.optional(v.string()),
+    originThreadId: v.optional(v.string()),
+    // A caller may opt a source-key update into an atomic server-clock cutoff.
+    // Normal reminders deliberately retain their existing behavior.
+    sourceKeyUpdateCutoffAt: v.optional(v.number()),
+    ...actorAuthArgs,
+  },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const sourceKey = a.sourceKey?.trim();
     if (sourceKey && !/^[a-f0-9]{64}$/.test(sourceKey)) throw new Error("Reminder source key is invalid");
+    if (a.sourceKeyUpdateCutoffAt !== undefined
+      && (!sourceKey || !Number.isFinite(a.sourceKeyUpdateCutoffAt))) {
+      throw new Error("Reminder source-key update cutoff is invalid");
+    }
+    // This is intentionally inside the transactional mutation rather than a
+    // caller-side clock check: a delayed worker must not update or create the
+    // source-keyed reminder after its owner-facing protection window starts.
+    if (sourceKey && a.sourceKeyUpdateCutoffAt !== undefined && Date.now() >= a.sourceKeyUpdateCutoffAt) {
+      return { ok: false as const, reason: "source_update_cutoff_passed" as const };
+    }
     // Automated travel and booking flows can retry after an interrupted web or
     // calendar handoff. Re-use the same pending reminder rather than creating
     // a second push/spoken alert, and refresh its timing if Gmail changed it.
