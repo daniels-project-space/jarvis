@@ -407,6 +407,59 @@ describe("durable foreground chat recovery", () => {
     ]);
   });
 
+  it("reclaims a claim after adversarial runner heartbeats stop without accepting its late completion", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await createTurn(t, "heartbeat-then-timeout");
+    const first = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "first-claim",
+      workerToken: WORKER,
+    });
+    expect(first).not.toBeNull();
+
+    // A live process may keep its lease while a bounded transport call is
+    // outstanding. Once that failure unwinds the worker, its heartbeat stops
+    // and the scheduled reaper must recover this claim exactly once.
+    for (let heartbeat = 0; heartbeat < 4; heartbeat += 1) {
+      vi.advanceTimersByTime(10_000);
+      await t.mutation(api.chatQueue.touchRunner, {
+        runnerId: "adversarial-runner",
+        activeMessageId: first!.assistantId,
+        claimToken: "first-claim",
+        workerToken: WORKER,
+      });
+      await expect(t.mutation(api.chatQueue.reapStuck, { workerToken: WORKER }))
+        .resolves.toMatchObject({ requeued: 0 });
+    }
+
+    vi.advanceTimersByTime(CHAT_TURN_STALE_MS + 1);
+    await expect(t.mutation(api.chatQueue.reapStuck, { workerToken: WORKER }))
+      .resolves.toMatchObject({ requeued: 1 });
+    await expect(t.mutation(api.chatQueue.finalize, {
+      messageId: first!.assistantId,
+      threadId: "main",
+      claimToken: "first-claim",
+      status: "done",
+      finalText: "late answer",
+      workerToken: WORKER,
+    })).resolves.toBe(false);
+
+    const replacement = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: userId,
+      claimToken: "replacement-claim",
+      workerToken: WORKER,
+    });
+    expect(replacement?.attemptCount).toBe(2);
+    await expect(t.mutation(api.chatQueue.finalize, {
+      messageId: replacement!.assistantId,
+      threadId: "main",
+      claimToken: "replacement-claim",
+      status: "done",
+      finalText: "recovered answer",
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+  });
+
   it("ends visibly after the bounded attempt budget instead of losing the turn", async () => {
     const t = convexTest(schema, modules);
     const userId = await createTurn(t, "bounded-recovery");

@@ -63,6 +63,7 @@ import {
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
 import { StreamPublisher } from "./stream-publisher";
+import { callForegroundConvex } from "./foreground-convex-call";
 
 // Subscription brain: each queued chat turn runs the Codex CLI headlessly,
 // with metered API keys blanked and only the subscription
@@ -81,26 +82,7 @@ const HANDOFF_AFTER_MS = RUN_BUDGET_MS - FOREGROUND_HANDOFF_OVERLAP_MS;
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
-  const response = await fetch(`${CONVEX_URL}/api/${kind}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      path,
-      args: { ...((args ?? {}) as Record<string, unknown>), workerToken },
-      format: "json",
-    }),
-  });
-  const body = await response.json().catch(() => null) as {
-    status?: string;
-    value?: unknown;
-    errorMessage?: string;
-  } | null;
-  if (!response.ok || !body || body.status === "error") {
-    throw new Error(
-      `Convex ${kind} ${path} failed: ${String(body?.errorMessage ?? response.status).slice(0, 300)}`,
-    );
-  }
-  return body.value;
+  return await callForegroundConvex(CONVEX_URL, workerToken, kind, path, args);
 }
 
 async function convexMutation(path: string, args: unknown) {
