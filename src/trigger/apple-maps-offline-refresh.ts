@@ -50,6 +50,41 @@ type DuePreflight = {
   creation?: { _id: string; kind?: string; data?: string } | null;
 };
 
+function calendarPreflightChanged(previous: RegistryPreflight, next: RegistryPreflight): boolean {
+  return next.flightMarker !== previous.flightMarker
+    || next.flightStart !== previous.flightStart
+    || next.at !== previous.at
+    || next.flightTitle !== previous.flightTitle
+    // Google Calendar stores the explicit IANA zone alongside the instant.
+    // Madrid and Paris can share an offset, so an itinerary zone correction
+    // does not always move `at`; it still needs a fresh owner-approved update.
+    || next.timeZone !== previous.timeZone;
+}
+
+/**
+ * `buildAppleMapsOfflinePreflight` intentionally omits a payload when its
+ * calculated action time has already passed. Rebuild its owner-visible payload
+ * just before that time so a post-Gmail `too_late` result compares every
+ * deterministic Calendar field, including an all-day flight's 09:00 handoff.
+ */
+function lateFlightChangesCalendarPreflight(
+  previous: RegistryPreflight,
+  sourceKey: string,
+  flight: ConfirmedBooking,
+): boolean {
+  const rebuilt = buildAppleMapsOfflinePreflight({
+    city: previous.city,
+    flights: [{ ...flight, tripVerified: true }],
+    sourceKey,
+    // The current clock is already past the candidate action. A two-day
+    // synthetic clock is safely before its preceding-local-day handoff even
+    // across DST, so the pure builder exposes the payload we need to compare.
+    now: Number(flight.start) - 2 * 24 * 60 * 60_000,
+  });
+  // A malformed rebuilt candidate cannot safely preserve a receipt either.
+  return rebuilt.status !== "ready" || calendarPreflightChanged(previous, rebuilt.preflight);
+}
+
 export type AppleMapsOfflineRefreshDependencies = {
   query: ConvexCall;
   mutation: ConvexCall;
@@ -108,10 +143,12 @@ async function markPending(
   error: string,
   checkedAt: number,
   nextAt?: number,
+  calendarRefreshRequired = false,
 ): Promise<void> {
   await mutation("appleMapsOfflinePreflights:markPending", {
     id: row._id, expectedUpdatedAt: row.updatedAt, state, error, checkedAt,
     ...(nextAt === undefined ? {} : { nextRefreshAt: nextAt }),
+    ...(calendarRefreshRequired ? { calendarRefreshRequired: true } : {}),
   }).catch(() => {});
 }
 
@@ -120,10 +157,11 @@ async function refreshWindowNow(
   row: DuePreflight,
   preflightAt: number,
   now: () => number,
+  calendarRefreshRequired = false,
 ): Promise<number | undefined> {
   const checkedAt = now();
   if (isAppleMapsOfflinePreflightRefreshWindowOpen(preflightAt, checkedAt)) return checkedAt;
-  await markPending(mutation, row, "too_late", SAFE_REFRESH_WINDOW_CLOSED_ERROR, checkedAt);
+  await markPending(mutation, row, "too_late", SAFE_REFRESH_WINDOW_CLOSED_ERROR, checkedAt, undefined, calendarRefreshRequired);
   return undefined;
 }
 
@@ -162,13 +200,13 @@ async function refreshOne(
     return "pending";
   }
   if (!flight) {
-    const checkedAt = await refreshWindowNow(dependencies.mutation, row, row.preflight.at, dependencies.now);
+    const checkedAt = await refreshWindowNow(dependencies.mutation, row, row.preflight.at, dependencies.now, true);
     if (checkedAt === undefined) return "skipped";
     await markPending(dependencies.mutation, row, "needs_flight_confirmation", "The selected Gmail flight could not be confirmed", checkedAt);
     return "pending";
   }
   if (!stay || !matchesAppleMapsOfflineCityProof(stay, cityProof)) {
-    const checkedAt = await refreshWindowNow(dependencies.mutation, row, row.preflight.at, dependencies.now);
+    const checkedAt = await refreshWindowNow(dependencies.mutation, row, row.preflight.at, dependencies.now, true);
     if (checkedAt === undefined) return "skipped";
     await markPending(dependencies.mutation, row, "needs_city_confirmation", "The selected Gmail booked stay changed; Jarvis will not guess the city", checkedAt);
     return "pending";
@@ -181,21 +219,34 @@ async function refreshOne(
     now,
   });
   if (built.status === "too_late") {
-    await markPending(dependencies.mutation, row, "too_late", "The one-day-before preparation time has passed", now);
+    // We reached this only after re-reading the exact selected itinerary. An
+    // earlier replacement flight makes the old Calendar preview stale even
+    // though we intentionally leave the durable reminder unchanged. Retain a
+    // receipt for the rare unchanged-payload timing-only outcome.
+    await markPending(
+      dependencies.mutation,
+      row,
+      "too_late",
+      "The one-day-before preparation time has passed",
+      now,
+      undefined,
+      lateFlightChangesCalendarPreflight(row.preflight, row.sourceKey, flight),
+    );
     return "skipped";
   }
   if (built.status !== "ready") {
-    const checkedAt = await refreshWindowNow(dependencies.mutation, row, row.preflight.at, dependencies.now);
+    const checkedAt = await refreshWindowNow(dependencies.mutation, row, row.preflight.at, dependencies.now, true);
     if (checkedAt === undefined) return "skipped";
     await markPending(dependencies.mutation, row, "needs_flight_confirmation", "The selected Gmail flight needs confirmation", checkedAt, checkedAt + APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS);
     return "pending";
   }
+  const changed = calendarPreflightChanged(row.preflight, built.preflight);
   // The saved reminder remains owner-visible until this mutation succeeds. A
   // Gmail itinerary may move its replacement later, but that must not let a
   // slow lookup revise the existing reminder after *its* protected window has
   // begun. Protect whichever reminder becomes due first.
   const protectedReminderAt = Math.min(row.preflight.at, built.preflight.at);
-  const reminderAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now);
+  const reminderAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now, changed);
   if (reminderAt === undefined) return "skipped";
   const sourceKeyUpdateCutoffAt = protectedReminderAt - APPLE_MAPS_OFFLINE_REFRESH_SAFETY_WINDOW_MS;
 
@@ -219,10 +270,12 @@ async function refreshOne(
         "too_late",
         SAFE_REFRESH_WINDOW_CLOSED_ERROR,
         Math.max(dependencies.now(), sourceKeyUpdateCutoffAt),
+        undefined,
+        changed,
       );
       return "skipped";
     }
-    const checkedAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now);
+    const checkedAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now, changed);
     if (checkedAt === undefined) return "skipped";
     await markPending(dependencies.mutation, row, "pending_refresh", "Jarvis could not update the durable reminder", checkedAt, checkedAt + RETRY_AFTER_TRANSIENT_FAILURE_MS);
     return "pending";
@@ -234,10 +287,6 @@ async function refreshOne(
   // rather than claim it stayed unchanged. No later reminder or Hub mutation
   // is attempted in this branch.
   const completionAt = dependencies.now();
-  const changed = built.preflight.flightMarker !== row.preflight.flightMarker
-    || built.preflight.flightStart !== row.preflight.flightStart
-    || built.preflight.at !== row.preflight.at
-    || built.preflight.flightTitle !== row.preflight.flightTitle;
   const refreshedProof: AppleMapsOfflineCityProof = {
     ...cityProof,
     title: stay.title.slice(0, 180),

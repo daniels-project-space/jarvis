@@ -6,6 +6,7 @@ import {
   APPLE_MAPS_OFFLINE_REFRESH_INTERVAL_MS,
   refreshAppleMapsOfflinePreflights,
 } from "./apple-maps-offline-refresh";
+import { buildAppleMapsOfflinePreflight } from "../lib/apple-maps-offline";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -80,6 +81,46 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(createdTags).not.toContain(`source:${row.sourceKey}`);
     expect(payloads.map((payload) => payload.path)).not.toContain("todos:add");
     expect(payloads.map((payload) => payload.path)).not.toContain("todos:list");
+  });
+
+  it("requires a fresh Calendar approval when the exact itinerary's time zone changes without moving the instant", async () => {
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    const originalFlight = {
+      ...flight,
+      id: flightIdentity.messageId,
+      marker: preflight.flightMarker,
+      start: preflight.flightStart,
+      title: preflight.flightTitle,
+      timeZone: "Europe/Madrid",
+      tripVerified: true,
+    };
+    const baseline = buildAppleMapsOfflinePreflight({
+      city: preflight.city,
+      flights: [originalFlight],
+      sourceKey: row.sourceKey,
+      now,
+    });
+    if (baseline.status !== "ready") throw new Error("expected a ready baseline preflight");
+    const timeZoneRow = { ...row, preflight: baseline.preflight };
+    const timeZoneCorrectedFlight = {
+      ...originalFlight,
+      timeZone: "Europe/Paris",
+    };
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([timeZoneRow]),
+      mutation,
+      now: () => now,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? timeZoneCorrectedFlight : stay),
+    })).resolves.toEqual({ due: 1, refreshed: 1, pending: 0, skipped: 0 });
+
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.objectContaining({
+      calendarRefreshRequired: true,
+      preflight: expect.objectContaining({
+        at: baseline.preflight.at,
+        timeZone: "Europe/Paris",
+      }),
+    }));
   });
 
   it("reconciles an ambiguous Hub create by its stable tag before a scheduled retry can duplicate it", async () => {
@@ -176,9 +217,147 @@ describe("saved Apple Maps preflight maintenance", () => {
       state: "too_late",
       error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
     }));
+    const [, timingOnlyArgs] = mutation.mock.calls.find(([path]) => path === "appleMapsOfflinePreflights:markPending")!;
+    expect(timingOnlyArgs).not.toHaveProperty("calendarRefreshRequired");
     expect(mutation).not.toHaveBeenCalledWith("reminders:add", expect.anything());
     expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("invalidates Calendar approval when Gmail finds an earlier confirmed flight whose preflight is already too late", async () => {
+    const postLookupNow = Date.parse("2030-01-10T12:00:00Z");
+    const earlierFlight = {
+      ...flight,
+      id: "flight-replacement",
+      marker: "jarvis-gmail-booking:flight-replacement",
+      start: Date.parse("2030-01-11T09:00:00+01:00"),
+      end: Date.parse("2030-01-11T12:00:00+01:00"),
+    };
+    const currentStay = {
+      ...stay,
+      start: Date.parse("2030-01-09T12:00:00+01:00"),
+      end: Date.parse("2030-01-12T12:00:00+01:00"),
+    };
+    const oldPreflight = {
+      ...preflight,
+      flightStart: Date.parse("2030-01-14T09:00:00+01:00"),
+      at: Date.parse("2030-01-13T09:00:00+01:00"),
+    };
+    const earlierFlightRow = {
+      ...row,
+      preflight: oldPreflight,
+      cityProof: {
+        ...cityProof,
+        start: currentStay.start,
+        end: currentStay.end,
+        verifiedAt: postLookupNow - 1_000,
+      },
+    };
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([earlierFlightRow]),
+      mutation,
+      now: () => postLookupNow,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight" ? earlierFlight : currentStay),
+    })).resolves.toEqual({ due: 1, refreshed: 0, pending: 0, skipped: 1 });
+
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
+      state: "too_late",
+      error: "The one-day-before preparation time has passed",
+      calendarRefreshRequired: true,
+    }));
+    expect(mutation).not.toHaveBeenCalledWith("reminders:add", expect.anything());
+    expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
+  });
+
+  it("invalidates Calendar approval when an exact Gmail flight changes from all-day to timed in the too-late branch", async () => {
+    const postLookupNow = Date.parse("2030-01-10T07:30:00Z");
+    const allDayFlight = {
+      ...flight,
+      id: flightIdentity.messageId,
+      marker: preflight.flightMarker,
+      title: preflight.flightTitle,
+      start: Date.parse("2030-01-11T08:00:00+01:00"),
+      end: Date.parse("2030-01-11T11:00:00+01:00"),
+      allDay: true,
+    };
+    const allDayPreflight = buildAppleMapsOfflinePreflight({
+      city: preflight.city,
+      flights: [{ ...allDayFlight, tripVerified: true }],
+      sourceKey: row.sourceKey,
+      now: postLookupNow - 24 * 60 * 60_000,
+    });
+    if (allDayPreflight.status !== "ready") throw new Error("expected an all-day baseline preflight");
+    const currentStay = {
+      ...stay,
+      start: Date.parse("2030-01-09T12:00:00+01:00"),
+      end: Date.parse("2030-01-12T12:00:00+01:00"),
+    };
+    const allDayRow = {
+      ...row,
+      preflight: allDayPreflight.preflight,
+      cityProof: {
+        ...cityProof,
+        start: currentStay.start,
+        end: currentStay.end,
+        verifiedAt: postLookupNow - 1_000,
+      },
+    };
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([allDayRow]),
+      mutation,
+      now: () => postLookupNow,
+      lookupBooking: vi.fn(async (identity) => identity.selectionId === "booking-flight"
+        ? { ...allDayFlight, allDay: false }
+        : currentStay),
+    })).resolves.toEqual({ due: 1, refreshed: 0, pending: 0, skipped: 1 });
+
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
+      state: "too_late",
+      error: "The one-day-before preparation time has passed",
+      calendarRefreshRequired: true,
+    }));
+  });
+
+  it.each([
+    "selected flight disappears",
+    "selected stay no longer matches the city proof",
+    "selected flight loses its valid IANA time zone",
+  ])("invalidates Calendar approval when %s after Gmail lookup crosses the stored safe window", async (observedInvalidity) => {
+    let clock = now;
+    const mutation = vi.fn().mockResolvedValue({ ok: true });
+    const lookupBooking = vi.fn(async (identity) => {
+      if (identity.selectionId === "booking-flight") {
+        if (observedInvalidity === "selected flight disappears") {
+          clock = row.preflight.at;
+          return null;
+        }
+        if (observedInvalidity === "selected flight loses its valid IANA time zone") {
+          clock = row.preflight.at;
+          return { ...flight, timeZone: "UTC" };
+        }
+        return flight;
+      }
+      clock = row.preflight.at;
+      return { ...stay, location: "A different hotel, Seville" };
+    });
+
+    await expect(refreshAppleMapsOfflinePreflights({
+      query: vi.fn().mockResolvedValue([row]),
+      mutation,
+      now: () => clock,
+      lookupBooking,
+    })).resolves.toEqual({ due: 1, refreshed: 0, pending: 0, skipped: 1 });
+
+    expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
+      state: "too_late",
+      error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
+      calendarRefreshRequired: true,
+    }));
+    expect(mutation).not.toHaveBeenCalledWith("reminders:add", expect.anything());
   });
 
   it("rechecks the clock after Gmail lookup before it writes the durable reminder", async () => {
@@ -206,6 +385,7 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
       state: "too_late",
       error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
+      calendarRefreshRequired: true,
     }));
     expect(mutation).not.toHaveBeenCalledWith("reminders:add", expect.anything());
     expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
@@ -275,6 +455,7 @@ describe("saved Apple Maps preflight maintenance", () => {
     expect(mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:markPending", expect.objectContaining({
       state: "too_late",
       error: "The five-minute safe preflight refresh window has passed; the durable reminder stays unchanged.",
+      calendarRefreshRequired: true,
     }));
     expect(mutation).not.toHaveBeenCalledWith("appleMapsOfflinePreflights:completeRefresh", expect.anything());
     expect(fetch).not.toHaveBeenCalled();

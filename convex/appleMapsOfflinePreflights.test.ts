@@ -34,7 +34,10 @@ describe("saved Apple Maps offline preflight registry", () => {
   it("enumerates only explicit saved-trip preflights and mirrors a pending state onto that TripDoc", async () => {
     const t = convexTest(schema, modules);
     const creationId = await t.mutation(api.creations.create, {
-      kind: "trip", title: "Seville", data: JSON.stringify({ kind: "trip", title: "Seville", destination: "Seville" }), workerToken: WORKER,
+      kind: "trip", title: "Seville", data: JSON.stringify({
+        kind: "trip", title: "Seville", destination: "Seville",
+        offlineMapPreflight: { sourceKey: SOURCE_KEY, updatedAt: 99, calendarRefreshRequired: false },
+      }), workerToken: WORKER,
     });
     const otherTrip = await t.mutation(api.creations.create, {
       kind: "trip", title: "Rome", data: JSON.stringify({ kind: "trip", title: "Rome", destination: "Rome" }), workerToken: WORKER,
@@ -54,7 +57,9 @@ describe("saved Apple Maps offline preflight registry", () => {
       id: due[0]._id, expectedUpdatedAt: due[0].updatedAt, state: "pending_google", error: "Google connection is unavailable", checkedAt: 101, nextRefreshAt: 200, workerToken: WORKER,
     })).resolves.toEqual({ ok: true });
     const saved = await t.query(api.creations.get, { id: creationId, workerToken: WORKER });
-    expect(JSON.parse(String(saved?.data))).toMatchObject({ offlineMapPreflight: { refreshState: "pending_google", nextRefreshAt: 200 } });
+    expect(JSON.parse(String(saved?.data))).toMatchObject({ offlineMapPreflight: {
+      refreshState: "pending_google", nextRefreshAt: 200, updatedAt: 99,
+    } });
 
     const readyToClose = (await t.query(registry.due, { now: 200, limit: 8, workerToken: WORKER }))[0];
     await expect(t.mutation(registry.completeRefresh, {
@@ -76,6 +81,181 @@ describe("saved Apple Maps offline preflight registry", () => {
       refreshState: "too_late",
       refreshError: "The safe refresh window has closed; the durable reminder stays unchanged.",
       todoStatus: "needs_retry",
+      updatedAt: 99,
+    } });
+  });
+
+  it("rotates the Calendar approval revision only when the Calendar payload changed", async () => {
+    const t = convexTest(schema, modules);
+    const creationId = await t.mutation(api.creations.create, {
+      kind: "trip",
+      title: "Seville",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Seville",
+        destination: "Seville",
+        offlineMapPreflight: { sourceKey: SOURCE_KEY, updatedAt: 99, calendarRefreshRequired: false },
+      }),
+      workerToken: WORKER,
+    });
+    const registry = (api as any).appleMapsOfflinePreflights;
+    await t.mutation(registry.upsert, {
+      creationId,
+      sourceKey: SOURCE_KEY,
+      preflight,
+      flightIdentity: identity,
+      cityProofIdentity: { ...identity, messageId: "stay-1", marker: "jarvis-gmail-booking:stay-1", selectionId: "stay-opaque", kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+      cityProof: proof,
+      nextRefreshAt: 100,
+      workerToken: WORKER,
+    });
+    const [due] = await t.query(registry.due, { now: 100, limit: 8, workerToken: WORKER });
+    await expect(t.mutation(registry.completeRefresh, {
+      id: due._id,
+      expectedUpdatedAt: due.updatedAt,
+      preflight,
+      flightIdentity: identity,
+      cityProofIdentity: { ...identity, messageId: "stay-1", marker: "jarvis-gmail-booking:stay-1", selectionId: "stay-opaque", kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+      cityProof: proof,
+      checkedAt: 101,
+      nextRefreshAt: 200,
+      refreshState: "scheduled",
+      todoStatus: "existing",
+      calendarRefreshRequired: true,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: true });
+
+    const saved = await t.query(api.creations.get, { id: creationId, workerToken: WORKER });
+    expect(JSON.parse(String(saved?.data))).toMatchObject({ offlineMapPreflight: {
+      updatedAt: 101,
+      calendarRefreshRequired: true,
+    } });
+
+    const [unchangedDue] = await t.query(registry.due, { now: 200, limit: 8, workerToken: WORKER });
+    await expect(t.mutation(registry.completeRefresh, {
+      id: unchangedDue._id,
+      expectedUpdatedAt: unchangedDue.updatedAt,
+      preflight,
+      flightIdentity: identity,
+      cityProofIdentity: { ...identity, messageId: "stay-1", marker: "jarvis-gmail-booking:stay-1", selectionId: "stay-opaque", kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+      cityProof: proof,
+      checkedAt: 201,
+      nextRefreshAt: 300,
+      refreshState: "scheduled",
+      todoStatus: "existing",
+      calendarRefreshRequired: false,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: true });
+
+    const retained = await t.query(api.creations.get, { id: creationId, workerToken: WORKER });
+    expect(JSON.parse(String(retained?.data))).toMatchObject({ offlineMapPreflight: {
+      updatedAt: 101,
+      calendarRefreshRequired: true,
+    } });
+  });
+
+  it("invalidates the Calendar approval when Gmail needs an exact itinerary confirmation", async () => {
+    const t = convexTest(schema, modules);
+    const creationId = await t.mutation(api.creations.create, {
+      kind: "trip",
+      title: "Seville",
+      data: JSON.stringify({
+        kind: "trip",
+        title: "Seville",
+        destination: "Seville",
+        offlineMapPreflight: { sourceKey: SOURCE_KEY, updatedAt: 99, calendarRefreshRequired: false },
+      }),
+      workerToken: WORKER,
+    });
+    const registry = (api as any).appleMapsOfflinePreflights;
+    await t.mutation(registry.upsert, {
+      creationId,
+      sourceKey: SOURCE_KEY,
+      preflight,
+      flightIdentity: identity,
+      cityProofIdentity: { ...identity, messageId: "stay-1", marker: "jarvis-gmail-booking:stay-1", selectionId: "stay-opaque", kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+      cityProof: proof,
+      nextRefreshAt: 100,
+      workerToken: WORKER,
+    });
+    const [due] = await t.query(registry.due, { now: 100, limit: 8, workerToken: WORKER });
+    await expect(t.mutation(registry.markPending, {
+      id: due._id,
+      expectedUpdatedAt: due.updatedAt,
+      state: "needs_flight_confirmation",
+      error: "The selected Gmail flight could not be confirmed",
+      checkedAt: 101,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: true });
+
+    const saved = await t.query(api.creations.get, { id: creationId, workerToken: WORKER });
+    expect(JSON.parse(String(saved?.data))).toMatchObject({ offlineMapPreflight: {
+      updatedAt: 101,
+      calendarRefreshRequired: true,
+      refreshState: "needs_flight_confirmation",
+    } });
+  });
+
+  it("rotates a Calendar approval for an observed post-Gmail too-late change, but not timing-only bookkeeping", async () => {
+    const t = convexTest(schema, modules);
+    const registry = (api as any).appleMapsOfflinePreflights;
+    const setup = async (sourceKey: string) => {
+      const creationId = await t.mutation(api.creations.create, {
+        kind: "trip",
+        title: "Seville",
+        data: JSON.stringify({
+          kind: "trip",
+          title: "Seville",
+          destination: "Seville",
+          offlineMapPreflight: { sourceKey, updatedAt: 99, calendarRefreshRequired: false },
+        }),
+        workerToken: WORKER,
+      });
+      await t.mutation(registry.upsert, {
+        creationId,
+        sourceKey,
+        preflight,
+        flightIdentity: identity,
+        cityProofIdentity: { ...identity, messageId: `stay-${sourceKey[0]}`, marker: `jarvis-gmail-booking:stay-${sourceKey[0]}`, selectionId: `stay-opaque-${sourceKey[0]}`, kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+        cityProof: proof,
+        nextRefreshAt: 100,
+        workerToken: WORKER,
+      });
+      const [due] = await t.query(registry.due, { now: 100, limit: 8, workerToken: WORKER });
+      return { creationId, due };
+    };
+
+    const timingOnly = await setup("d".repeat(64));
+    await expect(t.mutation(registry.markPending, {
+      id: timingOnly.due._id,
+      expectedUpdatedAt: timingOnly.due.updatedAt,
+      state: "too_late",
+      error: "The safe preflight refresh window has passed",
+      checkedAt: 101,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: true });
+    const retained = await t.query(api.creations.get, { id: timingOnly.creationId, workerToken: WORKER });
+    expect(JSON.parse(String(retained?.data))).toMatchObject({ offlineMapPreflight: {
+      updatedAt: 99,
+      calendarRefreshRequired: false,
+      refreshState: "too_late",
+    } });
+
+    const changed = await setup("e".repeat(64));
+    await expect(t.mutation(registry.markPending, {
+      id: changed.due._id,
+      expectedUpdatedAt: changed.due.updatedAt,
+      state: "too_late",
+      error: "The one-day-before preparation time has passed",
+      checkedAt: 101,
+      calendarRefreshRequired: true,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: true });
+    const invalidated = await t.query(api.creations.get, { id: changed.creationId, workerToken: WORKER });
+    expect(JSON.parse(String(invalidated?.data))).toMatchObject({ offlineMapPreflight: {
+      updatedAt: 101,
+      calendarRefreshRequired: true,
+      refreshState: "too_late",
     } });
   });
 

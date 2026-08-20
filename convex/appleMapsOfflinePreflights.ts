@@ -114,6 +114,27 @@ function patchTripPreflight(creation: any, changes: Record<string, unknown>): st
   }
 }
 
+/**
+ * Calendar approval receipts seal the preflight's `updatedAt` value. Worker
+ * bookkeeping (a successful no-op Gmail check or a transient provider error)
+ * must not rotate that receipt: it has not changed the Calendar event the
+ * owner reviewed. Keep a separate registry timestamp for worker concurrency.
+ */
+function calendarApprovalState(creation: any): { revision?: number; refreshRequired: boolean } {
+  if (creation?.kind !== "trip" || typeof creation.data !== "string") return { refreshRequired: false };
+  try {
+    const doc = JSON.parse(creation.data);
+    const preflight = doc?.offlineMapPreflight;
+    const updatedAt = Number(preflight?.updatedAt);
+    return {
+      ...(Number.isFinite(updatedAt) ? { revision: updatedAt } : {}),
+      refreshRequired: preflight?.calendarRefreshRequired === true,
+    };
+  } catch {
+    return { refreshRequired: false };
+  }
+}
+
 /** Owner action: create or replace the one registry row for one saved TripDoc. */
 export const upsert = mutation({
   args: {
@@ -223,6 +244,17 @@ export const completeRefresh = mutation({
     if (!row) return { ok: false as const, reason: "not_found" as const };
     if (row.updatedAt !== a.expectedUpdatedAt) return { ok: false as const, reason: "stale" as const };
     const creation = await ctx.db.get(row.creationId);
+    // A receipt is invalidated only when the Calendar event's own contents
+    // changed. `row.updatedAt` still advances below, so concurrent workers
+    // retain their normal compare-and-swap protection.
+    const calendarApproval = calendarApprovalState(creation);
+    const approvalRevision = !a.calendarRefreshRequired
+      ? calendarApproval.revision
+      : undefined;
+    // A background no-op check must not clear the owner-visible re-approval
+    // requirement left by a previous itinerary change. Only an explicit
+    // foreground re-prepare writes it back to false.
+    const calendarRefreshRequired = a.calendarRefreshRequired || calendarApproval.refreshRequired;
     const data = patchTripPreflight(creation, {
       ...a.preflight,
       sourceKey: row.sourceKey,
@@ -232,8 +264,8 @@ export const completeRefresh = mutation({
       nextRefreshAt: a.nextRefreshAt,
       refreshError: a.refreshError,
       todoStatus: a.todoStatus,
-      calendarRefreshRequired: a.calendarRefreshRequired,
-      updatedAt: a.checkedAt,
+      calendarRefreshRequired,
+      updatedAt: approvalRevision ?? a.checkedAt,
     });
     if (!data || !creation) return { ok: false as const, reason: "trip_missing" as const };
     await ctx.db.patch(creation._id, { data, updatedAt: a.checkedAt });
@@ -261,6 +293,11 @@ export const markPending = mutation({
     error: v.string(),
     checkedAt: v.number(),
     nextRefreshAt: v.optional(v.number()),
+    // A post-Gmail, protected-window cutoff can have observed a changed
+    // itinerary even though it cannot safely replace the durable reminder.
+    // Keep this optional so pure timing/provider status bookkeeping retains
+    // the current Calendar approval receipt.
+    calendarRefreshRequired: v.optional(v.boolean()),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
@@ -273,12 +310,27 @@ export const markPending = mutation({
     if (!row) return { ok: false as const, reason: "not_found" as const };
     if (row.updatedAt !== a.expectedUpdatedAt) return { ok: false as const, reason: "stale" as const };
     const creation = await ctx.db.get(row.creationId);
+    // Gmail has either reported an identity problem or a new preflight could
+    // not be persisted. In both cases, do not leave an approval for the prior
+    // Calendar snapshot usable. A pure provider outage has no observed
+    // itinerary change, so that one deliberately keeps the current receipt.
+    const calendarApprovalStale = a.calendarRefreshRequired === true
+      || a.state === "pending_refresh"
+      || a.state === "needs_flight_confirmation"
+      || a.state === "needs_city_confirmation";
     const data = patchTripPreflight(creation, {
       refreshState: a.state,
       refreshError: a.error,
       lastCheckedAt: a.checkedAt,
       nextRefreshAt: a.nextRefreshAt,
-      updatedAt: a.checkedAt,
+      ...(calendarApprovalStale ? { calendarRefreshRequired: true } : {}),
+      // A missing Gmail connection or a final-window status does not alter
+      // the Calendar payload already shown to the owner, so preserve its
+      // receipt binding when one exists. Observed/unpersisted itinerary
+      // changes instead get a fresh revision and require re-approval.
+      updatedAt: calendarApprovalStale
+        ? a.checkedAt
+        : calendarApprovalState(creation).revision ?? a.checkedAt,
     });
     if (creation && data) await ctx.db.patch(creation._id, { data, updatedAt: a.checkedAt });
     await ctx.db.patch(row._id, {
