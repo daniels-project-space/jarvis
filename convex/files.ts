@@ -183,14 +183,19 @@ async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired"
     if (!file || file.status === "deleted") continue;
     const claimActive = file.status === "uploading" && Number(file.uploadClaimExpiresAt ?? 0) > now;
     const ingestRetryAfterMs = activeIngestCleanupRetryAfter(file, now);
+    const turnLeaseRetryAfterMs = await activeTurnFileLeaseRetryAfter(ctx, file._id, now);
     await ctx.db.patch(fileId, claimActive ? {
       cancelRequestedAt: now,
       errorCode: `upload_${status}`,
       libraryVisible: false,
       updatedAt: now,
-    } : ingestRetryAfterMs !== null ? {
+    } : ingestRetryAfterMs !== null || turnLeaseRetryAfterMs !== null ? {
       status: "deleting",
-      deletePreviousStatus: file.status === "processing" ? "processing" : file.deletePreviousStatus,
+      deletePreviousStatus: file.status === "processing"
+        ? "processing"
+        : file.status === "deleting"
+          ? file.deletePreviousStatus
+          : file.status,
       uploadClaimToken: undefined,
       uploadClaimExpiresAt: undefined,
       cancelRequestedAt: now,
@@ -208,7 +213,11 @@ async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired"
       libraryVisible: false,
       updatedAt: now,
     });
-    cleanup.push({ fileId: String(fileId), r2Keys: cleanupKeysForFile(file), deferred: claimActive || ingestRetryAfterMs !== null });
+    cleanup.push({
+      fileId: String(fileId),
+      r2Keys: cleanupKeysForFile(file),
+      deferred: claimActive || ingestRetryAfterMs !== null || turnLeaseRetryAfterMs !== null,
+    });
     retired += 1;
   }
   await ctx.db.patch(batch._id, { status, updatedAt: now });

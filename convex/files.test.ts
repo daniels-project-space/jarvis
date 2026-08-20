@@ -620,6 +620,112 @@ describe("durable private chat files", () => {
     expect(expired).toEqual([expect.objectContaining({ batchId: String(abandoned.batchId), retired: 1 })]);
   });
 
+  it("defers a partial-batch cancellation while its ready source is pinned for a foreground turn", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "e1".repeat(32);
+    const batch = await reserve(t, "main", "leased-partial.txt", sha256, 2);
+    const fileId = batch.files[0].fileId as any;
+    const uploadClaimToken = "upload-claim-leased-partial";
+    const ingestClaimToken = "ingest-claim-leased-partial";
+    await t.mutation(api.files.claimUpload, {
+      batchId: batch.batchId as any,
+      fileId,
+      claimToken: uploadClaimToken,
+      contentType: "text/plain",
+      sha256,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.markUploaded, {
+      batchId: batch.batchId as any,
+      fileId,
+      sizeBytes: 24,
+      contentType: "text/plain",
+      sha256,
+      claimToken: uploadClaimToken,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.claimIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: ingestClaimToken,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.completeIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: ingestClaimToken,
+      sha256,
+      detectedMimeType: "text/plain",
+      status: "ready",
+      summary: "Ready source from a still-open upload batch",
+      extractedTextR2Key: `files/${fileId}/v1/extracted.txt`,
+      extractedChars: 18,
+      chunks: [{ ordinal: 0, text: "BATCH_PRIVATE_SOURCE" }],
+      workerToken: WORKER,
+    });
+    const messageId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Use the partial upload source.",
+      requestId: "leased-partial-batch-turn",
+      fileIds: [fileId],
+      workerToken: WORKER,
+    });
+    const claim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId,
+      claimToken: "leased-partial-batch-turn-token",
+      workerToken: WORKER,
+    });
+    if (!claim) throw new Error("foreground claim missing");
+    const leaseId = "turn-file-lease-partial-batch-0001";
+    expect(await t.mutation(api.files.acquireTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      sources: turnLeaseSources(claim.attachments),
+      workerToken: WORKER,
+    })).toMatchObject({ leaseId, leased: true });
+
+    // The second row is still reserved, so this is a legitimate unfinished
+    // batch cancellation. The ready row must become durable-deleting while
+    // its R2 cleanup remains deferred behind the exact foreground lease.
+    const cancellation = await t.mutation(api.files.cancelBatch, {
+      batchId: batch.batchId as any,
+      workerToken: WORKER,
+    });
+    expect(cancellation?.cleanup).toContainEqual(expect.objectContaining({
+      fileId: String(fileId),
+      deferred: true,
+    }));
+    const durable = await t.run(async (ctx) => await ctx.db.get(fileId));
+    expect(durable).toMatchObject({ status: "deleting", deletePreviousStatus: "ready", libraryVisible: false });
+    expect(await t.mutation(api.files.acquireTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId: "turn-file-lease-partial-batch-late-0001",
+      sources: turnLeaseSources(claim.attachments),
+      workerToken: WORKER,
+    })).toMatchObject({ leased: false });
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ready: false });
+    expect(await t.mutation(api.files.finishDelete, { fileId, workerToken: WORKER })).toBe(false);
+
+    expect(await t.mutation(api.files.releaseTurnFileLeases, {
+      threadId: "main",
+      messageId,
+      assistantId: claim.assistantId,
+      claimToken: claim.claimToken,
+      leaseId,
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ready: true });
+    expect(await t.mutation(api.files.finishDelete, { fileId, workerToken: WORKER })).toBe(true);
+  });
+
   it("exposes a ready SHA duplicate and its trusted chunks to the ingest worker", async () => {
     const t = convexTest(schema, modules);
     const sha256 = "1".repeat(64);
