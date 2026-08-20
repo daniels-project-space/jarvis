@@ -190,6 +190,48 @@ describe("durable foreground chat recovery", () => {
     });
   });
 
+  it("keeps owner approval receipts out of later model history", async () => {
+    const t = convexTest(schema, modules);
+    const firstUserId = await createTurn(t, "approval-history-source");
+    const firstClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: firstUserId,
+      claimToken: "approval-history-source-claim",
+      workerToken: WORKER,
+    });
+    const gmailReceipt = `${"a".repeat(64)}.${"b".repeat(43)}`;
+    const calendarReceipt = `${"c".repeat(64)}.${"d".repeat(43)}`;
+    await expect(t.mutation(api.chatQueue.finalize, {
+      messageId: firstClaim!.assistantId,
+      threadId: "main",
+      claimToken: "approval-history-source-claim",
+      status: "done",
+      finalText: [
+        "Your draft is ready.",
+        `[jarvis-gmail-send-approval:${gmailReceipt}]`,
+        `[JARVIS_GOOGLE_CALENDAR_APPROVAL:${calendarReceipt}]`,
+      ].join("\n"),
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+
+    const nextUserId = await createTurn(t, "approval-history-next");
+    await t.run(async (ctx) => {
+      const source = await ctx.db.get(firstClaim!.assistantId);
+      if (!source) throw new Error("source assistant turn was not stored");
+      await ctx.db.patch(nextUserId, { createdAt: source.createdAt + 1 });
+    });
+    const nextClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: nextUserId,
+      claimToken: "approval-history-next-claim",
+      workerToken: WORKER,
+    });
+
+    expect(nextClaim?.history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "assistant", text: "Your draft is ready." }),
+    ]));
+    expect(JSON.stringify(nextClaim?.history)).not.toContain(gmailReceipt);
+    expect(JSON.stringify(nextClaim?.history)).not.toContain(calendarReceipt);
+  });
+
   it("seals an authoritative cancellation fence before retry and rejects every late worker write", async () => {
     const t = convexTest(schema, modules);
     const userId = await createTurn(t, "cancel-fence");

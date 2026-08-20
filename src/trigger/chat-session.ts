@@ -9,6 +9,7 @@ import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { shouldCaptureDurableMemory } from "../lib/current-state";
 import { memoryConfidence } from "../lib/memory-governance";
 import { visibleTurnText } from "../lib/host-context";
+import { stripAssistantApprovals } from "../lib/sanitize";
 import { buildContext } from "../lib/context";
 import { isSpeculativeResearchApplicable } from "../lib/speculative-research";
 import {
@@ -619,7 +620,10 @@ async function processChatQueue(
       // warm conversational worker hostage after Daniel already has a reply.
       if (turn.finalText.trim() && shouldCaptureDurableMemory(visibleUserText)) void tasks.trigger("jarvis-chat-memory", {
         userText: visibleUserText,
-        assistantText: turn.finalText,
+        // An approval marker is a live, owner-only bearer receipt rather than
+        // durable memory. The chat card is rendered from the stored turn; the
+        // memory worker never needs the token or its sealed proposal.
+        assistantText: stripAssistantApprovals(turn.finalText),
         sourceMessageId: targetMessageId ? String(targetMessageId) : undefined,
       }).catch(() => {});
       timings.push({
