@@ -157,6 +157,34 @@ describe("Google Calendar creation approval boundary", () => {
     expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
   });
 
+  it("does not issue a receipt when the protected connection-status read resolves unavailable", async () => {
+    mock.convexQuery.mockResolvedValueOnce(null);
+
+    await expect(executeTool("google_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+    })).resolves.toMatch(/could not be verified right now.*no approval receipt was created/i);
+
+    expect(mock.convexQuery).toHaveBeenCalledWith("googleAuth:getConnectionStatus", {});
+    expect(mock.issueCalendarApproval).not.toHaveBeenCalled();
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not issue a receipt when the protected connection-status read rejects", async () => {
+    mock.convexQuery.mockRejectedValueOnce(new Error("Convex unavailable"));
+
+    await expect(executeTool("google_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+    })).resolves.toMatch(/could not be verified right now.*no approval receipt was created/i);
+
+    expect(mock.convexQuery).toHaveBeenCalledWith("googleAuth:getConnectionStatus", {});
+    expect(mock.issueCalendarApproval).not.toHaveBeenCalled();
+    expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+
   it("rejects a calendar-looking date that does not exist", async () => {
     await expect(executeTool("google_calendar_create", {
       title: "Impossible date",
