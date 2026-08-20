@@ -196,6 +196,43 @@ describe("browser errand owner gate and sealed execution lifecycle", () => {
     expect(expired?.leaseUntil).toBeUndefined();
   });
 
+  it("lets maintenance expose a lost browser runner as an unknown outcome without starting another run", async () => {
+    const t = convexTest(schema, modules);
+    const errandId = await createProposal(t);
+    await enrollOwner(t);
+    await t.mutation(api.browserErrands.decide, { errandId, decision: "approved", authTokenHash: OWNER });
+    const receipt = await foregroundExecutionReceipt(t, errandId);
+    await expect(t.mutation(api.browserErrands.claim, {
+      errandId,
+      leaseToken: LEASE,
+      foregroundReceiptKey: receipt,
+      workerToken: WORKER,
+    })).resolves.toMatchObject({ ok: true });
+
+    const running = await t.query(api.browserErrands.get, { errandId, authTokenHash: OWNER });
+    const originalStartedAt = running?.startedAt;
+    vi.setSystemTime(new Date(Number(running?.leaseUntil) + 1));
+
+    await expect(t.mutation(api.browserErrands.expireStale, { workerToken: WORKER }))
+      .resolves.toEqual({ expired: 1 });
+
+    // The owner can now see a terminal recovery state, while the original
+    // execution is not replayed or replaced with a new browser lease.
+    const recovered = await t.query(api.browserErrands.get, { errandId, authTokenHash: OWNER });
+    expect(recovered).toMatchObject({
+      status: "failed",
+      startedAt: originalStartedAt,
+      result: expect.stringMatching(/outcome is unknown/i),
+    });
+    expect(recovered?.leaseToken).toBeUndefined();
+    expect(recovered?.leaseUntil).toBeUndefined();
+    expect(recovered?.browserDeadlineAt).toBeUndefined();
+    expect(await t.run(async (ctx) => await ctx.db
+      .query("chatTurnOwnerToolUses")
+      .withIndex("by_receipt", (q: any) => q.eq("receiptKey", receipt))
+      .collect())).toHaveLength(1);
+  });
+
   it("expires a stale approval before browser work starts", async () => {
     const t = convexTest(schema, modules);
     const errandId = await createProposal(t);

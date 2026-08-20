@@ -983,6 +983,11 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
   let cloudWorkspaceResumed = 0;
   let expiredCloudWorkspaceHolds = 0;
   let quarantinedDispatches = 0;
+  // Browser errands are never retried by maintenance. This bounded terminal
+  // sweep only makes a lost runner's unknown outcome visible to the owner.
+  const browserErrandsReaped = await convexMutation("browserErrands:expireStale", {})
+    .then((result: any) => Math.max(0, Math.trunc(Number(result?.expired) || 0)))
+    .catch(() => 0);
   let controllerSession = "unknown" as ReturnType<typeof controllerSessionAutonomousWorkStatus>;
   if (runtimeAttestation) {
     try {
@@ -1144,6 +1149,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
     cloudWorkspaceResumed,
     expiredCloudWorkspaceHolds,
     quarantinedDispatches,
+    browserErrandsReaped,
     controllerSession,
     appleMapsOfflinePreflights,
     migration,

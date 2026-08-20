@@ -560,6 +560,53 @@ describe("production Trigger worker authority harness", () => {
     expect(trigger.definitions.get("jarvis-agent-fleet-supervisor").cron).toBe("*/1 * * * *");
   });
 
+  it("reaps only expired browser leases during maintenance without launching browser or worker work", async () => {
+    const requests: MutationTrace[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as MutationTrace;
+      requests.push(body);
+      const value = (() => {
+        switch (body.path) {
+          case "jobs:migrateControlPlane":
+            return { steps: 0, complete: true, phase: null };
+          case "browserErrands:expireStale":
+            return { expired: 1 };
+          case "jobs:reapStale":
+            return { requeued: [], releasedDispatches: [], abandoned: [], expiredCloudWorkspaceHolds: [], quarantinedDispatches: [] };
+          case "controllerSession:status":
+            return { state: "repair_required", code: "rotation_uncertain" };
+          case "jobs:cloudWorkspaceOrphans":
+          case "reminders:due":
+            return [];
+          default:
+            return null;
+        }
+      })();
+      return new Response(JSON.stringify({ status: "success", value }), { status: 200 });
+    }));
+
+    await expect(runAgentMaintenance()).resolves.toMatchObject({
+      browserErrandsReaped: 1,
+      repairs: 0,
+      controllerSession: "repair_required",
+    });
+
+    expect(requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: "browserErrands:expireStale",
+        args: expect.objectContaining({ workerToken: WORKER }),
+      }),
+    ]));
+    expect(requests.map((request) => request.path)).not.toEqual(expect.arrayContaining([
+      "browserErrands:claim",
+      "browserErrands:finish",
+      "browserErrands:propose",
+      "jobs:enqueue",
+    ]));
+    expect(trigger.batchTrigger).not.toHaveBeenCalled();
+    expect(boundaries.configuredCloudWorkspaceProvider).not.toHaveBeenCalled();
+  });
+
   it("turns a hung cloud-workspace cleanup into a typed timeout", async () => {
     vi.useFakeTimers();
     try {
