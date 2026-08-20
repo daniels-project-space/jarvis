@@ -669,6 +669,48 @@ describe("production Trigger worker authority harness", () => {
     expect(requests.map((request) => request.path)).not.toContain("jobs:enqueue");
   });
 
+  it("leaves a due reminder recoverable when its durable in-app delivery cannot be recorded", async () => {
+    const requests: MutationTrace[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as MutationTrace;
+      requests.push(body);
+      if (body.path === "chatQueue:postAssistant") {
+        return new Response(JSON.stringify({ status: "error", errorMessage: "chat storage unavailable" }), { status: 503 });
+      }
+      const value = (() => {
+        switch (body.path) {
+          case "jobs:migrateControlPlane":
+            return { steps: 0, complete: true, phase: null };
+          case "jobs:reapStale":
+            return { requeued: [], releasedDispatches: [], abandoned: [], expiredCloudWorkspaceHolds: [], quarantinedDispatches: [] };
+          case "controllerSession:status":
+            return { state: "repair_required", code: "rotation_uncertain" };
+          case "jobs:cloudWorkspaceOrphans":
+            return [];
+          case "reminders:due":
+            return [{ _id: "reminder-retry", text: "Call the hotel", at: Date.now() - 60_000 }];
+          default:
+            return null;
+        }
+      })();
+      return new Response(JSON.stringify({ status: "success", value }), { status: 200 });
+    }));
+
+    await expect(runAgentMaintenance()).resolves.toMatchObject({ controllerSession: "repair_required" });
+
+    expect(requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "reminders:due" }),
+      expect.objectContaining({ path: "chatQueue:postAssistant" }),
+    ]));
+    expect(requests.map((request) => request.path)).not.toContain("reminders:complete");
+    expect(notifications.sendPush).toHaveBeenCalledWith(
+      "⏰ JARVIS reminder",
+      "Call the hotel",
+      "/",
+      expect.objectContaining({ ttl: 3600, urgency: "high", category: "reminder" }),
+    );
+  });
+
   it("checkpoints an expired worker watchdog instead of leaving its lease running", async () => {
     configureFakeControllerAuthority();
     const t = convexTest(schema, modules);
