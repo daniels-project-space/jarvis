@@ -1115,17 +1115,22 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
       const late = minutesLate > 4
         ? ` (set for ${new Date(reminder.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" })})`
         : "";
-      await convexMutation("chatQueue:postAssistant", {
+      // The chat row is the durable in-app delivery record. Do not
+      // acknowledge the reminder when that write fails: `reminders:due`
+      // reclaims its delivery lease after five minutes, while completing here
+      // would permanently lose the visible reminder.
+      const deliveredInApp = await convexMutation("chatQueue:postAssistant", {
         threadId: await chatThread(),
         text: `⏰ Reminder, sir — ${reminder.text}${late}`,
-      }).catch(() => {});
+      }).then(() => true).catch(() => false);
       const reminderTag = `reminder-${String(reminder._id).slice(-20)}`;
       await sendPush(
         "⏰ JARVIS reminder",
         String(reminder.text).slice(0, 140),
         "/",
-        { tag: reminderTag, topic: reminderTag, ttl: 3600, urgency: "high" },
+        { tag: reminderTag, topic: reminderTag, ttl: 3600, urgency: "high", category: "reminder" },
       ).catch(() => {});
+      if (!deliveredInApp) continue;
       await convexMutation("reminders:complete", { id: reminder._id }).catch(() => {});
     }
   } catch {
