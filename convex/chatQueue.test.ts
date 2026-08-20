@@ -215,7 +215,7 @@ describe("durable foreground chat recovery", () => {
 
     const nextUserId = await createTurn(t, "approval-history-next");
     await t.run(async (ctx) => {
-      const source = await ctx.db.get(firstClaim!.assistantId);
+      const source = await ctx.db.get(firstClaim!.assistantId as any) as { createdAt: number } | null;
       if (!source) throw new Error("source assistant turn was not stored");
       await ctx.db.patch(nextUserId, { createdAt: source.createdAt + 1 });
     });

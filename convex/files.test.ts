@@ -1029,7 +1029,7 @@ describe("durable private chat files", () => {
 
     const refs = await t.run(async (ctx) => await ctx.db
       .query("creationFileRefs")
-      .withIndex("by_creation_file", (q) => q.eq("creationId", creationId).eq("fileId", source.fileId))
+      .withIndex("by_creation_file", (q) => q.eq("creationId", creationId).eq("fileId", source.fileId as any))
       .collect());
     expect(refs).toHaveLength(1);
     expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
