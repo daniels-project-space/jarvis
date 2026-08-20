@@ -4,6 +4,7 @@ import { isProxy } from "node:util/types";
 import { codexModelFor, normalizeReasoningEffort } from "./model-policy";
 import { appendAgentMessageDelta } from "./codex-stream";
 import { redactSensitiveText } from "../lib/secret-redaction";
+import { hasAssistantApproval } from "../lib/sanitize";
 import { BoundedJsonLineDecoder } from "../lib/bounded-json-lines";
 import { hasExactKeys, isJsonRecord, parseStrictJson } from "../lib/bounded-json";
 import {
@@ -41,6 +42,7 @@ export type CodexDynamicToolHostContext = Readonly<{
 type ActiveTurn = {
   turnId: string;
   threadId: string;
+  conversationId: string;
   invocationContext?: ToolInvocationContext;
   toolHostContext?: CodexDynamicToolHostContext;
   toolAbortController: AbortController;
@@ -633,6 +635,7 @@ export class CodexAppServer {
       this.active.set(turnId, {
         turnId,
         threadId,
+        conversationId: input.conversationId,
         ...(invocationContext ? { invocationContext } : {}),
         ...(toolHostContext ? { toolHostContext } : {}),
         toolAbortController,
@@ -799,6 +802,11 @@ export class CodexAppServer {
       active.abortCleanup?.();
       active.toolAbortController.abort();
       this.active.delete(turnId);
+      // An approval marker is an owner-only bearer receipt. App-server threads
+      // retain their own unseen context, so forgetting only the durable chat
+      // history is insufficient: reset this routing handle before any next
+      // turn can reuse the receipt-bearing Codex thread.
+      if (hasAssistantApproval(active.text)) this.threads.delete(active.conversationId);
       active.resolve({ finalText: active.text, threadId: active.threadId, code: status === "completed" ? 0 : -1, stderr: status === "completed" ? "" : this.errorText(turn?.error ?? status) });
     }
   }

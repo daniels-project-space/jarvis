@@ -70,6 +70,11 @@ export function stripGmailSendApproval(text: string): string {
   return text.replace(GMAIL_SEND_APPROVAL_MARKER_RE, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/** A completed turn carrying this must not remain in a warm model thread. */
+export function hasAssistantApproval(text: string): boolean {
+  return extractGoogleCalendarApproval(text) !== null || extractGmailSendApproval(text) !== null;
+}
+
 /** Remove every opaque, owner-click approval receipt from visible/speech text. */
 export function stripAssistantApprovals(text: string): string {
   return stripGmailSendApproval(stripGoogleCalendarApproval(text));
