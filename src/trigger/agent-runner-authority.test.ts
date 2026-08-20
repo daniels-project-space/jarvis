@@ -160,6 +160,9 @@ function bridgeProductionRunnerToConvex(
       case "jobs:markCloudWorkspaceTerminated":
         value = await t.mutation(api.jobs.markCloudWorkspaceTerminated, body.args as any);
         break;
+      case "jobs:noteCloudWorkspaceCleanupBlocked":
+        value = await t.mutation(api.jobs.noteCloudWorkspaceCleanupBlocked, body.args as any);
+        break;
       case "jobs:touchHeartbeat":
         value = await t.mutation(api.jobs.touchHeartbeat, body.args as any);
         break;
@@ -1393,6 +1396,73 @@ describe("production Trigger worker authority harness", () => {
     expect(state.attempt).toMatchObject({ status: "needs_input" });
     expect(state.retry).toBeNull();
     expect(state.attention?.detail).toContain("rotation_uncertain");
+  });
+
+  it("bounds a hung active workspace cleanup after a controller-session hold", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-session-hold-cleanup-timeout");
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+    const workspace = {
+      provider: "cloudflare" as const,
+      providerWorkspaceId: "session-hold-cleanup-workspace",
+      providerSessionId: "session-hold-cleanup-session",
+      root: "/workspace/repository",
+      createdAt: Date.now(),
+    };
+    const terminate = vi.fn(() => new Promise<void>(() => {}));
+    const provider = { name: "cloudflare" as const, terminate };
+    (dependencies.configuredCloudWorkspaceProvider as any).mockReturnValue(provider);
+    (dependencies.prepareCloudWorkspaceExecution as any).mockImplementation(async (input: any) => {
+      if (!await input.bindWorkspace(workspace)) throw new Error("fake workspace binding rejected");
+      return { provider, workspace, archive: await input.hydrateArchive() };
+    });
+    const operatorSignal =
+      "JARVIS_CODEX_SESSION_UNAVAILABLE[rotation_uncertain]: re-enrol the controller-managed ChatGPT session; do not add an API key";
+    (dependencies.prepareSubscriptionEnv as any).mockResolvedValue({
+      env: { PATH: process.env.PATH, CODEX_HOME: "/tmp/jarvis-session-hold-cleanup" },
+      error: operatorSignal,
+    });
+
+    vi.useFakeTimers();
+    try {
+      const run = invokeHarness(reservation, "session-hold-cleanup-timeout-run", dependencies);
+      await vi.waitFor(() => expect(terminate).toHaveBeenCalledWith(workspace, "terminal"), {
+        interval: 10,
+        timeout: 300,
+      });
+      await vi.advanceTimersByTimeAsync(CLOUD_WORKSPACE_CLEANUP_TIMEOUT_MS);
+      await expect(run).resolves.toEqual({ processed: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1)).first(),
+    }));
+    expect(bridge.trace).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: "jobs:noteCloudWorkspaceCleanupBlocked",
+        args: expect.objectContaining({
+          jobId,
+          providerWorkspaceId: workspace.providerWorkspaceId,
+          providerSessionId: workspace.providerSessionId,
+          code: "timeout",
+        }),
+      }),
+    ]));
+    expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:markCloudWorkspaceTerminated");
+    expect(state.job).toMatchObject({ status: "needs_input", attempt: 1 });
+    expect(state.attempt).toMatchObject({
+      status: "needs_input",
+      cloudWorkspaceCleanupEligible: true,
+      cleanupBlockedCode: "timeout",
+      cleanupAttempts: 1,
+    });
+    expect(state.attempt?.providerTerminatedAt).toBeUndefined();
   });
 
   it.each(["prepare", "preflight"] as const)(

@@ -3327,13 +3327,32 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       } finally {
         if (providerWorkspace) {
           const terminalReason = await executionStatus().catch(() => "unknown") === "cancelled" ? "cancelled" : "terminal";
-          await cloudProvider.terminate(providerWorkspace, terminalReason).then(async () => {
+          // This is still inside the paid Trigger worker's finalizer. Use the
+          // same finite cleanup envelope as orphan maintenance so a hung
+          // provider teardown cannot consume the worker's full runtime cap.
+          // A timeout is recorded on the exact bound attempt for the cheap,
+          // bounded orphan reaper; it never starts a replacement specialist.
+          try {
+            await awaitCloudWorkspaceCleanup(
+              cloudProvider.terminate(providerWorkspace, terminalReason),
+              cloudProvider.name,
+            );
             await convexMutation("jobs:markCloudWorkspaceTerminated", {
               jobId: job.jobId, expectedAttempt,
-              providerWorkspaceId: providerWorkspace!.providerWorkspaceId,
-              providerSessionId: providerWorkspace!.providerSessionId,
+              providerWorkspaceId: providerWorkspace.providerWorkspaceId,
+              providerSessionId: providerWorkspace.providerSessionId,
             }).catch(() => false);
-          }).catch(() => undefined);
+          } catch (error) {
+            const failure = error instanceof CloudWorkspaceError ? error : null;
+            await convexMutation("jobs:noteCloudWorkspaceCleanupBlocked", {
+              jobId: job.jobId,
+              expectedAttempt,
+              providerWorkspaceId: providerWorkspace.providerWorkspaceId,
+              providerSessionId: providerWorkspace.providerSessionId,
+              code: failure?.code ?? "provider_unavailable",
+              reason: failure?.message ?? "active worker cloud-workspace cleanup failed",
+            }).catch(() => false);
+          }
         }
         if (deliveryHeartbeat) clearInterval(deliveryHeartbeat);
         leaseControl.close();
