@@ -202,13 +202,15 @@ async function refreshOne(
   try {
     // Reminders have the stable TripDoc source key, so Convex updates exactly
     // one pending reminder and retains an owner-cancelled one as cancelled.
-    const reminder = await dependencies.mutation("reminders:add", {
+    await dependencies.mutation("reminders:add", {
       text: built.preflight.reminderText,
       at: built.preflight.at,
       sourceKey: row.sourceKey,
       sourceKeyUpdateCutoffAt,
     });
-    if (reminder?.ok === false && reminder.reason === "source_update_cutoff_passed") {
+  } catch (error) {
+    const code = error instanceof Error ? error.message : String(error);
+    if (code.includes("source_update_cutoff_passed")) {
       // The server mutation evaluates this cutoff atomically. Its refusal is
       // definitive even if this Trigger worker began before the window did.
       await markPending(
@@ -220,7 +222,6 @@ async function refreshOne(
       );
       return "skipped";
     }
-  } catch {
     const checkedAt = await refreshWindowNow(dependencies.mutation, row, protectedReminderAt, dependencies.now);
     if (checkedAt === undefined) return "skipped";
     await markPending(dependencies.mutation, row, "pending_refresh", "Jarvis could not update the durable reminder", checkedAt, checkedAt + RETRY_AFTER_TRANSIENT_FAILURE_MS);

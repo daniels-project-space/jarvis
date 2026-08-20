@@ -27,7 +27,10 @@ export const add = mutation({
     // caller-side clock check: a delayed worker must not update or create the
     // source-keyed reminder after its owner-facing protection window starts.
     if (sourceKey && a.sourceKeyUpdateCutoffAt !== undefined && Date.now() >= a.sourceKeyUpdateCutoffAt) {
-      return { ok: false as const, reason: "source_update_cutoff_passed" as const };
+      // Keep the normal mutation's return type stable for every ordinary
+      // reminder caller. The Trigger refresher recognizes this fixed code and
+      // records the travel preflight as too late without touching Hub.
+      throw new Error("source_update_cutoff_passed");
     }
     // Automated travel and booking flows can retry after an interrupted web or
     // calendar handoff. Re-use the same pending reminder rather than creating

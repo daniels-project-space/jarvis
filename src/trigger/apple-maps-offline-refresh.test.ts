@@ -258,7 +258,7 @@ describe("saved Apple Maps preflight maintenance", () => {
         });
         // Simulates Convex evaluating its own clock after this worker's
         // caller-side preflight check already succeeded.
-        return { ok: false, reason: "source_update_cutoff_passed" };
+        throw new Error("source_update_cutoff_passed");
       }
       return { ok: true };
     });

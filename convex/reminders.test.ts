@@ -58,7 +58,7 @@ describe("retry-safe timed reminders", () => {
       sourceKey: SOURCE_KEY,
       sourceKeyUpdateCutoffAt: Date.now() - 1,
       workerToken: WORKER,
-    })).resolves.toEqual({ ok: false, reason: "source_update_cutoff_passed" });
+    })).rejects.toThrow("source_update_cutoff_passed");
 
     await expect(t.query(api.reminders.upcoming, { workerToken: WORKER })).resolves.toEqual([
       expect.objectContaining({ _id: initial, text: "Download Seville map" }),
