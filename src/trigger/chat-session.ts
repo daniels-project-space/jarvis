@@ -160,6 +160,8 @@ type QueueClaim = {
   assistantId: Id<"chatMessages">;
   claimToken: string;
   ownerToolAccess?: boolean;
+  ownerToolNames?: string[];
+  ownerCalendarAndHubTodo?: true;
   attemptCount: number;
   history: Array<{ role: string; text: string }>;
   researchPrefetch?: { basis: string; context: string; expiresAt: number };
@@ -718,6 +720,8 @@ async function processChatQueue(
                   messageId: String(claim.userMessageId),
                   assistantId: String(claim.assistantId),
                   claimToken: claim.claimToken,
+                  toolNames: claim.ownerToolNames ?? [],
+                  ...(claim.ownerCalendarAndHubTodo ? { calendarAndHubTodo: true as const } : {}),
                 },
               }
               : undefined,

@@ -121,6 +121,7 @@ const DIRECT_EMAIL_SUPPORT_RE = /^(?:email|contact)\s+[A-Za-z0-9][A-Za-z0-9 .&'�
 const DIRECT_GMAIL_SUBSCRIPTIONS_RE = /\b(?:subscriptions?|newsletters?)\b/i;
 const DIRECT_CALENDAR_LIST_RE = /^(?:(?:show|view|list|check|read|open)\b\s+|what(?:'s|\s+is)\s+on\s+)my\s+(?:google\s*)?(?:calendar|gcal|agenda|schedule)\b/i;
 const DIRECT_CALENDAR_CREATE_RE = /^(?:(?:add|create|schedule|put|make|remind)\b[^\r\n\"`“”‘’]{0,160}\b(?:to|on|in)\s+my\s+(?:google\s*)?(?:calendar|gcal)\b|(?:add|create|schedule|put|make|remind)\s+(?:an?\s+)?(?:event|meeting|appointment|reminder)\b)/i;
+const DIRECT_CALENDAR_AND_HUB_TODO_RE = /(?:\b(?:calendar|gcal)\b[\s\S]{0,100}\b(?:and|also|plus|as well as)\b[\s\S]{0,100}\b(?:jarvis(?:['’]s)?\s*)?(?:to[- ]?do(?:\s+list)?|todo(?:s)?|task\s+list)\b|\b(?:jarvis(?:['’]s)?\s*)?(?:to[- ]?do(?:\s+list)?|todo(?:s)?|task\s+list)\b[\s\S]{0,100}\b(?:and|also|plus|as well as)\b[\s\S]{0,100}\b(?:calendar|gcal)\b)/i;
 const DIRECT_CALENDAR_UPDATE_RE = /^(?:change|edit|update|move|reschedule)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
 const DIRECT_CALENDAR_DELETE_RE = /^(?:delete|remove|cancel)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
 // A generic “run the browser errand” is not authorization. The owner must
@@ -182,6 +183,7 @@ function directOwnerCommand(lead: string): string {
 export type ForegroundOwnerDirectToolGrant = Readonly<{
   toolNames: string[];
   browserErrandId?: string;
+  calendarAndHubTodo?: true;
 }>;
 
 export function foregroundOwnerToolGrantForDirectRequest(userText: string): ForegroundOwnerDirectToolGrant {
@@ -223,6 +225,7 @@ export function foregroundOwnerToolGrantForDirectRequest(userText: string): Fore
   return Object.freeze({
     toolNames: [...FOREGROUND_OWNER_TOOL_NAMES].filter((toolName) => granted.has(toolName)),
     ...(browserErrandId ? { browserErrandId } : {}),
+    ...(calendarCreate && DIRECT_CALENDAR_AND_HUB_TODO_RE.test(command) ? { calendarAndHubTodo: true as const } : {}),
   });
 }
 

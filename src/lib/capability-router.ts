@@ -1,6 +1,5 @@
 import {
   FOREGROUND_OWNER_TOOL_NAMES,
-  foregroundOwnerToolNamesForDirectRequest,
   SUBSCRIPTION_TOOL_NAMES,
   TOOL_BELT_NAMES,
   TOOL_BELTS,
@@ -29,6 +28,16 @@ export type CapabilityRoutingOptions = {
    * Google Calendar capabilities.
    */
   ownerForeground?: boolean;
+  /**
+   * Exact owner-only definitions minted at authenticated message admission
+   * and carried by the active claim. Never derive these from `intent`.
+   */
+  ownerToolNames?: readonly string[];
+  /**
+   * Admission-persisted companion scope for the normal Hub to-do mutation.
+   * It is valid only alongside an admitted Calendar-create capability.
+   */
+  ownerCalendarAndHubTodo?: boolean;
 };
 
 type CapabilityRule = {
@@ -195,9 +204,20 @@ export function rankCapabilities(
   const normalized = original.replace(/\s+/g, " ").toLowerCase();
   const explicitVisual = EXPLICIT_VISUAL_RE.test(normalized);
   const ranked = new Map<string, CapabilityCandidate>();
-  const allowedToolNames = options.ownerForeground
-    ? new Set([...SUBSCRIPTION_TOOL_NAMES, ...FOREGROUND_OWNER_TOOL_NAMES])
-    : SUBSCRIPTION_TOOL_NAMES;
+  const ownerToolNames = options.ownerForeground
+    ? [...new Set(options.ownerToolNames ?? [])].filter((name) => FOREGROUND_OWNER_TOOL_NAMES.has(name))
+    : [];
+  const ownerCalendarAndHubTodo = options.ownerForeground
+    && options.ownerCalendarAndHubTodo === true
+    && ownerToolNames.includes("google_calendar_create");
+  const allowedToolNames = new Set(SUBSCRIPTION_TOOL_NAMES);
+  ownerToolNames.forEach((name) => allowedToolNames.add(name));
+  // A foreground owner turn has an additional authority boundary. Prevent a
+  // model-supplied `activeTool` or explicit belt from surfacing the Hub to-do
+  // unless the original owner command minted this exact companion scope.
+  if (options.ownerForeground && !ownerCalendarAndHubTodo) {
+    allowedToolNames.delete("todo_add");
+  }
 
   const add = (candidate: CapabilityCandidate) => {
     if (!TOOL_BELTS[candidate.belt].has(candidate.tool) || !allowedToolNames.has(candidate.tool)) return;
@@ -220,7 +240,7 @@ export function rankCapabilities(
   // rule. This only chooses a foreground discovery lane; the endpoint grants
   // definitions solely from the direct-command scope recorded at admission.
   if (options.ownerForeground) {
-    foregroundOwnerToolNamesForDirectRequest(original).forEach((tool, index) => {
+    ownerToolNames.forEach((tool, index) => {
       const belt = beltsForTool(tool)[0];
       if (!belt) return;
       add({
@@ -235,6 +255,11 @@ export function rankCapabilities(
             : "owner_google_calendar",
       });
     });
+    // The dual destination scope was fixed at owner-message admission and is
+    // carried in the active claim. Never infer it from dynamic model intent.
+    if (ownerCalendarAndHubTodo) {
+      add({ belt: "core", tool: "todo_add", score: 184, visual: false, reason: "owner_calendar_and_hub_todo" });
+    }
   }
 
   const activeTool = String(options.activeTool ?? "").trim();

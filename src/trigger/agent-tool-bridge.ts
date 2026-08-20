@@ -22,6 +22,10 @@ import {
 export const JARVIS_AGENT_TOOL_ENDPOINT = "https://jarvis-orcin-six.vercel.app/api/agent-tool";
 export const JARVIS_FOREGROUND_OWNER_TOOL_ENDPOINT = "https://jarvis-orcin-six.vercel.app/api/foreground-owner-tool";
 
+type ForegroundOwnerToolHostTurn = NonNullable<
+  CodexDynamicToolHostContext["foregroundOwnerToolTurn"]
+>;
+
 export const JARVIS_DYNAMIC_TOOLS: CodexDynamicToolSpec[] = [
   {
     type: "function",
@@ -289,9 +293,16 @@ export class AgentToolBridge {
 
   private foregroundOwnerTurn(
     hostContext?: CodexDynamicToolHostContext,
-  ): ForegroundOwnerToolTurn | null {
+  ): ForegroundOwnerToolHostTurn | null {
     const turn = hostContext?.foregroundOwnerToolTurn;
     return turn && this.ownerToolReceiptSecret ? turn : null;
+  }
+
+  private hasCalendarAndHubTodoScope(turn: ForegroundOwnerToolHostTurn | null): boolean {
+    return Boolean(
+      turn?.calendarAndHubTodo === true
+      && turn.toolNames?.includes("google_calendar_create"),
+    );
   }
 
   private async ownerRequest(
@@ -338,8 +349,14 @@ export class AgentToolBridge {
     const activeTool = typeof args?.activeTool === "string" ? args.activeTool.trim().slice(0, 120) : undefined;
     const explicitBelt = isToolBeltName(args?.belt) ? args.belt : undefined;
     const ownerTurn = this.foregroundOwnerTurn(hostContext);
+    const ownerCalendarAndHubTodo = this.hasCalendarAndHubTodoScope(ownerTurn);
     const ranking = intent
-      ? rankCapabilities(intent, { activeTool, ownerForeground: Boolean(ownerTurn) })
+      ? rankCapabilities(intent, {
+        activeTool,
+        ownerForeground: Boolean(ownerTurn),
+        ownerToolNames: ownerTurn?.toolNames,
+        ownerCalendarAndHubTodo,
+      })
       : null;
     const belt: ToolBeltName | undefined = explicitBelt ?? ranking?.candidates[0]?.belt ?? (intent ? "core" : undefined);
     if (!belt) return failureResult("invalid_request", "Provide a valid Jarvis tool belt or the current intent.");
@@ -352,7 +369,22 @@ export class AgentToolBridge {
       { operation: "discover", target: belt },
       signal,
     );
-    if (!ranking) return response;
+    if (!ranking) {
+      // An explicit model-selected belt cannot bypass the admission scope.
+      // Keep ordinary, hostless discovery unchanged, but remove Hub to-do
+      // metadata from a Calendar-only owner turn before it reaches the model.
+      if (!ownerTurn || ownerCalendarAndHubTodo || !response.success) return response;
+      const text = response.contentItems[0]?.type === "inputText" ? response.contentItems[0].text : "";
+      try {
+        const definitions = JSON.parse(text);
+        if (!Array.isArray(definitions)) {
+          return failureResult("invalid_response", "Jarvis tool discovery returned an invalid definition list.");
+        }
+        return result(JSON.stringify(definitions.filter((definition) => record(definition)?.name !== "todo_add")), true);
+      } catch {
+        return failureResult("invalid_response", "Jarvis tool discovery returned malformed JSON.");
+      }
+    }
 
     const ownerNames = ownerTurn
       ? ranking.candidates
@@ -392,7 +424,10 @@ export class AgentToolBridge {
     const rankedNames = ranking.candidates
       .filter((candidate) => candidate.belt === belt)
       .map((candidate) => candidate.tool);
-    const definitionsByName = new Map(definitions.flatMap((definition) => {
+    const scopedDefinitions = ownerTurn && !ownerCalendarAndHubTodo
+      ? definitions.filter((definition) => record(definition)?.name !== "todo_add")
+      : definitions;
+    const definitionsByName = new Map(scopedDefinitions.flatMap((definition) => {
       const candidate = record(definition);
       return typeof candidate?.name === "string" ? [[candidate.name, definition] as const] : [];
     }));
@@ -425,6 +460,10 @@ export class AgentToolBridge {
     }
     const toolName = name.trim();
     if (signal?.aborted) return cancelledResult();
+    const ownerTurn = this.foregroundOwnerTurn(hostContext);
+    if (toolName === "todo_add" && ownerTurn && !this.hasCalendarAndHubTodoScope(ownerTurn)) {
+      return failureResult("authorization_denied", "The original owner message did not authorize a Jarvis to-do addition.");
+    }
     if (this.authorizeTool) {
       const messageId = invocationContext?.userMessageId;
       if (!messageId) return failureResult("authorization_denied", "This tool call has no trusted user-message provenance.");
@@ -440,7 +479,6 @@ export class AgentToolBridge {
       }
     }
     if (isForegroundOwnerToolName(toolName)) {
-      const ownerTurn = this.foregroundOwnerTurn(hostContext);
       if (!ownerTurn || !callId) {
         return failureResult("authorization_denied", "This owner-only tool is unavailable outside its authenticated foreground turn.");
       }

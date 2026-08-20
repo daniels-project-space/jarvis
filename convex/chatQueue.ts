@@ -340,6 +340,7 @@ async function admitMessage(
       messageId: id,
       threadId,
       toolNames: ownerToolNames,
+      ...(ownerToolGrant.calendarAndHubTodo ? { calendarAndHubTodo: true } : {}),
       ...(ownerToolGrant.browserErrandId ? { browserErrandId: ownerToolGrant.browserErrandId } : {}),
       issuedAt: createdAt,
       expiresAt: createdAt + FOREGROUND_OWNER_TOOL_GRANT_TTL_MS,
@@ -1030,19 +1031,28 @@ async function claimPending(
     .query("chatTurnOwnerToolGrants")
     .withIndex("by_message", (q: any) => q.eq("messageId", pending._id))
     .first();
-  const ownerToolAccess = Boolean(
+  const liveOwnerToolGrant = Boolean(
     ownerToolGrant
       && ownerToolGrant.threadId === pending.threadId
       && ownerToolGrant.expiresAt > now
-      && Array.isArray(ownerToolGrant.toolNames)
-      && ownerToolGrant.toolNames.some((name: unknown) =>
-        isForegroundOwnerToolName(name)
-        && (name !== "browser_errand_run" || (
-          typeof ownerToolGrant.browserErrandId === "string"
-          && BROWSER_ERRAND_ID_RE.test(ownerToolGrant.browserErrandId)
-        )),
-      ),
+      && Array.isArray(ownerToolGrant.toolNames),
   );
+  const browserErrandId = typeof ownerToolGrant?.browserErrandId === "string"
+    && BROWSER_ERRAND_ID_RE.test(ownerToolGrant.browserErrandId)
+    ? ownerToolGrant.browserErrandId
+    : undefined;
+  // Carry only the exact, admission-persisted scope into this active claim.
+  // Model-generated wording and the remaining conversation never participate
+  // in this decision.
+  const ownerToolNames = liveOwnerToolGrant
+    ? [...FOREGROUND_OWNER_TOOL_NAMES].filter((name) =>
+      ownerToolGrant.toolNames.includes(name)
+      && (name !== "browser_errand_run" || Boolean(browserErrandId)),
+    )
+    : [];
+  const ownerToolAccess = ownerToolNames.length > 0;
+  const ownerCalendarAndHubTodo = ownerToolNames.includes("google_calendar_create")
+    && ownerToolGrant?.calendarAndHubTodo === true;
 
   const all = await ctx.db
     .query("chatMessages")
@@ -1144,6 +1154,8 @@ async function claimPending(
     assistantId,
     claimToken,
     ownerToolAccess,
+    ...(ownerToolAccess ? { ownerToolNames } : {}),
+    ...(ownerCalendarAndHubTodo ? { ownerCalendarAndHubTodo: true } : {}),
     attemptCount,
     history,
     researchPrefetch,
@@ -1324,6 +1336,7 @@ export const turnCancellationForWorker = query({
 type ForegroundOwnerToolLiveGrant = {
   toolNames: string[];
   browserErrandId?: string;
+  calendarAndHubTodo?: true;
 };
 
 async function foregroundOwnerToolGrantForLiveClaim(
@@ -1371,6 +1384,9 @@ async function foregroundOwnerToolGrantForLiveClaim(
   );
   return {
     toolNames,
+    ...(toolNames.includes("google_calendar_create") && grant.calendarAndHubTodo === true
+      ? { calendarAndHubTodo: true as const }
+      : {}),
     ...(toolNames.includes("browser_errand_run") && browserErrandId ? { browserErrandId } : {}),
   };
 }

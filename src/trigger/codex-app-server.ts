@@ -29,6 +29,10 @@ export type CodexForegroundOwnerToolTurn = Readonly<{
   messageId: string;
   assistantId: string;
   claimToken: string;
+  // Immutable, admission-derived owner scope. This host-only context never
+  // crosses the app-server protocol or becomes model-visible tool input.
+  toolNames?: readonly string[];
+  calendarAndHubTodo?: true;
 }>;
 
 // Host-only authority is intentionally distinct from ToolInvocationContext.
@@ -380,7 +384,13 @@ function normalizeDynamicToolHostContext(value: unknown): CodexDynamicToolHostCo
     throw new Error("foreground owner tool turn is invalid");
   }
   const fields = turn as Record<string, unknown>;
-  if (Object.keys(fields).some((key) => key !== "messageId" && key !== "assistantId" && key !== "claimToken")) {
+  if (Object.keys(fields).some((key) =>
+    key !== "messageId"
+    && key !== "assistantId"
+    && key !== "claimToken"
+    && key !== "toolNames"
+    && key !== "calendarAndHubTodo"
+  )) {
     throw new Error("foreground owner tool turn contains unknown fields");
   }
   const valid = (candidate: unknown): candidate is string => typeof candidate === "string"
@@ -388,11 +398,26 @@ function normalizeDynamicToolHostContext(value: unknown): CodexDynamicToolHostCo
   if (!valid(fields.messageId) || !valid(fields.assistantId) || !valid(fields.claimToken)) {
     throw new Error("foreground owner tool turn identifiers are invalid");
   }
+  const toolNames = fields.toolNames;
+  if (
+    toolNames !== undefined
+    && (!Array.isArray(toolNames)
+      || toolNames.length > 16
+      || toolNames.some((name) => typeof name !== "string" || !/^[a-z][a-z0-9_]{0,95}$/.test(name))
+      || new Set(toolNames).size !== toolNames.length)
+  ) {
+    throw new Error("foreground owner tool scope is invalid");
+  }
+  if (fields.calendarAndHubTodo !== undefined && fields.calendarAndHubTodo !== true) {
+    throw new Error("foreground owner tool companion scope is invalid");
+  }
   return Object.freeze({
     foregroundOwnerToolTurn: Object.freeze({
       messageId: fields.messageId,
       assistantId: fields.assistantId,
       claimToken: fields.claimToken,
+      ...(toolNames ? { toolNames: Object.freeze([...toolNames]) } : {}),
+      ...(fields.calendarAndHubTodo === true ? { calendarAndHubTodo: true as const } : {}),
     }),
   });
 }

@@ -415,6 +415,7 @@ describe("foreground agent tool bridge", () => {
         messageId: "message-1",
         assistantId: "assistant-1",
         claimToken: "claim-1",
+        toolNames: ["gmail_search", "gmail_read", "gmail_draft_reply"],
       },
     } as const;
 
@@ -471,6 +472,7 @@ describe("foreground agent tool bridge", () => {
         messageId: "message-1",
         assistantId: "assistant-1",
         claimToken: "claim-1",
+        toolNames: ["email_support"],
       },
     } as const;
 
@@ -503,6 +505,109 @@ describe("foreground agent tool bridge", () => {
       args: { company: "Rakuten", ask: "Please explain EU cashback claims." },
     });
     expect(requests.filter(({ url, init }) => url.pathname.endsWith("/agent-tool") && init?.method === "POST")).toEqual([]);
+  });
+
+  it("uses the admission-persisted dual scope for Hub to-do discovery and invocation", async () => {
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      ownerEndpoint: "https://jarvis.test/api/foreground-owner-tool",
+      ownerToolReceiptSecret: "w".repeat(48),
+      fetchImplementation: async (input, init) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/foreground-owner-tool")) {
+          return Response.json([
+            { name: "google_calendar_list", description: "List Calendar." },
+            { name: "google_calendar_create", description: "Prepare Calendar approval." },
+          ]);
+        }
+        if (init?.method === "GET") {
+          return Response.json([{ name: "todo_add", description: "Add a Hub to-do." }]);
+        }
+        return Response.json({ result: "Hub to-do added." });
+      },
+    });
+    const calendarOnly = {
+      foregroundOwnerToolTurn: {
+        messageId: "message-1",
+        assistantId: "assistant-1",
+        claimToken: "claim-1",
+        toolNames: ["google_calendar_list", "google_calendar_create"],
+      },
+    } as const;
+    const calendarAndTodo = {
+      foregroundOwnerToolTurn: {
+        ...calendarOnly.foregroundOwnerToolTurn,
+        calendarAndHubTodo: true,
+      },
+    } as const;
+    const modelSuppliedIntent = "Add a reminder to my Google Calendar and Jarvis to-do list tomorrow.";
+
+    const spoofed = await bridge.invoke(dynamicCall(
+      "jarvis_get_tools",
+      { intent: modelSuppliedIntent },
+      undefined,
+      undefined,
+      calendarOnly,
+    ));
+    expect(spoofed.success).toBe(true);
+    const spoofedPayload = JSON.parse(
+      spoofed.contentItems[0].type === "inputText" ? spoofed.contentItems[0].text : "{}",
+    );
+    expect(spoofedPayload.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "google_calendar_list",
+      "google_calendar_create",
+    ]);
+
+    // An explicit belt is another model-controlled path and must not expose
+    // the normal core definition on a Calendar-only owner turn.
+    const explicitCore = await bridge.invoke(dynamicCall(
+      "jarvis_get_tools",
+      { belt: "core" },
+      undefined,
+      undefined,
+      calendarOnly,
+    ));
+    expect(JSON.parse(
+      explicitCore.contentItems[0].type === "inputText" ? explicitCore.contentItems[0].text : "null",
+    )).toEqual([]);
+
+    const denied = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "todo_add", args: { text: "Call the dentist" } },
+      { userMessageId: "message-1" },
+      undefined,
+      calendarOnly,
+    ));
+    expect(denied.success).toBe(false);
+
+    const permitted = await bridge.invoke(dynamicCall(
+      "jarvis_get_tools",
+      { intent: modelSuppliedIntent },
+      undefined,
+      undefined,
+      calendarAndTodo,
+    ));
+    expect(permitted.success).toBe(true);
+    const permittedPayload = JSON.parse(
+      permitted.contentItems[0].type === "inputText" ? permitted.contentItems[0].text : "{}",
+    );
+    expect(permittedPayload.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "google_calendar_list",
+      "google_calendar_create",
+      "todo_add",
+    ]);
+    const added = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "todo_add", args: { text: "Call the dentist" } },
+      { userMessageId: "message-1" },
+      undefined,
+      calendarAndTodo,
+    ));
+    expect(added.success).toBe(true);
+    expect(requests.filter(({ url, init }) => url.pathname.endsWith("/agent-tool") && init?.method === "POST"))
+      .toHaveLength(1);
   });
 
   it("binds a foreground browser run receipt to its exact errand and rejects injected steps before any request", async () => {
