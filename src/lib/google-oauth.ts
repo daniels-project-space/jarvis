@@ -2,7 +2,11 @@ import "server-only";
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { controlQuery } from "./control-session";
-import { GOOGLE_GMAIL_MODIFY_SCOPE, hasGoogleScopes } from "./google-scopes";
+import {
+  GOOGLE_GMAIL_MODIFY_SCOPE,
+  GOOGLE_GMAIL_READONLY_SCOPE,
+  hasGoogleScopes,
+} from "./google-scopes";
 
 // Google OAuth connect infrastructure — shared access-token helper. This file
 // owns:
@@ -268,14 +272,27 @@ export async function getGoogleAccessToken(): Promise<string> {
  */
 export async function getGoogleAccessTokenForGmail(requiredScopes: readonly string[]): Promise<string> {
   const credentials = await loadCredentials();
-  if (
-    credentials.scope
-    && !hasGoogleScopes(credentials.scope, requiredScopes)
+  const requiresModify = requiredScopes.includes(GOOGLE_GMAIL_MODIFY_SCOPE);
+  const exactReadOnly = requiredScopes.length === 1 && requiredScopes[0] === GOOGLE_GMAIL_READONLY_SCOPE;
+  const unavailable = () => new GoogleOAuthError(
+    "Gmail inbox modifications are unavailable because Jarvis's Google connection does not grant the historical Gmail modify permission. Nothing changed.",
+  );
+  const reconnect = () => new GoogleOAuthError(
+    "Google Gmail is not connected with the required limited Gmail permission. Reconnect Google from Options to grant Gmail access.",
+  );
+
+  // A legacy env-var triplet contains no durable scope record. Preserve only
+  // its historical booking/read capability; it must never become authority
+  // to compose, send, or mutate Gmail merely because the provider might have
+  // granted more than the app can prove.
+  if (credentials.scope === undefined) {
+    if (!exactReadOnly) throw requiresModify ? unavailable() : reconnect();
+  } else if (
+    !hasGoogleScopes(credentials.scope, requiredScopes)
     && !hasGoogleScopes(credentials.scope, [GOOGLE_GMAIL_MODIFY_SCOPE])
   ) {
-    throw new GoogleOAuthError(
-      "Google Gmail is not connected with the required limited Gmail permission. Reconnect Google from Options to grant Gmail access.",
-    );
+    if (requiresModify) throw unavailable();
+    throw reconnect();
   }
   const key = credentialCacheKey(credentials);
   if (
