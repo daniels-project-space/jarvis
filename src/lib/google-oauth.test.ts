@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { GOOGLE_GMAIL_COMPOSE_SCOPE, GOOGLE_GMAIL_READONLY_SCOPE } from "./google-scopes";
+import {
+  GOOGLE_GMAIL_COMPOSE_SCOPE,
+  GOOGLE_GMAIL_MODIFY_SCOPE,
+  GOOGLE_GMAIL_READONLY_SCOPE,
+} from "./google-scopes";
 
 const mock = vi.hoisted(() => ({
   controlQuery: vi.fn(async (): Promise<unknown> => {
@@ -74,6 +78,19 @@ describe("Google OAuth access-token cache", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("allows unscoped legacy credentials only for read-only Gmail", async () => {
+    process.env.GMAIL_BOOKINGS_CLIENT_ID = "client";
+    process.env.GMAIL_BOOKINGS_CLIENT_SECRET = "secret";
+    process.env.GMAIL_BOOKINGS_REFRESH_TOKEN = "refresh";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const { getGoogleAccessTokenForGmail } = await import("./google-oauth");
+
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_COMPOSE_SCOPE])).rejects.toThrow(/Reconnect Google/i);
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_MODIFY_SCOPE])).rejects.toThrow(/inbox modifications are unavailable/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("fails closed before contacting Google when a stored connection lacks the requested Gmail grant", async () => {
     process.env.GOOGLE_CLIENT_ID = "client";
     process.env.GOOGLE_CLIENT_SECRET = "secret";
@@ -87,6 +104,22 @@ describe("Google OAuth access-token cache", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_COMPOSE_SCOPE])).rejects.toThrow(/Gmail permission/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not offer reconnect as a way to obtain Gmail modify authority", async () => {
+    process.env.GOOGLE_CLIENT_ID = "client";
+    process.env.GOOGLE_CLIENT_SECRET = "secret";
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    const { encryptGoogleRefreshToken, getGoogleAccessTokenForGmail } = await import("./google-oauth");
+    mock.controlQuery.mockResolvedValueOnce({
+      encryptedRefreshToken: encryptGoogleRefreshToken("refresh-token"),
+      scope: `${GOOGLE_GMAIL_READONLY_SCOPE} ${GOOGLE_GMAIL_COMPOSE_SCOPE}`,
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_MODIFY_SCOPE])).rejects.toThrow(/inbox modifications are unavailable/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
