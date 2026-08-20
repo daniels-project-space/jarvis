@@ -20,6 +20,11 @@ type PendingBrowserErrand = {
   };
 };
 
+type UnknownBrowserErrandOutcome = {
+  _id: string;
+  objective: string;
+};
+
 type DecisionState = {
   errandId: string;
   state: "working" | "done" | "error";
@@ -43,6 +48,10 @@ function actionSummary(errand: PendingBrowserErrand): string {
  */
 export function BrowserErrandApprovals({ owner }: { owner: boolean }) {
   const pending = useJarvisQuery(api.browserErrands.pending, owner ? {} : "skip") as PendingBrowserErrand[] | undefined;
+  const unknownOutcomes = useJarvisQuery(
+    api.browserErrands.unknownOutcomes,
+    owner ? {} : "skip",
+  ) as UnknownBrowserErrandOutcome[] | undefined;
   const [decision, setDecision] = useState<DecisionState>(null);
 
   useEffect(() => {
@@ -77,15 +86,34 @@ export function BrowserErrandApprovals({ owner }: { owner: boolean }) {
     }
   };
 
-  if (!owner || !pending?.length) return null;
+  if (!owner || (!pending?.length && !unknownOutcomes?.length)) return null;
 
   return (
     <section
       data-browser-errand-approvals
-      aria-label="Browser errands awaiting your approval"
+      aria-label="Browser errand approval and recovery status"
       className="space-y-2 border-b border-amber/15 pb-3"
     >
-      {pending.map((errand) => {
+      {unknownOutcomes?.map((errand) => (
+        <article
+          key={errand._id}
+          data-browser-errand-recovery={errand._id}
+          className="rounded-xl border border-amber/30 bg-amber/[0.055] px-3 py-2.5 text-xs text-ice"
+        >
+          <p className="font-mono text-[9px] uppercase tracking-[0.13em] text-amber/85">
+            browser errand outcome unknown
+          </p>
+          <p className="mt-0.5 font-medium text-ice">{errand.objective}</p>
+          <p className="mt-2 text-[11px] text-amber/90">
+            Its outcome is unknown. JARVIS did not retry it automatically.
+          </p>
+          <p className="mt-1 text-[11px] text-slate">
+            Request a fresh exact plan if you still want to proceed.
+          </p>
+        </article>
+      ))}
+
+      {pending?.map((errand) => {
         const state = decision?.errandId === errand._id ? decision : null;
         const paused = errand.status === "needs_step_approval";
         const sealed = Boolean(errand.executionSteps?.length);

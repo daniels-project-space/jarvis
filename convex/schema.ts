@@ -2524,5 +2524,6 @@ export default defineSchema({
   })
     .index("by_status", ["status", "requestedAt"])
     .index("by_status_lease", ["status", "leaseUntil"])
+    .index("by_status_finished", ["status", "finishedAt"])
     .index("by_chat", ["chatId", "requestedAt"]),
 });
