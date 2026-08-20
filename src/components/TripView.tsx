@@ -15,6 +15,8 @@ import "maplibre-gl/dist/maplibre-gl.css";
 type Coordinate = [number, number];
 type ItineraryItem = {
   id?: string;
+  /** Durable city/base identity; a date can contain stops from several cities. */
+  cityContextId?: string;
   placeId?: string;
   time?: string;
   durationMinutes?: number;
@@ -48,7 +50,7 @@ type ItineraryDay = {
   items: ItineraryItem[];
   route?: ItineraryRoute;
 };
-type CityContext = {
+export type TripCityContext = {
   id: string;
   city: string;
   center: { lat: number; lng: number };
@@ -58,10 +60,12 @@ type CityContext = {
   bookingReference?: TripBookedStayReferenceValue;
   bookingCheckedAt?: number;
 };
+type CityContext = TripCityContext;
 type TripDoc = {
   itinerary?: ItineraryDay[];
   cityContexts?: CityContext[];
   activeCityContextId?: string;
+  status?: string;
   [key: string]: any;
 };
 export type TripMapMarker = { key: string; lat: number; lng: number; kind: "stay" | "activity" | "airport"; name: string; locked?: boolean; discoveryId?: string };
@@ -118,6 +122,49 @@ const belongsToCityContext = (
   // those entries visible only when there is no ambiguity to leak across.
   return cityContexts.length <= 1;
 };
+
+/**
+ * Projects persisted multi-city itinerary data onto the active map base.
+ *
+ * A route stores geometry for the full original day rather than per-stop
+ * segments. When a day contains stops from more than one city, retaining that
+ * geometry for either city would draw a route from the other one. Keep the
+ * relevant tiles, but deliberately withhold the unverifiable mixed-city route
+ * until a city-specific route is saved.
+ */
+export function cityScopedItineraryDays(
+  days: ItineraryDay[],
+  activeCityContext: CityContext | null,
+  cityContexts: CityContext[],
+): ItineraryDay[] {
+  return days.flatMap((day) => {
+    const items = day.items.filter((item) => belongsToCityContext(item, activeCityContext, cityContexts));
+    if (!items.length) return [];
+    const routeIsEntirelyInActiveCity = items.length === day.items.length;
+    return [{ ...day, items, route: routeIsEntirelyInActiveCity ? day.route : undefined }];
+  });
+}
+
+/** The itinerary-only marker projection used by the active-city map. */
+export function itineraryMapMarkers(
+  days: ItineraryDay[],
+  doc: TripDoc,
+): TripMapMarker[] {
+  return days.flatMap((day) => day.items.flatMap((item, index) => {
+    const lat = Number(item.lat);
+    const lng = Number(item.lng);
+    if (!validLatLng(lat, lng)) return [];
+    const kind: TripMapMarker["kind"] = item.kind === "flight" ? "airport" : item.kind === "hotel" || item.kind === "stay" ? "stay" : "activity";
+    return [{
+      key: `it:${itineraryItemKey(day, item, index)}`,
+      lat,
+      lng,
+      kind,
+      name: item.title,
+      locked: item.source === "confirmed" || item.source === "gmail" || doc.status === "planned",
+    }];
+  }));
+}
 
 const validRouteCoordinates = (route?: ItineraryRoute | null): Coordinate[] =>
   (route?.coordinates ?? []).filter(
@@ -1027,7 +1074,7 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
     () => cityContexts.find((context) => context.id === doc?.activeCityContextId) ?? cityContexts[0] ?? null,
     [cityContexts, doc?.activeCityContextId],
   );
-  const itineraryDays = useMemo(
+  const rawItineraryDays = useMemo(
     () =>
       Array.isArray(doc?.itinerary)
         ? doc.itinerary.filter(
@@ -1036,6 +1083,10 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
           )
         : [],
     [doc?.itinerary],
+  );
+  const itineraryDays = useMemo(
+    () => cityScopedItineraryDays(rawItineraryDays, activeCityContext, cityContexts),
+    [activeCityContext, cityContexts, rawItineraryDays],
   );
   const discoveries = useMemo(
     () => (
@@ -1121,22 +1172,7 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
       if (belongsToCityContext(a, activeCityContext, cityContexts) && validLatLng(a.lat, a.lng))
         addMarker({ key: `act:${a.id ?? a.name}`, lat: a.lat, lng: a.lng, kind: "activity", name: `${a.name}${a.city ? ` · ${a.city}` : ""}`, locked: (doc.locked?.activities ?? []).includes(a.id ?? a.name) || (doc.locked?.activities ?? []).includes(a.name) });
     if (belongsToCityContext(doc.airport, activeCityContext, cityContexts) && validLatLng(doc.airport?.lat, doc.airport?.lng)) addMarker({ key: "airport", lat: doc.airport.lat, lng: doc.airport.lng, kind: "airport", name: doc.airport.name });
-    for (const day of itineraryDays) {
-      day.items.forEach((item, index) => {
-        const lat = Number(item.lat);
-        const lng = Number(item.lng);
-        if (!validLatLng(lat, lng)) return;
-        const kind: Marker["kind"] = item.kind === "flight" ? "airport" : item.kind === "hotel" || item.kind === "stay" ? "stay" : "activity";
-        addMarker({
-          key: `it:${itineraryItemKey(day, item, index)}`,
-          lat,
-          lng,
-          kind,
-          name: item.title,
-          locked: item.source === "confirmed" || item.source === "gmail" || doc.status === "planned",
-        });
-      });
-    }
+    for (const marker of itineraryMapMarkers(itineraryDays, doc)) addMarker(marker);
     return ms;
   }, [activeCityContext, bookingNow, cityContexts, discoveries, doc, itineraryDays]);
 

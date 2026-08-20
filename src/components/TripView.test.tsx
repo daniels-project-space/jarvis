@@ -15,7 +15,7 @@ vi.mock("@/lib/secure-convex", () => ({
     args === "skip" || !tripViewFixture.doc ? undefined : { data: JSON.stringify(tripViewFixture.doc) },
 }));
 
-import TripView, { bookedStayMapMarker, isFreshTripBookedStayReference, mergeTripMapMarker, TripBookedStayReference, TripDayControls, TripOfflineMapPreflight, TripTimeline } from "./TripView";
+import TripView, { bookedStayMapMarker, cityScopedItineraryDays, isFreshTripBookedStayReference, itineraryMapMarkers, mergeTripMapMarker, TripBookedStayReference, TripDayControls, TripOfflineMapPreflight, TripTimeline } from "./TripView";
 
 describe("TripTimeline", () => {
   it("keeps a time-valid Gmail stay visibly distinct from a hotel candidate", () => {
@@ -311,6 +311,64 @@ describe("TripView city contexts", () => {
     expect(markup).toContain("Amsterdam Canal Stay");
     expect(markup).not.toContain("Berlin Courtyard Stay</span>");
     expect(markup).not.toContain("Berlin Courtyard Stay</div>");
+  });
+
+  it("keeps each active city’s itinerary tiles, geometry, and map markers isolated", () => {
+    const contexts = [
+      { id: "amsterdam", city: "Amsterdam", center: { lat: 52.3676, lng: 4.9041 } },
+      { id: "berlin", city: "Berlin", center: { lat: 52.52, lng: 13.405 } },
+    ];
+    const days = [
+      {
+        date: "2026-09-12",
+        label: "Amsterdam day",
+        items: [
+          { id: "ams-museum", cityContextId: "amsterdam", time: "10:00", title: "Amsterdam Museum", kind: "activity", lat: 52.36, lng: 4.9 },
+          { id: "ams-market", cityContextId: "amsterdam", time: "12:00", title: "Amsterdam Market", kind: "activity", lat: 52.37, lng: 4.91 },
+        ],
+        route: { mode: "walking", status: "ready", coordinates: [[4.9, 52.36], [4.91, 52.37]], durationSeconds: 900, distanceMeters: 1_100 },
+      },
+      {
+        date: "2026-09-13",
+        label: "Berlin day",
+        items: [
+          { id: "ber-island", cityContextId: "berlin", time: "10:00", title: "Museum Island", kind: "activity", lat: 52.52, lng: 13.4 },
+          { id: "ber-park", cityContextId: "berlin", time: "13:00", title: "Tiergarten", kind: "activity", lat: 52.51, lng: 13.35 },
+        ],
+        route: { mode: "walking", status: "ready", coordinates: [[13.4, 52.52], [13.35, 52.51]], durationSeconds: 1_200, distanceMeters: 1_600 },
+      },
+      {
+        date: "2026-09-14",
+        label: "Cross-city discussion",
+        items: [
+          { id: "ams-canal", cityContextId: "amsterdam", title: "Canal walk", kind: "activity", lat: 52.38, lng: 4.89 },
+          { id: "ber-gate", cityContextId: "berlin", title: "Brandenburg Gate", kind: "activity", lat: 52.5163, lng: 13.3777 },
+        ],
+        route: { mode: "driving", status: "ready", coordinates: [[4.89, 52.38], [13.3777, 52.5163]], durationSeconds: 22_000, distanceMeters: 650_000 },
+      },
+    ] satisfies Parameters<typeof cityScopedItineraryDays>[0];
+
+    const amsterdamDays = cityScopedItineraryDays(days, contexts[0], contexts);
+    expect(amsterdamDays.map((day) => day.date)).toEqual(["2026-09-12", "2026-09-14"]);
+    expect(amsterdamDays[0].route?.coordinates).toEqual([[4.9, 52.36], [4.91, 52.37]]);
+    expect(amsterdamDays[1].items.map((item) => item.title)).toEqual(["Canal walk"]);
+    expect(amsterdamDays[1].route).toBeUndefined();
+    expect(itineraryMapMarkers(amsterdamDays, { status: "planned" }).map((marker) => marker.name)).toEqual([
+      "Amsterdam Museum",
+      "Amsterdam Market",
+      "Canal walk",
+    ]);
+
+    const berlinDays = cityScopedItineraryDays(days, contexts[1], contexts);
+    expect(berlinDays.map((day) => day.date)).toEqual(["2026-09-13", "2026-09-14"]);
+    expect(berlinDays[0].route?.coordinates).toEqual([[13.4, 52.52], [13.35, 52.51]]);
+    expect(berlinDays[1].items.map((item) => item.title)).toEqual(["Brandenburg Gate"]);
+    expect(berlinDays[1].route).toBeUndefined();
+    expect(itineraryMapMarkers(berlinDays, { status: "planned" }).map((marker) => marker.name)).toEqual([
+      "Museum Island",
+      "Tiergarten",
+      "Brandenburg Gate",
+    ]);
   });
 
   it("keeps legacy destination-only documents usable as their single active city", () => {
