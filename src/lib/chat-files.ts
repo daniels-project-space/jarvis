@@ -59,6 +59,29 @@ export type ChatFileManifest = {
   }>;
 };
 
+/** The fields that identify the private object(s) a foreground turn can hand
+ * to the model. This deliberately excludes presentation metadata such as the
+ * filename and excerpt selection: those are not object sources. */
+export type PrivateFileSource = Pick<ChatFileManifest, "mimeType" | "sizeBytes" | "status"> & {
+  r2Key: string;
+  previewR2Key?: string;
+};
+
+/**
+ * A compact, deterministic identity for the exact private media source used
+ * by a turn. Both the Trigger worker and Convex compute this value, so a
+ * just-before-send lease cannot silently validate a replacement object.
+ */
+export function privateFileSourceKey(source: PrivateFileSource): string {
+  return JSON.stringify([
+    String(source.status),
+    normalizeUploadMime(source.mimeType),
+    Number(source.sizeBytes),
+    String(source.r2Key),
+    source.previewR2Key ? String(source.previewR2Key) : "",
+  ]);
+}
+
 export type ChatThreadFileCatalogItem = Pick<
   ChatFileManifest,
   "fileId" | "name" | "relativePath" | "mimeType" | "sizeBytes" | "status" | "summary"
