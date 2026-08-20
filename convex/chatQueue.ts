@@ -56,7 +56,7 @@ const FOREGROUND_STARTUP_FAILURE_TEXT =
   "Jarvis couldn't start this reply right now. Tap retry to try again.";
 const CANCELLED_REPLY_TEXT = "Reply cancelled.";
 const OWNER_TOOL_COMMITTED_REPLY_TEXT =
-  "Reply cancelled. An already-started owner-authorized Gmail or Google Calendar request may still finish; check Gmail or Google Calendar before retrying.";
+  "Reply cancelled. An already-started owner-authorized request may still finish; check its destination before retrying.";
 const TURN_CANCELLATION_PREFIX = "foregroundTurnCancellation";
 const GUEST_CHAT_BUCKET_CAPACITY = 3;
 const GUEST_CHAT_REFILL_MS = 2 * 60_000;
@@ -84,6 +84,7 @@ async function ensureSession(ctx: { db: any }, threadId: string) {
 
 const FOREGROUND_OWNER_TOOL_GRANT_TTL_MS = 20 * 60_000;
 const FOREGROUND_OWNER_TOOL_MAX_USES_PER_TURN = 48;
+const BROWSER_ERRAND_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 async function deleteTurnPrefetch(ctx: { db: any }, messageId: string) {
   const rows = await ctx.db
@@ -322,9 +323,10 @@ async function admitMessage(
   });
   // This scope is minted only after conversationIdentity accepted the
   // authenticated owner and the submitted message starts with a direct,
-  // unquoted Gmail/Google Calendar command. No browser credential is retained:
-  // later tool calls are separately bound to the active assistant claim and a
-  // short receipt, and never rescan arbitrary conversation text for authority.
+  // unquoted Gmail/Google Calendar/browser-errand command. No browser
+  // credential is retained: later tool calls are separately bound to the
+  // active assistant claim and a short receipt, and never rescan arbitrary
+  // conversation text for authority.
   const ownerToolNames = foregroundOwnerToolNamesForDirectRequest(submittedText);
   if (
     ownerToolNames.length > 0
@@ -1373,6 +1375,7 @@ export const redeemForegroundOwnerToolForWorker = mutation({
     claimToken: v.string(),
     callId: v.string(),
     toolName: v.string(),
+    browserErrandId: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -1382,6 +1385,11 @@ export const redeemForegroundOwnerToolForWorker = mutation({
     if (!isForegroundOwnerToolName(toolName) || !/^[A-Za-z0-9_.:-]{1,256}$/.test(callId)) {
       return { allowed: false };
     }
+    const browserErrandId = a.browserErrandId?.trim();
+    if (
+      (toolName === "browser_errand_run" && (!browserErrandId || !BROWSER_ERRAND_ID_RE.test(browserErrandId)))
+      || (toolName !== "browser_errand_run" && browserErrandId !== undefined)
+    ) return { allowed: false };
     const allowedNames = await foregroundOwnerToolNamesForLiveClaim(ctx, a);
     if (!allowedNames.includes(toolName)) return { allowed: false };
     const receiptKey = `${String(a.assistantId)}:${callId}`;
@@ -1407,9 +1415,12 @@ export const redeemForegroundOwnerToolForWorker = mutation({
       assistantId: a.assistantId,
       callId,
       toolName,
+      ...(browserErrandId ? { browserErrandId } : {}),
       committedAt: Date.now(),
     });
-    return { allowed: true };
+    return toolName === "browser_errand_run"
+      ? { allowed: true, receiptKey }
+      : { allowed: true };
   },
 });
 

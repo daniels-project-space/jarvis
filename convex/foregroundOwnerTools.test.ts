@@ -145,6 +145,55 @@ describe("foreground owner Google/Gmail turn fence", () => {
     })).resolves.toEqual({ allowed: false });
   });
 
+  it("mints a one-time browser execution receipt only for a direct owner run request and binds its errand ID", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await admitOwnerTurn(t, "Run approved browser errand browserErrand123.");
+    const claim = await t.mutation(queue.claimMessage, {
+      messageId: userId,
+      claimToken: "browser-owner-claim",
+      workerToken: WORKER,
+    });
+
+    await expect(t.query(queue.foregroundOwnerToolDefinitionsForWorker, {
+      messageId: userId,
+      assistantId: claim.assistantId,
+      claimToken: "browser-owner-claim",
+      belt: "core",
+      workerToken: WORKER,
+    })).resolves.toEqual({ allowed: true, toolNames: ["browser_errand_run"] });
+
+    const redeemed = await t.mutation(queue.redeemForegroundOwnerToolForWorker, {
+      messageId: userId,
+      assistantId: claim.assistantId,
+      claimToken: "browser-owner-claim",
+      callId: "browser-owner-call",
+      toolName: "browser_errand_run",
+      browserErrandId: "browserErrand123",
+      workerToken: WORKER,
+    });
+    expect(redeemed).toEqual({
+      allowed: true,
+      receiptKey: `${String(claim.assistantId)}:browser-owner-call`,
+    });
+    await expect(t.mutation(queue.redeemForegroundOwnerToolForWorker, {
+      messageId: userId,
+      assistantId: claim.assistantId,
+      claimToken: "browser-owner-claim",
+      callId: "browser-owner-call",
+      toolName: "browser_errand_run",
+      browserErrandId: "browserErrand123",
+      workerToken: WORKER,
+    })).resolves.toEqual({ allowed: false });
+    await expect(t.mutation(queue.redeemForegroundOwnerToolForWorker, {
+      messageId: userId,
+      assistantId: claim.assistantId,
+      claimToken: "browser-owner-claim",
+      callId: "browser-owner-wrong-id",
+      toolName: "browser_errand_run",
+      workerToken: WORKER,
+    })).resolves.toEqual({ allowed: false });
+  });
+
   it("does not mint owner scope from quoted or pasted mailbox instructions", async () => {
     const t = convexTest(schema, modules);
     const userId = await admitOwnerTurn(

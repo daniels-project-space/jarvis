@@ -4,10 +4,10 @@ import { requireActor, requireAdmin, requireViewer, viewerAuthArgs } from "./con
 
 // Browser errands — JARVIS acting as Daniel in a logged-in browser.
 //
-// The approval gate lives HERE, in Convex, not in the tool layer: `run` refuses
-// to hand a plan to jarvis-browser unless this table says Daniel approved that
-// exact envelope. A model that decides to skip the proposal step simply cannot
-// obtain a runnable errand.
+// The durable approval boundary is deliberately stronger than an English plan:
+// Convex canonicalizes the executable steps at proposal time, snapshots them
+// into the approved record, and returns only that snapshot to the browser.
+// No later model tool call can replace, append, or reinterpret those steps.
 
 const envelopeValidator = v.object({
   allowedHosts: v.array(v.string()),
@@ -17,18 +17,211 @@ const envelopeValidator = v.object({
   ttlMs: v.number(),
 });
 
-// `ttlMs` is passed to jarvis-browser as the task lifetime as well as being
-// the owner's approval lifetime. Keep the Convex lease a little longer than
-// that task lifetime so a still-valid browser task is never reaped underneath
-// itself, while still giving a crashed request a terminal, non-retryable end.
+const browserStepValidator = v.union(
+  v.object({ action: v.literal("navigate"), url: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("read"), selector: v.optional(v.string()), limit: v.optional(v.number()), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("click"), selector: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("type"), selector: v.string(), text: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("select"), selector: v.string(), value: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("screenshot"), fullPage: v.optional(v.boolean()), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("send"), selector: v.string(), label: v.optional(v.string()) }),
+);
+
+const ACTIONS = ["navigate", "read", "click", "type", "select", "screenshot", "send"] as const;
+const ACTION_SET = new Set<string>(ACTIONS);
 const MIN_TASK_TTL_MS = 60_000;
 const MAX_TASK_TTL_MS = 6 * 60 * 60_000;
 const LEASE_GRACE_MS = 2 * 60_000;
 const MAX_REAP_BATCH = 20;
+const MAX_ALLOWED_HOSTS = 12;
+const MAX_ALLOWED_ACTIONS = ACTIONS.length;
+const MAX_STEPS = 200;
+const MAX_SENDS = 10;
+const MAX_OBJECTIVE_CHARS = 500;
+const MAX_CREDENTIAL_ID_CHARS = 160;
+const MAX_LABEL_CHARS = 240;
+const MAX_SELECTOR_CHARS = 500;
+const MAX_TYPE_TEXT_CHARS = 1_000;
+const MAX_SELECT_VALUE_CHARS = 500;
+const MAX_NAVIGATE_URL_CHARS = 2_048;
+const MAX_READ_LIMIT = 2_000;
+const BROWSER_ERRAND_RECEIPT_KEY = /^[A-Za-z0-9_.:-]{1,512}$/;
+const HOST_RE = /^(?:\*\.)?(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
-function boundedTaskTtl(ttlMs: number): number {
-  if (!Number.isFinite(ttlMs)) return MIN_TASK_TTL_MS;
-  return Math.min(MAX_TASK_TTL_MS, Math.max(MIN_TASK_TTL_MS, Math.trunc(ttlMs)));
+type BrowserAction = (typeof ACTIONS)[number];
+type BrowserEnvelope = {
+  allowedHosts: string[];
+  allowedActions: BrowserAction[];
+  maxSends: number;
+  maxSteps: number;
+  ttlMs: number;
+};
+type BrowserStep =
+  | { action: "navigate"; url: string; label?: string }
+  | { action: "read"; selector?: string; limit?: number; label?: string }
+  | { action: "click"; selector: string; label?: string }
+  | { action: "type"; selector: string; text: string; label?: string }
+  | { action: "select"; selector: string; value: string; label?: string }
+  | { action: "screenshot"; fullPage?: boolean; label?: string }
+  | { action: "send"; selector: string; label?: string };
+
+function record(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function boundedText(value: unknown, label: string, maxChars: number, preserveWhitespace = false): string {
+  if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  const normalized = preserveWhitespace
+    ? value.replace(/\r\n?/g, "\n")
+    : value.trim();
+  if (!normalized.trim() || normalized.length > maxChars || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(normalized)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return normalized;
+}
+
+function optionalLabel(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return boundedText(value, "step label", MAX_LABEL_CHARS);
+}
+
+function boundedInteger(value: unknown, label: string, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isSafeInteger(value)) {
+    throw new Error(`${label} must be a whole number`);
+  }
+  if (value < min || value > max) throw new Error(`${label} must be between ${min} and ${max}`);
+  return value;
+}
+
+function normalizedHost(value: unknown): string {
+  const host = boundedText(value, "allowed host", 253).toLowerCase().replace(/\.$/, "");
+  if (!HOST_RE.test(host)) throw new Error("allowed host is invalid");
+  return host;
+}
+
+function hostAllowed(host: string, allowedHosts: readonly string[]): boolean {
+  return allowedHosts.some((allowed) => {
+    if (allowed.startsWith("*.")) {
+      const suffix = allowed.slice(1);
+      return host.endsWith(suffix) && host.length > suffix.length;
+    }
+    return host === allowed;
+  });
+}
+
+function normalizeEnvelope(value: unknown): BrowserEnvelope {
+  if (!record(value)) throw new Error("browser errand envelope is invalid");
+  if (!Array.isArray(value.allowedHosts) || !Array.isArray(value.allowedActions)) {
+    throw new Error("browser errand envelope is invalid");
+  }
+  const allowedHosts = [...new Set(value.allowedHosts.map(normalizedHost))];
+  if (!allowedHosts.length || allowedHosts.length > MAX_ALLOWED_HOSTS) {
+    throw new Error("a plan must name between one and twelve allowed hosts");
+  }
+  const allowedActions = [...new Set(value.allowedActions.map((action) => boundedText(action, "allowed action", 24)))];
+  if (!allowedActions.length || allowedActions.length > MAX_ALLOWED_ACTIONS || allowedActions.some((action) => !ACTION_SET.has(action))) {
+    throw new Error("browser errand actions are invalid");
+  }
+  const maxSends = boundedInteger(value.maxSends, "max sends", 0, MAX_SENDS);
+  if (maxSends > 0 && !allowedActions.includes("send")) {
+    throw new Error("a send budget requires 'send' in allowedActions");
+  }
+  return {
+    allowedHosts,
+    allowedActions: allowedActions as BrowserAction[],
+    maxSends,
+    maxSteps: boundedInteger(value.maxSteps, "max steps", 1, MAX_STEPS),
+    ttlMs: boundedInteger(value.ttlMs, "approval lifetime", MIN_TASK_TTL_MS, MAX_TASK_TTL_MS),
+  };
+}
+
+function normalizeNavigateUrl(value: unknown, envelope: BrowserEnvelope): string {
+  const raw = boundedText(value, "navigate URL", MAX_NAVIGATE_URL_CHARS);
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("navigate URL is invalid");
+  }
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password || url.port) {
+    throw new Error("navigate URL is invalid");
+  }
+  const host = url.hostname.toLowerCase();
+  if (!hostAllowed(host, envelope.allowedHosts)) {
+    throw new Error("navigate URL is outside the allowed host list");
+  }
+  url.hash = "";
+  return url.toString();
+}
+
+function normalizeSteps(value: unknown, envelope: BrowserEnvelope): BrowserStep[] {
+  if (!Array.isArray(value) || !value.length || value.length > envelope.maxSteps) {
+    throw new Error("browser errand must include a bounded executable step list");
+  }
+  const steps: BrowserStep[] = [];
+  let sends = 0;
+  for (const raw of value) {
+    if (!record(raw) || typeof raw.action !== "string" || !ACTION_SET.has(raw.action)) {
+      throw new Error("browser errand step is invalid");
+    }
+    const action = raw.action as BrowserAction;
+    if (!envelope.allowedActions.includes(action)) {
+      throw new Error(`step '${action}' is outside the allowed action list`);
+    }
+    const label = optionalLabel(raw.label);
+    switch (action) {
+      case "navigate":
+        steps.push({ action, url: normalizeNavigateUrl(raw.url, envelope), ...(label ? { label } : {}) });
+        break;
+      case "read": {
+        const selector = raw.selector === undefined ? undefined : boundedText(raw.selector, "read selector", MAX_SELECTOR_CHARS);
+        const limit = raw.limit === undefined ? undefined : boundedInteger(raw.limit, "read limit", 1, MAX_READ_LIMIT);
+        steps.push({ action, ...(selector ? { selector } : {}), ...(limit ? { limit } : {}), ...(label ? { label } : {}) });
+        break;
+      }
+      case "click":
+      case "send": {
+        const selector = boundedText(raw.selector, `${action} selector`, MAX_SELECTOR_CHARS);
+        steps.push({ action, selector, ...(label ? { label } : {}) });
+        if (action === "send" && ++sends > envelope.maxSends) throw new Error("executable steps exceed the approved send budget");
+        break;
+      }
+      case "type":
+        steps.push({
+          action,
+          selector: boundedText(raw.selector, "type selector", MAX_SELECTOR_CHARS),
+          text: boundedText(raw.text, "type text", MAX_TYPE_TEXT_CHARS, true),
+          ...(label ? { label } : {}),
+        });
+        break;
+      case "select":
+        steps.push({
+          action,
+          selector: boundedText(raw.selector, "select selector", MAX_SELECTOR_CHARS),
+          value: boundedText(raw.value, "select value", MAX_SELECT_VALUE_CHARS),
+          ...(label ? { label } : {}),
+        });
+        break;
+      case "screenshot":
+        if (raw.fullPage !== undefined && typeof raw.fullPage !== "boolean") throw new Error("screenshot fullPage is invalid");
+        steps.push({ action, ...(raw.fullPage === undefined ? {} : { fullPage: raw.fullPage }), ...(label ? { label } : {}) });
+        break;
+    }
+  }
+  return steps;
+}
+
+function stepSummary(step: BrowserStep): string {
+  const label = step.label ? ` — ${step.label}` : "";
+  switch (step.action) {
+    case "navigate": return `Navigate to ${step.url}${label}`;
+    case "read": return `Read ${step.selector ? `(${step.selector})` : "the page"}${step.limit ? `, up to ${step.limit} characters` : ""}${label}`;
+    case "click": return `Click ${step.selector}${label}`;
+    case "type": return `Type ${JSON.stringify(step.text)} into ${step.selector}${label}`;
+    case "select": return `Select ${JSON.stringify(step.value)} in ${step.selector}${label}`;
+    case "screenshot": return `Take ${step.fullPage ? "a full-page " : "a "}screenshot${label}`;
+    case "send": return `Send/submit with ${step.selector}${label}`;
+  }
 }
 
 function terminalLeaseFailure(now: number) {
@@ -38,6 +231,7 @@ function terminalLeaseFailure(now: number) {
     finishedAt: now,
     leaseToken: undefined,
     leaseUntil: undefined,
+    browserDeadlineAt: undefined,
   };
 }
 
@@ -46,24 +240,25 @@ export const propose = mutation({
     objective: v.string(),
     credentialId: v.optional(v.string()),
     envelope: envelopeValidator,
-    plan: v.array(v.string()),
+    steps: v.array(browserStepValidator),
     chatId: v.optional(v.string()),
     authTokenHash: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    if (a.envelope.allowedHosts.length === 0) throw new Error("a plan must name at least one host");
-    if (a.envelope.maxSends > 0 && !a.envelope.allowedActions.includes("send")) {
-      throw new Error("a send budget requires 'send' in allowedActions");
-    }
+    const envelope = normalizeEnvelope(a.envelope);
+    const executionSteps = normalizeSteps(a.steps, envelope);
     return await ctx.db.insert("browserErrands", {
-      objective: a.objective.slice(0, 500),
-      credentialId: a.credentialId,
-      envelope: a.envelope,
-      plan: a.plan.slice(0, 30).map((s) => s.slice(0, 300)),
+      objective: boundedText(a.objective, "objective", MAX_OBJECTIVE_CHARS, true),
+      ...(a.credentialId ? { credentialId: boundedText(a.credentialId, "credential ID", MAX_CREDENTIAL_ID_CHARS) } : {}),
+      envelope,
+      executionSteps,
+      // The card displays server-derived summaries of the exact normalized
+      // fields above; a model's separate English narrative has no authority.
+      plan: executionSteps.map(stepSummary),
       status: "proposed",
-      chatId: a.chatId,
+      ...(a.chatId ? { chatId: boundedText(a.chatId, "chat ID", 160) } : {}),
       requestedAt: Date.now(),
     });
   },
@@ -99,43 +294,77 @@ export const decide = mutation({
     if (errand.status !== "proposed" && errand.status !== "needs_step_approval") return false;
     // A paused browser task has no sealed replacement step/envelope yet. Do
     // not turn an old broad approval into permission to rerun earlier steps.
-    // The owner may close it, then ask for a fresh, exact proposal instead.
     if (errand.status === "needs_step_approval" && a.decision === "approved") return false;
+
     const now = Date.now();
+    if (a.decision === "declined") {
+      await ctx.db.patch(a.errandId, {
+        status: "declined",
+        resolvedAt: now,
+        approvalExpiresAt: undefined,
+        approvedSteps: undefined,
+        approvedEnvelope: undefined,
+      });
+      return true;
+    }
+
+    // A legacy `plan` string array is intentionally insufficient. Only a
+    // canonical executable snapshot can become an approved browser run.
+    if (!errand.executionSteps?.length) return false;
+    let envelope: BrowserEnvelope;
+    let steps: BrowserStep[];
+    try {
+      envelope = normalizeEnvelope(errand.envelope);
+      steps = normalizeSteps(errand.executionSteps, envelope);
+    } catch {
+      return false;
+    }
     await ctx.db.patch(a.errandId, {
-      status: a.decision,
+      status: "approved",
       resolvedAt: now,
-      ...(a.decision === "approved"
-        ? { approvalExpiresAt: now + boundedTaskTtl(errand.envelope.ttlMs) }
-        : { approvalExpiresAt: undefined }),
+      approvalExpiresAt: now + envelope.ttlMs,
+      approvedEnvelope: envelope,
+      approvedSteps: steps,
+      browserDeadlineAt: undefined,
     });
     return true;
   },
 });
 
 /**
- * Claim an approved errand for execution. Single-use by design: it flips to
- * "running" in the same transaction, so a replayed tool call cannot re-run an
- * approval Daniel granted once.
+ * Claim an approved errand for execution. A claim needs the already-redeemed
+ * foreground owner receipt recorded by chatQueue; this makes the receipt and
+ * the owner-visible approval both necessary for every browser run.
  */
 export const claim = mutation({
   args: {
     errandId: v.id("browserErrands"),
-    // Generated server-side by runApprovedErrand. It fences finalization so a
-    // late request cannot overwrite a later recovery decision.
     leaseToken: v.string(),
+    foregroundReceiptKey: v.string(),
     authTokenHash: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    if (!BROWSER_ERRAND_RECEIPT_KEY.test(a.foregroundReceiptKey)) {
+      return { ok: false as const, reason: "a one-time foreground owner execution receipt is required" };
+    }
+    const ownerReceipt = await ctx.db
+      .query("chatTurnOwnerToolUses")
+      .withIndex("by_receipt", (q: any) => q.eq("receiptKey", a.foregroundReceiptKey))
+      .first();
+    if (
+      !ownerReceipt
+      || ownerReceipt.toolName !== "browser_errand_run"
+      || ownerReceipt.browserErrandId !== String(a.errandId)
+    ) {
+      return { ok: false as const, reason: "a matching one-time foreground owner execution receipt is required" };
+    }
+
     const errand = await ctx.db.get(a.errandId);
     if (!errand) return { ok: false as const, reason: "no such errand" };
     const now = Date.now();
     if (errand.status === "running" && Number(errand.leaseUntil ?? 0) <= now) {
-      // Never replay a stale errand: the prior browser request may have made
-      // an irreversible change before its caller disappeared. Mark it
-      // terminal and make Daniel request a fresh, explicit plan instead.
       await ctx.db.patch(a.errandId, terminalLeaseFailure(now));
       return { ok: false as const, reason: "the earlier execution lease expired; its outcome is unknown and it was not retried" };
     }
@@ -145,9 +374,34 @@ export const claim = mutation({
     if (!/^[A-Za-z0-9_-]{24,128}$/.test(a.leaseToken)) {
       return { ok: false as const, reason: "invalid execution lease" };
     }
+    if (!errand.approvedEnvelope || !errand.approvedSteps?.length) {
+      await ctx.db.patch(a.errandId, {
+        status: "needs_step_approval",
+        result: "This legacy approval did not contain a sealed executable plan. Nothing was run; request a new exact proposal.",
+        escalation: "A new exact browser proposal is required before execution.",
+        finishedAt: now,
+        approvalExpiresAt: undefined,
+      });
+      return { ok: false as const, reason: "approval has no sealed executable plan" };
+    }
+    let approvedEnvelope: BrowserEnvelope;
+    let approvedSteps: BrowserStep[];
+    try {
+      approvedEnvelope = normalizeEnvelope(errand.approvedEnvelope);
+      approvedSteps = normalizeSteps(errand.approvedSteps, approvedEnvelope);
+    } catch {
+      await ctx.db.patch(a.errandId, {
+        status: "needs_step_approval",
+        result: "The sealed browser plan could not be validated. Nothing was run; request a new exact proposal.",
+        escalation: "A new exact browser proposal is required before execution.",
+        finishedAt: now,
+        approvalExpiresAt: undefined,
+      });
+      return { ok: false as const, reason: "sealed plan is invalid" };
+    }
     const approvalExpiresAt = Number(
       errand.approvalExpiresAt
-      ?? Number(errand.resolvedAt ?? errand.requestedAt) + boundedTaskTtl(errand.envelope.ttlMs),
+      ?? Number(errand.resolvedAt ?? errand.requestedAt) + approvedEnvelope.ttlMs,
     );
     if (!Number.isFinite(approvalExpiresAt) || approvalExpiresAt <= now) {
       await ctx.db.patch(a.errandId, {
@@ -157,18 +411,25 @@ export const claim = mutation({
       });
       return { ok: false as const, reason: "approval expired before execution began" };
     }
+    // Browser lifetime is the remaining approval window, not the original
+    // arbitrary proposal duration. The service gets this normalized TTL and
+    // Vercel also refuses to issue/await steps after the absolute deadline.
+    const browserDeadlineAt = Math.min(approvalExpiresAt, now + approvedEnvelope.ttlMs);
+    const remainingTtlMs = Math.max(1, browserDeadlineAt - now);
     await ctx.db.patch(a.errandId, {
       status: "running",
       startedAt: now,
       leaseToken: a.leaseToken,
-      leaseUntil: now + boundedTaskTtl(errand.envelope.ttlMs) + LEASE_GRACE_MS,
+      browserDeadlineAt,
+      leaseUntil: browserDeadlineAt + LEASE_GRACE_MS,
     });
     return {
       ok: true as const,
       objective: errand.objective,
       credentialId: errand.credentialId ?? null,
-      envelope: errand.envelope,
-      plan: errand.plan,
+      envelope: { ...approvedEnvelope, ttlMs: remainingTtlMs },
+      steps: approvedSteps,
+      browserDeadlineAt,
     };
   },
 });
@@ -191,17 +452,26 @@ export const finish = mutation({
     const errand = await ctx.db.get(a.errandId);
     if (!errand) return false;
     if (errand.status !== "running" || errand.leaseToken !== a.leaseToken) return false;
+    const now = Date.now();
+    // A matching late response is not a valid receipt. The browser task had a
+    // hard deadline; preserve an unknown outcome instead of accepting a
+    // potentially post-deadline provider action as completed work.
+    if (!Number.isFinite(errand.leaseUntil) || Number(errand.leaseUntil) <= now) {
+      await ctx.db.patch(a.errandId, terminalLeaseFailure(now));
+      return false;
+    }
     await ctx.db.patch(a.errandId, {
       status: a.status,
       result: a.result?.slice(0, 4000),
       escalation: a.escalation?.slice(0, 1000),
       sends: a.sends,
-      finishedAt: Date.now(),
+      finishedAt: now,
       leaseToken: undefined,
       leaseUntil: undefined,
+      browserDeadlineAt: undefined,
       // An escalation re-opens the approval gate, so clear the earlier decision.
       ...(a.status === "needs_step_approval"
-        ? { resolvedAt: undefined, approvalExpiresAt: undefined }
+        ? { resolvedAt: undefined, approvalExpiresAt: undefined, approvedSteps: undefined, approvedEnvelope: undefined }
         : {}),
     });
     return true;
@@ -211,8 +481,6 @@ export const finish = mutation({
 /**
  * Owner-triggered, bounded cleanup for callers that died after claiming an
  * errand. This only ever fails a stale run; it never retries browser work.
- * `claim` performs the same single-row cleanup as a backstop, so a stale row
- * cannot block a later explicit run even if the owner has not opened the UI.
  */
 export const expireStale = mutation({
   args: {
@@ -228,8 +496,6 @@ export const expireStale = mutation({
       .take(limit);
 
     // A small legacy sweep covers rows created before `leaseUntil` existed.
-    // It is intentionally bounded and only terminalizes a row; it never
-    // creates a new browser task or changes a completed result.
     const selected = [...expired];
     if (selected.length < limit) {
       const known = new Set(selected.map((row) => row._id));
@@ -247,9 +513,6 @@ export const expireStale = mutation({
 
     let reaped = 0;
     for (const row of selected) {
-      // A concurrent terminal receipt wins: checking the current row makes
-      // cleanup idempotent and prevents this bounded reaper from overwriting
-      // it on an old snapshot.
       const current = await ctx.db.get(row._id);
       if (!current || current.status !== "running" || Number(current.leaseUntil ?? 0) > now) continue;
       await ctx.db.patch(current._id, terminalLeaseFailure(now));

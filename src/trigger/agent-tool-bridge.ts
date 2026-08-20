@@ -13,6 +13,7 @@ import {
 import {
   FOREGROUND_OWNER_TOOL_NAMES,
   TOOL_BELT_NAMES,
+  foregroundOwnerToolReceiptTarget,
   isForegroundOwnerToolName,
   isToolBeltName,
   type ToolBeltName,
@@ -443,11 +444,15 @@ export class AgentToolBridge {
       if (!ownerTurn || !callId) {
         return failureResult("authorization_denied", "This owner-only tool is unavailable outside its authenticated foreground turn.");
       }
+      const receiptTarget = foregroundOwnerToolReceiptTarget(toolName, args);
+      if (!receiptTarget) {
+        return failureResult("invalid_request", "This foreground owner tool requires its exact approved arguments.");
+      }
       const response = await this.ownerRequest(
         ownerTurn,
         callId,
         "invoke",
-        toolName,
+        receiptTarget,
         {
           method: "POST",
           // Provenance is reconstructed by the endpoint from the signed

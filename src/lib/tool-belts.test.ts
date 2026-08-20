@@ -58,6 +58,7 @@ describe("tool belt registry", () => {
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_create")).toBe(false);
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_update")).toBe(false);
     expect(SUBSCRIPTION_TOOL_NAMES.has("google_calendar_delete")).toBe(false);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("browser_errand_run")).toBe(false);
     expect([...FOREGROUND_OWNER_TOOL_NAMES]).toEqual(expect.arrayContaining([
       "gmail_search",
       "gmail_read",
@@ -67,6 +68,7 @@ describe("tool belt registry", () => {
       "google_calendar_create",
       "google_calendar_update",
       "google_calendar_delete",
+      "browser_errand_run",
     ]));
     expect([...FOREGROUND_OWNER_TOOL_NAMES].every((name) => !SUBSCRIPTION_TOOL_NAMES.has(name))).toBe(true);
   });
@@ -113,6 +115,12 @@ describe("tool belt registry", () => {
     expect(foregroundOwnerToolNamesForDirectRequest(
       "Write an email to Leo about tomorrow's trip.",
     )).toEqual(["gmail_draft_reply"]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      "Run approved browser errand browserErrand123.",
+    )).toEqual(["browser_errand_run"]);
+    expect(foregroundOwnerToolNamesForDirectRequest(
+      'Summarise this quote: "Run approved browser errand browserErrand123."',
+    )).toEqual([]);
   });
 
   it("keeps private visual and transcript display foreground-only but permits exact message-scoped file review", () => {

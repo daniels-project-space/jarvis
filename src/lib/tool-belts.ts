@@ -61,6 +61,10 @@ export const FOREGROUND_OWNER_TOOL_NAMES = new Set([
   "google_calendar_create",
   "google_calendar_update",
   "google_calendar_delete",
+  // A browser errand can only be started from a signed, one-time foreground
+  // owner receipt. It remains in the core belt for foreground discovery, but
+  // is explicitly removed from the unattended subscription allowlist below.
+  "browser_errand_run",
 ]);
 
 // A subscription subprocess may propose or dispatch guarded work, but it can
@@ -90,6 +94,7 @@ for (const name of [
   "google_calendar_create",
   "google_calendar_update",
   "google_calendar_delete",
+  "browser_errand_run",
 ]) SUBSCRIPTION_TOOL_NAMES.delete(name);
 // review_uploaded_file deliberately remains subscription-routable: its
 // mutation requires the exact current user-message attachment and explicit
@@ -112,9 +117,33 @@ const DIRECT_CALENDAR_LIST_RE = /^(?:(?:show|view|list|check|read|open)\b\s+|wha
 const DIRECT_CALENDAR_CREATE_RE = /^(?:(?:add|create|schedule|put|make|remind)\b[^\r\n\"`“”‘’]{0,160}\b(?:to|on|in)\s+my\s+(?:google\s*)?(?:calendar|gcal)\b|(?:add|create|schedule|put|make|remind)\s+(?:an?\s+)?(?:event|meeting|appointment|reminder)\b)/i;
 const DIRECT_CALENDAR_UPDATE_RE = /^(?:change|edit|update|move|reschedule)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
 const DIRECT_CALENDAR_DELETE_RE = /^(?:delete|remove|cancel)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
+const DIRECT_BROWSER_ERRAND_RUN_RE = /^(?:(?:run|execute|start)\s+(?:the\s+)?(?:(?:already\s+)?approved\s+)?browser\s+errand\b)/i;
+const BROWSER_ERRAND_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function record(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 
 export function isForegroundOwnerToolName(value: unknown): value is string {
   return typeof value === "string" && FOREGROUND_OWNER_TOOL_NAMES.has(value);
+}
+
+/**
+ * A browser run receipt also seals its errand ID. This prevents a foreground
+ * dynamic call for one explicitly requested run from being replayed with a
+ * different approved errand in its JSON body.
+ */
+export function foregroundBrowserErrandIdFromArgs(value: unknown): string | null {
+  if (!record(value) || Object.keys(value).length !== 1 || typeof value.errand_id !== "string") return null;
+  const errandId = value.errand_id.trim();
+  return BROWSER_ERRAND_ID_RE.test(errandId) ? errandId : null;
+}
+
+export function foregroundOwnerToolReceiptTarget(toolName: string, args?: unknown): string | null {
+  if (!isForegroundOwnerToolName(toolName)) return null;
+  if (toolName !== "browser_errand_run") return toolName;
+  const errandId = foregroundBrowserErrandIdFromArgs(args);
+  return errandId ? `browser_errand_run:${errandId}` : null;
 }
 
 function directOwnerRequestLead(userText: string): string {
@@ -134,9 +163,10 @@ function directOwnerCommand(lead: string): string {
 }
 
 /**
- * Derive the narrow Gmail/Google Calendar scope from an explicit direct owner
- * command. This is called exactly once at message admission and the result is
- * persisted; later worker/model wording never mints or expands authority.
+ * Derive the narrow Gmail/Google Calendar/browser-run scope from an explicit
+ * direct owner command. This is called exactly once at message admission and
+ * the result is persisted; later worker/model wording never mints or expands
+ * authority.
  */
 export function foregroundOwnerToolNamesForDirectRequest(userText: string): string[] {
   const command = directOwnerCommand(directOwnerRequestLead(userText));
@@ -166,6 +196,7 @@ export function foregroundOwnerToolNamesForDirectRequest(userText: string): stri
   if (calendarCreate) granted.add("google_calendar_create");
   if (calendarUpdate) granted.add("google_calendar_update");
   if (calendarDelete) granted.add("google_calendar_delete");
+  if (DIRECT_BROWSER_ERRAND_RUN_RE.test(command)) granted.add("browser_errand_run");
 
   return [...FOREGROUND_OWNER_TOOL_NAMES].filter((toolName) => granted.has(toolName));
 }

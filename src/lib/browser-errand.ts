@@ -5,16 +5,12 @@ import { gmailSearch, gmailReadMessage } from "./gmail";
 import { convexMutation } from "./context";
 import { getSecret } from "./vault";
 
-// Client for the jarvis-browser service — the credentialed browser that acts as
-// Daniel inside a plan he approved.
+// Client for the jarvis-browser service — the credentialed browser that acts
+// as Daniel inside an owner-approved, foreground-receipted plan.
 //
-// Two properties this module must never lose:
-//  1. It never handles a credential. `credentialId` is an opaque handle; the
-//     sealed value lives root-only on the browser host and is typed straight
-//     into a login form there. Nothing here can resolve it.
-//  2. It never runs an unapproved plan. Execution begins by CLAIMING an
-//     approved errand from Convex, which is single-use — so a repeated or
-//     model-fabricated call cannot reuse one approval twice.
+// This module never handles browser credentials. More importantly, it never
+// accepts executable steps from its caller: Convex returns only the sealed
+// snapshot copied into the approved record.
 
 export type BrowserStep =
   | { action: "navigate"; url: string; label?: string }
@@ -41,70 +37,118 @@ export type ErrandOutcome = {
   escalation?: string;
 };
 
-// The service address is NOT a secret, so it does not need a vault row — it
-// defaults to the deployed route and is overridable by env. Only the bearer is
-// sensitive, and it resolves vault-first, env-fallback: the same shape
-// render-service uses (RENDER_URL/RENDER_TOKEN work as Convex env vars rather
-// than vault rows). That means bringing this online needs one pasted env var,
-// not a vault write — which requires the root token and is owner-only by design.
+export type BrowserErrandRunAuthorization = Readonly<{
+  foregroundReceiptKey: string;
+}>;
+
 const DEFAULT_BROWSER_URL = "https://87.106.233.113.nip.io/jarvis-browser";
+const RECEIPT_KEY_RE = /^[A-Za-z0-9_.:-]{1,512}$/;
+const MAX_UNTRUSTED_PAGE_TEXT_CHARS = 600;
 
 class BrowserServiceUnconfigured extends Error {}
+class BrowserDeadlineExceeded extends Error {}
 
 async function serviceConfig(): Promise<{ base: string; token: string }> {
   const base = (process.env.JARVIS_BROWSER_URL
     ?? await getSecret("jarvisbrowser", "JARVIS_BROWSER_URL").catch(() => null)
     ?? DEFAULT_BROWSER_URL).replace(/\/+$/, "");
 
-  // Preferred path: Vercel OIDC. The deployment already holds a short-lived,
-  // Vercel-signed JWT proving it is this project; jarvis-browser verifies it
-  // against Vercel's public JWKS. Nothing secret is stored, pasted or committed
-  // to make this work — which is the whole reason it is first in the chain.
+  // Preferred path: Vercel OIDC. The deployment holds a short-lived signed
+  // JWT; no browser credential is copied into Vercel, Convex, or the model.
   const oidc = await getVercelOidcToken().catch(() => null);
   if (oidc) return { base, token: oidc };
 
-  // Fallbacks for local dev and break-glass, in decreasing order of convenience.
   const token = process.env.JARVIS_BROWSER_TOKEN
     ?? await getSecret("jarvisbrowser", "JARVIS_BROWSER_TOKEN").catch(() => null);
-
   if (!token) {
     throw new BrowserServiceUnconfigured(
-      "No Vercel OIDC token and no JARVIS_BROWSER_TOKEN. In production this means OIDC is off — "
-      + "enable Settings → Security → Secure Backend Access with OIDC Federation on the jarvis "
-      + "project (it is on by default). Locally, set JARVIS_BROWSER_TOKEN; the value is in "
-      + "/etc/jarvis-browser/env on the browser host (sudo jarvis-browser-token).",
+      "No Vercel OIDC token and no JARVIS_BROWSER_TOKEN are available for the browser service.",
     );
   }
   return { base, token };
 }
 
+function assertBeforeBrowserDeadline(deadlineAt?: number): void {
+  if (deadlineAt !== undefined && (!Number.isSafeInteger(deadlineAt) || deadlineAt <= Date.now())) {
+    throw new BrowserDeadlineExceeded();
+  }
+}
+
 async function call(
   path: string,
-  init: { method: "GET" | "POST"; body?: unknown; token: string; base: string },
-): Promise<{ status: number; body: any }> {
-  const response = await fetch(`${init.base}${path}`, {
-    method: init.method,
-    headers: {
-      authorization: `Bearer ${init.token}`,
-      ...(init.body ? { "content-type": "application/json" } : {}),
-    },
-    ...(init.body ? { body: JSON.stringify(init.body) } : {}),
-    cache: "no-store",
-  });
-  const body = await response.json().catch(() => ({}));
-  return { status: response.status, body };
+  init: { method: "GET" | "POST"; body?: unknown; token: string; base: string; deadlineAt?: number },
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  assertBeforeBrowserDeadline(init.deadlineAt);
+  const controller = new AbortController();
+  let timedOut = false;
+  const remainingMs = init.deadlineAt === undefined ? undefined : Math.max(1, init.deadlineAt - Date.now());
+  const timeout = remainingMs === undefined
+    ? undefined
+    : setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, remainingMs);
+  try {
+    const response = await fetch(`${init.base}${path}`, {
+      method: init.method,
+      headers: {
+        authorization: `Bearer ${init.token}`,
+        ...(init.body ? { "content-type": "application/json" } : {}),
+      },
+      ...(init.body ? { body: JSON.stringify(init.body) } : {}),
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    const rawBody = await response.json().catch(() => ({}));
+    return {
+      status: response.status,
+      body: rawBody && typeof rawBody === "object" && !Array.isArray(rawBody)
+        ? rawBody as Record<string, unknown>
+        : {},
+    };
+  } catch (error) {
+    if (timedOut || error instanceof BrowserDeadlineExceeded || init.deadlineAt !== undefined && Date.now() >= init.deadlineAt) {
+      throw new BrowserDeadlineExceeded();
+    }
+    throw error;
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function knownProviderStatus(value: unknown): "awaiting_email_code" | "needs_otp" | "logged_in" | null {
+  return value === "awaiting_email_code" || value === "needs_otp" || value === "logged_in"
+    ? value
+    : null;
+}
+
+function safeUntrustedPageText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_UNTRUSTED_PAGE_TEXT_CHARS);
+}
+
+function boundedSends(value: unknown, current: number, max: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return Math.min(max, current + 1);
+  return Math.min(max, Math.max(current, value));
+}
+
+function safeLoginCodeSenderHint(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const sender = value.trim();
+  return /^[^\s@<>]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,63}$/.test(sender) ? sender : null;
 }
 
 /**
- * Fetch a login code from Daniel's mailbox for an email-code site.
- *
- * Bounded deliberately: scoped to the credential's configured sender, to mail
- * newer than the login attempt, and returns ONLY a short code. It never returns
- * message bodies or links, so this cannot become a general inbox read, and an
- * emailed link cannot steer the browser off the approved hosts.
+ * Fetch a login code from Daniel's mailbox for an email-code site. The browser
+ * provider may nominate only a bounded email sender; page/provider details
+ * never flow into the model transcript or durable errand result.
  */
 async function fetchLoginCode(senderHint: string | null, since: number): Promise<string | null> {
-  const sender = (senderHint ?? "").trim();
+  const sender = senderHint ?? "";
   if (!sender) return null;
   const afterSeconds = Math.floor(since / 1000) - 60;
   const messages = await gmailSearch(`from:${sender} after:${afterSeconds}`, 5).catch(() => []);
@@ -112,7 +156,6 @@ async function fetchLoginCode(senderHint: string | null, since: number): Promise
     const detail = await gmailReadMessage(message.id).catch(() => null);
     if (!detail) continue;
     const haystack = `${detail.subject ?? ""} ${detail.snippet ?? ""} ${detail.bodyText ?? ""}`;
-    // Prefer a code adjacent to code-ish wording; fall back to a lone 6-digit run.
     const labelled = haystack.match(/(?:code|passcode|pin|otp)\D{0,20}([A-Z0-9]{4,8})\b/i);
     if (labelled) return labelled[1];
     const bare = haystack.match(/\b(\d{6})\b/);
@@ -121,21 +164,45 @@ async function fetchLoginCode(senderHint: string | null, since: number): Promise
   return null;
 }
 
+async function waitWithinDeadline(waitMs: number, deadlineAt: number): Promise<void> {
+  assertBeforeBrowserDeadline(deadlineAt);
+  const remaining = deadlineAt - Date.now();
+  if (remaining < waitMs) throw new BrowserDeadlineExceeded();
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+  assertBeforeBrowserDeadline(deadlineAt);
+}
+
 export async function listBrowserCredentials(): Promise<Array<{ id: string; label: string; host: string }>> {
   const { base, token } = await serviceConfig();
   const { status, body } = await call("/credentials", { method: "GET", base, token });
-  if (status !== 200) throw new Error(`browser service returned ${status}`);
-  return body.credentials ?? [];
+  if (status !== 200 || !Array.isArray(body.credentials)) throw new Error(`browser service returned ${status}`);
+  return body.credentials
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value))
+    .flatMap((credential) => (
+      typeof credential.id === "string" && typeof credential.label === "string" && typeof credential.host === "string"
+        ? [{ id: credential.id.slice(0, 160), label: credential.label.slice(0, 240), host: credential.host.slice(0, 253) }]
+        : []
+    ));
 }
 
 /**
- * Run a plan Daniel already approved. Claims the errand first; if it is not in
- * `approved` state this refuses rather than proceeding.
+ * Run the exact owner-approved step snapshot. `foregroundReceiptKey` must be
+ * a one-time live-turn receipt that chatQueue already bound to this errand.
  */
-export async function runApprovedErrand(errandId: string, steps: BrowserStep[]): Promise<ErrandOutcome> {
-  // Resolve configuration before claiming. A missing OIDC/browser credential
-  // is an ordinary availability problem, not a reason to consume Daniel's
-  // approval and leave an errand permanently `running`.
+export async function runApprovedErrand(
+  errandId: string,
+  authorization: BrowserErrandRunAuthorization | undefined,
+): Promise<ErrandOutcome> {
+  if (!authorization || !RECEIPT_KEY_RE.test(authorization.foregroundReceiptKey)) {
+    return {
+      status: "failed",
+      summary: "A one-time foreground owner execution receipt is required before a browser errand can run.",
+      sends: 0,
+      transcript: [],
+    };
+  }
+  // Resolve configuration before claiming. A missing browser credential is an
+  // availability problem, not a reason to consume Daniel's approved plan.
   let service: { base: string; token: string };
   try {
     service = await serviceConfig();
@@ -148,18 +215,18 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
     };
   }
 
-  // This opaque fence is generated only in the trusted server runtime. Convex
-  // records it with the claim and accepts a final receipt only from this run;
-  // a late or replayed caller cannot overwrite its outcome.
   const leaseToken = randomUUID().replaceAll("-", "");
   let claim: any;
   try {
-    claim = await convexMutation("browserErrands:claim", { errandId, leaseToken });
+    claim = await convexMutation("browserErrands:claim", {
+      errandId,
+      leaseToken,
+      foregroundReceiptKey: authorization.foregroundReceiptKey,
+    });
   } catch {
     // The mutation may have committed just before its response was lost. A
-    // best-effort matching receipt closes only that exact lease; if no claim
-    // committed it is a harmless no-op. A lease reaper remains the durable
-    // fallback if Convex itself is unavailable here.
+    // matching final receipt can close only this exact lease; no browser task
+    // has been issued and nothing is retried automatically.
     await convexMutation("browserErrands:finish", {
       errandId,
       leaseToken,
@@ -177,7 +244,28 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
   if (!claim?.ok) {
     return {
       status: "failed",
-      summary: `Not runnable: ${claim?.reason ?? "no approval on record"}. Propose the plan and let Daniel approve it first.`,
+      summary: `Not runnable: ${typeof claim?.reason === "string" ? claim.reason.slice(0, 240) : "no approval on record"}. Propose the plan and let Daniel approve it first.`,
+      sends: 0,
+      transcript: [],
+    };
+  }
+
+  const steps = Array.isArray(claim.steps) ? claim.steps as BrowserStep[] : [];
+  const envelope = claim.envelope as BrowserEnvelope | undefined;
+  const browserDeadlineAt = typeof claim.browserDeadlineAt === "number" && Number.isSafeInteger(claim.browserDeadlineAt)
+    ? claim.browserDeadlineAt
+    : 0;
+  if (!steps.length || !envelope || browserDeadlineAt <= Date.now()) {
+    await convexMutation("browserErrands:finish", {
+      errandId,
+      leaseToken,
+      status: "failed",
+      result: "The sealed browser plan was unavailable at execution time. Nothing was retried automatically.",
+      sends: 0,
+    }).catch(() => undefined);
+    return {
+      status: "failed",
+      summary: "The sealed browser plan was unavailable at execution time. Nothing was retried automatically.",
       sends: 0,
       transcript: [],
     };
@@ -191,6 +279,8 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
 
   const finish = async (outcome: ErrandOutcome): Promise<ErrandOutcome> => {
     if (taskMayExist) {
+      // Cleanup is safe and deliberately best-effort even after the browser
+      // deadline. It never starts or advances a browser task.
       await call(`/tasks/${taskId}/close`, { method: "POST", base, token }).catch(() => undefined);
     }
     await convexMutation("browserErrands:finish", {
@@ -205,68 +295,75 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
   };
 
   try {
-    // Set this before the request: a network error can happen after the
-    // browser service accepted the task but before we received its response.
     taskMayExist = true;
     const opened = await call("/tasks", {
       method: "POST",
       base,
       token,
+      deadlineAt: browserDeadlineAt,
       body: {
         taskId,
         envelope: {
           objective: claim.objective,
           credentialId: claim.credentialId ?? undefined,
           approvalRef: String(errandId),
-          ...claim.envelope,
+          ...envelope,
+          // The provider receives an absolute deadline as well as the
+          // remaining normalized TTL. Vercel independently aborts every
+          // request/step at this same deadline.
+          deadlineAt: browserDeadlineAt,
         },
       },
     });
 
-    // Email-code sites: the site has mailed a code; collect it and finish signing in.
-    if (opened.status === 202 && opened.body?.status === "awaiting_email_code") {
+    const openedStatus = knownProviderStatus(opened.body.status);
+    if (opened.status === 202 && openedStatus === "awaiting_email_code") {
       const requestedAt = Date.now();
       let code: string | null = null;
-      // Mail delivery is not instant; a few short waits beat one long one.
-      for (const waitMs of [4000, 6000, 10_000]) {
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-        code = await fetchLoginCode(opened.body.codeSenderHint ?? null, requestedAt);
+      const senderHint = safeLoginCodeSenderHint(opened.body.codeSenderHint);
+      for (const waitMs of [4_000, 6_000, 10_000]) {
+        await waitWithinDeadline(waitMs, browserDeadlineAt);
+        code = await fetchLoginCode(senderHint, requestedAt);
         if (code) break;
       }
       if (!code) {
         return await finish({
           status: "failed",
-          summary: "Requested a login code but none arrived in the mailbox within ~20s. Check the credential's sender hint.",
+          summary: "A login code was requested but could not be completed before the browser deadline. Nothing was retried automatically.",
           sends: 0,
           transcript,
         });
       }
-      const completed = await call(`/tasks/${taskId}/login-code`, { method: "POST", base, token, body: { code } });
-      if (completed.body?.status !== "logged_in") {
+      const completed = await call(`/tasks/${taskId}/login-code`, {
+        method: "POST", base, token, deadlineAt: browserDeadlineAt, body: { code },
+      });
+      if (knownProviderStatus(completed.body.status) !== "logged_in") {
         return await finish({
           status: "failed",
-          summary: `Login code was rejected: ${completed.body?.detail ?? "unknown reason"}`,
+          summary: "The browser could not confirm the login code. Nothing was retried automatically.",
           sends: 0,
           transcript,
         });
       }
       transcript.push("signed in (email code)");
     } else if (opened.status !== 201) {
-      const reason = opened.body?.status === "needs_otp"
-        ? "The site asked for a one-time code and none is stored. Add a TOTP secret with `jarvis-cred edit`, or log in once by hand."
-        : opened.body?.reason ?? opened.body?.detail ?? `service returned ${opened.status}`;
-      return await finish({ status: "failed", summary: `Could not start: ${reason}`, sends: 0, transcript });
+      const summary = openedStatus === "needs_otp"
+        ? "The site requires a one-time code that is not available to this browser errand. Complete the sign-in yourself."
+        : `Could not start the browser task (service status ${opened.status}).`;
+      return await finish({ status: "failed", summary, sends: 0, transcript });
     } else {
-      transcript.push(`signed in (${opened.body.auth})`);
+      transcript.push("browser task started");
     }
 
     for (const step of steps) {
-      const { status, body } = await call(`/tasks/${taskId}/step`, { method: "POST", base, token, body: step });
-
+      assertBeforeBrowserDeadline(browserDeadlineAt);
+      const { status, body } = await call(`/tasks/${taskId}/step`, {
+        method: "POST", base, token, deadlineAt: browserDeadlineAt, body: step,
+      });
       if (status === 403) {
         return await finish({
           status: "blocked",
-          summary: `Stopped — ${body.reason}. This class of action has no approval path; do it yourself.`,
+          summary: "Stopped — the browser host blocked a prohibited action. Do it yourself if needed.",
           sends,
           transcript,
         });
@@ -274,8 +371,8 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
       if (status === 409) {
         return await finish({
           status: "needs_step_approval",
-          summary: `Paused — ${body.reason}. Nothing further was done.`,
-          escalation: body.reason,
+          summary: "Paused — the browser host refused a step outside the sealed plan or policy boundary. Nothing further was done.",
+          escalation: "The browser host refused a step outside the sealed plan or policy boundary.",
           sends,
           transcript,
         });
@@ -283,33 +380,37 @@ export async function runApprovedErrand(errandId: string, steps: BrowserStep[]):
       if (status !== 200) {
         return await finish({
           status: "failed",
-          summary: `Step '${step.action}' failed: ${body.reason ?? status}`,
+          summary: `The sealed '${step.action}' step could not be completed (service status ${status}).`,
           sends,
           transcript,
         });
       }
 
-      if (step.action === "send") sends = body.sends ?? sends + 1;
-      transcript.push(
-        step.action === "read"
-          ? `read ${body.url}: ${String(body.untrustedPageText ?? "").slice(0, 600)}`
-          : `${step.action}${step.label ? ` — ${step.label}` : ""} → ${body.url ?? "ok"}`,
-      );
+      if (step.action === "send") sends = boundedSends(body.sends, sends, envelope.maxSends);
+      if (step.action === "read") {
+        const evidence = safeUntrustedPageText(body.untrustedPageText);
+        transcript.push(evidence ? `read untrusted page evidence: ${evidence}` : "read page (no text returned)");
+      } else {
+        transcript.push(`${step.action}${step.label ? ` — ${step.label}` : ""}`);
+      }
     }
 
     return await finish({
       status: "done",
-      summary: `Completed "${claim.objective}" in ${steps.length} steps${sends ? `, ${sends} message(s) sent` : ""}.`,
+      summary: `Completed "${String(claim.objective).slice(0, 500)}" in ${steps.length} sealed steps${sends ? `, ${sends} message(s) sent` : ""}.`,
       sends,
       transcript,
     });
-  } catch {
-    // Do not reflect an upstream error into chat or durable state: provider
-    // messages can contain private data. The matching lease is terminalized
-    // when possible and never retried automatically.
+  } catch (error) {
+    // Provider `reason`/`detail` fields and thrown messages are deliberately
+    // not reflected to the model or durable result. The status below is the
+    // complete allowlisted external-error surface.
+    const deadline = error instanceof BrowserDeadlineExceeded;
     return await finish({
       status: "failed",
-      summary: "The browser errand stopped before a final result arrived. Its outcome may be unknown, so it was not retried automatically.",
+      summary: deadline
+        ? "The browser deadline elapsed before a final result arrived. Its outcome may be unknown, so it was not retried automatically."
+        : "The browser errand stopped before a final result arrived. Its outcome may be unknown, so it was not retried automatically.",
       sends,
       transcript,
     });
@@ -320,5 +421,13 @@ export async function readErrandAudit(errandId: string): Promise<unknown[]> {
   const { base, token } = await serviceConfig();
   const taskId = `errand-${String(errandId).replace(/[^A-Za-z0-9_-]/g, "")}`.slice(0, 64);
   const { body } = await call(`/tasks/${taskId}/audit`, { method: "GET", base, token });
-  return body.events ?? [];
+  // This helper has no current model caller. Preserve only bounded event kinds
+  // for future owner audit UI rather than returning raw provider event details.
+  return Array.isArray(body.events)
+    ? body.events.slice(0, 100).flatMap((event) => {
+      if (!event || typeof event !== "object" || Array.isArray(event)) return [];
+      const kind = (event as Record<string, unknown>).kind;
+      return typeof kind === "string" ? [{ kind: kind.slice(0, 80) }] : [];
+    })
+    : [];
 }

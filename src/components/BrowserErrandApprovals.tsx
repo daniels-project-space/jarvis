@@ -9,6 +9,7 @@ type PendingBrowserErrand = {
   _id: string;
   objective: string;
   plan: string[];
+  executionSteps?: Array<Record<string, unknown>>;
   status: "proposed" | "needs_step_approval";
   escalation?: string;
   envelope: {
@@ -64,7 +65,7 @@ export function BrowserErrandApprovals({ owner }: { owner: boolean }) {
         errandId: errand._id,
         state: "done",
         detail: next === "approved"
-          ? "Approved once. Nothing runs until JARVIS is explicitly asked to run this exact plan."
+          ? "Approved once. Nothing runs until you directly ask JARVIS to run these exact sealed steps."
           : "Declined. Nothing ran.",
       });
     } catch {
@@ -87,6 +88,7 @@ export function BrowserErrandApprovals({ owner }: { owner: boolean }) {
       {pending.map((errand) => {
         const state = decision?.errandId === errand._id ? decision : null;
         const paused = errand.status === "needs_step_approval";
+        const sealed = Boolean(errand.executionSteps?.length);
         return (
           <article
             key={errand._id}
@@ -116,6 +118,23 @@ export function BrowserErrandApprovals({ owner }: { owner: boolean }) {
               </ol>
             )}
 
+            {errand.executionSteps?.length ? (
+              <details className="mt-2 rounded-lg border border-amber/15 bg-black/15 px-2 py-1.5 text-[10px] text-slate">
+                <summary className="cursor-pointer font-mono uppercase tracking-[0.09em] text-amber/85">
+                  Exact sealed executable steps ({errand.executionSteps.length})
+                </summary>
+                <ol className="mt-1.5 space-y-1">
+                  {errand.executionSteps.map((step, index) => (
+                    <li key={`${errand._id}-sealed-${index}`} className="break-all font-mono text-[10px] text-ice/80">
+                      {index + 1}. {JSON.stringify(step)}
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            ) : (
+              <p className="mt-2 text-[11px] text-amber/90">This legacy proposal has no sealed executable plan and cannot be approved to run.</p>
+            )}
+
             {paused ? (
               <div className="mt-2 rounded-lg border border-amber/20 bg-black/15 px-2 py-1.5 text-[11px] text-amber/90">
                 <p>{errand.escalation || "The browser requested a step outside the approved envelope."}</p>
@@ -124,14 +143,14 @@ export function BrowserErrandApprovals({ owner }: { owner: boolean }) {
                 </p>
               </div>
             ) : (
-              <p className="mt-2 text-[11px] text-slate">Approval permits this exact plan once; it does not start the browser by itself.</p>
+              <p className="mt-2 text-[11px] text-slate">Approval permits these exact sealed steps once; it does not start the browser by itself. A separate direct request creates a one-time foreground execution receipt.</p>
             )}
 
             {state?.state === "done" ? (
               <p aria-live="polite" className="mt-2 text-[11px] text-cyan">{state.detail}</p>
             ) : (
               <div className="mt-2 flex flex-wrap items-center gap-2">
-                {!paused && (
+                {!paused && sealed && (
                   <button
                     type="button"
                     onClick={() => void decide(errand, "approved")}

@@ -7,6 +7,7 @@ const mock = vi.hoisted(() => ({
   convexQuery: vi.fn(),
   gmailUnsubscribe: vi.fn(),
   gmailMarkSpam: vi.fn(),
+  runApprovedErrand: vi.fn(),
 }));
 
 vi.mock("./context", () => ({
@@ -31,6 +32,10 @@ vi.mock("./gmail", () => ({
   gmailUnsubscribe: mock.gmailUnsubscribe,
   gmailMarkSpam: mock.gmailMarkSpam,
 }));
+vi.mock("./browser-errand", () => ({
+  listBrowserCredentials: vi.fn(),
+  runApprovedErrand: mock.runApprovedErrand,
+}));
 
 import { executeTool, TOOL_DEFS } from "./tools";
 
@@ -48,5 +53,31 @@ describe("Gmail destructive action boundary", () => {
 
     expect(mock.gmailUnsubscribe).not.toHaveBeenCalled();
     expect(mock.gmailMarkSpam).not.toHaveBeenCalled();
+  });
+
+  it("never accepts caller-supplied browser steps and requires the foreground execution receipt", async () => {
+    const definition = TOOL_DEFS.find((tool) => tool.name === "browser_errand_run");
+    expect(definition?.parameters.required).toEqual(["errand_id"]);
+    expect(definition?.parameters.properties).not.toHaveProperty("steps");
+
+    await expect(executeTool("browser_errand_run", {
+      errand_id: "browserErrand123",
+      steps: [{ action: "type", text: "different text" }],
+    })).resolves.toContain("accepts only errand_id");
+    await expect(executeTool("browser_errand_run", { errand_id: "browserErrand123" }))
+      .resolves.toContain("one-time foreground owner receipt");
+    expect(mock.runApprovedErrand).not.toHaveBeenCalled();
+
+    mock.runApprovedErrand.mockResolvedValue({
+      status: "done", summary: "Completed safely.", sends: 0, transcript: [],
+    });
+    await expect(executeTool(
+      "browser_errand_run",
+      { errand_id: "browserErrand123" },
+      { foregroundBrowserErrandExecution: { receiptKey: "assistant-1:call-browser-1" } },
+    )).resolves.toBe("Completed safely.");
+    expect(mock.runApprovedErrand).toHaveBeenCalledWith("browserErrand123", {
+      foregroundReceiptKey: "assistant-1:call-browser-1",
+    });
   });
 });

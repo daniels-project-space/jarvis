@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  normalizeForegroundBrowserErrandExecution,
   normalizeToolInvocationContext,
   TOOL_INVOCATION_ID_MAX_LENGTH,
 } from "./tool-invocation-context";
@@ -33,5 +34,14 @@ describe("tool invocation context", () => {
       { userMessageId: "message-1" },
       { allowUserMessageId: true },
     )).toEqual({ userMessageId: "message-1" });
+  });
+
+  it("accepts only a bounded host-only browser execution receipt key", () => {
+    expect(normalizeForegroundBrowserErrandExecution({ receiptKey: "assistant-1:call-1" }))
+      .toEqual({ receiptKey: "assistant-1:call-1" });
+    expect(() => normalizeForegroundBrowserErrandExecution({ receiptKey: "bad key" }))
+      .toThrow(/receipt is invalid/i);
+    expect(() => normalizeForegroundBrowserErrandExecution({ receiptKey: "ok", errandId: "attacker" }))
+      .toThrow(/unknown fields/i);
   });
 });

@@ -73,4 +73,17 @@ describe("owner direct-tool invocation context", () => {
     expect(await response.json()).toEqual({ result: "Tool failed: requestId is invalid" });
     expect(mock.executeTool).not.toHaveBeenCalled();
   });
+
+  it("does not let an owner-session browser route bypass the one-time foreground execution receipt", async () => {
+    const response = await POST(request({
+      name: "browser_errand_run",
+      args: { errand_id: "browserErrand123" },
+    }));
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      result: "Browser errands require a one-time foreground owner execution receipt.",
+    });
+    expect(mock.executeTool).not.toHaveBeenCalled();
+  });
 });

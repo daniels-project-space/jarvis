@@ -42,6 +42,12 @@ export async function POST(req: NextRequest) {
   try {
     const { name, args, requestId } = await req.json();
     toolName = String(name);
+    // An owner session alone is not a browser-execution authorization. Browser
+    // errands must pass through /api/foreground-owner-tool, whose signed,
+    // redeemed receipt is bound to a live owner turn and exact errand ID.
+    if (toolName === "browser_errand_run") {
+      return Response.json({ result: "Browser errands require a one-time foreground owner execution receipt." }, { status: 403 });
+    }
     const invocationContext = normalizeToolInvocationContext(
       requestId === undefined ? undefined : { requestId },
     );

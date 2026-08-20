@@ -7,6 +7,7 @@ import {
   JARVIS_DYNAMIC_TOOLS,
   JARVIS_TOOL_INSTRUCTIONS,
 } from "./agent-tool-bridge";
+import { verifyForegroundOwnerToolReceipt } from "../lib/foreground-owner-tool-receipt.server";
 import { TOOL_BELT_NAMES } from "../lib/tool-belts";
 import type { CodexDynamicToolCall } from "./codex-app-server";
 
@@ -446,6 +447,55 @@ describe("foreground agent tool bridge", () => {
       args: { query: "hotel" },
     });
     expect(String(ownerRequests[1].init?.body)).not.toContain("claim-1");
+  });
+
+  it("binds a foreground browser run receipt to its exact errand and rejects injected steps before any request", async () => {
+    const secret = "w".repeat(48);
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    const bridge = new AgentToolBridge("dispatch-token", {
+      endpoint: "https://jarvis.test/api/agent-tool",
+      ownerEndpoint: "https://jarvis.test/api/foreground-owner-tool",
+      ownerToolReceiptSecret: secret,
+      fetchImplementation: async (input, init) => {
+        requests.push({ url: new URL(String(input)), init });
+        return Response.json({ result: "browser task started" });
+      },
+    });
+    const hostContext = {
+      foregroundOwnerToolTurn: {
+        messageId: "message-1",
+        assistantId: "assistant-1",
+        claimToken: "claim-1",
+      },
+    } as const;
+
+    const called = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "browser_errand_run", args: { errand_id: "browserErrand123" } },
+      { userMessageId: "message-1" },
+      undefined,
+      hostContext,
+    ));
+    expect(called.success).toBe(true);
+    expect(requests).toHaveLength(1);
+    const receipt = verifyForegroundOwnerToolReceipt(
+      (requests[0].init?.headers as Record<string, string>)["x-jarvis-owner-tool-receipt"],
+      secret,
+    );
+    expect(receipt).toMatchObject({
+      operation: "invoke",
+      target: "browser_errand_run:browserErrand123",
+    });
+
+    const injected = await bridge.invoke(dynamicCall(
+      "jarvis_call_tool",
+      { name: "browser_errand_run", args: { errand_id: "browserErrand123", steps: [{ action: "type" }] } },
+      { userMessageId: "message-1" },
+      undefined,
+      hostContext,
+    ));
+    expect(injected.success).toBe(false);
+    expect(requests).toHaveLength(1);
   });
 
   it("advertises native JSON tools without shell or capability-token instructions", () => {

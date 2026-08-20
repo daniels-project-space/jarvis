@@ -9,6 +9,8 @@ import {
 import {
   FOREGROUND_OWNER_TOOL_NAMES,
   TOOL_BELTS,
+  foregroundBrowserErrandIdFromArgs,
+  foregroundOwnerToolReceiptTarget,
   isForegroundOwnerToolName,
   isToolBeltName,
   slimToolDefinition,
@@ -95,7 +97,21 @@ export async function POST(req: NextRequest) {
     if (!isForegroundOwnerToolName(toolName) || !FOREGROUND_OWNER_TOOL_NAMES.has(toolName)) {
       return Response.json({ result: "Tool unavailable to this foreground owner conversation." }, { status: 403 });
     }
-    const receipt = receiptFor(req, "invoke", toolName);
+    const args = resultArgs(body?.args);
+    // Browser run receipts bind both the tool and the exact errand ID. Unlike
+    // other foreground tools, no extra model-supplied arguments (especially
+    // a fresh step list) are accepted at this boundary.
+    const receiptTarget = foregroundOwnerToolReceiptTarget(toolName, args);
+    if (!receiptTarget) {
+      return Response.json({ result: "Tool unavailable to this foreground owner conversation." }, { status: 403 });
+    }
+    const browserErrandId = toolName === "browser_errand_run"
+      ? foregroundBrowserErrandIdFromArgs(args)
+      : null;
+    if (toolName === "browser_errand_run" && !browserErrandId) {
+      return Response.json({ result: "Tool unavailable to this foreground owner conversation." }, { status: 403 });
+    }
+    const receipt = receiptFor(req, "invoke", receiptTarget);
     const worker = workerToken();
     if (!receipt || !worker) {
       return Response.json({ result: "Tool unavailable to this foreground owner conversation." }, { status: 403 });
@@ -106,9 +122,17 @@ export async function POST(req: NextRequest) {
       claimToken: receipt.claimToken,
       callId: receipt.callId,
       toolName,
+      ...(browserErrandId ? { browserErrandId } : {}),
       workerToken: worker,
-    }) as { allowed?: boolean };
+    }) as { allowed?: boolean; receiptKey?: unknown };
     if (!gate?.allowed) {
+      return Response.json({ result: "Tool unavailable to this foreground owner conversation." }, { status: 403 });
+    }
+    const foregroundBrowserErrandExecution = toolName === "browser_errand_run"
+      && typeof gate.receiptKey === "string"
+      ? { receiptKey: gate.receiptKey }
+      : undefined;
+    if (toolName === "browser_errand_run" && !foregroundBrowserErrandExecution) {
       return Response.json({ result: "Tool unavailable to this foreground owner conversation." }, { status: 403 });
     }
     // A successful redemption is the provider-call linearization point. Do
@@ -117,8 +141,9 @@ export async function POST(req: NextRequest) {
     // Do not accept caller-supplied invocation context. The receipt already
     // reconstructed the immutable owner message, while no browser auth hash or
     // `_subscription_reasoner` ever crosses into this route.
-    const result = await executeTool(toolName, resultArgs(body?.args), {
+    const result = await executeTool(toolName, args, {
       invocationContext: { userMessageId: receipt.messageId },
+      ...(foregroundBrowserErrandExecution ? { foregroundBrowserErrandExecution } : {}),
     });
     return Response.json({ result });
   } catch {

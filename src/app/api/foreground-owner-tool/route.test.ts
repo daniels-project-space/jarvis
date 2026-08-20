@@ -20,6 +20,7 @@ vi.mock("@/lib/tools", () => ({
     { name: "gmail_search", description: "Search Gmail." },
     { name: "gmail_draft_reply", description: "Create a Gmail draft." },
     { name: "google_calendar_create", description: "Create an approval card." },
+    { name: "browser_errand_run", description: "Run an approved browser errand." },
     { name: "work_control", description: "Must never be exposed here." },
   ],
 }));
@@ -111,6 +112,54 @@ describe("foreground owner Gmail/Google tool endpoint", () => {
       { invocationContext: { userMessageId: "message-1" } },
     );
     expect(JSON.stringify(mock.executeTool.mock.calls)).not.toContain("_subscription_reasoner");
+  });
+
+  it("binds a browser run receipt to one exact errand and forwards only the redeemed execution authority", async () => {
+    mock.controlMutation.mockResolvedValueOnce({
+      allowed: true,
+      receiptKey: "assistant-1:call-browser-1",
+    });
+    const response = await POST(request("POST", "/api/foreground-owner-tool", {
+      receipt: receipt("invoke", "browser_errand_run:browserErrand123", "call-browser-1"),
+      body: { name: "browser_errand_run", args: { errand_id: "browserErrand123" } },
+    }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ result: "owner result" });
+    expect(mock.controlMutation).toHaveBeenCalledWith("chatQueue:redeemForegroundOwnerToolForWorker", {
+      ...turn,
+      callId: "call-browser-1",
+      toolName: "browser_errand_run",
+      browserErrandId: "browserErrand123",
+      workerToken: WORKER,
+    });
+    expect(mock.executeTool).toHaveBeenCalledWith(
+      "browser_errand_run",
+      { errand_id: "browserErrand123" },
+      {
+        invocationContext: { userMessageId: "message-1" },
+        foregroundBrowserErrandExecution: { receiptKey: "assistant-1:call-browser-1" },
+      },
+    );
+  });
+
+  it("rejects step injection or an errand-id mismatch before redeeming a browser run receipt", async () => {
+    const injected = await POST(request("POST", "/api/foreground-owner-tool", {
+      receipt: receipt("invoke", "browser_errand_run:browserErrand123", "browser-injected"),
+      body: {
+        name: "browser_errand_run",
+        args: { errand_id: "browserErrand123", steps: [{ action: "type", text: "different text" }] },
+      },
+    }));
+    expect(injected.status).toBe(403);
+
+    const mismatched = await POST(request("POST", "/api/foreground-owner-tool", {
+      receipt: receipt("invoke", "browser_errand_run:browserErrand123", "browser-mismatch"),
+      body: { name: "browser_errand_run", args: { errand_id: "browserErrand456" } },
+    }));
+    expect(mismatched.status).toBe(403);
+    expect(mock.controlMutation).not.toHaveBeenCalled();
+    expect(mock.executeTool).not.toHaveBeenCalled();
   });
 
   it("continues a redeemed provider call when cancellation lands after its commit point", async () => {

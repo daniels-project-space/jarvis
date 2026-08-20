@@ -86,6 +86,27 @@ const backgroundExecutionProfileValidator = v.union(
   }),
 );
 
+// Keep the browser errand execution contract in the durable schema rather
+// than accepting an untyped JSON blob. `approvedSteps` is a snapshot taken at
+// the owner decision boundary; legacy unsealed rows intentionally cannot run.
+const browserErrandEnvelopeValidator = v.object({
+  allowedHosts: v.array(v.string()),
+  allowedActions: v.array(v.string()),
+  maxSends: v.number(),
+  maxSteps: v.number(),
+  ttlMs: v.number(),
+});
+
+const browserErrandStepValidator = v.union(
+  v.object({ action: v.literal("navigate"), url: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("read"), selector: v.optional(v.string()), limit: v.optional(v.number()), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("click"), selector: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("type"), selector: v.string(), text: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("select"), selector: v.string(), value: v.string(), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("screenshot"), fullPage: v.optional(v.boolean()), label: v.optional(v.string()) }),
+  v.object({ action: v.literal("send"), selector: v.string(), label: v.optional(v.string()) }),
+);
+
 const missionSupervisorDecisionOriginValidator = v.union(
   v.literal("model"),
   v.literal("policy"),
@@ -289,6 +310,10 @@ export default defineSchema({
     assistantId: v.id("chatMessages"),
     callId: v.string(),
     toolName: v.string(),
+    // Present only for a browser run. It binds the redeemed one-time
+    // foreground receipt to one exact durable errand ID before `claim` will
+    // hand any sealed browser steps to the provider.
+    browserErrandId: v.optional(v.string()),
     committedAt: v.number(),
   })
     .index("by_receipt", ["receiptKey"])
@@ -2462,14 +2487,17 @@ export default defineSchema({
   browserErrands: defineTable({
     objective: v.string(),
     credentialId: v.optional(v.string()),
-    envelope: v.object({
-      allowedHosts: v.array(v.string()),
-      allowedActions: v.array(v.string()),
-      maxSends: v.number(),
-      maxSteps: v.number(),
-      ttlMs: v.number(),
-    }),
-    plan: v.array(v.string()), // human-readable steps, shown at approval time
+    // Normalized, bounded proposal envelope. It is snapshotted into
+    // `approvedEnvelope` with the executable steps when Daniel approves.
+    envelope: browserErrandEnvelopeValidator,
+    // Human-readable, server-derived summaries of `executionSteps`, shown at
+    // approval time. It is never an execution input.
+    plan: v.array(v.string()),
+    // Legacy records may not have a sealed executable plan. They are kept for
+    // audit, but cannot be approved for execution.
+    executionSteps: v.optional(v.array(browserErrandStepValidator)),
+    approvedSteps: v.optional(v.array(browserErrandStepValidator)),
+    approvedEnvelope: v.optional(browserErrandEnvelopeValidator),
     status: v.string(), // proposed | approved | declined | expired | running | done | failed | blocked | needs_step_approval
     result: v.optional(v.string()),
     escalation: v.optional(v.string()), // why it paused, when status = needs_step_approval
@@ -2483,6 +2511,10 @@ export default defineSchema({
     // only the claimant can finish the run it started.
     leaseToken: v.optional(v.string()),
     leaseUntil: v.optional(v.number()),
+    // The browser service receives only the remaining bounded lifetime at
+    // claim time. This absolute deadline lets Vercel stop before a late lease
+    // finalization and gives audit/recovery an unambiguous browser cutoff.
+    browserDeadlineAt: v.optional(v.number()),
     finishedAt: v.optional(v.number()),
   })
     .index("by_status", ["status", "requestedAt"])

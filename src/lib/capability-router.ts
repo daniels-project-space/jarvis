@@ -228,7 +228,11 @@ export function rankCapabilities(
         tool,
         score: 188 - index * 2,
         visual: false,
-        reason: tool.startsWith("gmail_") ? "owner_gmail" : "owner_google_calendar",
+        reason: tool.startsWith("gmail_")
+          ? "owner_gmail"
+          : tool === "browser_errand_run"
+            ? "owner_browser_errand"
+            : "owner_google_calendar",
       });
     });
   }

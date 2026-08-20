@@ -24,6 +24,11 @@ const proposed = {
   objective: "Ask support why the refund is delayed",
   status: "proposed" as const,
   plan: ["Open the existing support ticket", "Read its status", "Send one follow-up"],
+  executionSteps: [
+    { action: "navigate", url: "https://support.example.com/tickets/123" },
+    { action: "read", selector: "main", limit: 500 },
+    { action: "send", selector: "button[type=submit]" },
+  ],
   envelope: {
     allowedHosts: ["support.example.com"],
     allowedActions: ["navigate", "read", "type", "send"],
@@ -44,6 +49,8 @@ describe("BrowserErrandApprovals", () => {
     expect(markup).toContain("Ask support why the refund is delayed");
     expect(markup).toContain("support.example.com");
     expect(markup).toContain("Open the existing support ticket");
+    expect(markup).toContain("Exact sealed executable steps (3)");
+    expect(markup).toContain("https://support.example.com/tickets/123");
     expect(markup).toContain("Approve exact plan");
     expect(markup).toContain("Decline");
     expect(markup).toContain("does not start the browser by itself");
