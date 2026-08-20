@@ -740,6 +740,90 @@ describe("durable private chat files", () => {
     expect(await t.query(api.files.get, { fileId, workerToken: WORKER })).toBeNull();
   });
 
+  it("holds deletion open while an ingest claim can still write derived private media", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "b".repeat(64);
+    const batch = await reserve(t, "main", "delete-during-video-processing.mp4", sha256, 1, "video/mp4");
+    const fileId = batch.files[0].fileId as any;
+    const uploadClaimToken = "upload-claim-delete-during-ingest";
+    const ingestClaimToken = "ingest-claim-delete-during-ingest";
+    await t.mutation(api.files.claimUpload, {
+      batchId: batch.batchId as any,
+      fileId,
+      claimToken: uploadClaimToken,
+      contentType: "video/mp4",
+      sha256,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.markUploaded, {
+      batchId: batch.batchId as any,
+      fileId,
+      sizeBytes: 24,
+      contentType: "video/mp4",
+      sha256,
+      claimToken: uploadClaimToken,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.claimIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: ingestClaimToken,
+      workerToken: WORKER,
+    });
+
+    expect(await t.mutation(api.files.beginDelete, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ok: true, deferred: true, idempotent: false });
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ready: false });
+    expect(await t.mutation(api.files.finishDelete, { fileId, workerToken: WORKER })).toBe(false);
+    expect(await t.mutation(api.files.heartbeatIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: ingestClaimToken,
+      workerToken: WORKER,
+    })).toBe(false);
+
+    expect(await t.mutation(api.files.beginDelete, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ok: true, deferred: true, idempotent: true });
+  });
+
+  it("defers batch cancellation when one file still owns an ingest claim", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "c".repeat(64);
+    const batch = await reserve(t, "main", "partial-video-upload.mp4", sha256, 2, "video/mp4");
+    const fileId = batch.files[0].fileId as any;
+    const uploadClaimToken = "upload-claim-partial-video";
+    await t.mutation(api.files.claimUpload, {
+      batchId: batch.batchId as any,
+      fileId,
+      claimToken: uploadClaimToken,
+      contentType: "video/mp4",
+      sha256,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.markUploaded, {
+      batchId: batch.batchId as any,
+      fileId,
+      sizeBytes: 24,
+      contentType: "video/mp4",
+      sha256,
+      claimToken: uploadClaimToken,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.claimIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: "ingest-claim-partial-video",
+      workerToken: WORKER,
+    });
+
+    const cancellation = await t.mutation(api.files.cancelBatch, { batchId: batch.batchId as any, workerToken: WORKER });
+    expect(cancellation?.cleanup).toContainEqual(expect.objectContaining({ fileId: String(fileId), deferred: true }));
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId, workerToken: WORKER }))
+      .toMatchObject({ ready: false });
+    expect(await t.mutation(api.files.finishDelete, { fileId, workerToken: WORKER })).toBe(false);
+  });
+
   it("searches and sequentially reads only files linked to the exact invoking message", async () => {
     const t = convexTest(schema, modules);
     const selected = await makeReady(t, "main", "long-report.txt", "6".repeat(64), [
@@ -930,5 +1014,29 @@ describe("durable private chat files", () => {
     expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
       .toEqual(expect.objectContaining({ ok: true }));
     expect(await t.mutation(api.files.finishDelete, { fileId: source.fileId as any, workerToken: WORKER })).toBe(true);
+  });
+
+  it("pins an explicitly selected private source file for transcript and document creations", async () => {
+    const t = convexTest(schema, modules);
+    const source = await makeReady(t, "main", "arrival-note.m4a", "d".repeat(64), "private transcript text");
+    const creationId = await t.mutation(api.creations.create, {
+      kind: "doc",
+      title: "Transcript · arrival-note.m4a",
+      data: "private transcript text",
+      sourceFiles: [{ fileId: source.fileId as any, name: "untrusted stale label" }],
+      workerToken: WORKER,
+    });
+
+    const refs = await t.run(async (ctx) => await ctx.db
+      .query("creationFileRefs")
+      .withIndex("by_creation_file", (q) => q.eq("creationId", creationId).eq("fileId", source.fileId))
+      .collect());
+    expect(refs).toHaveLength(1);
+    expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
+      .toEqual({ ok: false, reason: "creation_reference" });
+
+    await t.mutation(api.creations.remove, { id: creationId, workerToken: WORKER });
+    expect(await t.mutation(api.files.beginDelete, { fileId: source.fileId as any, workerToken: WORKER }))
+      .toEqual(expect.objectContaining({ ok: true }));
   });
 });

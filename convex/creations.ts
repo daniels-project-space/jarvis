@@ -3,7 +3,7 @@ import { type Id } from "./_generated/dataModel";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { inferCreationFiling } from "./creationFiling";
-import { linkMessageFilesToCreation } from "./fileHelpers";
+import { linkExplicitFilesToCreation, linkMessageFilesToCreation } from "./fileHelpers";
 import { MAX_TRIP_CANVAS_BYTES, tripCanvas, type TripCanvasRecord } from "./tripCanvas";
 import { redactLegacyCreationUrls, trustedLegacyCreationUrl } from "../src/lib/legacy-creation-url";
 
@@ -308,6 +308,7 @@ export const create = mutation({
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    await linkExplicitFilesToCreation(ctx, creationId, a.sourceFiles);
     await linkMessageFilesToCreation(ctx, creationId, a.sourceMessageId);
     return creationId;
   },

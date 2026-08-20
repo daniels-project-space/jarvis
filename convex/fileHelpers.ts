@@ -185,6 +185,54 @@ export async function linkMessageFilesToCreation(
   return linked;
 }
 
+/**
+ * Tools that open a selected library file as a derived creation do not have a
+ * user-message snapshot to link. Pin the exact ready source in the same
+ * transaction so deleting the source cannot leave its transcript/document
+ * behind as an untracked private derivative.
+ */
+export async function linkExplicitFilesToCreation(
+  ctx: { db: any },
+  creationId: any,
+  declaredSources: ReadonlyArray<{ fileId: any; name?: string }> | undefined,
+  role = "source",
+): Promise<number> {
+  if (!declaredSources?.length) return 0;
+  if (declaredSources.length > 32) {
+    throw new ConvexError({ code: "INVALID_CREATION_SOURCE", message: "Creation source file bound exceeded" });
+  }
+  const creation = await ctx.db.get(creationId);
+  if (!creation) throw new ConvexError({ code: "INVALID_CREATION_SOURCE", message: "Creation was not found" });
+  const sourceFiles = new Map<string, { fileId: any; name: string }>(
+    (creation.sourceFiles ?? []).map((file: any) => [String(file.fileId), { fileId: file.fileId, name: String(file.name) }]),
+  );
+  let linked = 0;
+  const uniqueSources = new Map<string, { fileId: any; name?: string }>();
+  for (const source of declaredSources) uniqueSources.set(String(source.fileId), source);
+  for (const source of uniqueSources.values()) {
+    const file = await ctx.db.get(source.fileId);
+    if (!file || !FILE_READY_STATUSES.has(String(file.status))) {
+      throw new ConvexError({ code: "INVALID_CREATION_SOURCE", message: "Creation source file is not ready" });
+    }
+    const existing = await ctx.db
+      .query("creationFileRefs")
+      .withIndex("by_creation_file", (q: any) => q.eq("creationId", creationId).eq("fileId", file._id))
+      .first();
+    if (!existing) {
+      await ctx.db.insert("creationFileRefs", {
+        creationId,
+        fileId: file._id,
+        role: role.trim().slice(0, 40) || "source",
+        createdAt: Date.now(),
+      });
+      linked += 1;
+    }
+    sourceFiles.set(String(file._id), { fileId: file._id, name: String(file.originalName).slice(0, 240) });
+  }
+  await ctx.db.patch(creationId, { sourceFiles: [...sourceFiles.values()].slice(0, 32) });
+  return linked;
+}
+
 const DETERMINISTIC_FILE_FOLLOW_UP =
   /\b(?:that|this|the|last|previous|uploaded|attached|my|our)\s+(?:file|document|doc|pdf|spreadsheet|csv|image|photo|video|audio|clip|recording)\b/;
 const DETERMINISTIC_FILE_SOURCE_REFERENCE =

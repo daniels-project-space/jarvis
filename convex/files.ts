@@ -41,6 +41,8 @@ const extractedChunk = v.object({
   cellRange: v.optional(v.string()),
 });
 
+const INGEST_CLAIM_STALE_MS = 90_000;
+
 function ownerThread(value: string | undefined): string {
   const threadId = value?.trim() || "main";
   if (!threadId || threadId.length > 120 || threadId.startsWith("guest:")) {
@@ -114,6 +116,21 @@ function cleanupKeysForFile(file: any): string[] {
   ])];
 }
 
+/**
+ * A deleting row may still have a live ingestion worker which can be between
+ * writing deterministic derived objects and recording them in Convex. Keep
+ * the durable deletion outbox open until that claim can no longer write.
+ */
+function activeIngestCleanupRetryAfter(file: any, now: number): number | null {
+  const isIngesting = file.status === "processing"
+    || (file.status === "deleting" && file.deletePreviousStatus === "processing");
+  if (!isIngesting || !file.ingestClaimToken) return null;
+  const lastProgressAt = Number(file.lastProgressAt ?? 0);
+  if (!Number.isFinite(lastProgressAt)) return null;
+  const retryAfterMs = lastProgressAt + INGEST_CLAIM_STALE_MS - now;
+  return retryAfterMs > 0 ? retryAfterMs : null;
+}
+
 async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired" | "cancelled") {
   const now = Date.now();
   const cleanup: Array<{ fileId: string; r2Keys: string[]; deferred: boolean }> = [];
@@ -122,7 +139,17 @@ async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired"
     const file = await ctx.db.get(fileId);
     if (!file || file.status === "deleted") continue;
     const claimActive = file.status === "uploading" && Number(file.uploadClaimExpiresAt ?? 0) > now;
+    const ingestRetryAfterMs = activeIngestCleanupRetryAfter(file, now);
     await ctx.db.patch(fileId, claimActive ? {
+      cancelRequestedAt: now,
+      errorCode: `upload_${status}`,
+      libraryVisible: false,
+      updatedAt: now,
+    } : ingestRetryAfterMs !== null ? {
+      status: "deleting",
+      deletePreviousStatus: file.status === "processing" ? "processing" : file.deletePreviousStatus,
+      uploadClaimToken: undefined,
+      uploadClaimExpiresAt: undefined,
       cancelRequestedAt: now,
       errorCode: `upload_${status}`,
       libraryVisible: false,
@@ -138,7 +165,7 @@ async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired"
       libraryVisible: false,
       updatedAt: now,
     });
-    cleanup.push({ fileId: String(fileId), r2Keys: cleanupKeysForFile(file), deferred: claimActive });
+    cleanup.push({ fileId: String(fileId), r2Keys: cleanupKeysForFile(file), deferred: claimActive || ingestRetryAfterMs !== null });
     retired += 1;
   }
   await ctx.db.patch(batch._id, { status, updatedAt: now });
@@ -363,9 +390,14 @@ export const claimCancelledUploadCleanup = mutation({
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status === "deleted") return null;
-    if (file.status === "deleting") return { ready: true as const, r2Keys: cleanupKeysForFile(file) };
-    if (file.status !== "uploading" || !file.cancelRequestedAt) return null;
     const now = Date.now();
+    if (file.status === "deleting") {
+      const retryAfterMs = activeIngestCleanupRetryAfter(file, now);
+      return retryAfterMs === null
+        ? { ready: true as const, r2Keys: cleanupKeysForFile(file) }
+        : { ready: false as const, retryAfterMs };
+    }
+    if (file.status !== "uploading" || !file.cancelRequestedAt) return null;
     if (Number(file.uploadClaimExpiresAt ?? 0) > now) {
       return { ready: false as const, retryAfterMs: Number(file.uploadClaimExpiresAt) - now };
     }
@@ -680,7 +712,7 @@ export const claimIngest = mutation({
     const file = await ctx.db.get(args.fileId);
     if (!file || file.ingestVersion !== args.ingestVersion) return null;
     const now = Date.now();
-    if (file.status === "processing" && Number(file.lastProgressAt ?? 0) > now - 90_000) return null;
+    if (file.status === "processing" && Number(file.lastProgressAt ?? 0) > now - INGEST_CLAIM_STALE_MS) return null;
     if (!["uploaded", "error", "processing"].includes(file.status) || file.ingestAttempt >= 3) return null;
     const claimToken = args.claimToken.trim().slice(0, 160);
     if (!claimToken) return null;
@@ -830,7 +862,7 @@ export const retryIngest = mutation({
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
-    const staleProcessing = file?.status === "processing" && Number(file.lastProgressAt ?? 0) <= Date.now() - 90_000;
+    const staleProcessing = file?.status === "processing" && Number(file.lastProgressAt ?? 0) <= Date.now() - INGEST_CLAIM_STALE_MS;
     if (!file || (!staleProcessing && !["uploaded", "error", "stored_only"].includes(file.status))) return null;
     const now = Date.now();
     const ingestVersion = file.ingestVersion + 1;
@@ -857,7 +889,7 @@ export const pendingIngest = query({
       ctx.db.query("files").withIndex("by_status_updated", (q) => q.eq("status", "error")).order("asc").take(limit),
       ctx.db.query("files").withIndex("by_status_updated", (q) => q.eq("status", "processing")).order("asc").take(limit),
     ]);
-    const staleBefore = Date.now() - 90_000;
+    const staleBefore = Date.now() - INGEST_CLAIM_STALE_MS;
     return [...uploaded, ...failed, ...processing]
       .filter((file) => file.ingestAttempt < 3 && (file.status !== "processing" || Number(file.lastProgressAt ?? 0) <= staleBefore))
       .slice(0, limit)
@@ -1090,10 +1122,19 @@ export const beginDelete = mutation({
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status === "deleted") return null;
-    if (file.status === "deleting") return { ok: true as const, r2Keys: cleanupKeysForFile(file), idempotent: true as const };
+    const now = Date.now();
+    if (file.status === "deleting") {
+      const retryAfterMs = activeIngestCleanupRetryAfter(file, now);
+      return {
+        ok: true as const,
+        deferred: retryAfterMs !== null,
+        ...(retryAfterMs === null ? {} : { retryAfterMs }),
+        r2Keys: cleanupKeysForFile(file),
+        idempotent: true as const,
+      };
+    }
     const reference = await ctx.db.query("creationFileRefs").withIndex("by_file", (q) => q.eq("fileId", file._id)).first();
     if (reference) return { ok: false as const, reason: "creation_reference" as const };
-    const now = Date.now();
     if (file.status === "uploading" && Number(file.uploadClaimExpiresAt ?? 0) > now) {
       await ctx.db.patch(file._id, {
         cancelRequestedAt: now,
@@ -1105,6 +1146,22 @@ export const beginDelete = mutation({
         ok: true as const,
         deferred: true as const,
         retryAfterMs: Number(file.uploadClaimExpiresAt) - now,
+        r2Keys: cleanupKeysForFile(file),
+        idempotent: false as const,
+      };
+    }
+    const ingestRetryAfterMs = activeIngestCleanupRetryAfter(file, now);
+    if (ingestRetryAfterMs !== null) {
+      await ctx.db.patch(file._id, {
+        status: "deleting",
+        deletePreviousStatus: "processing",
+        libraryVisible: false,
+        updatedAt: now,
+      });
+      return {
+        ok: true as const,
+        deferred: true as const,
+        retryAfterMs: ingestRetryAfterMs,
         r2Keys: cleanupKeysForFile(file),
         idempotent: false as const,
       };
@@ -1137,6 +1194,7 @@ export const finishDelete = mutation({
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status !== "deleting") return false;
+    if (activeIngestCleanupRetryAfter(file, Date.now()) !== null) return false;
     const [chunks, threadLinks] = await Promise.all([
       ctx.db.query("fileChunks").withIndex("by_file_ordinal", (q) => q.eq("fileId", file._id)).collect(),
       ctx.db.query("threadFiles").withIndex("by_file", (q) => q.eq("fileId", file._id)).collect(),
