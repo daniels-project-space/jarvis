@@ -33,7 +33,10 @@ import { listICloudEvents } from "./icloud-calendar";
 import { getManagedGooglePrimaryCalendarEvent, listGooglePrimaryCalendarEvents, type GoogleCalendarCreateInput } from "./google-calendar";
 import { googleCalendarApprovalMarker, issueGoogleCalendarApproval, issueGoogleCalendarApprovalProposal } from "./google-calendar-approval.server";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
-import { buildAppleMapsOfflinePreflight } from "./apple-maps-offline";
+import {
+  buildAppleMapsOfflinePreflight,
+  nextAppleMapsOfflinePreflightRefreshAt,
+} from "./apple-maps-offline";
 import {
   appleMapsOfflineGmailIdentity,
   appleMapsOfflineHubTodoTag,
@@ -2760,26 +2763,37 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   // identities Daniel selected here, so a later refresh cannot drift to a
   // different trip sharing the same date or city.
   const now = Date.now();
-  const nextRefreshAt = Math.max(now + 60_000, Math.min(preflight.at - 5 * 60_000, now + 6 * 60 * 60_000));
-  let automaticRefresh: "scheduled" | "draft_manual_only" | "pending_city_identity" | "pending_registry" = workspace.storage === "creation"
+  // A Hub outage should not leave this owner-visible to-do waiting for the
+  // normal six-hour itinerary refresh. Near the live reminder, do not create
+  // a background retry that could run inside its protected five-minute window.
+  const nextRefreshAt = nextAppleMapsOfflinePreflightRefreshAt(
+    preflight.at,
+    now,
+    todoStatus === "needs_retry",
+  );
+  let automaticRefresh: "scheduled" | "too_late" | "draft_manual_only" | "pending_city_identity" | "pending_registry" = workspace.storage === "creation"
     ? "pending_city_identity"
     : "draft_manual_only";
   if (workspace.storage === "creation") {
-    const proofBooking = exactCityProofBooking(matching, cityProof);
-    if (proofBooking) {
-      try {
-        const registered = await convexMutation("appleMapsOfflinePreflights:upsert", {
-          creationId: trip.id,
-          sourceKey: preflight.sourceKey,
-          preflight,
-          flightIdentity: appleMapsOfflineGmailIdentity(selected, bookingCalendarSelectionId(selected)),
-          cityProofIdentity: appleMapsOfflineGmailIdentity(proofBooking, bookingCalendarSelectionId(proofBooking)),
-          cityProof,
-          nextRefreshAt,
-        });
-        automaticRefresh = registered?.ok ? "scheduled" : "pending_registry";
-      } catch {
-        automaticRefresh = "pending_registry";
+    if (nextRefreshAt === null) {
+      automaticRefresh = "too_late";
+    } else {
+      const proofBooking = exactCityProofBooking(matching, cityProof);
+      if (proofBooking) {
+        try {
+          const registered = await convexMutation("appleMapsOfflinePreflights:upsert", {
+            creationId: trip.id,
+            sourceKey: preflight.sourceKey,
+            preflight,
+            flightIdentity: appleMapsOfflineGmailIdentity(selected, bookingCalendarSelectionId(selected)),
+            cityProofIdentity: appleMapsOfflineGmailIdentity(proofBooking, bookingCalendarSelectionId(proofBooking)),
+            cityProof,
+            nextRefreshAt,
+          });
+          automaticRefresh = registered?.ok ? "scheduled" : "pending_registry";
+        } catch {
+          automaticRefresh = "pending_registry";
+        }
       }
     }
   }
@@ -2797,7 +2811,13 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     reminderStatus: "scheduled",
     calendarStatus,
     refreshState: automaticRefresh,
-    ...(automaticRefresh === "scheduled" ? { lastCheckedAt: now, nextRefreshAt, calendarRefreshRequired: false } : {}),
+    ...(automaticRefresh === "scheduled" && nextRefreshAt !== null
+      ? { lastCheckedAt: now, nextRefreshAt, calendarRefreshRequired: false }
+      : {}),
+    ...(automaticRefresh === "too_late" ? {
+      lastCheckedAt: now,
+      refreshError: "The safe window for automatic preflight refresh has closed; the durable reminder stays unchanged.",
+    } : {}),
     updatedAt: now,
   };
   await saveTrip(trip.id, trip.doc, true, tripContext);
@@ -2820,6 +2840,8 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
       : "Google Calendar is not connected yet; ask Jarvis to prepare this exact trip again after connecting it.";
   const refreshNote = automaticRefresh === "scheduled"
     ? "Jarvis will now refresh only this saved trip's exact Gmail flight and booked-stay sources, and update its existing reminder/to-do if that itinerary changes."
+    : automaticRefresh === "too_late"
+      ? "The safe window for automatic preflight refresh has closed; the durable reminder stays unchanged."
     : workspace.storage === "draft"
       ? "This is still a live draft, so its reminder is manual-only until you save the trip."
       : "The reminder is scheduled, but automatic refresh is waiting for one exact Gmail booked-stay identity; Jarvis will not guess one.";

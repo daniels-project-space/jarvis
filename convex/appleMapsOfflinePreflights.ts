@@ -14,6 +14,19 @@ const REFRESH_STATES = [
 ] as const;
 type RefreshState = typeof REFRESH_STATES[number];
 
+// Only rows with an actual future maintenance path belong in the worker queue.
+// `needs_*` rows may be parked without a timestamp while their exact booking
+// identity is confirmed, so the range below also excludes missing timestamps.
+// Terminal rows are deliberately absent even if a historical indexed value is
+// still present.
+const REFRESHABLE_STATES = [
+  "scheduled",
+  "pending_refresh",
+  "pending_google",
+  "needs_flight_confirmation",
+  "needs_city_confirmation",
+] as const satisfies readonly RefreshState[];
+
 const identityValidator = v.object({
   selectionId: v.string(),
   messageId: v.string(),
@@ -157,10 +170,21 @@ export const due = query({
     requireWorker(a.workerToken);
     const limit = Math.max(1, Math.min(8, Math.floor(a.limit)));
     if (!Number.isFinite(a.now)) return [];
-    const rows = await ctx.db
+    // Do not rely on clearing an optional indexed field to park a record:
+    // historical `too_late` rows can retain an index entry for `undefined`.
+    // The state-first index makes terminal rows permanently invisible to the
+    // worker queue, while the finite lower bound also parks every `needs_*`
+    // record that intentionally has no retry time.
+    const rows = (await Promise.all(REFRESHABLE_STATES.map((state) => ctx.db
       .query("appleMapsOfflinePreflights")
-      .withIndex("by_nextRefreshAt", (q) => q.lte("nextRefreshAt", a.now))
-      .take(limit);
+      .withIndex("by_refreshState_nextRefreshAt", (q) => q
+        .eq("refreshState", state)
+        .gt("nextRefreshAt", Number.MIN_SAFE_INTEGER)
+        .lte("nextRefreshAt", a.now))
+      .take(limit))))
+      .flat()
+      .sort((left, right) => Number(left.nextRefreshAt) - Number(right.nextRefreshAt))
+      .slice(0, limit);
     return await Promise.all(rows.map(async (row) => ({
       ...row,
       creation: await ctx.db.get(row.creationId),
@@ -178,14 +202,20 @@ export const completeRefresh = mutation({
     cityProofIdentity: identityValidator,
     cityProof: cityProofValidator,
     checkedAt: v.number(),
-    nextRefreshAt: v.number(),
+    nextRefreshAt: v.optional(v.number()),
+    refreshState: v.union(v.literal("scheduled"), v.literal("too_late")),
+    refreshError: v.optional(v.string()),
     todoStatus: v.union(v.literal("created"), v.literal("existing"), v.literal("needs_retry")),
     calendarRefreshRequired: v.boolean(),
     ...actorAuthArgs,
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
-    if (!Number.isFinite(a.expectedUpdatedAt) || !Number.isFinite(a.checkedAt) || !Number.isFinite(a.nextRefreshAt)
+    if (!Number.isFinite(a.expectedUpdatedAt) || !Number.isFinite(a.checkedAt)
+      || (a.nextRefreshAt !== undefined && !Number.isFinite(a.nextRefreshAt))
+      || (a.refreshState === "scheduled" && !Number.isFinite(a.nextRefreshAt))
+      || (a.refreshState === "too_late" && (a.nextRefreshAt !== undefined || !bounded(a.refreshError, 180)))
+      || (a.refreshState === "scheduled" && a.refreshError !== undefined)
       || !validPreflight(a.preflight) || !validIdentity(a.flightIdentity) || !validIdentity(a.cityProofIdentity) || !validProof(a.cityProof)) {
       return { ok: false as const, reason: "invalid" as const };
     }
@@ -197,10 +227,10 @@ export const completeRefresh = mutation({
       ...a.preflight,
       sourceKey: row.sourceKey,
       flightSelectionId: a.flightIdentity.selectionId,
-      refreshState: "scheduled",
+      refreshState: a.refreshState,
       lastCheckedAt: a.checkedAt,
       nextRefreshAt: a.nextRefreshAt,
-      refreshError: undefined,
+      refreshError: a.refreshError,
       todoStatus: a.todoStatus,
       calendarRefreshRequired: a.calendarRefreshRequired,
       updatedAt: a.checkedAt,
@@ -212,8 +242,8 @@ export const completeRefresh = mutation({
       flightIdentity: a.flightIdentity,
       cityProofIdentity: a.cityProofIdentity,
       cityProof: a.cityProof,
-      refreshState: "scheduled",
-      lastError: undefined,
+      refreshState: a.refreshState,
+      lastError: a.refreshError,
       lastCheckedAt: a.checkedAt,
       nextRefreshAt: a.nextRefreshAt,
       updatedAt: a.checkedAt,

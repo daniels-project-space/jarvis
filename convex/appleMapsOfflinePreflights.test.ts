@@ -55,5 +55,68 @@ describe("saved Apple Maps offline preflight registry", () => {
     })).resolves.toEqual({ ok: true });
     const saved = await t.query(api.creations.get, { id: creationId, workerToken: WORKER });
     expect(JSON.parse(String(saved?.data))).toMatchObject({ offlineMapPreflight: { refreshState: "pending_google", nextRefreshAt: 200 } });
+
+    const readyToClose = (await t.query(registry.due, { now: 200, limit: 8, workerToken: WORKER }))[0];
+    await expect(t.mutation(registry.completeRefresh, {
+      id: readyToClose._id,
+      expectedUpdatedAt: readyToClose.updatedAt,
+      preflight,
+      flightIdentity: identity,
+      cityProofIdentity: { ...identity, messageId: "stay-1", marker: "jarvis-gmail-booking:stay-1", selectionId: "stay-opaque", kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+      cityProof: proof,
+      checkedAt: 201,
+      refreshState: "too_late",
+      refreshError: "The safe refresh window has closed; the durable reminder stays unchanged.",
+      todoStatus: "needs_retry",
+      calendarRefreshRequired: false,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: true });
+    const finalSaved = await t.query(api.creations.get, { id: creationId, workerToken: WORKER });
+    expect(JSON.parse(String(finalSaved?.data))).toMatchObject({ offlineMapPreflight: {
+      refreshState: "too_late",
+      refreshError: "The safe refresh window has closed; the durable reminder stays unchanged.",
+      todoStatus: "needs_retry",
+    } });
+  });
+
+  it("keeps more than one worker batch of parked records out of the due queue", async () => {
+    const t = convexTest(schema, modules);
+    const registry = (api as any).appleMapsOfflinePreflights;
+    const parkedSourceKeys = ["1", "2", "3", "4", "5", "6"].map((digit) => digit.repeat(64));
+    const liveSourceKey = "a".repeat(64);
+    const sourceKeys = [...parkedSourceKeys, liveSourceKey];
+
+    for (const [index, sourceKey] of sourceKeys.entries()) {
+      const creationId = await t.mutation(api.creations.create, {
+        kind: "trip", title: `Trip ${index}`, data: JSON.stringify({ kind: "trip", title: `Trip ${index}`, destination: "Seville" }), workerToken: WORKER,
+      });
+      await expect(t.mutation(registry.upsert, {
+        creationId, sourceKey, preflight, flightIdentity: identity,
+        cityProofIdentity: { ...identity, messageId: `stay-${index}`, marker: `jarvis-gmail-booking:stay-${index}`, selectionId: `stay-opaque-${index}`, kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+        cityProof: proof, nextRefreshAt: 100, workerToken: WORKER,
+      })).resolves.toMatchObject({ ok: true });
+    }
+
+    const initialDue = await t.query(registry.due, { now: 100, limit: 8, workerToken: WORKER });
+    expect(initialDue).toHaveLength(7);
+    for (const [index, dueRow] of initialDue.filter((dueRow: any) => parkedSourceKeys.includes(dueRow.sourceKey)).entries()) {
+      await expect(t.mutation(registry.markPending, {
+        id: dueRow._id,
+        expectedUpdatedAt: dueRow.updatedAt,
+        state: index === 5 ? "needs_city_confirmation" : "too_late",
+        error: index === 5 ? "The booked-stay proof needs an exact confirmation" : "The safe preflight refresh window has passed",
+        checkedAt: 101,
+        workerToken: WORKER,
+      })).resolves.toEqual({ ok: true });
+    }
+    const liveRow = initialDue.find((dueRow: any) => dueRow.sourceKey === liveSourceKey);
+    await expect(t.mutation(registry.markPending, {
+      id: liveRow._id, expectedUpdatedAt: liveRow.updatedAt,
+      state: "pending_refresh", error: "Retry the saved reminder refresh", checkedAt: 101, nextRefreshAt: 100, workerToken: WORKER,
+    })).resolves.toEqual({ ok: true });
+
+    const queued = await t.query(registry.due, { now: 100, limit: 4, workerToken: WORKER });
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ sourceKey: liveSourceKey, refreshState: "pending_refresh" });
   });
 });
