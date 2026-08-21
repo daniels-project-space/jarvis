@@ -73,10 +73,14 @@ async function readApprovalToken(req: NextRequest): Promise<string> {
  * but the provider call requires a same-origin click from an enrolled owner.
  */
 export async function POST(req: NextRequest) {
-  if (!isSameOriginRequest(req)) return Response.json({ ok: false, error: "cross-origin approval rejected" }, { status: 403 });
+  if (!isSameOriginRequest(req)) {
+    return Response.json({ ok: false, error: "cross-origin approval rejected" }, { status: 403, headers: PRIVATE_HEADERS });
+  }
   const actor = await controlActor(req);
-  if (!actor) return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
-  if (!isOwnerActor(actor)) return Response.json({ ok: false, error: "owner enrollment required" }, { status: 403 });
+  if (!actor) return Response.json({ ok: false, error: "unauthorized" }, { status: 401, headers: PRIVATE_HEADERS });
+  if (!isOwnerActor(actor)) {
+    return Response.json({ ok: false, error: "owner enrollment required" }, { status: 403, headers: PRIVATE_HEADERS });
+  }
   if (!iCloudCalendarConfigured()) {
     return Response.json({
       ok: false,
@@ -88,13 +92,16 @@ export async function POST(req: NextRequest) {
     token = await readApprovalToken(req);
   } catch (error) {
     const status = error instanceof ApprovalRequestError ? error.status : 400;
-    return Response.json({ ok: false, error: status === 413 ? "approval request too large" : "calendar approval is invalid or expired" }, { status });
+    return Response.json(
+      { ok: false, error: status === 413 ? "approval request too large" : "calendar approval is invalid or expired" },
+      { status, headers: PRIVATE_HEADERS },
+    );
   }
   let approval;
   try {
     approval = verifyICloudCalendarApproval(token);
   } catch {
-    return Response.json({ ok: false, error: "calendar approval is invalid or expired" }, { status: 400 });
+    return Response.json({ ok: false, error: "calendar approval is invalid or expired" }, { status: 400, headers: PRIVATE_HEADERS });
   }
   try {
     const event = await createICloudEvent({ ...approval.event, idempotencyKey: approval.nonce });

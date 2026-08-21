@@ -47,6 +47,7 @@ describe("iCloud Calendar owner approval route", () => {
     const response = await POST(request({ token: "receipt" }));
 
     expect(response.status).toBe(403);
+    expect(response.headers.get("cache-control")).toContain("no-store");
     expect(mock.verify).not.toHaveBeenCalled();
     expect(mock.create).not.toHaveBeenCalled();
   });
