@@ -12,11 +12,19 @@ export type RecoveredCall = { name: string; args: any };
 //   <function>timer{"minutes":2,"label":"Timer"}></function>
 const FN_RE = /<function>?\s*(\w+)\s*(\{[\s\S]*?\})?\s*>?\s*<\/function>/gi;
 export const GOOGLE_CALENDAR_APPROVAL_MARKER = "JARVIS_GOOGLE_CALENDAR_APPROVAL";
+export const ICLOUD_CALENDAR_APPROVAL_MARKER = "JARVIS_ICLOUD_CALENDAR_APPROVAL";
 const CALENDAR_APPROVAL_TOKEN_RE = new RegExp(
   `\\[${GOOGLE_CALENDAR_APPROVAL_MARKER}:([A-Za-z0-9_-]{20,4096}\\.[A-Za-z0-9_-]{20,128})\\]`,
 );
 const CALENDAR_APPROVAL_MARKER_RE = new RegExp(
   `\\s*\\[${GOOGLE_CALENDAR_APPROVAL_MARKER}:[A-Za-z0-9_-]{20,4096}\\.[A-Za-z0-9_-]{20,128}\\]\\s*`,
+  "g",
+);
+const ICLOUD_CALENDAR_APPROVAL_TOKEN_RE = new RegExp(
+  `\\[${ICLOUD_CALENDAR_APPROVAL_MARKER}:([A-Za-z0-9_-]{20,4096}\\.[A-Za-z0-9_-]{20,128})\\]`,
+);
+const ICLOUD_CALENDAR_APPROVAL_MARKER_RE = new RegExp(
+  `\\s*\\[${ICLOUD_CALENDAR_APPROVAL_MARKER}:[A-Za-z0-9_-]{20,4096}\\.[A-Za-z0-9_-]{20,128}\\]\\s*`,
   "g",
 );
 const GMAIL_SEND_APPROVAL_TOKEN_RE = new RegExp(
@@ -61,6 +69,15 @@ export function stripGoogleCalendarApproval(text: string): string {
   return text.replace(CALENDAR_APPROVAL_MARKER_RE, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/** The iCloud receipt is rendered only as a protected owner approval card. */
+export function extractICloudCalendarApproval(text: string): string | null {
+  return text.match(ICLOUD_CALENDAR_APPROVAL_TOKEN_RE)?.[1] ?? null;
+}
+
+export function stripICloudCalendarApproval(text: string): string {
+  return text.replace(ICLOUD_CALENDAR_APPROVAL_MARKER_RE, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /** The token is rendered as a dedicated owner-only send button, never chat text. */
 export function extractGmailSendApproval(text: string): string | null {
   return text.match(GMAIL_SEND_APPROVAL_TOKEN_RE)?.[1] ?? null;
@@ -72,12 +89,14 @@ export function stripGmailSendApproval(text: string): string {
 
 /** A completed turn carrying this must not remain in a warm model thread. */
 export function hasAssistantApproval(text: string): boolean {
-  return extractGoogleCalendarApproval(text) !== null || extractGmailSendApproval(text) !== null;
+  return extractGoogleCalendarApproval(text) !== null
+    || extractICloudCalendarApproval(text) !== null
+    || extractGmailSendApproval(text) !== null;
 }
 
 /** Remove every opaque, owner-click approval receipt from visible/speech text. */
 export function stripAssistantApprovals(text: string): string {
-  return stripGmailSendApproval(stripGoogleCalendarApproval(text));
+  return stripGmailSendApproval(stripICloudCalendarApproval(stripGoogleCalendarApproval(text)));
 }
 
 // True when the row is pure tool-garbage a human should never see.

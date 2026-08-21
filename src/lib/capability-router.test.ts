@@ -117,6 +117,27 @@ describe("capability router", () => {
     ]));
     expect(calendarWithQuotedTodo.candidates.map(({ tool }) => tool)).not.toContain("todo_add");
 
+    const iCloudScope = {
+      ownerForeground: true,
+      ownerToolNames: ["icloud_calendar_create"],
+    } as const;
+    const iCloudCalendar = rankCapabilities("Add a reminder to my iCloud Calendar", iCloudScope);
+    expect(iCloudCalendar.candidates.slice(0, 1).map(({ belt, tool, reason }) => ({ belt, tool, reason }))).toEqual([
+      { belt: "core", tool: "icloud_calendar_create", reason: "owner_icloud_calendar" },
+    ]);
+    const iCloudCalendarAndTodo = rankCapabilities(
+      "Add a reminder to my iCloud Calendar and Jarvis to-do list tomorrow morning.",
+      { ...iCloudScope, ownerCalendarAndHubTodo: true },
+    );
+    expect(iCloudCalendarAndTodo.candidates.map(({ tool }) => tool)).toEqual(expect.arrayContaining([
+      "icloud_calendar_create",
+      "todo_add",
+    ]));
+    expect(rankCapabilities(
+      "Add a reminder to my iCloud Calendar and Jarvis to-do list tomorrow morning.",
+      iCloudScope,
+    ).candidates.map(({ tool }) => tool)).not.toContain("todo_add");
+
     const emailSupport = rankCapabilities("Email Rakuten and ask about cashback claims in the EU", {
       ownerForeground: true,
       ownerToolNames: ["email_support"],

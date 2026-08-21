@@ -10,6 +10,9 @@ const mock = vi.hoisted(() => ({
   issueCalendarProposal: vi.fn(() => "signed-calendar-change-receipt"),
   googleCalendarCreate: vi.fn(),
   googleCalendarGetManaged: vi.fn(),
+  iCloudConfigured: vi.fn(),
+  issueICloudApproval: vi.fn(() => "signed-icloud-calendar-receipt"),
+  iCloudCreate: vi.fn(),
 }));
 vi.mock("./context", () => ({ convexMutation: mock.convexMutation, convexQuery: mock.convexQuery }));
 vi.mock("./control-context", () => ({
@@ -20,7 +23,15 @@ vi.mock("./booking-email", () => ({
   lookupGmailBookingsReadOnly: vi.fn(), scanGmailBookingConfirmations: vi.fn(),
 }));
 vi.mock("./icloud-calendar", () => ({
-  createICloudEvent: vi.fn(), deleteICloudEvent: vi.fn(), findICloudEvents: vi.fn(), listICloudEvents: vi.fn(),
+  createICloudEvent: mock.iCloudCreate,
+  deleteICloudEvent: vi.fn(),
+  findICloudEvents: vi.fn(),
+  listICloudEvents: vi.fn(),
+  iCloudCalendarConfigured: mock.iCloudConfigured,
+}));
+vi.mock("./icloud-calendar-approval.server", () => ({
+  issueICloudCalendarApproval: mock.issueICloudApproval,
+  iCloudCalendarApprovalMarker: (token: string) => `[JARVIS_ICLOUD_CALENDAR_APPROVAL:${token}]`,
 }));
 vi.mock("./google-calendar", () => ({
   createGooglePrimaryCalendarEvent: mock.googleCalendarCreate,
@@ -241,5 +252,53 @@ describe("Google Calendar creation approval boundary", () => {
       action: "delete", eventId: "jarvisabcdef0123456789", expectedEtag: "\"revision-1\"",
     });
     expect(mock.googleCalendarCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe("iCloud Calendar creation approval boundary", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mock.iCloudConfigured.mockReturnValue(true);
+    mock.issueICloudApproval.mockReturnValue("signed-icloud-calendar-receipt");
+  });
+
+  it("prepares a real-date iCloud event without writing until the owner clicks the receipt", async () => {
+    const result = await executeTool("icloud_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+      reminder_minutes_before: 15,
+    });
+
+    expect(result).toContain("Nothing has been added yet");
+    expect(result).toContain("JARVIS_ICLOUD_CALENDAR_APPROVAL:signed-icloud-calendar-receipt");
+    expect(mock.issueICloudApproval).toHaveBeenCalledWith(expect.objectContaining({
+      title: "Planning session", allDay: false, reminderMinutesBefore: 15,
+    }));
+    expect(mock.iCloudCreate).not.toHaveBeenCalled();
+  });
+
+  it("fails closed without an iCloud cloud-runtime credential pair", async () => {
+    mock.iCloudConfigured.mockReturnValue(false);
+
+    await expect(executeTool("icloud_calendar_create", {
+      title: "Planning session",
+      date: "2026-08-20",
+      time: "09:00",
+    })).resolves.toMatch(/not configured.*no approval receipt was created/i);
+
+    expect(mock.issueICloudApproval).not.toHaveBeenCalled();
+    expect(mock.iCloudCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a nonexistent London wall-clock time before issuing an iCloud receipt", async () => {
+    await expect(executeTool("icloud_calendar_create", {
+      title: "DST gap",
+      date: "2026-03-29",
+      time: "01:30",
+    })).resolves.toMatch(/does not exist in Europe\/London/i);
+
+    expect(mock.issueICloudApproval).not.toHaveBeenCalled();
+    expect(mock.iCloudCreate).not.toHaveBeenCalled();
   });
 });

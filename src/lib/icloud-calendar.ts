@@ -34,7 +34,11 @@ export type ICloudEventInput = {
   location?: string;
   notes?: string;
   reminderMinutesBefore?: number;
+  /** A signed approval nonce makes a retry target the same iCloud resource. */
+  idempotencyKey?: string;
 };
+
+export type ICloudEventWriteResult = ICloudEvent & { created: boolean };
 
 type XmlRecord = Record<string, unknown>;
 
@@ -49,9 +53,16 @@ const parser = new XMLParser({
 
 export class ICloudCalendarError extends Error {}
 
+export function iCloudCalendarConfigured(): boolean {
+  return Boolean(
+    process.env.ICLOUD_CALENDAR_APPLE_ID?.trim()
+    && process.env.ICLOUD_CALENDAR_APP_PASSWORD?.trim(),
+  );
+}
+
 function credentials(): { appleId: string; appPassword: string } {
-  const appleId = process.env.ICLOUD_CALENDAR_APPLE_ID;
-  const appPassword = process.env.ICLOUD_CALENDAR_APP_PASSWORD;
+  const appleId = process.env.ICLOUD_CALENDAR_APPLE_ID?.trim();
+  const appPassword = process.env.ICLOUD_CALENDAR_APP_PASSWORD?.trim();
   if (!appleId || !appPassword) {
     throw new ICloudCalendarError("iCloud Calendar is not configured in this cloud runtime.");
   }
@@ -96,7 +107,12 @@ function authHeader(): string {
 async function caldavRequest(
   method: string,
   url: string,
-  options: { body?: BodyInit; depth?: "0" | "1"; headers?: HeadersInit } = {},
+  options: {
+    body?: BodyInit;
+    depth?: "0" | "1";
+    headers?: HeadersInit;
+    allowedStatuses?: readonly number[];
+  } = {},
 ): Promise<{ response: Response; url: string }> {
   let current = url;
   for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -123,7 +139,7 @@ async function caldavRequest(
       continue;
     }
     if ([401, 403].includes(response.status)) throw new ICloudCalendarError("iCloud rejected the calendar credential.");
-    if (!response.ok && response.status !== 207) {
+    if (!response.ok && response.status !== 207 && !options.allowedStatuses?.includes(response.status)) {
       const detail = (await response.text()).replace(/\s+/g, " ").trim().slice(0, 180);
       throw new ICloudCalendarError(`iCloud Calendar returned HTTP ${response.status}${detail ? `: ${detail}` : ""}.`);
     }
@@ -255,11 +271,15 @@ export async function listICloudEvents(start: number, end: number, requestedCale
   return events.sort((left, right) => left.start - right.start || left.title.localeCompare(right.title));
 }
 
-export async function createICloudEvent(input: ICloudEventInput): Promise<ICloudEvent> {
+export async function createICloudEvent(input: ICloudEventInput): Promise<ICloudEventWriteResult> {
   const calendar = await resolveCalendar(input.calendar);
   const allDay = input.allDay === true;
   const end = input.end ?? input.start + (allDay ? 86_400_000 : 60 * 60_000);
-  const uid = `${randomUUID()}@jarvis`;
+  const idempotencyKey = input.idempotencyKey?.trim();
+  if (idempotencyKey && !/^[A-Za-z0-9_-]{16,64}$/.test(idempotencyKey)) {
+    throw new ICloudCalendarError("iCloud Calendar idempotency key is invalid.");
+  }
+  const uid = idempotencyKey ? `jarvis-approval-${idempotencyKey}@jarvis` : `${randomUUID()}@jarvis`;
   const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//JARVIS//iCloud Calendar//EN", "CALSCALE:GREGORIAN", "BEGIN:VEVENT", `UID:${uid}`, `DTSTAMP:${toIcalUtc(Date.now())}`];
   if (allDay) {
     lines.push(`DTSTART;VALUE=DATE:${toLondonDate(input.start)}`, `DTEND;VALUE=DATE:${toLondonDate(end)}`);
@@ -277,6 +297,9 @@ export async function createICloudEvent(input: ICloudEventInput): Promise<ICloud
   const { response } = await caldavRequest("PUT", eventUrl, {
     body: lines.join("\r\n"),
     headers: { "Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*" },
+    // A retry after a lost response uses the exact receipt-nonce resource.
+    // iCloud's conditional conflict means the original write already won.
+    allowedStatuses: idempotencyKey ? [412] : undefined,
   });
   return {
     uid,
@@ -290,6 +313,7 @@ export async function createICloudEvent(input: ICloudEventInput): Promise<ICloud
     etag: response.headers.get("etag") ?? undefined,
     calendarName: calendar.name,
     source: "icloud",
+    created: response.status !== 412,
   };
 }
 

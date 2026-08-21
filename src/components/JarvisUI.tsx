@@ -17,6 +17,7 @@ import { registerSW, subscribePush } from "@/lib/push";
 import {
   extractGmailSendApproval,
   extractGoogleCalendarApproval,
+  extractICloudCalendarApproval,
   isToolGarbage,
   sanitizeAssistantText,
   stripAssistantApprovals,
@@ -372,6 +373,53 @@ function GoogleCalendarApprovalCard({ token }: { token: string }) {
             className="rounded-lg border border-cyan/40 bg-cyan/10 px-2 py-1 font-medium text-cyan transition hover:bg-cyan/20 disabled:opacity-50"
           >
             {state === "approving" ? "saving…" : "Approve calendar change"}
+          </button>
+          <span aria-live="polite" className={state === "error" ? "text-amber" : "text-slate"}>
+            {state === "error" ? detail : "Nothing changes until you click."}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ICloudCalendarApprovalCard({ token }: { token: string }) {
+  const [state, setState] = useState<"ready" | "approving" | "completed" | "error">("ready");
+  const [detail, setDetail] = useState("");
+
+  const approve = async () => {
+    if (state !== "ready") return;
+    setState("approving");
+    setDetail("");
+    try {
+      const response = await viewerFetch("/api/icloud-calendar/approve", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      const payload = await response.json().catch(() => ({})) as { ok?: unknown; created?: unknown; error?: unknown };
+      if (!response.ok || payload.ok !== true) throw new Error(String(payload.error ?? "iCloud Calendar approval was rejected."));
+      setState("completed");
+      setDetail(payload.created === false ? "Already present in iCloud Calendar." : "Added to iCloud Calendar.");
+    } catch (error) {
+      setState("error");
+      setDetail(String(error instanceof Error ? error.message : "iCloud Calendar approval was rejected."));
+    }
+  };
+
+  return (
+    <div data-icloud-calendar-approval className="mt-1.5 inline-flex max-w-[88%] items-center gap-2 rounded-xl border border-cyan/30 bg-cyan/[0.06] px-3 py-2 text-xs text-ice">
+      {state === "completed" ? (
+        <span aria-live="polite">{detail}</span>
+      ) : (
+        <>
+          <button
+            type="button"
+            onClick={() => void approve()}
+            disabled={state === "approving"}
+            className="rounded-lg border border-cyan/40 bg-cyan/10 px-2 py-1 font-medium text-cyan transition hover:bg-cyan/20 disabled:opacity-50"
+          >
+            {state === "approving" ? "saving…" : "Approve iCloud event"}
           </button>
           <span aria-live="polite" className={state === "error" ? "text-amber" : "text-slate"}>
             {state === "error" ? detail : "Nothing changes until you click."}
@@ -5815,20 +5863,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               .map((m) => {
                 if (m.role === "assistant" && m.text) {
                   const calendarApprovalToken = extractGoogleCalendarApproval(m.text);
+                  const iCloudCalendarApprovalToken = extractICloudCalendarApproval(m.text);
                   const gmailSendApprovalToken = extractGmailSendApproval(m.text);
                   const visibleText = isToolGarbage(m.text)
                     ? sanitizeAssistantText(m.text)
                     : stripAssistantApprovals(m.text);
-                  return { ...m, text: visibleText, calendarApprovalToken, gmailSendApprovalToken };
+                  return { ...m, text: visibleText, calendarApprovalToken, iCloudCalendarApprovalToken, gmailSendApprovalToken };
                 }
                 if (m.role === "user" && m.text) {
-                  return { ...m, text: visibleTurnText(m.text), calendarApprovalToken: null, gmailSendApprovalToken: null };
+                  return { ...m, text: visibleTurnText(m.text), calendarApprovalToken: null, iCloudCalendarApprovalToken: null, gmailSendApprovalToken: null };
                 }
-                return { ...m, calendarApprovalToken: null, gmailSendApprovalToken: null };
+                return { ...m, calendarApprovalToken: null, iCloudCalendarApprovalToken: null, gmailSendApprovalToken: null };
               })
               // A guest never receives a card through the normal worker path,
               // but do not materialize one if a legacy row is ever present.
-              .filter((m) => m.text || (!guest && (m.attachment || m.calendarApprovalToken || m.gmailSendApprovalToken)) || m.status === "streaming")
+              .filter((m) => m.text || (!guest && (m.attachment || m.calendarApprovalToken || m.iCloudCalendarApprovalToken || m.gmailSendApprovalToken)) || m.status === "streaming")
               .map((m) => (
               <div key={m._id} className={`rise ${m.role === "user" ? "text-right" : "text-left"}`}>
                 <GuestSafeAttachment
@@ -5865,6 +5914,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 </GuestSafeAttachment>
                 {m.role === "assistant" && !guest && m.calendarApprovalToken && (
                   <GoogleCalendarApprovalCard token={m.calendarApprovalToken} />
+                )}
+                {m.role === "assistant" && !guest && m.iCloudCalendarApprovalToken && (
+                  <ICloudCalendarApprovalCard token={m.iCloudCalendarApprovalToken} />
                 )}
                 {m.role === "assistant" && !guest && m.gmailSendApprovalToken && (
                   <GmailSendApprovalCard token={m.gmailSendApprovalToken} />
