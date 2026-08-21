@@ -1335,6 +1335,7 @@ export const authorizeFileTool = query({
       [/^(?:market|price_chart|market_analysis)$/, /\b(?:check|show|get|find|look up|analy[sz]e|review|current|live|latest)\b.{0,36}\b(?:market|price|stock|crypto|asset|ticker|coin)\b/],
       [/^briefing$/, /\b(?:show|give|read|create)\b.{0,24}\bbriefing\b/],
       [/^calendar_view$/, /\b(?:show|view|open|check|read)\b.{0,24}\bcalendar\b/],
+      [/^icloud_calendar_create$/, /\b(?:add|create|schedule|put|make|remind)\b.{0,64}\b(?:(?:i(?:\s|-)?cloud|apple)\s+)?(?:calendar|event|meeting|appointment|reminder)\b/],
       [/^(?:gmail_search|gmail_read|gmail_list_subscriptions)$/, /\b(?:gmail|google\s+mail|e-?mails?|inbox|mailbox)\b/],
       [/^gmail_draft_reply$/, /\b(?:gmail|google\s+mail|e-?mails?|inbox|mailbox)\b.{0,48}\b(?:draft|reply|respond|write|compose)\b|\b(?:draft|reply|respond|write|compose)\b.{0,48}\b(?:gmail|google\s+mail|e-?mails?|inbox|mailbox)\b/],
       [/^google_calendar_list$/, /\b(?:google\s*calendar|gcal)\b/],

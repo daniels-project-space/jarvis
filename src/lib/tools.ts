@@ -29,7 +29,12 @@ import { exactTextWorkOrder } from "./work-order";
 import { resolveHostProjectContext } from "./host-project-context";
 import { withHostContext } from "./host-context";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
-import { listICloudEvents } from "./icloud-calendar";
+import { iCloudCalendarConfigured, listICloudEvents } from "./icloud-calendar";
+import {
+  iCloudCalendarApprovalMarker,
+  issueICloudCalendarApproval,
+  type ICloudCalendarApprovalEvent,
+} from "./icloud-calendar-approval.server";
 import {
   getManagedGooglePrimaryCalendarEvent,
   getManagedGooglePrimaryCalendarEventForSourceKey,
@@ -556,6 +561,24 @@ export const TOOL_DEFS = [
         view: { type: "string", enum: ["day", "week", "month"], description: "default week" },
         date: { type: "string", description: "YYYY-MM-DD anchor, default today" },
       },
+    },
+  },
+  {
+    name: "icloud_calendar_create",
+    description:
+      "Prepare exactly one event on Daniel's iCloud Calendar. Use only from an authenticated foreground owner request that explicitly asks to add it to Calendar. It renders an owner-only approval button; the event is not written until Daniel clicks that protected button. It cannot invite people, create video links, attach files, or send updates.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        date: { type: "string", description: "YYYY-MM-DD" },
+        time: { type: "string", description: "HH:MM 24h; omit for an all-day event" },
+        end_time: { type: "string", description: "HH:MM 24h; default one hour after a timed event" },
+        location: { type: "string" },
+        notes: { type: "string" },
+        reminder_minutes_before: { type: "number", description: "Optional popup reminder, 1-40320 minutes before" },
+      },
+      required: ["title", "date"],
     },
   },
   {
@@ -2210,6 +2233,58 @@ type PreparedGoogleCalendarEvent = {
   time: string | null;
 };
 
+type PreparedICloudCalendarEvent = {
+  event: ICloudCalendarApprovalEvent;
+  date: string;
+  time: string | null;
+};
+
+function prepareICloudCalendarEvent(args: any): PreparedICloudCalendarEvent | string {
+  const title = String(args.title ?? "").trim();
+  const date = String(args.date ?? "");
+  if (!title || !isCalendarDate(date)) return "I need a title and a real date (YYYY-MM-DD).";
+  if (args.time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.time))) return "I need the start time as HH:MM (24-hour).";
+  if (args.end_time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.end_time))) return "I need the end time as HH:MM (24-hour).";
+  const allDay = !args.time;
+  const start = allDay ? londonMs(date, "00:00") : londonMs(date, String(args.time));
+  if (!allDay && !isExactLondonDateTime(start, date, String(args.time))) {
+    return "That local time does not exist in Europe/London because of the daylight-saving change. Choose another time.";
+  }
+  let end: number;
+  if (allDay) {
+    end = londonMs(addDateDays(date, 1), "00:00");
+  } else if (args.end_time) {
+    let endDate = date;
+    end = londonMs(endDate, String(args.end_time));
+    if (end <= start) {
+      endDate = addDateDays(date, 1);
+      end = londonMs(endDate, String(args.end_time));
+    }
+    if (!isExactLondonDateTime(end, endDate, String(args.end_time))) {
+      return "That local end time does not exist in Europe/London because of the daylight-saving change. Choose another time.";
+    }
+  } else {
+    end = start + 60 * 60_000;
+  }
+  const reminderMinutesBefore = args.reminder_minutes_before == null ? undefined : Number(args.reminder_minutes_before);
+  if (reminderMinutesBefore != null && (!Number.isInteger(reminderMinutesBefore) || reminderMinutesBefore < 1 || reminderMinutesBefore > 40_320)) {
+    return "The iCloud Calendar popup reminder must be a whole number from 1 to 40320 minutes before the event.";
+  }
+  return {
+    event: {
+      title: title.slice(0, 140),
+      start,
+      end,
+      allDay,
+      location: args.location ? String(args.location).slice(0, 140) : undefined,
+      notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
+      reminderMinutesBefore,
+    },
+    date,
+    time: args.time ? String(args.time) : null,
+  };
+}
+
 function prepareGoogleCalendarEvent(args: any): PreparedGoogleCalendarEvent | string {
   const title = String(args.title ?? "").trim();
   const date = String(args.date ?? "");
@@ -2313,6 +2388,23 @@ async function googleCalendarCreate(args: any): Promise<string> {
   // short-lived signed receipt before it writes to Google's API.
   const approval = issueGoogleCalendarApproval(prepared.event);
   return `Ready for your approval: Google Calendar event "${prepared.event.title}" on ${prepared.date}${prepared.time ? ` at ${prepared.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
+}
+
+async function iCloudCalendarCreate(args: any): Promise<string> {
+  const prepared = prepareICloudCalendarEvent(args);
+  if (typeof prepared === "string") return prepared;
+  if (!iCloudCalendarConfigured()) {
+    return "iCloud Calendar is not configured in this Jarvis environment, so no approval receipt was created.";
+  }
+  // A model can prepare an event, but it cannot infer an owner click. The
+  // route behind this signed, short-lived receipt is the only CalDAV writer.
+  let approval: string;
+  try {
+    approval = issueICloudCalendarApproval(prepared.event);
+  } catch {
+    return "iCloud Calendar readiness could not be verified right now, so no approval receipt was created. Try again shortly.";
+  }
+  return `Ready for your approval: iCloud Calendar event "${prepared.event.title}" on ${prepared.date}${prepared.time ? ` at ${prepared.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve iCloud event button below within 10 minutes. No invitations or updates will be sent.\n${iCloudCalendarApprovalMarker(approval)}`;
 }
 
 async function googleCalendarUpdate(args: any): Promise<string> {
@@ -5502,6 +5594,8 @@ export async function executeTool(
       return await calendarRemove(args);
     case "calendar_view":
       return await calendarView(args);
+    case "icloud_calendar_create":
+      return await iCloudCalendarCreate(args);
     case "google_calendar_list":
       return await googleCalendarList(args);
     case "google_calendar_create":

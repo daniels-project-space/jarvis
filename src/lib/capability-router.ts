@@ -209,7 +209,7 @@ export function rankCapabilities(
     : [];
   const ownerCalendarAndHubTodo = options.ownerForeground
     && options.ownerCalendarAndHubTodo === true
-    && ownerToolNames.includes("google_calendar_create");
+    && (ownerToolNames.includes("icloud_calendar_create") || ownerToolNames.includes("google_calendar_create"));
   const allowedToolNames = new Set(SUBSCRIPTION_TOOL_NAMES);
   ownerToolNames.forEach((name) => allowedToolNames.add(name));
   // A foreground owner turn has an additional authority boundary. Prevent a
@@ -236,7 +236,7 @@ export function rankCapabilities(
     }));
   }
 
-  // Mailbox and Google Calendar access is deliberately not a general tool
+  // Mailbox and Calendar access are deliberately not a general tool
   // rule. This only chooses a foreground discovery lane; the endpoint grants
   // definitions solely from the direct-command scope recorded at admission.
   if (options.ownerForeground) {
@@ -252,7 +252,9 @@ export function rankCapabilities(
           ? "owner_gmail"
           : tool === "browser_errand_run"
             ? "owner_browser_errand"
-            : "owner_google_calendar",
+            : tool === "icloud_calendar_create"
+              ? "owner_icloud_calendar"
+              : "owner_google_calendar",
       });
     });
     // The dual destination scope was fixed at owner-message admission and is

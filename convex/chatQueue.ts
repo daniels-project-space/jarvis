@@ -1051,7 +1051,7 @@ async function claimPending(
     )
     : [];
   const ownerToolAccess = ownerToolNames.length > 0;
-  const ownerCalendarAndHubTodo = ownerToolNames.includes("google_calendar_create")
+  const ownerCalendarAndHubTodo = (ownerToolNames.includes("icloud_calendar_create") || ownerToolNames.includes("google_calendar_create"))
     && ownerToolGrant?.calendarAndHubTodo === true;
 
   const all = await ctx.db
@@ -1384,7 +1384,7 @@ async function foregroundOwnerToolGrantForLiveClaim(
   );
   return {
     toolNames,
-    ...(toolNames.includes("google_calendar_create") && grant.calendarAndHubTodo === true
+    ...((toolNames.includes("icloud_calendar_create") || toolNames.includes("google_calendar_create")) && grant.calendarAndHubTodo === true
       ? { calendarAndHubTodo: true as const }
       : {}),
     ...(toolNames.includes("browser_errand_run") && browserErrandId ? { browserErrandId } : {}),

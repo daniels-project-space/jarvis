@@ -2,7 +2,7 @@ const TOOL_BELT_REGISTRY = {
   core: new Set([
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_view",
-    "google_calendar_list", "google_calendar_create", "google_calendar_update", "google_calendar_delete",
+    "icloud_calendar_create", "google_calendar_list", "google_calendar_create", "google_calendar_update", "google_calendar_delete",
     "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image", "show_uploaded_file", "open_uploaded_transcript", "review_uploaded_file",
     // Errands Daniel starts by voice ("email Rakuten and ask about…"), so they
     // belong in core: a tool absent from every belt is unreachable in the
@@ -58,6 +58,7 @@ export const FOREGROUND_OWNER_TOOL_NAMES = new Set([
   "gmail_draft_reply",
   "gmail_list_subscriptions",
   "email_support",
+  "icloud_calendar_create",
   "google_calendar_list",
   "google_calendar_create",
   "google_calendar_update",
@@ -92,9 +93,9 @@ for (const name of [
   // This schedules an owner-visible reminder and Hub to-do. It must never be
   // inferred or executed by an unattended subscription worker.
   "travel_offline_maps_prepare",
-  // Google Calendar is foreground-only. It must never become an implicit
-  // side effect of a subscription worker, and its iCloud counterpart remains
-  // the default calendar lane.
+  // Calendar writes are foreground-only. They must never become an implicit
+  // side effect of a subscription worker.
+  "icloud_calendar_create",
   "google_calendar_list",
   "google_calendar_create",
   "google_calendar_update",
@@ -120,7 +121,7 @@ const DIRECT_GMAIL_DRAFT_FOLLOW_UP_RE = /\b(?:and\s+)?(?:(?:draft|compose)\s+(?:
 const DIRECT_EMAIL_SUPPORT_RE = /^(?:email|contact)\s+[A-Za-z0-9][A-Za-z0-9 .&'’-]{0,80}\s+(?:(?:and|to)\s+)?(?:ask|request|query|complain|chase|tell|say)\b/i;
 const DIRECT_GMAIL_SUBSCRIPTIONS_RE = /\b(?:subscriptions?|newsletters?)\b/i;
 const DIRECT_CALENDAR_LIST_RE = /^(?:(?:show|view|list|check|read|open)\b\s+|what(?:'s|\s+is)\s+on\s+)my\s+(?:google\s*)?(?:calendar|gcal|agenda|schedule)\b/i;
-const DIRECT_CALENDAR_CREATE_RE = /^(?:(?:add|create|schedule|put|make|remind)\b[^\r\n\"`“”‘’]{0,160}\b(?:to|on|in)\s+my\s+(?:google\s*)?(?:calendar|gcal)\b|(?:add|create|schedule|put|make|remind)\s+(?:an?\s+)?(?:event|meeting|appointment|reminder)\b)/i;
+const DIRECT_CALENDAR_CREATE_RE = /^(?:(?:add|create|schedule|put|make|remind)\b[^\r\n\"`“”‘’]{0,160}\b(?:to|on|in)\s+(?:my\s+)?(?:(?:i(?:\s|-)?cloud|apple|google)\s+)?(?:calendar|gcal)\b|(?:add|create|schedule|put|make|remind)\s+(?:an?\s+)?(?:event|meeting|appointment|reminder)\b)/i;
 const DIRECT_CALENDAR_AND_HUB_TODO_RE = /(?:\b(?:calendar|gcal)\b[\s\S]{0,100}\b(?:and|also|plus|as well as)\b[\s\S]{0,100}\b(?:jarvis(?:['’]s)?\s*)?(?:to[- ]?do(?:\s+list)?|todo(?:s)?|task\s+list)\b|\b(?:jarvis(?:['’]s)?\s*)?(?:to[- ]?do(?:\s+list)?|todo(?:s)?|task\s+list)\b[\s\S]{0,100}\b(?:and|also|plus|as well as)\b[\s\S]{0,100}\b(?:calendar|gcal)\b)/i;
 const DIRECT_CALENDAR_UPDATE_RE = /^(?:change|edit|update|move|reschedule)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
 const DIRECT_CALENDAR_DELETE_RE = /^(?:delete|remove|cancel)\b[^\r\n\"`“”‘’]{0,160}\b(?:calendar|gcal|event|meeting|appointment|reminder)\b/i;
@@ -206,14 +207,19 @@ export function foregroundOwnerToolGrantForDirectRequest(userText: string): Fore
   }
 
   const calendarCreate = DIRECT_CALENDAR_CREATE_RE.test(command);
+  // `gcal` is conventional shorthand for Google Calendar. Treat it as
+  // explicit Google intent so a request can never silently land in iCloud.
+  const explicitGoogleCalendar = /\b(?:google\s*(?:calendar|gcal)|gcal)\b/i.test(command);
+  const iCloudCalendarCreate = calendarCreate && !explicitGoogleCalendar;
   const calendarUpdate = DIRECT_CALENDAR_UPDATE_RE.test(command);
   const calendarDelete = DIRECT_CALENDAR_DELETE_RE.test(command);
-  if (DIRECT_CALENDAR_LIST_RE.test(command) || calendarCreate || calendarUpdate || calendarDelete) {
+  if (DIRECT_CALENDAR_LIST_RE.test(command) || (calendarCreate && explicitGoogleCalendar) || calendarUpdate || calendarDelete) {
     // An event lookup may be needed before any requested edit/delete, so the
     // explicitly requested Calendar action may also list the matching event.
     granted.add("google_calendar_list");
   }
-  if (calendarCreate) granted.add("google_calendar_create");
+  if (iCloudCalendarCreate) granted.add("icloud_calendar_create");
+  if (calendarCreate && explicitGoogleCalendar) granted.add("google_calendar_create");
   if (calendarUpdate) granted.add("google_calendar_update");
   if (calendarDelete) granted.add("google_calendar_delete");
   const browserErrandMatch = command.match(DIRECT_BROWSER_ERRAND_RUN_RE);
