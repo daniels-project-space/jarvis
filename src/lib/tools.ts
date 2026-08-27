@@ -4431,8 +4431,10 @@ async function tripPlanTool(args: any, invocationContext?: ToolInvocationContext
   const destIata = String(args.dest_iata ?? "").trim();
   const depart = String(args.depart_date ?? "");
   const ret = String(args.return_date ?? "");
-  if (!destination || !destIata || !/^\d{4}-\d{2}-\d{2}$/.test(depart) || !/^\d{4}-\d{2}-\d{2}$/.test(ret))
+  if (!destination || !destIata || !isCalendarDate(depart) || !isCalendarDate(ret))
     return "I need destination, its airport code, and both dates (YYYY-MM-DD).";
+  if (Date.parse(ret) <= Date.parse(depart))
+    return "This trip planner needs at least one overnight stay, so the return date must be after the departure date before I search anything.";
   const budget = Number(args.budget_total_gbp) || 0;
   if (budget <= 0)
     return "BUDGET MISSING — do NOT search yet. Ask Daniel one short question: what's the total budget for this trip?";

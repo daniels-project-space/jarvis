@@ -84,4 +84,20 @@ describe("private creation media records", () => {
       workerToken: WORKER,
     })).rejects.toThrow("invalid private creation asset key");
   });
+
+  it("treats an exact owner retry after private-media cleanup as a successful deletion", async () => {
+    const t = convexTest(schema, modules);
+    const id = await t.run((ctx) => ctx.db.insert("creations", {
+      kind: "image",
+      title: "Retry-safe private image",
+      assetR2Key: PRIVATE_KEY,
+      assetContentType: "image/png",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+
+    await expect(t.mutation(api.creations.remove, { id, workerToken: WORKER })).resolves.toBe(true);
+    await expect(t.mutation(api.creations.remove, { id, workerToken: WORKER })).resolves.toBe(true);
+    await expect(t.query(api.creations.get, { id, workerToken: WORKER })).resolves.toBeNull();
+  });
 });
