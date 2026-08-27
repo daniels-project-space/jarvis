@@ -1116,18 +1116,24 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
   try {
     const due: any[] = (await convexMutation("reminders:due", {})) ?? [];
     for (const reminder of due) {
-      const minutesLate = Math.round((Date.now() - reminder.at) / 60000);
-      const late = minutesLate > 4
-        ? ` (set for ${new Date(reminder.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" })})`
-        : "";
-      // The chat row is the durable in-app delivery record. Do not
-      // acknowledge the reminder when that write fails: `reminders:due`
-      // reclaims its delivery lease after five minutes, while completing here
-      // would permanently lose the visible reminder.
-      const deliveredInApp = await convexMutation("chatQueue:postAssistant", {
+      const deliveryAttempt = Number(reminder.deliveryAttempt);
+      // New Trigger code must not recreate a reminder without the Convex
+      // delivery-generation fence.  During a Trigger-first rollout, leave it
+      // recoverable until the matching Convex deployment is available.
+      if (!Number.isSafeInteger(deliveryAttempt) || deliveryAttempt < 1) continue;
+      // The chat row is the durable in-app delivery record.  Its insert and
+      // the terminal reminder transition must share the exact lease attempt;
+      // otherwise a reaper reclaim can let an old and a new worker speak the
+      // same reminder.  Do not publish an external push until this worker has
+      // won that transition: a stale reclaimer must be silent everywhere.
+      const deliveredInApp = await convexMutation("reminders:deliver", {
+        id: reminder._id,
+        deliveryAttempt,
         threadId: await chatThread(),
-        text: `⏰ Reminder, sir — ${reminder.text}${late}`,
-      }).then(() => true).catch(() => false);
+      }).then((result) => result === true).catch(() => false);
+      if (!deliveredInApp) continue;
+      // Push is intentionally best effort, but only the durable winner emits
+      // it. Its stable tag lets device providers coalesce ordinary retries.
       const reminderTag = `reminder-${String(reminder._id).slice(-20)}`;
       await sendPush(
         "⏰ JARVIS reminder",
@@ -1135,8 +1141,6 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
         "/",
         { tag: reminderTag, topic: reminderTag, ttl: 3600, urgency: "high", category: "reminder" },
       ).catch(() => {});
-      if (!deliveredInApp) continue;
-      await convexMutation("reminders:complete", { id: reminder._id }).catch(() => {});
     }
   } catch {
     /* reminders must never block fleet dispatch */

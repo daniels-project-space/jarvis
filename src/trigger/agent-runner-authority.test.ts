@@ -719,14 +719,11 @@ describe("production Trigger worker authority harness", () => {
     expect(requests.map((request) => request.path)).not.toContain("jobs:enqueue");
   });
 
-  it("leaves a due reminder recoverable when its durable in-app delivery cannot be recorded", async () => {
+  it("keeps a stale reclaimed reminder silent when its fenced delivery loses", async () => {
     const requests: MutationTrace[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as MutationTrace;
       requests.push(body);
-      if (body.path === "chatQueue:postAssistant") {
-        return new Response(JSON.stringify({ status: "error", errorMessage: "chat storage unavailable" }), { status: 503 });
-      }
       const value = (() => {
         switch (body.path) {
           case "jobs:migrateControlPlane":
@@ -738,7 +735,10 @@ describe("production Trigger worker authority harness", () => {
           case "jobs:cloudWorkspaceOrphans":
             return [];
           case "reminders:due":
-            return [{ _id: "reminder-retry", text: "Call the hotel", at: Date.now() - 60_000 }];
+            return [{ _id: "reminder-retry", text: "Call the hotel", at: Date.now() - 60_000, deliveryAttempt: 1 }];
+          case "reminders:deliver":
+            // The lease was reclaimed between `due` and the atomic effect.
+            return false;
           default:
             return null;
         }
@@ -750,15 +750,14 @@ describe("production Trigger worker authority harness", () => {
 
     expect(requests).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: "reminders:due" }),
-      expect.objectContaining({ path: "chatQueue:postAssistant" }),
+      expect.objectContaining({
+        path: "reminders:deliver",
+        args: expect.objectContaining({ id: "reminder-retry", deliveryAttempt: 1 }),
+      }),
     ]));
+    expect(requests.map((request) => request.path)).not.toContain("chatQueue:postAssistant");
     expect(requests.map((request) => request.path)).not.toContain("reminders:complete");
-    expect(notifications.sendPush).toHaveBeenCalledWith(
-      "⏰ JARVIS reminder",
-      "Call the hotel",
-      "/",
-      expect.objectContaining({ ttl: 3600, urgency: "high", category: "reminder" }),
-    );
+    expect(notifications.sendPush).not.toHaveBeenCalled();
   });
 
   it("checkpoints an expired worker watchdog instead of leaving its lease running", async () => {
