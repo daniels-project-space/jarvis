@@ -6,6 +6,7 @@ const mock = vi.hoisted(() => ({
   validateAdminSession: vi.fn(),
   controlQuery: vi.fn(),
   controlMutation: vi.fn(),
+  isSameOriginRequest: vi.fn(),
   putPrivateCreationAsset: vi.fn(),
   deletePrivateCreationAsset: vi.fn(),
   creationMediaUrl: vi.fn(),
@@ -16,6 +17,7 @@ vi.mock("@/lib/control-session", () => ({
   validateAdminSession: mock.validateAdminSession,
   controlQuery: mock.controlQuery,
   controlMutation: mock.controlMutation,
+  isSameOriginRequest: mock.isSameOriginRequest,
 }));
 vi.mock("@/lib/creation-assets", () => ({
   putPrivateCreationAsset: mock.putPrivateCreationAsset,
@@ -47,6 +49,7 @@ function request(format: "png" | "svg" = "png") {
 describe("creation export persistence", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mock.isSameOriginRequest.mockReturnValue(true);
     mock.adminSessionHash.mockResolvedValue(OWNER);
     mock.validateAdminSession.mockResolvedValue(true);
     mock.controlQuery.mockResolvedValue(board);
@@ -85,6 +88,18 @@ describe("creation export persistence", () => {
       type: "image",
       downloadUrl: "/api/creation-download?id=export-1",
     }));
+  });
+
+  it("rejects a cross-origin export before consulting the owner session or storing bytes", async () => {
+    mock.isSameOriginRequest.mockReturnValue(false);
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: "cross-origin export rejected" });
+    expect(mock.adminSessionHash).not.toHaveBeenCalled();
+    expect(mock.putPrivateCreationAsset).not.toHaveBeenCalled();
+    expect(mock.controlMutation).not.toHaveBeenCalled();
   });
 
   it("rejects non-board sources before uploading anything", async () => {

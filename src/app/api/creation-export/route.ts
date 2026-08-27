@@ -1,5 +1,11 @@
 import type { NextRequest } from "next/server";
-import { adminSessionHash, controlMutation, controlQuery, validateAdminSession } from "@/lib/control-session";
+import {
+  adminSessionHash,
+  controlMutation,
+  controlQuery,
+  isSameOriginRequest,
+  validateAdminSession,
+} from "@/lib/control-session";
 import { creationMediaUrl, deletePrivateCreationAsset, putPrivateCreationAsset } from "@/lib/creation-assets";
 
 // Client-rendered board exports (PNG/SVG) land here: Excalidraw can only
@@ -25,6 +31,9 @@ type Creation = {
 };
 
 export async function POST(req: NextRequest) {
+  if (!isSameOriginRequest(req)) {
+    return Response.json({ error: "cross-origin export rejected" }, { status: 403 });
+  }
   const authTokenHash = await adminSessionHash(req);
   if (!authTokenHash || !(await validateAdminSession(authTokenHash))) {
     return Response.json({ error: "unauthorised" }, { status: 401 });

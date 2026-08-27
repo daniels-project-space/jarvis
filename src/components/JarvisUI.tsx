@@ -24,6 +24,7 @@ import {
 } from "../lib/sanitize";
 import {
   canSubmitICloudCalendarApproval,
+  iCloudCalendarApprovalFailureState,
   iCloudCalendarApprovalButtonLabel,
   type ICloudCalendarApprovalCardState,
 } from "@/lib/icloud-calendar-approval-card";
@@ -407,7 +408,15 @@ function ICloudCalendarApprovalCard({ token }: { token: string }) {
         body: JSON.stringify({ token }),
       });
       const payload = await response.json().catch(() => ({})) as { ok?: unknown; created?: unknown; error?: unknown };
-      if (!response.ok || payload.ok !== true) throw new Error(String(payload.error ?? "iCloud Calendar approval was rejected."));
+      if (!response.ok || payload.ok !== true) {
+        const failureState = iCloudCalendarApprovalFailureState(response.status);
+        if (failureState === "expired") {
+          setState(failureState);
+          setDetail("This approval has expired or is no longer valid. Ask Jarvis to prepare a new event.");
+          return;
+        }
+        throw new Error(String(payload.error ?? "iCloud Calendar approval was rejected."));
+      }
       setState("completed");
       setDetail(payload.created === false ? "Already present in iCloud Calendar." : "Added to iCloud Calendar.");
     } catch (error) {
@@ -420,6 +429,8 @@ function ICloudCalendarApprovalCard({ token }: { token: string }) {
     <div data-icloud-calendar-approval className="mt-1.5 inline-flex max-w-[88%] items-center gap-2 rounded-xl border border-cyan/30 bg-cyan/[0.06] px-3 py-2 text-xs text-ice">
       {state === "completed" ? (
         <span aria-live="polite">{detail}</span>
+      ) : state === "expired" ? (
+        <span aria-live="polite" className="text-amber">{detail}</span>
       ) : (
         <>
           <button
