@@ -97,6 +97,44 @@ describe("retry-safe timed reminders", () => {
     ]);
   });
 
+  it("does not let an earlier schedule's late worker match a re-armed reminder", async () => {
+    const t = convexTest(schema, modules);
+    const initial = await t.mutation(api.reminders.add, {
+      text: "Download Seville map",
+      at: Date.now() - 60_000,
+      sourceKey: SOURCE_KEY,
+      workerToken: WORKER,
+    });
+    const [firstDelivery] = await t.mutation(api.reminders.due, { workerToken: WORKER });
+    await expect(t.mutation(api.reminders.deliver, {
+      id: initial,
+      deliveryAttempt: firstDelivery.deliveryAttempt,
+      threadId: "main",
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+
+    await t.mutation(api.reminders.add, {
+      text: "Download Seville map after flight moved",
+      at: Date.now() + 60_000,
+      sourceKey: SOURCE_KEY,
+      workerToken: WORKER,
+    });
+    // Simulate time reaching the rescheduled reminder without allowing the
+    // earlier worker to reuse its old delivery generation.
+    await t.run(async (ctx) => {
+      await ctx.db.patch(initial, { at: Date.now() - 1 });
+    });
+    const [rescheduledDelivery] = await t.mutation(api.reminders.due, { workerToken: WORKER });
+    expect(rescheduledDelivery.deliveryAttempt).toBe(firstDelivery.deliveryAttempt + 1);
+
+    await expect(t.mutation(api.reminders.deliver, {
+      id: initial,
+      deliveryAttempt: firstDelivery.deliveryAttempt,
+      threadId: "main",
+      workerToken: WORKER,
+    })).resolves.toBe(false);
+  });
+
   it("never revives an automated reminder the owner cancelled", async () => {
     const t = convexTest(schema, modules);
     const initial = await t.mutation(api.reminders.add, {
@@ -117,6 +155,56 @@ describe("retry-safe timed reminders", () => {
 });
 
 describe("due reminder fairness", () => {
+  it("fences a reclaimed delivery so only its current worker can weave the reminder", async () => {
+    const t = convexTest(schema, modules);
+    const reminderId = await t.mutation(api.reminders.add, {
+      text: "Call the hotel",
+      at: Date.now() - 60_000,
+      workerToken: WORKER,
+    });
+    const [first] = await t.mutation(api.reminders.due, { workerToken: WORKER });
+    expect(first.deliveryAttempt).toBe(1);
+
+    await t.run(async (ctx) => {
+      await ctx.db.patch(reminderId, {
+        deliverStartedAt: Date.now() - 10 * 60_000,
+      });
+    });
+    const [reclaimed] = await t.mutation(api.reminders.due, { workerToken: WORKER });
+    expect(reclaimed.deliveryAttempt).toBe(2);
+
+    await expect(t.mutation(api.reminders.deliver, {
+      id: reminderId,
+      deliveryAttempt: first.deliveryAttempt,
+      threadId: "main",
+      workerToken: WORKER,
+    })).resolves.toBe(false);
+    await expect(t.mutation(api.reminders.deliver, {
+      id: reminderId,
+      deliveryAttempt: reclaimed.deliveryAttempt,
+      threadId: "main",
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+    await expect(t.mutation(api.reminders.deliver, {
+      id: reminderId,
+      deliveryAttempt: reclaimed.deliveryAttempt,
+      threadId: "main",
+      workerToken: WORKER,
+    })).resolves.toBe(false);
+
+    await expect(t.run(async (ctx) =>
+      await ctx.db.query("chatMessages")
+        .withIndex("by_thread", (q) => q.eq("threadId", "main"))
+        .collect(),
+    )).resolves.toEqual([
+      expect.objectContaining({
+        role: "assistant",
+        delivery: "notification",
+        text: "⏰ Reminder, sir — Call the hotel",
+      }),
+    ]);
+  });
+
   it("reserves delivery capacity for due reminders while reclaiming a large stale backlog", async () => {
     const t = convexTest(schema, modules);
     const now = Date.now();

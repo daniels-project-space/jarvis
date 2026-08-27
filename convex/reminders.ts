@@ -55,7 +55,9 @@ export const add = mutation({
             originThreadId: a.originThreadId,
             ...(existing.status === "done" ? {
               status: "pending",
-              deliveryAttempts: 0,
+              // This is also the delivery fence.  Do not reset it when a
+              // source-keyed reminder is re-armed: a very late worker from
+              // the earlier schedule must never match the new delivery.
               deliverStartedAt: undefined,
             } : {}),
           });
@@ -109,7 +111,60 @@ export const due = mutation({
         deliverStartedAt: now,
         deliveryAttempts: (row.deliveryAttempts ?? 0) + 1,
       });
-    return fire.map((row: any) => ({ _id: row._id, text: row.text, at: row.at, originThreadId: row.originThreadId }));
+    return fire.map((row: any) => ({
+      _id: row._id,
+      text: row.text,
+      at: row.at,
+      originThreadId: row.originThreadId,
+      // `deliveryAttempts` is a monotonic lease generation, not merely
+      // observability.  The worker must present this exact value when it
+      // persists the visible reminder.
+      deliveryAttempt: (row.deliveryAttempts ?? 0) + 1,
+    }));
+  },
+});
+
+export const deliver = mutation({
+  args: {
+    id: v.id("reminders"),
+    deliveryAttempt: v.number(),
+    threadId: v.string(),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const reminder = await ctx.db.get(a.id);
+    // The five-minute reaper can hand the same reminder to a newer Trigger
+    // run.  Persisting the chat row and terminal reminder state in this one
+    // transaction lets exactly one lease win, including response-lost retry
+    // paths, instead of allowing both workers to weave the alert.
+    if (
+      !reminder
+      || reminder.status !== "delivering"
+      || reminder.deliveryAttempts !== a.deliveryAttempt
+    ) return false;
+    const now = Date.now();
+    const minutesLate = Math.round((now - reminder.at) / 60_000);
+    const late = minutesLate > 4
+      ? ` (set for ${new Date(reminder.at).toLocaleTimeString("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Europe/London",
+      })})`
+      : "";
+    await ctx.db.insert("chatMessages", {
+      threadId: a.threadId,
+      role: "assistant",
+      text: `⏰ Reminder, sir — ${reminder.text}${late}`,
+      status: "done",
+      delivery: "notification",
+      createdAt: now,
+    });
+    await ctx.db.patch(reminder._id, {
+      status: "done",
+      deliverStartedAt: undefined,
+    });
+    return true;
   },
 });
 
