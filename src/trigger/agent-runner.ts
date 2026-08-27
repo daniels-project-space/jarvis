@@ -1244,6 +1244,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const processed = 1;
     const expectedAttempt = Number(job.attempt ?? 1);
     const authorityDigest = typeof job.authorityDigest === "string" ? job.authorityDigest : "";
+    const claimedWorkerRunId = options.reservation.workerRunId.slice(0, 120);
     const authorizeBoundary = async (phase: AgentRunnerAuthorityPhase) => {
       const boundary: any = await convexMutation("jobs:authorizeExecutionBoundary", {
         jobId: job.jobId,
@@ -1675,7 +1676,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         });
         const live = await convexMutation(
           deliveryFence ? "jobs:touchDeliveryHeartbeat" : "jobs:touchHeartbeat",
-          { jobId: job.jobId, expectedAttempt, ...(deliveryFence ?? {}) },
+          deliveryFence
+            ? { jobId: job.jobId, expectedAttempt, ...deliveryFence }
+            : { jobId: job.jobId, expectedAttempt, workerRunId: claimedWorkerRunId },
         ).catch(() => false);
         const recorded = live && await convexMutation("jobs:updateProgress", {
           jobId: job.jobId,
@@ -2501,7 +2504,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               .catch(() => undefined)
               .then(() => convexMutation(
                 deliveryFence ? "jobs:touchDeliveryHeartbeat" : "jobs:touchHeartbeat",
-                { jobId: job.jobId, expectedAttempt, ...(deliveryFence ?? {}) },
+                deliveryFence
+                  ? { jobId: job.jobId, expectedAttempt, ...deliveryFence }
+                  : { jobId: job.jobId, expectedAttempt, workerRunId: claimedWorkerRunId },
               ))
               .catch(() => undefined);
           }
