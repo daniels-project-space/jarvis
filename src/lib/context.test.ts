@@ -77,6 +77,42 @@ describe("bounded foreground context snapshots", () => {
     expect(context).toContain("about £123,456");
   });
 
+  it("does not reuse a text-specific brain snapshot when another turn stalls", async () => {
+    const marker = "SENTINEL-MEMORY-MARKER";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ value: { memory: [{ title: "Sentinel", body: marker }] } }),
+      })
+      .mockImplementationOnce(() => new Promise(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildContext("Review the Sentinel migration")).resolves.toContain(marker);
+
+    const nextTurn = buildContext("Review the compass travel plan");
+    await vi.advanceTimersByTimeAsync(CONTEXT_INPUT_DEADLINE_MS);
+
+    await expect(nextTurn).resolves.not.toContain(marker);
+  });
+
+  it("keeps same-query brain grounding available during a snapshot stall", async () => {
+    const marker = "RETRY-MEMORY-MARKER";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ value: { memory: [{ title: "Retry", body: marker }] } }),
+      })
+      .mockImplementationOnce(() => new Promise(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildContext("Review the retry migration")).resolves.toContain(marker);
+
+    const retry = buildContext("Review the retry migration");
+    await vi.advanceTimersByTimeAsync(CONTEXT_INPUT_DEADLINE_MS);
+
+    await expect(retry).resolves.toContain(marker);
+  });
+
   it("returns a fresh successful snapshot and records it as last-known-good", async () => {
     let known: { value: unknown; capturedAt: number } | null = null;
     await expect(boundedSnapshot(

@@ -12,7 +12,11 @@ import { HUB_CONTEXT_URL, hubContextRequestArgs } from "./hub-context";
 const CONVEX_URL = resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL, process.env.CONVEX_URL);
 let hubCache: { value: any; expiresAt: number } | null = null;
 let hubRequest: Promise<any> | null = null;
-let brainLastKnownGood: { value: any; capturedAt: number } | null = null;
+// `brainContext:snapshot` includes memory-search results for the current user
+// text. A fallback therefore must be scoped to that exact search input: a
+// stalled new question must not inherit the prior question's relevant-memory
+// hits merely because both ran in the same warm foreground process.
+let brainLastKnownGood: { value: any; capturedAt: number; queryKey: string } | null = null;
 let hubLastKnownGood: { value: any; capturedAt: number } | null = null;
 
 // These snapshots enrich a foreground answer; they are never allowed to hold
@@ -145,11 +149,16 @@ export async function buildContext(
       projectRegistry: PROJECT_REGISTRY,
     });
   }
+  // Keep the key identical to the bounded query payload. It retains the
+  // no-wait last-known-good path for a retry while preventing text-specific
+  // retrieval grounding from crossing into a distinct turn.
+  const brainQueryText = userText?.slice(0, 240) || undefined;
+  const brainQueryKey = brainQueryText ?? "";
   const [brain, hub] = await Promise.all([
     boundedSnapshot(
-      (signal) => q(CONVEX_URL, "brainContext:snapshot", { userText: userText?.slice(0, 240) || undefined }, signal),
-      () => brainLastKnownGood,
-      (snapshot) => { brainLastKnownGood = snapshot; },
+      (signal) => q(CONVEX_URL, "brainContext:snapshot", { userText: brainQueryText }, signal),
+      () => brainLastKnownGood?.queryKey === brainQueryKey ? brainLastKnownGood : null,
+      (snapshot) => { brainLastKnownGood = { ...snapshot, queryKey: brainQueryKey }; },
     ),
     // Hub data is only eligible for the existing calendar/to-do or wealth
     // compiler branches. Avoid making every unrelated substantive turn wait
