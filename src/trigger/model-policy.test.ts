@@ -22,9 +22,15 @@ describe("subscription model policy", () => {
 
   it("routes conversation difficulty without spending frontier intelligence on reflexes", () => {
     expect(pickConversationTier("hello Jarvis")).toBe("luna");
+    expect(pickConversationTier("Thanks, Jarvis!")).toBe("luna");
+    expect(pickConversationTier("Hey Jarvis, what's on my calendar?")).toBe("luna");
     expect(pickConversationTier("Show me the weather in London")).toBe("luna");
     expect(pickConversationTier("Brainstorm a sharper product strategy for Jarvis and compare the trade-offs")).toBe("terra");
     expect(pickConversationTier("Trace the root cause of this multi-repo production outage from first principles")).toBe("sol");
+  });
+
+  it("does not route a substantive request to Luna merely because it starts with a greeting", () => {
+    expect(pickConversationTier("Hey Jarvis, fix the loading spinner")).toBe("terra");
   });
 
   it("does not treat bounded host-screen evidence as user-request complexity", () => {

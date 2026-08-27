@@ -1,6 +1,6 @@
 import "server-only";
 import { currentAdminSession } from "./control-context";
-import { compileContext } from "./context-compiler";
+import { classifyContextProfile, compileContext } from "./context-compiler";
 import { resolveConvexUrl } from "./convex-url";
 import { PORTFOLIO_NORTH_STAR, PROJECT_REGISTRY } from "./project-registry";
 import { HUB_CONTEXT_URL, hubContextRequestArgs } from "./hub-context";
@@ -133,6 +133,18 @@ export async function reportIncident(source: string, signature: string, message:
 export async function buildContext(
   userText?: string,
 ): Promise<string> {
+  // A pure greeting/acknowledgement must not wait on two optional remote
+  // snapshots. It has no live-state dependency, and compileContext already
+  // emits the same explicit reflex instruction without any fetched evidence.
+  if (classifyContextProfile(userText) === "reflex") {
+    return compileContext({
+      userText,
+      northStar: PORTFOLIO_NORTH_STAR,
+      brain: null,
+      hub: null,
+      projectRegistry: PROJECT_REGISTRY,
+    });
+  }
   const [brain, hub] = await Promise.all([
     boundedSnapshot(
       (signal) => q(CONVEX_URL, "brainContext:snapshot", { userText: userText?.slice(0, 240) || undefined }, signal),

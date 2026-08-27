@@ -4,6 +4,7 @@ vi.mock("server-only", () => ({}));
 
 import {
   boundedSnapshot,
+  buildContext,
   CONTEXT_INPUT_DEADLINE_MS,
   CONTEXT_LAST_KNOWN_GOOD_MS,
 } from "./context";
@@ -13,7 +14,29 @@ describe("bounded foreground context snapshots", () => {
     vi.useFakeTimers();
     vi.setSystemTime(100_000);
   });
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("does not wait on optional remote snapshots for a pure conversational reflex", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildContext("Hello, Jarvis!")).resolves.toContain("Respond immediately and naturally");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the live-context path for a substantive request with a greeting prefix", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ value: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildContext("Hey Jarvis, fix the loading spinner")).resolves.toContain("Give the next useful action first");
+    expect(fetchMock).toHaveBeenCalled();
+  });
 
   it("returns a fresh successful snapshot and records it as last-known-good", async () => {
     let known: { value: unknown; capturedAt: number } | null = null;

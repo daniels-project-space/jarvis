@@ -1,5 +1,6 @@
 import { normalizeWorkModelTier, type WorkModelTier } from "../lib/work-models";
 import { visibleTurnText } from "../lib/host-context";
+import { isConversationalReflex } from "../lib/conversation-intent";
 
 export const CODEX_MODEL_POLICY = {
   luna: { model: "gpt-5.6-luna", effort: "low" },
@@ -115,10 +116,7 @@ export function pickConversationTier(text: string): WorkModelTier {
     value.length > 700 ||
     /\b(root cause|multi[- ]?(repo|project|file)|architecture migration|security incident|production outage|think (really |very )?hard|from first principles|deep dive)\b/.test(value)
   ) return "sol";
-  if (
-    value.length <= 60 &&
-    /^(hi|hey|hello|yo|thanks|thank you|ok|okay|sup|morning|evening|good (morning|evening|day)|what'?s up|how are you)\b/.test(value)
-  ) return "luna";
+  if (value.length <= 80 && isConversationalReflex(value)) return "luna";
   if (
     value.length <= 80 &&
     !/\b(brainstorm|compare|design|plan|strategy|analy[sz]e|investigate|recommend|fix|build|create)\b/.test(value)
