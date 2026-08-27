@@ -116,7 +116,7 @@ export async function POST(req: NextRequest) {
     // reflect them into chat; the card already contains the safe preview.
     return Response.json({
       ok: false,
-      error: "iCloud Calendar could not add that event. Check the iCloud Calendar connection and prepare a fresh approval.",
+      error: "iCloud Calendar could not add that event. Check the iCloud Calendar connection, then retry this approval before it expires.",
     }, { status: 502, headers: PRIVATE_HEADERS });
   }
 }

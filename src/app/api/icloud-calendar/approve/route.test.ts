@@ -125,7 +125,7 @@ describe("iCloud Calendar owner approval route", () => {
     expect(response.status).toBe(502);
     await expect(response.json()).resolves.toEqual({
       ok: false,
-      error: "iCloud Calendar could not add that event. Check the iCloud Calendar connection and prepare a fresh approval.",
+      error: "iCloud Calendar could not add that event. Check the iCloud Calendar connection, then retry this approval before it expires.",
     });
   });
 });

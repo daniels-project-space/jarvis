@@ -22,6 +22,11 @@ import {
   sanitizeAssistantText,
   stripAssistantApprovals,
 } from "../lib/sanitize";
+import {
+  canSubmitICloudCalendarApproval,
+  iCloudCalendarApprovalButtonLabel,
+  type ICloudCalendarApprovalCardState,
+} from "@/lib/icloud-calendar-approval-card";
 import { createOrbMotionFrame, deriveOrbVisual, type OrbMotionFrame } from "@/lib/orb-motion";
 import {
   cacheCompactWorkSnapshot,
@@ -384,11 +389,11 @@ function GoogleCalendarApprovalCard({ token }: { token: string }) {
 }
 
 function ICloudCalendarApprovalCard({ token }: { token: string }) {
-  const [state, setState] = useState<"ready" | "approving" | "completed" | "error">("ready");
+  const [state, setState] = useState<ICloudCalendarApprovalCardState>("ready");
   const [detail, setDetail] = useState("");
 
   const approve = async () => {
-    if (state !== "ready") return;
+    if (!canSubmitICloudCalendarApproval(state)) return;
     setState("approving");
     setDetail("");
     try {
@@ -416,10 +421,10 @@ function ICloudCalendarApprovalCard({ token }: { token: string }) {
           <button
             type="button"
             onClick={() => void approve()}
-            disabled={state === "approving"}
+            disabled={!canSubmitICloudCalendarApproval(state)}
             className="rounded-lg border border-cyan/40 bg-cyan/10 px-2 py-1 font-medium text-cyan transition hover:bg-cyan/20 disabled:opacity-50"
           >
-            {state === "approving" ? "saving…" : "Approve iCloud event"}
+            {iCloudCalendarApprovalButtonLabel(state)}
           </button>
           <span aria-live="polite" className={state === "error" ? "text-amber" : "text-slate"}>
             {state === "error" ? detail : "Nothing changes until you click."}
