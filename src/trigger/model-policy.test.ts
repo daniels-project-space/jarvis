@@ -8,6 +8,7 @@ import {
   codexReviewExecPrefix,
   normalizeReasoningEffort,
   pickConversationTier,
+  shouldUseLunaFastLane,
 } from "./model-policy";
 import { withHostContext } from "../lib/host-context";
 
@@ -31,6 +32,17 @@ describe("subscription model policy", () => {
 
   it("does not route a substantive request to Luna merely because it starts with a greeting", () => {
     expect(pickConversationTier("Hey Jarvis, fix the loading spinner")).toBe("terra");
+  });
+
+  it("reserves the stripped Luna thread for exact social reflexes", () => {
+    expect(shouldUseLunaFastLane("hello Jarvis", "luna")).toBe(true);
+    expect(shouldUseLunaFastLane("Thanks, Jarvis!", "luna")).toBe(true);
+    // These stay on Luna, but need the normal capability briefing and the
+    // thread that retains context for a live-data or visual follow-up.
+    expect(pickConversationTier("What's on my calendar?")).toBe("luna");
+    expect(shouldUseLunaFastLane("What's on my calendar?", "luna")).toBe(false);
+    expect(shouldUseLunaFastLane("Show me the weather in London", "luna")).toBe(false);
+    expect(shouldUseLunaFastLane("hello Jarvis", "terra")).toBe(false);
   });
 
   it("does not treat bounded host-screen evidence as user-request complexity", () => {
