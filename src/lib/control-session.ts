@@ -47,6 +47,7 @@ export async function validateAdminSession(tokenHash: string | null): Promise<bo
 
 export async function adminSessionStatus(
   tokenHash: string | null,
+  signal?: AbortSignal,
 ): Promise<AdminSessionStatus> {
   if (!tokenHash) return { valid: false };
   try {
@@ -55,6 +56,7 @@ export async function adminSessionStatus(
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ path: "controlAuth:sessionStatus", args: { tokenHash }, format: "json" }),
       cache: "no-store",
+      signal,
     });
     const payload = await response.json();
     if (!response.ok || payload?.status === "error") return { valid: false, unavailable: true };

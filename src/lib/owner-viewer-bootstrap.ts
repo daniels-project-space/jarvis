@@ -3,6 +3,11 @@ import "server-only";
 import { adminSessionStatus, sha256Hex } from "@/lib/control-session";
 import { issueViewerToken } from "@/lib/viewer-jwt";
 
+// This is an optional fast path. Never let an unavailable Convex lookup hold
+// the owner’s first HTML response hostage; the client bootstrap remains the
+// safe recovery path after this short budget expires.
+export const OWNER_VIEWER_BOOTSTRAP_DEADLINE_MS = 900;
+
 export type OwnerViewerBootstrap = {
   token: string;
   expiresAt: number;
@@ -43,15 +48,31 @@ export async function getInitialOwnerViewerSession(
   const ownerToken = ownerCookie?.trim();
   if (!ownerToken || !isTrustedOwnerViewerBootstrapRequest(request)) return null;
 
-  try {
-    const ownerSession = await adminSessionStatus(await sha256Hex(ownerToken));
-    if (!ownerSession.valid) return null;
+  const controller = new AbortController();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("owner viewer bootstrap timed out"));
+    }, OWNER_VIEWER_BOOTSTRAP_DEADLINE_MS);
+  });
 
-    return await issueViewerToken({ kind: "owner" });
+  try {
+    return await Promise.race([
+      (async () => {
+        const ownerSession = await adminSessionStatus(await sha256Hex(ownerToken), controller.signal);
+        if (!ownerSession.valid) return null;
+
+        return await issueViewerToken({ kind: "owner" });
+      })(),
+      deadline,
+    ]);
   } catch {
     // This path is an optional fast start. Fail closed so an unavailable
     // session lookup or signer cannot turn an unauthenticated render into an
     // owner capability.
     return null;
+  } finally {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
   }
 }
