@@ -532,6 +532,16 @@ export class CodexAppServer {
   }
 
   async runTurn(input: CodexTurnInput): Promise<CodexTurnResult> {
+    // The foreground caller can derive two lazy values from one preparation
+    // promise. Observe both before any startup await: a cancelled or rejected
+    // cold thread must not leave those derived promises unhandled while the
+    // caller is already unwinding. We still await the same aggregate below,
+    // so this observer never changes input ordering or error propagation.
+    const lazyInputs = Promise.all([
+      Promise.resolve(input.contextBlock),
+      Promise.resolve(input.imageInputs ?? []),
+    ]);
+    void lazyInputs.catch(() => undefined);
     const outputSchema = input.outputSchema === undefined ? undefined
       : validateCodexOutputSchema(input.outputSchema);
     const invocationContext = normalizeToolInvocationContext(input.invocationContext, {
@@ -610,10 +620,7 @@ export class CodexAppServer {
     // `thread/start` carries only static instructions and capabilities. Start
     // it before awaiting independently-prepared foreground context or inline
     // images so a cold thread never serializes behind the bounded snapshot.
-    const [contextBlock, suppliedImageInputs] = await Promise.all([
-      Promise.resolve(input.contextBlock),
-      Promise.resolve(input.imageInputs ?? []),
-    ]).catch((error) => {
+    const [contextBlock, suppliedImageInputs] = await lazyInputs.catch((error) => {
       // A lazily supplied input can fail after the static thread was accepted.
       // Do not retain that otherwise-empty cold thread: the next real turn
       // must create a thread and seed its durable conversation history.
