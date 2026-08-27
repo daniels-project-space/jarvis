@@ -16,6 +16,7 @@ vi.mock("@/lib/viewer-jwt", () => ({ issueViewerToken: mock.issueViewerToken }))
 
 import {
   getInitialOwnerViewerSession,
+  OWNER_VIEWER_BOOTSTRAP_DEADLINE_MS,
   requestOriginFromHeaders,
 } from "./owner-viewer-bootstrap";
 
@@ -40,7 +41,7 @@ describe("getInitialOwnerViewerSession", () => {
     });
 
     expect(mock.sha256Hex).toHaveBeenCalledWith("owner-cookie");
-    expect(mock.adminSessionStatus).toHaveBeenCalledWith("owner-session-hash");
+    expect(mock.adminSessionStatus).toHaveBeenCalledWith("owner-session-hash", expect.any(AbortSignal));
     expect(mock.issueViewerToken).toHaveBeenCalledTimes(1);
     expect(mock.issueViewerToken).toHaveBeenCalledWith({ kind: "owner" });
   });
@@ -97,5 +98,25 @@ describe("getInitialOwnerViewerSession", () => {
 
     await expect(getInitialOwnerViewerSession("owner-cookie", directOwnerNavigation)).resolves.toBeNull();
     expect(mock.issueViewerToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the client bootstrap when owner validation stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      let signal: AbortSignal | undefined;
+      mock.adminSessionStatus.mockImplementation((_tokenHash: string, nextSignal?: AbortSignal) => {
+        signal = nextSignal;
+        return new Promise(() => {});
+      });
+
+      const bootstrap = getInitialOwnerViewerSession("owner-cookie", directOwnerNavigation);
+      await vi.advanceTimersByTimeAsync(OWNER_VIEWER_BOOTSTRAP_DEADLINE_MS);
+
+      await expect(bootstrap).resolves.toBeNull();
+      expect(signal?.aborted).toBe(true);
+      expect(mock.issueViewerToken).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

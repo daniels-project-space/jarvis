@@ -26,4 +26,17 @@ describe("owner session status classification", () => {
       expiresAt: 123_456,
     });
   });
+
+  it("forwards an owner-bootstrap abort signal to the Convex lookup", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ value: { valid: false } })));
+    vi.stubGlobal("fetch", request);
+    const controller = new AbortController();
+
+    await adminSessionStatus("d".repeat(64), controller.signal);
+
+    expect(request).toHaveBeenCalledWith(
+      expect.stringContaining("/api/query"),
+      expect.objectContaining({ signal: controller.signal }),
+    );
+  });
 });
