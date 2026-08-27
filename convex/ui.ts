@@ -364,14 +364,31 @@ export const getVideoCmd = query({
 // Orb mood: the brain shifts the orb's colour to match the conversation's
 // tone; the client lerps toward it slowly and falls back to green when stale.
 export const setMood = mutation({
-  args: { mood: v.string(), manual: v.optional(v.boolean()), ...actorAuthArgs },
+  args: {
+    mood: v.string(),
+    manual: v.optional(v.boolean()),
+    source: v.optional(v.union(v.literal("cleared"), v.literal("model"))),
+    threadId: v.optional(v.string()),
+    ...actorAuthArgs,
+  },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
     const ex = await ctx.db.query("ui").withIndex("by_key", (q: any) => q.eq("key", "mood")).first();
     // Mood is alive but not a strobe: a genuine model shift holds ~45s before
     // the next. Daniel's MANUAL picks (options panel) always take instantly.
-    if (!a.manual && ex && ex.value !== a.mood && a.mood !== "alert" && Date.now() - (ex.updatedAt ?? 0) < 45_000) return;
-    const doc = { key: "mood", type: "mood", value: a.mood, title: a.manual ? "manual" : "auto", updatedAt: Date.now() };
+    // A deliberate return to automatic mode is immediate and is not a model
+    // nudge: it must reveal the current local conversation, not hold calm.
+    const source = a.manual ? "manual" : a.source ?? "model";
+    if (source === "model" && ex && ex.value !== a.mood && a.mood !== "alert" && Date.now() - (ex.updatedAt ?? 0) < 45_000) return;
+    const doc = {
+      key: "mood",
+      type: "mood",
+      value: a.mood,
+      title: a.manual ? "manual" : "auto",
+      source,
+      ...(source === "model" && a.threadId ? { threadId: a.threadId } : {}),
+      updatedAt: Date.now(),
+    };
     if (ex) await ctx.db.patch(ex._id, doc);
     else await ctx.db.insert("ui", doc);
   },

@@ -69,7 +69,7 @@ describe("foreground agent tool bridge", () => {
     try {
       const listed = await bridge.invoke(dynamicCall("jarvis_get_tools", { belt: "core" }));
       const args = { text: `Daniel's "quoted" $HOME; $(touch nope)\nnext line` };
-      const invocationContext = { requestId: "request-1", userMessageId: "message-1" };
+      const invocationContext = { requestId: "request-1", threadId: "conversation-thread-1", userMessageId: "message-1" };
       const called = await bridge.invoke(dynamicCall(
         "jarvis_call_tool",
         { name: "show", args },
@@ -258,7 +258,7 @@ describe("foreground agent tool bridge", () => {
         return Response.json({ result: "accepted" });
       },
     });
-    const invocationContext = { requestId: "stable-request", userMessageId: "stable-message" };
+    const invocationContext = { requestId: "stable-request", threadId: "conversation-thread-1", userMessageId: "stable-message" };
     const call = dynamicCall("jarvis_call_tool", {
       name: "show",
       args: { kind: "markdown", value: "hello" },

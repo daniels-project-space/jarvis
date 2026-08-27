@@ -34,6 +34,8 @@ const contentTypes: Record<string, string> = {
   "/work-map": "text/html; charset=utf-8",
   "/work-map.js": "text/javascript; charset=utf-8",
   "/work-map.css": "text/css; charset=utf-8",
+  "/orb-mood": "text/html; charset=utf-8",
+  "/orb-mood.js": "text/javascript; charset=utf-8",
   "/location": "text/html; charset=utf-8",
   "/location.js": "text/javascript; charset=utf-8",
   "/booking-marker": "text/html; charset=utf-8",
@@ -176,6 +178,19 @@ const workMapFixtureHtml = [
   "</html>",
 ].join("\n");
 
+const orbMoodFixtureHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Jarvis orb mood fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/orb-mood.js" defer></script>
+  </body>
+</html>`;
+
 const locationFixtureHtml = `<!doctype html>
 <html lang="en">
   <head>
@@ -264,6 +279,7 @@ async function main() {
     "offline-map": join(projectRoot, "e2e/fixtures/apple-maps-offline.browser.tsx"),
     "city-itinerary": join(projectRoot, "e2e/fixtures/trip-city-itinerary-scope.browser.tsx"),
     "work-map": join(projectRoot, "e2e/fixtures/work-map-bubble.browser.tsx"),
+    "orb-mood": join(projectRoot, "e2e/fixtures/orb-mood.browser.tsx"),
   },
   format: "iife",
   jsx: "automatic",
@@ -290,6 +306,7 @@ async function main() {
   const offlineMapJsPath = join(outputDir, "offline-map.js");
   const cityItineraryJsPath = join(outputDir, "city-itinerary.js");
   const workMapJsPath = join(outputDir, "work-map.js");
+  const orbMoodJsPath = join(outputDir, "orb-mood.js");
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
@@ -304,6 +321,7 @@ async function main() {
     access(offlineMapJsPath),
     access(cityItineraryJsPath),
     access(workMapJsPath),
+    access(orbMoodJsPath),
   ]);
 
   const server = createServer(async (request, response) => {
@@ -435,6 +453,11 @@ async function main() {
     response.end(workMapFixtureHtml);
     return;
   }
+  if (pathname === "/orb-mood") {
+    response.writeHead(200);
+    response.end(orbMoodFixtureHtml);
+    return;
+  }
   if (pathname === "/work-map.css") {
     response.writeHead(200);
     response.end(workMapCss);
@@ -471,6 +494,7 @@ async function main() {
     "/caption.js": captionJsPath,
     "/caption.css": captionCssPath,
     "/work-map.js": workMapJsPath,
+    "/orb-mood.js": orbMoodJsPath,
     "/location.js": locationJsPath,
     "/booking-marker.js": bookingMarkerJsPath,
     "/offline-map.js": offlineMapJsPath,

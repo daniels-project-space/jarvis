@@ -44,6 +44,7 @@ describe("foreground agent-tool invocation context", () => {
       args: { kind: "markdown", value: "hello" },
       invocationContext: {
         requestId: "request-1",
+        threadId: "thread-1",
         userMessageId: "message-1",
       },
     }));
@@ -55,6 +56,7 @@ describe("foreground agent-tool invocation context", () => {
       {
         invocationContext: {
           requestId: "request-1",
+          threadId: "thread-1",
           userMessageId: "message-1",
         },
       },

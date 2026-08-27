@@ -17,6 +17,19 @@ export const ORB_MOODS = [
 
 export type OrbMood = (typeof ORB_MOODS)[number];
 
+// An automatic mood is the model's existing, explicit read of a nuanced
+// moment. Keep it brief: the next real turn should be free to change JARVIS's
+// register, and an abandoned tab must not reopen in yesterday's emotion.
+export const AUTO_MOOD_HOLD_MS = 90_000;
+
+export type OrbMoodRow = {
+  source?: string;
+  threadId?: string;
+  title?: string;
+  updatedAt?: number;
+  value?: string;
+};
+
 export const MOOD_COLORS: Record<OrbMood, string> = {
   calm: "#00ff88",
   focused: "#4a9eed",
@@ -29,6 +42,31 @@ export const MOOD_COLORS: Record<OrbMood, string> = {
   alert: "#ff5470",
   excited: "#ff6b9c",
 };
+
+export function isOrbMood(value: unknown): value is OrbMood {
+  return typeof value === "string" && (ORB_MOODS as readonly string[]).includes(value);
+}
+
+/**
+ * Model-selected moods already travel through the authenticated UI state.
+ * Honour a recent automatic selection without persisting or exporting any
+ * transcript-derived signal, then let the local conversation take over again.
+ */
+export function freshAutomaticOrbMood(
+  row: OrbMoodRow | null | undefined,
+  activeThreadId: string,
+  now = Date.now(),
+): OrbMood | null {
+  if (
+    row?.title !== "auto"
+    || row.source !== "model"
+    || row.threadId !== activeThreadId
+    || !isOrbMood(row.value)
+    || typeof row.updatedAt !== "number"
+  ) return null;
+  const age = now - row.updatedAt;
+  return age >= 0 && age <= AUTO_MOOD_HOLD_MS ? row.value : null;
+}
 
 const has = (text: string, pattern: RegExp) => pattern.test(text);
 

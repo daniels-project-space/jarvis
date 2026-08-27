@@ -717,6 +717,7 @@ async function processChatQueue(
             turnAttachments.length > 0,
             {
               requestId: claim.requestId,
+              threadId: claim.threadId,
               userMessageId: claim.userMessageId,
             },
             claim.ownerToolAccess

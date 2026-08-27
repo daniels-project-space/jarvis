@@ -6,6 +6,8 @@ import { spokenCaptionStageClassName } from "../lib/spoken-caption-layout";
 
 const orbSource = readFileSync(new URL("./ThreeOrb.tsx", import.meta.url), "utf8");
 const jarvisSource = readFileSync(new URL("./JarvisUI.tsx", import.meta.url), "utf8");
+const moodHookSource = readFileSync(new URL("../lib/use-conversation-mood.ts", import.meta.url), "utf8");
+const personaSource = readFileSync(new URL("../lib/persona.ts", import.meta.url), "utf8");
 
 describe("particle orb source contracts", () => {
   it("owns one WebGL renderer/canvas mount and no deprecated or independent clocks", () => {
@@ -48,6 +50,21 @@ describe("particle orb source contracts", () => {
     expect(jarvisSource).not.toContain("32 * motion.aside");
     expect(orbSource).not.toContain("orbCycleSeconds");
     expect(orbSource).not.toContain("advanceOrbPhase");
+  });
+
+  it("keeps the live conversational mood connected to the accessible orb surface", () => {
+    expect(orbSource).toContain("data-jarvis-orb");
+    expect(orbSource).toContain("data-orb-mood={mood}");
+    expect(orbSource).toContain("JARVIS visual core, ${mood} mood");
+    expect(jarvisSource).toContain("useConversationMood({");
+    expect(jarvisSource).toContain('api.ui.getMood, guest ? "skip" : {}');
+    expect(jarvisSource).toContain('source: "cleared"');
+    expect(jarvisSource).toContain("data-jarvis-mood={activeMood}");
+    expect(jarvisSource).toContain("mood={activeMood}");
+    expect(moodHookSource).toContain("freshAutomaticOrbMood(moodRow, thread)");
+    expect(moodHookSource).toContain("message.status === \"done\"");
+    expect(moodHookSource).toContain("automaticMoodForThread || freshAutoMood");
+    expect(personaSource).toContain("let it subtly change your register too");
   });
 
   it("binds browser frame methods before giving them to the runtime", () => {

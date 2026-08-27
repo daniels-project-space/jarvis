@@ -9,9 +9,11 @@ describe("tool invocation context", () => {
   it("normalizes bounded durable identifiers without adding model arguments", () => {
     expect(normalizeToolInvocationContext({
       requestId: " request-1 ",
+      threadId: " thread-1 ",
       userMessageId: " message-1 ",
-    }, { allowUserMessageId: true })).toEqual({
+    }, { allowThreadId: true, allowUserMessageId: true })).toEqual({
       requestId: "request-1",
+      threadId: "thread-1",
       userMessageId: "message-1",
     });
     expect(normalizeToolInvocationContext({})).toBeUndefined();
@@ -34,6 +36,15 @@ describe("tool invocation context", () => {
       { userMessageId: "message-1" },
       { allowUserMessageId: true },
     )).toEqual({ userMessageId: "message-1" });
+  });
+
+  it("requires the dynamic bridge before accepting originating thread provenance", () => {
+    expect(() => normalizeToolInvocationContext({ threadId: "thread-1" }))
+      .toThrow("thread provenance");
+    expect(normalizeToolInvocationContext(
+      { threadId: "thread-1" },
+      { allowThreadId: true },
+    )).toEqual({ threadId: "thread-1" });
   });
 
   it("accepts only a bounded host-only browser execution receipt key", () => {

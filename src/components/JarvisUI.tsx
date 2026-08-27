@@ -35,7 +35,8 @@ import {
   type CompactWorkCache,
   type CompactWorkSnapshot,
 } from "@/lib/active-work";
-import { inferConversationMood, MOOD_COLORS, type OrbMood } from "@/lib/conversation-mood";
+import { MOOD_COLORS } from "@/lib/conversation-mood";
+import { useConversationMood } from "@/lib/use-conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat, type VoiceCaptureOutcome } from "@/lib/voice-loop";
@@ -2184,12 +2185,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // The colour changes locally on the first keystroke/word, rather than
   // waiting for a streamed model reply or a Convex write. A deliberate manual
   // choice remains authoritative until Daniel returns it to automatic mode.
-  const moodRow = useJarvisQuery(api.ui.getMood, guest ? "skip" : {}) as { value: string; title?: string; updatedAt: number } | null | undefined;
-  const [contextMood, setContextMood] = useState<OrbMood>("calm");
-  const manualMood = moodRow?.title === "manual" && moodRow.value in MOOD_COLORS ? (moodRow.value as OrbMood) : null;
-  const activeMood = manualMood ?? contextMood;
+  // The brain's existing orb_mood tool remains a short-lived, nuanced nudge
+  // rather than an ignored database write or a permanent override.
+  const moodRow = useJarvisQuery(api.ui.getMood, guest ? "skip" : {}) as { value: string; title?: string; source?: string; threadId?: string; updatedAt: number } | null | undefined;
+  const { activeMood, moodSource, updateConversationMood } = useConversationMood({
+    messages,
+    messagesHydrated,
+    moodRow,
+    thread,
+  });
   const moodColor = MOOD_COLORS[activeMood];
-  const updateConversationMood = (text: string) => setContextMood((previous) => inferConversationMood(text, previous));
 
   // Orbit bubbles: when a new panel takes the stage, the previous one shrinks
   // into a bobbing bubble beside the orb — tap to bring it back.
@@ -5274,6 +5279,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         data-jarvis-embed-surface
         data-jarvis-embed-expanded="false"
         data-voice-state={orbState}
+        data-jarvis-mood={activeMood}
+        data-jarvis-mood-source={moodSource}
         className={`relative flex h-dvh w-full flex-col justify-between gap-2 overflow-hidden rounded-2xl border border-white/10 bg-[#05070d]/95 p-2.5 shadow-2xl backdrop-blur-xl transition ${composerDragActive ? "ring-1 ring-inset ring-cyan/60" : ""}`}
         onDragEnter={composerDropHandlers.onDragEnter}
         onDragOver={composerDropHandlers.onDragOver}
@@ -5411,6 +5418,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         data-jarvis-embed-surface
         data-jarvis-embed-expanded="true"
         data-voice-state={orbState}
+        data-jarvis-mood={activeMood}
+        data-jarvis-mood-source={moodSource}
         className={`relative flex h-dvh w-full flex-col overflow-hidden bg-[#05070d] transition ${composerDragActive ? "ring-1 ring-inset ring-cyan/60" : ""}`}
         {...composerDropHandlers}
       >
@@ -5486,6 +5495,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               <ThreeOrb
                 state={orbState}
                 energyRef={energyRef}
+                mood={activeMood}
                 moodColor={moodColor}
                 motionRef={orbMotionRef}
                 reduceMotion={prefs.reduceMotion}
@@ -5720,7 +5730,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           onClose={() => setOptionsOpen(false)}
           onToggleLive={() => void toggleLive()}
           onMood={(m) => void setMoodMut({ mood: m, manual: true })}
-          onClearMood={() => void setMoodMut({ mood: "calm", manual: false })}
+          onClearMood={() => void setMoodMut({ mood: "calm", manual: false, source: "cleared" })}
           onOpenLibrary={() => {
             setOptionsOpen(false);
             setPanelFull(false);
@@ -5827,6 +5837,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             <ThreeOrb
               state={orbState}
               energyRef={energyRef}
+              mood={activeMood}
               moodColor={moodColor}
               motionRef={orbMotionRef}
               aside={compactAside || (commandExpanded && !overlayUp)}

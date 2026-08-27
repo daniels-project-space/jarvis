@@ -130,6 +130,7 @@ describe("Codex app-server dynamic tools", () => {
       reasoningEffort: "high",
       invocationContext: {
         requestId: "request-1",
+        threadId: "conversation-thread-1",
         userMessageId: "message-1",
       },
       toolHostContext: {
@@ -177,6 +178,7 @@ describe("Codex app-server dynamic tools", () => {
       callId: "call-1",
       invocationContext: {
         requestId: "request-1",
+        threadId: "conversation-thread-1",
         userMessageId: "message-1",
       },
       toolHostContext: {
