@@ -324,6 +324,50 @@ describe("Codex app-server dynamic tools", () => {
     expect(writes).toHaveLength(1);
   });
 
+  it("observes derived lazy input failures after cold-start cancellation", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+    const abort = new AbortController();
+    let rejectPipelinedInput!: (error: Error) => void;
+    const pipelinedTurnInput = new Promise<{ context: string; imageInputs: [] }>((_resolve, reject) => {
+      rejectPipelinedInput = reject;
+    });
+    // This mirrors the attachment-free chat fast path: the base promise is
+    // observed, while its two derived inputs are handed to the app server.
+    void pipelinedTurnInput.catch(() => undefined);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const turn = server.runTurn({
+        conversationId: "cancel-derived-lazy-inputs",
+        userText: "hello",
+        history: [],
+        contextBlock: pipelinedTurnInput.then((input) => input.context),
+        imageInputs: pipelinedTurnInput.then((input) => input.imageInputs),
+        preamble: "test",
+        modelTier: "luna",
+        signal: abort.signal,
+        onDelta: () => {},
+      });
+
+      await vi.waitFor(() => expect(writes).toHaveLength(1));
+      expect(writes[0].method).toBe("thread/start");
+      abort.abort();
+      await expect(turn).rejects.toThrow("Codex conversation turn was cancelled");
+      rejectPipelinedInput(new Error("late pipeline failure"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("interrupts the exact admitted turn and ignores every late event after cancellation", async () => {
     const onDynamicToolCall = vi.fn(async () => ({
       contentItems: [{ type: "inputText" as const, text: "must not run" }],
