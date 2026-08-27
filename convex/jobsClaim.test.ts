@@ -459,6 +459,39 @@ describe("real Convex specialist/controller race matrix", () => {
     expect((await rows(f.t)).jobs[0].status).toBe("running");
   });
 
+  it("rejects a stale Trigger heartbeat without extending the claimed specialist lease", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-21T12:00:00Z"));
+    const f = await specialistFixture();
+    const before = await f.t.run(async (ctx) => {
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", f.jobId)).first();
+      return runtime?.heartbeatAt;
+    });
+
+    vi.advanceTimersByTime(1_000);
+    expect(await f.t.mutation(api.jobs.touchHeartbeat, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      workerRunId: "stale-trigger-run",
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await f.t.run(async (ctx) => {
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", f.jobId)).first();
+      return runtime?.heartbeatAt;
+    })).toBe(before);
+
+    expect(await f.t.mutation(api.jobs.touchHeartbeat, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      workerRunId: "specialist-run",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await f.t.run(async (ctx) => {
+      const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", f.jobId)).first();
+      return runtime?.heartbeatAt;
+    })).toBe(Date.now());
+  });
+
   it("commits one specialist receipt, replays response loss, and never creates another specialist execution", async () => {
     const f = await specialistFixture();
     expect(await f.t.mutation(api.jobs.markVerifiedForDelivery, f.commitArgs)).toBe(true);

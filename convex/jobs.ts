@@ -3920,12 +3920,15 @@ export const touchHeartbeat = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
+    workerRunId: v.string(),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const job = await ctx.db.get(a.jobId);
-    if (!job || job.status !== "running" || (job.attempt ?? 1) !== a.expectedAttempt) return false;
+    if (!job || job.status !== "running" || (job.attempt ?? 1) !== a.expectedAttempt
+      || job.workerRunId !== a.workerRunId
+      || !await claimedDispatchReceiptForRow(ctx, job, a.workerRunId)) return false;
     const runtime = await jobRuntimeFor(ctx, a.jobId);
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!runtime || !attempt || attempt.status !== "running") return false;
