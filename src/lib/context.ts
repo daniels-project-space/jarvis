@@ -1,6 +1,6 @@
 import "server-only";
 import { currentAdminSession } from "./control-context";
-import { classifyContextProfile, compileContext } from "./context-compiler";
+import { classifyContextProfile, compileContext, requiresHubSnapshot } from "./context-compiler";
 import { resolveConvexUrl } from "./convex-url";
 import { PORTFOLIO_NORTH_STAR, PROJECT_REGISTRY } from "./project-registry";
 import { HUB_CONTEXT_URL, hubContextRequestArgs } from "./hub-context";
@@ -151,11 +151,16 @@ export async function buildContext(
       () => brainLastKnownGood,
       (snapshot) => { brainLastKnownGood = snapshot; },
     ),
-    boundedSnapshot(
-      (signal) => hubSnapshot(signal),
-      () => hubLastKnownGood,
-      (snapshot) => { hubLastKnownGood = snapshot; },
-    ),
+    // Hub data is only eligible for the existing calendar/to-do or wealth
+    // compiler branches. Avoid making every unrelated substantive turn wait
+    // on (or disclose its text-adjacent timing to) that cross-app snapshot.
+    requiresHubSnapshot(userText)
+      ? boundedSnapshot(
+        (signal) => hubSnapshot(signal),
+        () => hubLastKnownGood,
+        (snapshot) => { hubLastKnownGood = snapshot; },
+      )
+      : Promise.resolve(null),
   ]);
   // Keep the expensive state snapshot durable and reusable, but compile only
   // the evidence needed for this exact turn. Passing the entire snapshot made

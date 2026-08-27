@@ -3,6 +3,7 @@ import {
   classifyContextProfile,
   compileContext,
   CONTEXT_COMPILER_MAX_CHARS,
+  requiresHubSnapshot,
 } from "./context-compiler";
 
 const now = Date.now();
@@ -80,6 +81,13 @@ describe("context compiler", () => {
     expect(result).not.toContain("WEALTH");
     expect(result).not.toContain("CALENDAR");
     expect(result).not.toContain("BUSINESS STATE");
+  });
+
+  it("only requests the Project Hub snapshot for turns whose compiler branch can use it", () => {
+    expect(requiresHubSnapshot("Fix the Jarvis voice interruption")).toBe(false);
+    expect(requiresHubSnapshot("How is the Media Engine advertising campaign doing?")).toBe(false);
+    expect(requiresHubSnapshot("What's on my calendar tomorrow?")).toBe(true);
+    expect(requiresHubSnapshot("What's our current wealth?")).toBe(true);
   });
 
   it("routes natural YouTube and media campaign questions to only their relevant business pulse", () => {

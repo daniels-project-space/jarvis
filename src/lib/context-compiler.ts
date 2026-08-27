@@ -178,6 +178,16 @@ export function classifyContextProfile(userText?: string): ContextProfile {
   return "operational";
 }
 
+/**
+ * The Project Hub snapshot carries only calendar, to-do, and wealth evidence.
+ * Keep it off ordinary substantive turns: compileContext cannot consume it
+ * unless the turn matches one of these two existing branches.
+ */
+export function requiresHubSnapshot(userText?: string): boolean {
+  const value = text(userText, 900);
+  return TIME.test(value) || MONEY.test(value);
+}
+
 function projectMatches(project: unknown, userText: string) {
   const row = asRow(project);
   const data = asRow(row.data);

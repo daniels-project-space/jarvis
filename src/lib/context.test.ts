@@ -8,6 +8,7 @@ import {
   CONTEXT_INPUT_DEADLINE_MS,
   CONTEXT_LAST_KNOWN_GOOD_MS,
 } from "./context";
+import { HUB_CONTEXT_URL } from "./hub-context";
 
 describe("bounded foreground context snapshots", () => {
   beforeEach(() => {
@@ -16,6 +17,7 @@ describe("bounded foreground context snapshots", () => {
   });
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.useRealTimers();
   });
 
@@ -36,6 +38,43 @@ describe("bounded foreground context snapshots", () => {
 
     await expect(buildContext("Hey Jarvis, fix the loading spinner")).resolves.toContain("Give the next useful action first");
     expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it("does not fetch Project Hub for unrelated substantive turns", async () => {
+    vi.stubEnv("JARVIS_HUB_CONTEXT_TOKEN", "dedicated-jarvis-context-token");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ value: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await buildContext("Fix the Jarvis voice interruption");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith(HUB_CONTEXT_URL))).toBe(false);
+  });
+
+  it("still fetches Project Hub for calendar and wealth evidence", async () => {
+    vi.stubEnv("JARVIS_HUB_CONTEXT_TOKEN", "dedicated-jarvis-context-token");
+    const fetchMock = vi.fn(async (url: string) => ({
+      ok: true,
+      json: async () => ({
+        value: url.startsWith(HUB_CONTEXT_URL)
+          ? {
+            todos: [{ text: "Renew passport" }],
+            events: [{ title: "Design review", start: Date.UTC(2026, 7, 27) }],
+            wealth: { currentTotalGBP: 123_456 },
+          }
+          : null,
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const context = await buildContext("What's on my calendar tomorrow, and what is my current wealth?");
+
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith(HUB_CONTEXT_URL))).toBe(true);
+    expect(context).toContain("Renew passport");
+    expect(context).toContain("about £123,456");
   });
 
   it("returns a fresh successful snapshot and records it as last-known-good", async () => {
