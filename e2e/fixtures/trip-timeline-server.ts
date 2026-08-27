@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import postcss from "postcss";
+import tailwindcss from "@tailwindcss/postcss";
 import { build } from "esbuild";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -29,6 +31,9 @@ const contentTypes: Record<string, string> = {
   "/caption": "text/html; charset=utf-8",
   "/caption.js": "text/javascript; charset=utf-8",
   "/caption.css": "text/css; charset=utf-8",
+  "/work-map": "text/html; charset=utf-8",
+  "/work-map.js": "text/javascript; charset=utf-8",
+  "/work-map.css": "text/css; charset=utf-8",
   "/location": "text/html; charset=utf-8",
   "/location.js": "text/javascript; charset=utf-8",
   "/booking-marker": "text/html; charset=utf-8",
@@ -42,7 +47,9 @@ const contentTypes: Record<string, string> = {
 const csp = [
   "default-src 'self'",
   "base-uri 'none'",
-  "connect-src 'none'",
+  // Fixtures never need a remote connection. The work-map fixture does fetch
+  // its same-origin summary endpoint so its interactive component stays real.
+  "connect-src 'self'",
   "font-src 'self'",
   "form-action 'none'",
   "img-src 'self' data:",
@@ -153,6 +160,22 @@ const captionFixtureHtml = [
   "</html>",
 ].join("\n");
 
+const workMapFixtureHtml = [
+  "<!doctype html>",
+  "<html lang=\"en\">",
+  "  <head>",
+  "    <meta charset=\"utf-8\" />",
+  "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+  "    <title>Jarvis work map fixture</title>",
+  "    <link rel=\"stylesheet\" href=\"/work-map.css\" />",
+  "  </head>",
+  "  <body>",
+  "    <div id=\"root\"></div>",
+  "    <script src=\"/work-map.js\" defer></script>",
+  "  </body>",
+  "</html>",
+].join("\n");
+
 const locationFixtureHtml = `<!doctype html>
 <html lang="en">
   <head>
@@ -208,6 +231,10 @@ const cityItineraryFixtureHtml = `<!doctype html>
 
 async function main() {
   const outputDir = await mkdtemp(join(tmpdir(), "jarvis-trip-timeline-fixture-"));
+  const workMapCss = await postcss([tailwindcss()]).process(
+    await readFile(join(projectRoot, "src/app/globals.css"), "utf8"),
+    { from: join(projectRoot, "src/app/globals.css") },
+  ).then((result) => result.css);
   const fixtureVideoPath = join(outputDir, "fixture-video.mp4");
   await execFileAsync("ffmpeg", [
     "-loglevel", "error",
@@ -236,6 +263,7 @@ async function main() {
     "booking-marker": join(projectRoot, "e2e/fixtures/trip-booked-stay-marker.browser.tsx"),
     "offline-map": join(projectRoot, "e2e/fixtures/apple-maps-offline.browser.tsx"),
     "city-itinerary": join(projectRoot, "e2e/fixtures/trip-city-itinerary-scope.browser.tsx"),
+    "work-map": join(projectRoot, "e2e/fixtures/work-map-bubble.browser.tsx"),
   },
   format: "iife",
   jsx: "automatic",
@@ -261,6 +289,7 @@ async function main() {
   const bookingMarkerJsPath = join(outputDir, "booking-marker.js");
   const offlineMapJsPath = join(outputDir, "offline-map.js");
   const cityItineraryJsPath = join(outputDir, "city-itinerary.js");
+  const workMapJsPath = join(outputDir, "work-map.js");
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
@@ -274,6 +303,7 @@ async function main() {
     access(bookingMarkerJsPath),
     access(offlineMapJsPath),
     access(cityItineraryJsPath),
+    access(workMapJsPath),
   ]);
 
   const server = createServer(async (request, response) => {
@@ -336,6 +366,20 @@ async function main() {
     return;
   }
 
+  if (pathname === "/api/work-map/summary") {
+    response.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": csp,
+      "Content-Type": "application/json; charset=utf-8",
+    });
+    response.end(method === "HEAD" ? undefined : JSON.stringify({
+      ok: true,
+      openTodoCount: 2,
+      todos: [{ text: "Fixture to-do", tags: ["fixture"] }],
+    }));
+    return;
+  }
+
   if (!(pathname in contentTypes)) {
     response.writeHead(404, { "Content-Security-Policy": csp });
     response.end();
@@ -386,6 +430,16 @@ async function main() {
     response.end(captionFixtureHtml);
     return;
   }
+  if (pathname === "/work-map") {
+    response.writeHead(200);
+    response.end(workMapFixtureHtml);
+    return;
+  }
+  if (pathname === "/work-map.css") {
+    response.writeHead(200);
+    response.end(workMapCss);
+    return;
+  }
   if (pathname === "/location") {
     response.writeHead(200);
     response.end(locationFixtureHtml);
@@ -407,32 +461,29 @@ async function main() {
     return;
   }
 
+  const assets: Record<string, string> = {
+    "/fixture.js": fixtureJsPath,
+    "/fixture.css": fixtureCssPath,
+    "/artifact.js": artifactJsPath,
+    "/private-video.js": privateVideoJsPath,
+    "/private-pdf.js": privatePdfJsPath,
+    "/voice.js": voiceJsPath,
+    "/caption.js": captionJsPath,
+    "/caption.css": captionCssPath,
+    "/work-map.js": workMapJsPath,
+    "/location.js": locationJsPath,
+    "/booking-marker.js": bookingMarkerJsPath,
+    "/offline-map.js": offlineMapJsPath,
+    "/city-itinerary.js": cityItineraryJsPath,
+  };
+  const assetPath = assets[pathname];
+  if (!assetPath) {
+    response.writeHead(404, { "Content-Security-Policy": csp });
+    response.end();
+    return;
+  }
   response.writeHead(200);
-  response.end(await readFile(
-    pathname === "/fixture.js"
-      ? fixtureJsPath
-      : pathname === "/artifact.js"
-        ? artifactJsPath
-        : pathname === "/private-video.js"
-          ? privateVideoJsPath
-          : pathname === "/private-pdf.js"
-            ? privatePdfJsPath
-        : pathname === "/fixture.css"
-        ? fixtureCssPath
-        : pathname === "/caption.js"
-          ? captionJsPath
-          : pathname === "/caption.css"
-            ? captionCssPath
-            : pathname === "/location.js"
-              ? locationJsPath
-              : pathname === "/booking-marker.js"
-                ? bookingMarkerJsPath
-                : pathname === "/offline-map.js"
-                  ? offlineMapJsPath
-                  : pathname === "/city-itinerary.js"
-                    ? cityItineraryJsPath
-                  : voiceJsPath,
-  ));
+  response.end(await readFile(assetPath));
   });
 
   const cleanup = async () => {

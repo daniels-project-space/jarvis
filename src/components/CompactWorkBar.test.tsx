@@ -840,7 +840,7 @@ describe("FleetCommandCenter", () => {
     const jarvis = readFileSync(new URL("./JarvisUI.tsx", import.meta.url), "utf8");
     expect(workBar).toMatch(/data-fleet-surface="collapsed"[\s\S]{0,520}absolute left-2 top-2/);
     expect(workBar).toMatch(/data-fleet-surface="expanded"[\s\S]{0,260}md:left-2 md:right-auto/);
-    expect(jarvis).toMatch(/<FleetCommandCenter[\s\S]{0,220}hidden=\{overlayUp\}/);
+    expect(jarvis).toMatch(/<FleetCommandCenter[\s\S]{0,220}hidden=\{overlayUp \|\| workMapOpen\}/);
     expect(jarvis.match(/setPanel\(\{ type: "fleet"/g)).toHaveLength(1);
     expect(jarvis).toMatch(/onOpenGoals[\s\S]{0,300}setPanel\(\{ type: "fleet"/);
   });
