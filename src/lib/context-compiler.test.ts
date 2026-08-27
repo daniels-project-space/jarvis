@@ -56,8 +56,9 @@ const input = {
 
 describe("context compiler", () => {
   it("keeps reflex turns intentionally lean", () => {
-    const result = compileContext({ ...input, userText: "hello" });
-    expect(classifyContextProfile("hello")).toBe("reflex");
+    const result = compileContext({ ...input, userText: "hello, Jarvis!" });
+    expect(classifyContextProfile("hello, Jarvis!")).toBe("reflex");
+    expect(classifyContextProfile("Hey Jarvis, what's on my calendar?")).toBe("focused");
     expect(result).toContain("Respond immediately and naturally");
     expect(result).not.toContain("DURABLE OUTCOMES");
     expect(result.length).toBeLessThan(CONTEXT_COMPILER_MAX_CHARS);

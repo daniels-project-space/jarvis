@@ -1,4 +1,5 @@
 import { freshCurrentLocation, freshDeviceLocation } from "./live-location";
+import { isConversationalReflex } from "./conversation-intent";
 
 export type ContextProfile = "reflex" | "focused" | "operational" | "strategic";
 
@@ -40,7 +41,6 @@ export type ContextCompilerInput = {
 
 export const CONTEXT_COMPILER_MAX_CHARS = 6_200;
 
-const REFLEX = /^(?:hi|hey|hello|yo|thanks|thank you|ok(?:ay)?|sup|morning|evening|good (?:morning|evening|day)|what'?s up|how are you)[!.?\s]*$/i;
 const STRATEGIC = /\b(?:architecture|strategy|portfolio|roadmap|trade-?offs?|compare|decision|design|multi[- ]?(?:repo|project)|root cause|production outage|from first principles|deep dive)\b/i;
 const FOCUSED = /\b(?:weather|time|calendar|schedule|todo|remind|price|price of|play|pause|open|show|where|when|who|what is|what's)\b/i;
 const PLANNING = /\b(?:plan|build|create|fix|investigate|research|analyse|analyze|recommend|implement|ship|delegate|agent|mission|goal|project)\b/i;
@@ -172,7 +172,7 @@ const rowLine = (row: ContextRow, max = 520) => {
 
 export function classifyContextProfile(userText?: string): ContextProfile {
   const value = text(userText, 900);
-  if (!value || REFLEX.test(value)) return "reflex";
+  if (isConversationalReflex(value)) return "reflex";
   if (STRATEGIC.test(value)) return "strategic";
   if (FOCUSED.test(value) && !PLANNING.test(value)) return "focused";
   return "operational";
