@@ -135,6 +135,7 @@ import {
   createStandbyListenerLeaseFence,
   nextStandbyListenerLease,
   renewStandbyListenerLease,
+  shouldArmStandbyListener,
   type StandbyListenerLease,
   STANDBY_LISTENER_RENEWAL_DEADLINE_MS,
   STANDBY_LISTENER_RENEWAL_INTERVAL_MS,
@@ -2578,7 +2579,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // the authenticated Jarvis iframe owns the fenced logical listener lease.
     // That single lease keeps main Jarvis and every installed overlay from
     // hearing the same wake phrase at the same time.
-    if (guest || !standbyClient || !standbyIsEligible() || document.hidden) {
+    if (!standbyClient || !shouldArmStandbyListener({
+      guest,
+      client: standbyClient,
+      eligible: standbyIsEligible(),
+      hidden: document.hidden,
+      live: liveRef.current,
+    })) {
       releaseStandbyListener();
       return;
     }
@@ -2620,8 +2627,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         || !lease
         || !leaseIsCurrent
         || epoch !== standbyEpochRef.current
-        || document.hidden
-        || !standbyIsEligible()
+        || !shouldArmStandbyListener({
+          guest,
+          client: standbyClient,
+          eligible: standbyIsEligible(),
+          hidden: document.hidden,
+          live: liveRef.current,
+        })
       ) {
         // Never stop the global recognizer from a stale async branch. If a
         // newer local lease owns it, only revoke this branch's remote token.
@@ -2641,8 +2653,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           epoch !== standbyEpochRef.current
           || !standbyLeaseOwnedRef.current
           || !isCurrentStandbyLease(lease)
-          || document.hidden
-          || !standbyIsEligible()
+          || !shouldArmStandbyListener({
+            guest,
+            client: standbyClient,
+            eligible: standbyIsEligible(),
+            hidden: document.hidden,
+            live: liveRef.current,
+          })
         ) {
           if (isCurrentStandbyLease(lease)) releaseStandbyListener();
           return;

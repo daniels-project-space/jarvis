@@ -119,6 +119,20 @@ describe("live voice bootstrap policy", () => {
     expect(source).toContain("standbyLeaseFence.clear()");
   });
 
+  it("does not re-arm standby recognition while persistent live capture is active", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    const rearmWake = source.slice(
+      source.indexOf("rearmWake = () =>"),
+      source.indexOf("function toggleWake"),
+    );
+
+    expect(rearmWake).toContain("shouldArmStandbyListener({");
+    expect(rearmWake).toContain("live: liveRef.current");
+    // Both asynchronous handoffs re-check this policy: a live session can
+    // start while the remote lease or the wakeword module is still loading.
+    expect(rearmWake.match(/live: liveRef\.current/g)).toHaveLength(3);
+  });
+
   it("keeps the single spoken transcript slightly smaller and lower than the orb", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
     expect(source).toContain("SPOKEN_CAPTION_TEXT_CLASS");

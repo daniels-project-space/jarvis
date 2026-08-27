@@ -21,6 +21,27 @@ export type StandbyListenerLease = {
   sequence: number;
 };
 
+/**
+ * Passive browser recognition and a persistent live microphone session must
+ * never coexist in one document. Keeping this policy here makes every
+ * re-arm path (including a late host/embed handoff) share the same fence.
+ */
+export function shouldArmStandbyListener({
+  guest,
+  client,
+  eligible,
+  hidden,
+  live,
+}: {
+  guest: boolean;
+  client: string | null;
+  eligible: boolean;
+  hidden: boolean;
+  live: boolean;
+}): boolean {
+  return !guest && !!client && eligible && !hidden && !live;
+}
+
 // A standby identity belongs to one mounted Jarvis document, never to shared
 // session storage. Duplicated tabs can inherit sessionStorage, which would let
 // two recognizers renew an otherwise valid server lease under the same client.

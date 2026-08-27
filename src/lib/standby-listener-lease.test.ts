@@ -4,6 +4,7 @@ import {
   createStandbyListenerLeaseFence,
   nextStandbyListenerLease,
   renewStandbyListenerLease,
+  shouldArmStandbyListener,
   STANDBY_LISTENER_LOCAL_LEASE_MS,
   STANDBY_LISTENER_RENEWAL_DEADLINE_MS,
   STANDBY_LISTENER_RENEWAL_INTERVAL_MS,
@@ -45,6 +46,21 @@ describe("standby listener lease fence", () => {
     const second = nextStandbyListenerLease("standby:document", first.sequence);
     expect(first).toEqual({ id: "standby:document:1", sequence: 1 });
     expect(second).toEqual({ id: "standby:document:2", sequence: 2 });
+  });
+
+  it("never arms standby recognition beside an active live microphone", () => {
+    const eligible = {
+      guest: false,
+      client: "standby:document",
+      eligible: true,
+      hidden: false,
+      live: false,
+    };
+
+    expect(shouldArmStandbyListener(eligible)).toBe(true);
+    expect(shouldArmStandbyListener({ ...eligible, live: true })).toBe(false);
+    expect(shouldArmStandbyListener({ ...eligible, hidden: true })).toBe(false);
+    expect(shouldArmStandbyListener({ ...eligible, client: null })).toBe(false);
   });
 
   it("expires exactly once unless a completed renewal extends it", () => {
