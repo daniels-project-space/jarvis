@@ -1027,9 +1027,15 @@ function CompactLiveWorkBubble({ snapshot, onOpen }: { snapshot: CompactWorkSnap
   />;
 }
 
-export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpandedChange, onSelectedJobChange, initialExpanded = false }: { snapshot: CompactWorkSnapshot; detail?: CompactJobDetail | null; hidden?: boolean; onExpandedChange?: (expanded: boolean) => void; onSelectedJobChange?: (jobId: string | null) => void; initialExpanded?: boolean }) {
+export type FleetOpenRequest = {
+  sequence: number;
+  jobId?: string;
+};
+
+export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpandedChange, onSelectedJobChange, initialExpanded = false, externalOpenRequest, onExternalOpenHandled }: { snapshot: CompactWorkSnapshot; detail?: CompactJobDetail | null; hidden?: boolean; onExpandedChange?: (expanded: boolean) => void; onSelectedJobChange?: (jobId: string | null) => void; initialExpanded?: boolean; externalOpenRequest?: FleetOpenRequest | null; onExternalOpenHandled?: () => void }) {
   const [expanded, setExpanded] = useState(initialExpanded);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const handledExternalRequest = useRef<number | null>(null);
   const retainedSelectedId = retainedFleetSelection(selectedId, snapshot);
   const [controlError, setControlError] = useState("");
   const active = snapshot.active;
@@ -1083,6 +1089,15 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     }, 0);
     return () => clearTimeout(timer);
   }, [onSelectedJobChange, retainedSelectedId, selectedId]);
+  useEffect(() => {
+    if (!externalOpenRequest || handledExternalRequest.current === externalOpenRequest.sequence) return;
+    handledExternalRequest.current = externalOpenRequest.sequence;
+    setExpanded(true);
+    setSelectedId(externalOpenRequest.jobId ?? null);
+    onExpandedChange?.(true);
+    onSelectedJobChange?.(externalOpenRequest.jobId ?? null);
+    onExternalOpenHandled?.();
+  }, [externalOpenRequest, onExpandedChange, onExternalOpenHandled, onSelectedJobChange]);
   if (!active || !fleet || hidden) return null;
   if (!expanded) return <CompactLiveWorkBubble snapshot={snapshot} onOpen={(jobId) => { if (jobId) selectJob(jobId); setOpen(true); }} />;
 

@@ -87,7 +87,9 @@ import { viewerFetch, viewerFetchWithTimeout } from "@/lib/viewer-request";
 import { shouldPersistLiveLocation, type ReportedLiveLocation } from "@/lib/live-location";
 import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { isForegroundBusy } from "@/lib/foreground-state";
-import { FleetCommandCenter } from "./CompactWorkBar";
+import { FleetCommandCenter, type FleetOpenRequest } from "./CompactWorkBar";
+import { WorkMapBubble } from "./WorkMapBubble";
+import { shouldHideWorkMap, type WorkMapTodoItem } from "@/lib/work-map";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { googleOAuthReturnNotice, type GoogleOAuthReturnNotice } from "@/lib/google-oauth-return";
 import {
@@ -1747,6 +1749,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     api.commandCenter.fleetSnapshot,
     embedded || guest || !activeThreadReady ? "skip" : {},
   ) as CompactWorkSnapshot | undefined;
+  const workMapDocuments = useJarvisQuery(
+    api.creations.list,
+    embedded || guest ? "skip" : { category: "documents", limit: 60 },
+  ) as unknown[] | undefined;
+  // Keep the map count aligned with the exact Documents surface it opens.
+  // Uploaded chat attachments live in a different library and should not imply
+  // they are available from this shortcut.
+  const workMapDocumentCount = workMapDocuments?.length ?? 0;
   const controllerSessionReadiness = useJarvisQuery(
     api.controllerSession.status,
     guest ? "skip" : {},
@@ -1972,6 +1982,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   };
   useEffect(() => () => clearCaptionTimers(), []);
   const [commandExpanded, setCommandExpanded] = useState(false);
+  const [workMapOpen, setWorkMapOpen] = useState(false);
+  const workMapRequestSequence = useRef(0);
+  const [workMapOpenRequest, setWorkMapOpenRequest] = useState<FleetOpenRequest | null>(null);
+  const openMapWork = useCallback((jobId?: string) => {
+    workMapRequestSequence.current += 1;
+    setWorkMapOpenRequest({ sequence: workMapRequestSequence.current, ...(jobId ? { jobId } : {}) });
+  }, []);
+  const openMapDocuments = useCallback(() => {
+    setPanelFull(false);
+    setPanelMin(false);
+    void setPanel({ type: "creations", value: JSON.stringify({ category: "documents" }), title: "Documents" });
+  }, [setPanel]);
+  const openMapTodos = useCallback((items: WorkMapTodoItem[]) => {
+    setPanelFull(false);
+    setPanelMin(false);
+    void setPanel({ type: "widget", value: JSON.stringify({ kind: "todos", label: "To-do list", items }), title: "To-do list" });
+  }, [setPanel]);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
   // comes back. Fresh panel content pops it open again.
   const lastPanelAt = useRef(0);
@@ -5224,6 +5251,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const overlayUp = !!panel && !panelMin;
   const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
+  const workMapHidden = shouldHideWorkMap({
+    chatMode,
+    live,
+    optionsOpen,
+    stagePanelOpen: Boolean(panel) || overlayUp || fullBleed || compactAside,
+    commandExpanded,
+    hasBubbles: bubbles.length > 0,
+    hasCaption: Boolean(caption),
+    researching: liveResearch.phase !== "idle",
+    recording,
+    speaking,
+    hasActiveVideo: Boolean(activeVideo),
+  });
   const embeddedWorkspacePanel = embedded
     && overlayUp
     && (panelFull || panelRoute?.presentation !== "compact");
@@ -5749,9 +5789,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           <FleetCommandCenter
             snapshot={visibleCommandSnapshot}
             detail={workDetail}
-            hidden={overlayUp}
+            hidden={overlayUp || workMapOpen}
             onExpandedChange={setCommandExpanded}
             onSelectedJobChange={setWorkDetailJobId}
+            externalOpenRequest={workMapOpenRequest}
+            onExternalOpenHandled={() => setWorkMapOpenRequest(null)}
           />
           {panel && panel.type !== "video" && !panelMin && !panelFull ? (
             <div className={`absolute inset-x-0 top-0 bottom-[64px] z-20 flex min-h-0 min-w-0 items-center p-1 ${panelRoute?.presentation === "compact" ? "justify-center xl:justify-start xl:pl-10 xl:pr-[28%]" : "justify-center"}`}>
@@ -5791,6 +5833,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               reduceMotion={prefs.reduceMotion}
             />
           </div>
+          <WorkMapBubble
+            snapshot={visibleCommandSnapshot}
+            documentCount={workMapDocumentCount}
+            owner={Boolean(viewerToken) && !guest && !embedded}
+            hidden={workMapHidden}
+            reduceMotion={prefs.reduceMotion}
+            onOpenChangeAction={setWorkMapOpen}
+            onOpenDocumentsAction={openMapDocuments}
+            onOpenTodosAction={openMapTodos}
+            onOpenWorkAction={(jobId) => openMapWork(jobId)}
+            onOpenAllWorkAction={() => openMapWork()}
+          />
           {!overlayUp && live === "off" && prefs.liveDefault && permissions.microphone !== "granted" && permissions.microphone !== "unsupported" && (
             <button
               type="button"

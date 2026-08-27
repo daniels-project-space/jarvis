@@ -391,6 +391,42 @@ body {
   transform: translateX(-140%);
   animation: work-progress-glint 2.8s ease-in-out infinite;
 }
+
+/* The work map is a sparse, DOM/SVG satellite around the existing orb. Its
+   motion communicates a real leased worker without turning the stage into a
+   competing dashboard. */
+.work-map-line,
+.work-map-live-line {
+  vector-effect: non-scaling-stroke;
+  stroke-width: .26;
+  stroke: rgba(148, 163, 184, .34);
+}
+.work-map-live-line { stroke: rgba(52, 211, 153, .7); }
+.work-map-anchor,
+.work-map-live-anchor { fill: rgba(148, 163, 184, .72); }
+.work-map-live-anchor { fill: rgb(52, 211, 153); }
+.work-map-trigger-dot,
+.work-map-state-dot,
+.work-map-worker-dot {
+  display: inline-block;
+  width: .42rem;
+  height: .42rem;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  background: rgba(148, 163, 184, .56);
+  box-shadow: 0 0 0 1px rgba(255,255,255,.08);
+}
+.work-map-trigger-dot { background: rgba(34, 211, 238, .8); }
+.work-map-worker-dot { width: .34rem; height: .34rem; }
+.work-map-pulse {
+  background: rgb(52, 211, 153);
+  box-shadow: 0 0 0 1px rgba(209, 250, 229, .56), 0 0 12px rgba(52, 211, 153, .82);
+  animation: work-map-pulse 1.65s ease-in-out infinite;
+}
+@keyframes work-map-pulse {
+  0%, 100% { opacity: .78; transform: scale(.92); box-shadow: 0 0 0 1px rgba(209, 250, 229, .45), 0 0 7px rgba(52, 211, 153, .48); }
+  50% { opacity: 1; transform: scale(1.28); box-shadow: 0 0 0 3px rgba(52, 211, 153, .08), 0 0 18px rgba(52, 211, 153, .9); }
+}
 @keyframes work-progress-glint {
   60%, 100% { transform: translateX(420%); }
 }
@@ -401,7 +437,8 @@ body {
   .scene-block, .scene-metric, .scene-progress, .scene-bar, .scene-gantt,
   .scene-funnel, .scene-line, .scene-donut, .scene-gauge, .scene-candle,
   .scene-gallery, .scene-focus, .scene-live-dot, .scene-signal-glow,
-  .work-live-pulse, .work-progress-update, .work-progress-glint::after {
+  .work-live-pulse, .work-progress-update, .work-progress-glint::after,
+  .work-map-pulse {
     animation: none !important;
     opacity: 1;
     clip-path: none;
@@ -444,4 +481,10 @@ html.jarvis-reduce-motion .work-progress-arrow {
   opacity: 1;
   clip-path: none;
   transition-duration: 0.01ms !important;
+}
+html.jarvis-reduce-motion .work-map-pulse,
+html.jarvis-reduce-motion .work-map-trigger,
+html.jarvis-reduce-motion .work-map-category {
+  animation: none !important;
+  transition-duration: .01ms !important;
 }
