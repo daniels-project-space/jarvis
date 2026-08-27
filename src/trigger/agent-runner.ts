@@ -3521,6 +3521,14 @@ export const agentWorker = task({
   queue: { name: BACKGROUND_QUEUE, concurrencyLimit: BACKGROUND_CONCURRENCY_LIMIT },
   maxDuration: AGENT_WORKER_MAX_DURATION_SECONDS,
   run: async (payload: AgentWorkerPayload, { ctx }) => {
+    // Convex deploys first. If a Trigger-first deploy races an older Convex
+    // schema, leave the existing compatibility bridge in place until this
+    // deployment can prove V2 availability on its next run.
+    await convexMutation("jobs:activateHeartbeatProtocolV2", {
+      triggerDeploymentVersion: typeof ctx.deployment?.version === "string"
+        ? ctx.deployment.version
+        : undefined,
+    }).catch(() => null);
     metadata
       .set("status", "claiming")
       .set("stage", "claiming")
@@ -3573,6 +3581,14 @@ export const agentFleetSupervisor = schedules.task({
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,
   run: async (_payload, { ctx }) => {
+    // Activate before this scheduler can reserve a fresh worker. Existing
+    // versionless claims retain their bounded drain; every new reservation is
+    // then claimed only by a V2 worker with an exact run heartbeat fence.
+    await convexMutation("jobs:activateHeartbeatProtocolV2", {
+      triggerDeploymentVersion: typeof ctx.deployment?.version === "string"
+        ? ctx.deployment.version
+        : undefined,
+    }).catch(() => null);
     const maintenance = await runAgentMaintenance({ triggerDeploymentVersion: ctx.deployment?.version });
     const supervisor = await runMissionSupervisorDeadmanSweep()
       .catch(() => ({ skipped: false, due: 0, dispatched: 0, failed: 1, launches: [] }));

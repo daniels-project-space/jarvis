@@ -1569,6 +1569,17 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
 
+  // A one-way deployment cutover for worker heartbeat fencing. The first V2
+  // Trigger worker records availability before it claims work; versionless
+  // workers that were already running get only their bounded drain window.
+  workerProtocolRollouts: defineTable({
+    key: v.string(),
+    protocolVersion: v.literal(2),
+    activatedAt: v.number(),
+    activatedByDeploymentVersion: v.optional(v.string()),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
   // One-time bounded cursor for assigning indexed ownership to legacy
   // proactive attention rows. The recurring reconciler never falls back to a
   // whole-table scan while this rollout is incomplete.

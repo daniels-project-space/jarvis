@@ -24,7 +24,11 @@ const sha256 = (value: string) => createHash("sha256").update(value).digest("hex
 
 type Policy = "manual" | "read_only" | "auto_merge";
 
-async function specialistFixture(policy: Policy = "manual", goalStage?: "validating") {
+async function specialistFixture(
+  policy: Policy = "manual",
+  goalStage?: "validating",
+  heartbeatProtocolVersion: 2 | null = 2,
+) {
   const t = convexTest(schema, modules);
   const admitted = await testMissionAdmission(t, {
     key: `specialist-${policy}-${goalStage ?? "work"}`,
@@ -53,7 +57,9 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
   const claim = await t.mutation(api.jobs.claimDispatched, {
     jobId, dispatchId: batch.reservations[0].dispatchId,
     ...triggerClaimAuthority(batch.reservations[0]),
-    workerRunId: "specialist-run", heartbeatProtocolVersion: 2, workerToken: WORKER,
+    workerRunId: "specialist-run",
+    ...(heartbeatProtocolVersion === 2 ? { heartbeatProtocolVersion } : {}),
+    workerToken: WORKER,
   });
   expect(claim).toMatchObject({
     jobId, authorityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
@@ -569,6 +575,50 @@ describe("real Convex specialist/controller race matrix", () => {
     expect(await f.t.mutation(api.jobs.touchHeartbeat, {
       jobId: f.jobId, expectedAttempt: 2, workerToken: WORKER,
     })).toBe(true);
+  });
+
+  it("drains an in-flight versionless claim, then reaps and relaunches it only through V2", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-27T20:00:00Z"));
+    const f = await specialistFixture("manual", undefined, null);
+    expect((await rows(f.t)).jobs[0]).not.toHaveProperty("heartbeatProtocolVersion");
+
+    expect(await f.t.mutation(api.jobs.activateHeartbeatProtocolV2, {
+      triggerDeploymentVersion: "20260827.7", workerToken: WORKER,
+    })).toMatchObject({ activated: true, protocolVersion: 2 });
+    // The already-claimed old worker can finish or checkpoint during its
+    // normal Trigger lifetime; it is not cut off at deployment time.
+    expect(await f.t.mutation(api.jobs.touchHeartbeat, {
+      jobId: f.jobId, expectedAttempt: 1, workerToken: WORKER,
+    })).toBe(true);
+
+    // A versionless worker cannot hold the lease beyond the old worker's
+    // maximum duration plus one normal stale sweep. The reaper owns recovery.
+    vi.advanceTimersByTime(35 * 60_000 + 5 * 60_000 + 1);
+    expect(await f.t.mutation(api.jobs.touchHeartbeat, {
+      jobId: f.jobId, expectedAttempt: 1, workerToken: WORKER,
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.reapStale, { workerToken: WORKER }))
+      .toMatchObject({ requeued: [expect.any(String)] });
+
+    vi.advanceTimersByTime(60_000);
+    const batch = await f.t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1, reason: "post-cutover-retry", workerToken: WORKER,
+    });
+    const reservation = batch.reservations[0]!;
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId, dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation), workerRunId: "old-retry-worker", workerToken: WORKER,
+    })).toMatchObject({ executable: false, held: true, code: "heartbeat_protocol_v2_required" });
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId, dispatchId: reservation.dispatchId,
+      ...triggerClaimAuthority(reservation), workerRunId: "v2-retry-worker",
+      heartbeatProtocolVersion: 2, workerToken: WORKER,
+    })).toMatchObject({ jobId: f.jobId, attempt: 2 });
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({ attempt: 2, heartbeatProtocolVersion: 2 });
+    expect(state.attempts.find((attempt) => attempt.attempt === 2))
+      .toMatchObject({ heartbeatProtocolVersion: 2, workerRunId: "v2-retry-worker" });
   });
 
   it("commits one specialist receipt, replays response loss, and never creates another specialist execution", async () => {

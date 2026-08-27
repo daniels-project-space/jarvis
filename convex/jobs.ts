@@ -883,6 +883,18 @@ export const enqueueV2 = mutation({
 // v3 is the explicit, bounded owner of historical scheduler admission. Hot
 // polls never infer or repair authority for legacy rows.
 const CONTROL_PLANE_MIGRATION = "scheduling-admission-v5-readonly-history";
+const HEARTBEAT_PROTOCOL_ROLLOUT = "fenced-heartbeats-v2";
+// Trigger grants a worker thirty minutes. Add one normal stale sweep so an
+// old worker that was already live at cutover can checkpoint or terminate
+// before its legacy no-ID liveness path closes.
+const LEGACY_HEARTBEAT_DRAIN_MS = 35 * 60 * 1000;
+
+async function heartbeatProtocolRollout(ctx: any) {
+  return await ctx.db
+    .query("workerProtocolRollouts")
+    .withIndex("by_key", (q: any) => q.eq("key", HEARTBEAT_PROTOCOL_ROLLOUT))
+    .first();
+}
 
 async function migrationState(ctx: any) {
   const existing = await ctx.db
@@ -1028,6 +1040,36 @@ export const migrateControlPlane = mutation({
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     return await migrateControlPlaneStep(ctx);
+  },
+});
+
+// A new Trigger deployment announces the fenced heartbeat protocol before it
+// claims or schedules work. The record is deliberately one-way: it converts
+// the old permissive bridge into a bounded drain for workers already running,
+// without requiring a coordinated stop-the-world deployment.
+export const activateHeartbeatProtocolV2 = mutation({
+  args: {
+    triggerDeploymentVersion: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const existing = await heartbeatProtocolRollout(ctx);
+    if (existing) return {
+      activated: false,
+      activatedAt: existing.activatedAt,
+      protocolVersion: existing.protocolVersion,
+    };
+    const now = Date.now();
+    const deploymentVersion = a.triggerDeploymentVersion?.trim().slice(0, 160);
+    await ctx.db.insert("workerProtocolRollouts", {
+      key: HEARTBEAT_PROTOCOL_ROLLOUT,
+      protocolVersion: 2,
+      activatedAt: now,
+      activatedByDeploymentVersion: deploymentVersion || undefined,
+      updatedAt: now,
+    });
+    return { activated: true, activatedAt: now, protocolVersion: 2 as const };
   },
 });
 
@@ -2797,6 +2839,22 @@ export const claimDispatched = mutation({
       jobStatus: j?.status ?? "missing", jobDispatchId: j?.dispatchId,
       requestDispatchId: a.dispatchId, requestWorkerRunId: a.workerRunId, attempt: priorAttempt,
     });
+    // `heartbeatProtocolVersion` used to be absent, so keep an exact
+    // response-lost replay alive during rollout. Once a V2 worker has
+    // announced itself, though, a new versionless claim must not establish an
+    // unfenced heartbeat lease for a later retry.
+    if (a.heartbeatProtocolVersion !== 2) {
+      const rollout = await heartbeatProtocolRollout(ctx);
+      const runId = a.workerRunId.slice(0, 120);
+      const replayOfExistingLegacyClaim = priorAttempt?.heartbeatProtocolVersion !== 2
+        && (priorAttempt?.workerRunId === runId || j?.deliveryRunId === runId);
+      if (rollout && !replayOfExistingLegacyClaim) return {
+        executable: false,
+        held: true,
+        code: "heartbeat_protocol_v2_required",
+        jobId: j?._id,
+      } as any;
+    }
     const observedMachinePatch = j?.triggerMachinePreset ? {
       triggerObservedMachinePreset: a.triggerObservedMachinePreset,
       triggerObservedMachineReason: triggerObservedReason,
@@ -3937,15 +3995,18 @@ export const touchHeartbeat = mutation({
     const runtime = await jobRuntimeFor(ctx, a.jobId);
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!runtime || !attempt || attempt.status !== "running") return false;
-    // The marker is bound to the current attempt. During the one
-    // rolling-deploy bridge, a versionless legacy claim may still send its
-    // historical no-ID heartbeat; supplying an ID always opts into the
-    // stricter exact-run fence.
+    const now = Date.now();
+    // The marker is bound to the current attempt. A legacy no-ID heartbeat is
+    // allowed only for the finite drain after a V2 worker becomes available;
+    // every later claim has to prove its exact Trigger run.
     const requiresExactFence = attempt.heartbeatProtocolVersion === 2 || typeof a.workerRunId === "string";
     if (requiresExactFence && (typeof a.workerRunId !== "string"
       || job.workerRunId !== a.workerRunId
       || !await claimedDispatchReceiptForRow(ctx, job, a.workerRunId))) return false;
-    const now = Date.now();
+    if (!requiresExactFence) {
+      const rollout = await heartbeatProtocolRollout(ctx);
+      if (rollout && now > Number(rollout.activatedAt) + LEGACY_HEARTBEAT_DRAIN_MS) return false;
+    }
     await ctx.db.patch(runtime._id, { heartbeatAt: now, updatedAt: now });
     // Attempt rows are immutable evidence except for causal/terminal updates;
     // runtime owns the compact liveness clock used by the five-minute reaper.

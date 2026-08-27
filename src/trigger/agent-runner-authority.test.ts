@@ -115,6 +115,9 @@ function bridgeProductionRunnerToConvex(
     await beforeCall?.(body);
     let value: unknown;
     switch (body.path) {
+      case "jobs:activateHeartbeatProtocolV2":
+        value = await t.mutation(api.jobs.activateHeartbeatProtocolV2, body.args as any);
+        break;
       case "jobs:claimDispatched":
         value = await t.mutation(api.jobs.claimDispatched, body.args as any);
         break;
@@ -874,6 +877,7 @@ describe("production Trigger worker authority harness", () => {
 
     expect(result).toMatchObject({ processed: 0, stale: true, continued: false, runtime: "trigger" });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:activateHeartbeatProtocolV2",
       "jobs:claimDispatched",
       "jobs:reserveDispatchBatch",
     ]);
@@ -912,6 +916,7 @@ describe("production Trigger worker authority harness", () => {
 
     expect(result).toMatchObject({ processed: 0, stale: true, continued: false, runtime: "trigger" });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:activateHeartbeatProtocolV2",
       "jobs:claimDispatched",
       "jobs:reserveDispatchBatch",
     ]);
@@ -1016,11 +1021,12 @@ describe("production Trigger worker authority harness", () => {
       runId: "trigger-authoritative-run",
     });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:activateHeartbeatProtocolV2",
       "jobs:claimDispatched",
       "jobs:checkpointAndRequeue",
       "jobs:reserveDispatchBatch",
     ]);
-    const claim = bridge.trace[0];
+    const claim = bridge.trace[1];
     expect(claim.args).toMatchObject({
       jobId: String(jobId),
       dispatchId: reservation.dispatchId,
@@ -1086,6 +1092,7 @@ describe("production Trigger worker authority harness", () => {
       runtime: "trigger",
     });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:activateHeartbeatProtocolV2",
       "jobs:claimDispatched",
       "jobs:reserveDispatchBatch",
     ]);
@@ -1108,6 +1115,7 @@ describe("production Trigger worker authority harness", () => {
       runtime: "trigger",
     });
     expect(bridge.trace.map((entry) => entry.path)).toEqual([
+      "jobs:activateHeartbeatProtocolV2",
       "jobs:claimDispatched",
       "jobs:checkpointAndRequeue",
       "jobs:reserveDispatchBatch",
