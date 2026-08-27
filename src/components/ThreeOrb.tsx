@@ -46,13 +46,16 @@ const FALLBACK_LINKS = FALLBACK_PARTICLES.flatMap((point, index) => {
 export default function ThreeOrb({
   state = "idle",
   energyRef,
+  mood = "calm",
   moodColor,
   motionRef,
   aside = false,
   reduceMotion = false,
+  forceFallback = false,
 }: {
   state?: OrbState;
   energyRef?: { current: number };
+  mood?: string;
   moodColor?: string;
   motionRef?: MutableRefObject<OrbMotionFrame>;
   // true while an overlay owns the stage: the orb drifts into the free right
@@ -61,6 +64,9 @@ export default function ThreeOrb({
   // could stick until reload).
   aside?: boolean;
   reduceMotion?: boolean;
+  // Useful for constrained remote/embedded surfaces that deliberately choose
+  // the lightweight SVG core instead of attempting a WebGL context.
+  forceFallback?: boolean;
 }) {
   const [webglUnavailable, setWebglUnavailable] = useState(false);
   const fallbackContainerRef = useRef<HTMLDivElement>(null);
@@ -154,13 +160,7 @@ export default function ThreeOrb({
       return { timing, visual: deriveOrbVisual(motionFrame, reducedMotion()), energy: smoothEnergy };
     };
 
-    let renderer: THREE.WebGLRenderer;
-    try {
-      renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: "high-performance" });
-    } catch {
-      // WebGL can be unavailable after a driver reset, inside a remote browser,
-      // or on battery-constrained devices. The orb is decoration: it must never
-      // be allowed to take the work surface down with it.
+    const startFallback = () => {
       runtime.useFallback();
       runtime.start((timestamp) => {
         if (document.hidden) return;
@@ -169,6 +169,23 @@ export default function ThreeOrb({
         lastRenderedAt = timestamp;
         stepMotion(timestamp);
       });
+    };
+
+    if (forceFallback) {
+      startFallback();
+      return () => {
+        destroyed = true;
+        runtime.dispose();
+      };
+    }
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: "high-performance" });
+    } catch {
+      // WebGL can be unavailable after a driver reset, inside a remote browser,
+      // or on battery-constrained devices. The orb is decoration: it must never
+      // be allowed to take the work surface down with it.
+      startFallback();
       return () => {
         destroyed = true;
         runtime.dispose();
@@ -491,11 +508,18 @@ export default function ThreeOrb({
   }, []);
 
   return (
-    <div ref={mountRef} className="relative h-full w-full">
+    <div
+      ref={mountRef}
+      role="img"
+      aria-label={`JARVIS visual core, ${mood} mood`}
+      data-jarvis-orb
+      data-orb-mood={mood}
+      className="relative h-full w-full"
+    >
       {webglUnavailable && (
         <div
           ref={fallbackContainerRef}
-          aria-label="JARVIS visual core"
+          aria-hidden="true"
           className="absolute inset-0 grid place-items-center will-change-transform"
         >
           <svg

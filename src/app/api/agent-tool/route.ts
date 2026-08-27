@@ -34,6 +34,7 @@ export async function POST(req: NextRequest) {
       return Response.json({ result: "Tool unavailable to subscription conversation workers." }, { status: 403 });
     }
     const invocationContext = normalizeToolInvocationContext(body?.invocationContext, {
+      allowThreadId: true,
       allowUserMessageId: true,
     });
     return Response.json({

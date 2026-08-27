@@ -5143,6 +5143,7 @@ export async function executeTool(
 ): Promise<string> {
   const authTokenHash = hostContext.authTokenHash;
   const invocationContext = normalizeToolInvocationContext(hostContext.invocationContext, {
+    allowThreadId: true,
     allowUserMessageId: true,
   });
   const foregroundBrowserErrandExecution = normalizeForegroundBrowserErrandExecution(
@@ -5663,7 +5664,11 @@ export async function executeTool(
       return await creationsList(args);
     case "orb_mood": {
       const mood = ["calm", "focused", "dreamy", "warm", "tender", "playful", "curious", "serious", "alert", "excited"].includes(String(args.mood)) ? String(args.mood) : "calm";
-      await convexMutation("ui:setMood", { mood });
+      await convexMutation("ui:setMood", {
+        mood,
+        source: "model",
+        threadId: invocationContext?.threadId ?? await activeThread(),
+      });
       return `Mood set: ${mood}. (Say nothing about it — it just happens.)`;
     }
     case "news_today":

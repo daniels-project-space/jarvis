@@ -2,6 +2,7 @@ export const TOOL_INVOCATION_ID_MAX_LENGTH = 120;
 
 export type ToolInvocationContext = Readonly<{
   requestId?: string;
+  threadId?: string;
   userMessageId?: string;
 }>;
 
@@ -21,6 +22,7 @@ export type ToolExecutionHostContext = Readonly<{
 }>;
 
 type NormalizeToolInvocationContextOptions = {
+  allowThreadId?: boolean;
   allowUserMessageId?: boolean;
 };
 
@@ -68,19 +70,26 @@ export function normalizeToolInvocationContext(
     throw new Error("tool invocation context must be an object");
   }
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some((key) => key !== "requestId" && key !== "userMessageId")) {
+  if (Object.keys(input).some((key) => key !== "requestId" && key !== "threadId" && key !== "userMessageId")) {
     throw new Error("tool invocation context contains unknown fields");
+  }
+  if (!options.allowThreadId && input.threadId !== undefined) {
+    throw new Error("thread provenance is not accepted from this caller");
   }
   if (!options.allowUserMessageId && input.userMessageId !== undefined) {
     throw new Error("user message provenance is not accepted from this caller");
   }
   const requestId = boundedIdentifier(input.requestId, "requestId");
+  const threadId = options.allowThreadId
+    ? boundedIdentifier(input.threadId, "threadId")
+    : undefined;
   const userMessageId = options.allowUserMessageId
     ? boundedIdentifier(input.userMessageId, "userMessageId")
     : undefined;
-  if (!requestId && !userMessageId) return undefined;
+  if (!requestId && !threadId && !userMessageId) return undefined;
   return Object.freeze({
     ...(requestId ? { requestId } : {}),
+    ...(threadId ? { threadId } : {}),
     ...(userMessageId ? { userMessageId } : {}),
   });
 }

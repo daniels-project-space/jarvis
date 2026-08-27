@@ -24,6 +24,27 @@ describe("shared orb motion", () => {
     expect(oneSecondAt60).toBeCloseTo(frameDamping(2, 1), 8);
   });
 
+  it("eases a conversation colour across frames instead of cutting to the new mood", () => {
+    const target = "#ff5470";
+    const distance = (left: string, right: string) => [1, 3, 5].reduce(
+      (total, offset) => total + Math.abs(Number.parseInt(left.slice(offset, offset + 2), 16) - Number.parseInt(right.slice(offset, offset + 2), 16)),
+      0,
+    );
+    const start = createOrbMotionFrame("#00ff88");
+    const first = advanceOrbMotionFrame(start, {
+      state: "idle", moodColor: target, motionSeconds: 0.1, easingSeconds: 0.1, aside: false,
+    });
+    const later = advanceOrbMotionFrame(first, {
+      state: "idle", moodColor: target, motionSeconds: 0.4, easingSeconds: 0.4, aside: false, reduceMotion: true,
+    });
+
+    expect(first.color).not.toBe(start.color);
+    expect(first.color).not.toBe(target);
+    expect(distance(first.color, target)).toBeLessThan(distance(start.color, target));
+    expect(distance(later.color, target)).toBeLessThan(distance(first.color, target));
+    expect(later.phase).toBe(first.phase);
+  });
+
   it("keeps phase and elapsed time continuous instead of resetting each cycle", () => {
     const frame = createOrbMotionFrame();
     expect(frame.elapsedSeconds).toBe(0);

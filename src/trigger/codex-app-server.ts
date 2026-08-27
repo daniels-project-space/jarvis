@@ -535,6 +535,7 @@ export class CodexAppServer {
     const outputSchema = input.outputSchema === undefined ? undefined
       : validateCodexOutputSchema(input.outputSchema);
     const invocationContext = normalizeToolInvocationContext(input.invocationContext, {
+      allowThreadId: true,
       allowUserMessageId: true,
     });
     const toolHostContext = normalizeDynamicToolHostContext(input.toolHostContext);
