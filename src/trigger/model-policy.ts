@@ -123,3 +123,11 @@ export function pickConversationTier(text: string): WorkModelTier {
   ) return "luna";
   return "terra";
 }
+
+// The lightweight foreground thread intentionally omits the broad capability
+// and infrastructure briefing. It is safe only for an exact social reflex;
+// other short Luna turns can still need live-data/tool grounding and normal
+// conversation continuity.
+export function shouldUseLunaFastLane(text: string, tier: string): boolean {
+  return tier === "luna" && isConversationalReflex(visibleTurnText(text));
+}

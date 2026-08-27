@@ -18,7 +18,12 @@ import {
   privateFileSourceKey,
   type ChatThreadFileCatalogItem,
 } from "../lib/chat-files";
-import { codexModelFor, codexReviewExecPrefix, pickConversationTier } from "./model-policy";
+import {
+  codexModelFor,
+  codexReviewExecPrefix,
+  pickConversationTier,
+  shouldUseLunaFastLane,
+} from "./model-policy";
 import { materializeCodexChatImages } from "./chat-image-input";
 import {
   reconcileReadyClaimAttachments,
@@ -335,7 +340,7 @@ async function runTurn(
       history,
       contextBlock: freshContext,
       imageInputs,
-      preamble: model === "luna" ? lunaFastPreamble() : conversationPreamble(),
+      preamble: shouldUseLunaFastLane(userText, model) ? lunaFastPreamble() : conversationPreamble(),
       modelTier: model,
       allowTools: true,
       invocationContext,
@@ -690,13 +695,13 @@ async function processChatQueue(
           fileCatalog,
           buildBoundedFileContext([...turnAttachments]),
         ].filter(Boolean).join("\n\n");
-        // Luna-tier turns get their own lightweight Codex thread (see
-        // lunaFastPreamble above) so a cold runner's first greeting doesn't pay
-        // for the full conversation preamble. Attachments/owner-tool grants stay
-        // on the richer main thread unconditionally — those never come from a
-        // trivial greeting in practice, and this leaves their existing behavior
-        // (including the private-file thread-forgetting below) untouched.
-        const lunaFastLane = model === "luna" && turnAttachments.length === 0 && !claim.ownerToolAccess;
+        // Only exact social reflexes get the lightweight Codex thread. Other
+        // short Luna turns stay on the normal conversation thread so the
+        // capability briefing and prior grounded turn remain available.
+        // Attachments/owner-tool grants always remain on the richer thread.
+        const lunaFastLane = shouldUseLunaFastLane(visibleUserText, model)
+          && turnAttachments.length === 0
+          && !claim.ownerToolAccess;
         const codexConversationId = lunaFastLane ? `${claim.threadId}::luna-fast` : claim.threadId;
         try {
           return await session.runTurn((activeServer, onStarted) => runTurn(
