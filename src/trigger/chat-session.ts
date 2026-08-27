@@ -310,7 +310,7 @@ async function runTurn(
   claimToken: string,
   userText: string,
   history: { role: string; text: string }[],
-  contextBlock: string,
+  contextBlock: CodexTurnInput["contextBlock"],
   imageInputs: NonNullable<CodexTurnInput["imageInputs"]>,
   model: string,
   hasPrivateFiles: boolean,
@@ -331,8 +331,10 @@ async function runTurn(
   publisher.start();
   try {
     const visualDirective = visualInitiativeDirective(visibleTurnText(userText));
-    const freshContext = `${contextBlock}\n\nCurrent date: ${new Date().toDateString()}.` +
-      (visualDirective ? `\n\n${visualDirective}` : "");
+    const freshContext = Promise.resolve(contextBlock).then((value) =>
+      `${value}\n\nCurrent date: ${new Date().toDateString()}.` +
+        (visualDirective ? `\n\n${visualDirective}` : ""),
+    );
     let sawDelta = false;
     const result = await server.runTurn({
       conversationId,
@@ -659,114 +661,157 @@ async function processChatQueue(
       // after claim, so an unavailable source is omitted while the user's
       // claimed text still receives a normal answer.
       const attachmentsBeforeMaterialization = await refreshClaimAttachments(claim);
+      const model = pickConversationTier(visibleUserText);
       const contextPromise = buildContext(visibleUserText);
       const imageInputsPromise = materializeCodexChatImages(claim.userText, attachmentsBeforeMaterialization, {
         signal: cancellationAbort.signal,
       });
-      // Context snapshots and private image reads are independent. Image turns
-      // should pay the slower branch, not the sum of both branches.
-      const [baseContext, initialImageInputs] = await Promise.all([contextPromise, imageInputsPromise]);
-      // Refresh once after byte materialization, then pin the exact result in
-      // CodexAppServer.beforeTurn. The later mutation is the authoritative
-      // send boundary; this query lets us discard stale bytes early as well.
-      let attachments = await refreshClaimAttachments(claim);
-      let imageInputs = samePrivateAttachmentSources(attachmentsBeforeMaterialization, attachments)
-        ? initialImageInputs
-        : await materializeCodexChatImages(claim.userText, attachments, {
-          signal: cancellationAbort.signal,
-        });
       const fileCatalog = buildBoundedThreadFileCatalog(claim.fileCatalog);
       const researchContext = claim.researchPrefetch
         && claim.researchPrefetch.expiresAt > Date.now()
         && isSpeculativeResearchApplicable(claim.researchPrefetch.basis, visibleUserText)
           ? claim.researchPrefetch.context
           : "";
-      const contextReadyAt = Date.now();
-      const model = pickConversationTier(visibleUserText);
       const stages: Partial<Record<"codexAck" | "firstDelta" | "firstConvexPaint", number>> = {};
-      const runAttachedAttempt = async (
-        turnAttachments: readonly PrivateClaimAttachment[],
-        turnImageInputs: NonNullable<CodexTurnInput["imageInputs"]>,
-      ) => {
-        const privateFence = createPrivateAttachmentFence(claim, turnAttachments);
-        const context = [
-          baseContext,
-          researchContext,
-          fileCatalog,
-          buildBoundedFileContext([...turnAttachments]),
-        ].filter(Boolean).join("\n\n");
-        // Only exact social reflexes get the lightweight Codex thread. Other
-        // short Luna turns stay on the normal conversation thread so the
-        // capability briefing and prior grounded turn remain available.
-        // Attachments/owner-tool grants always remain on the richer thread.
-        const lunaFastLane = shouldUseLunaFastLane(visibleUserText, model)
-          && turnAttachments.length === 0
-          && !claim.ownerToolAccess;
-        const codexConversationId = lunaFastLane ? `${claim.threadId}::luna-fast` : claim.threadId;
-        try {
-          return await session.runTurn((activeServer, onStarted) => runTurn(
-            activeServer,
-            codexConversationId,
-            claim.assistantId,
-            claim.claimToken,
-            claim.userText,
-            claim.history,
-            context,
-            turnImageInputs,
-            model,
-            turnAttachments.length > 0,
-            {
-              requestId: claim.requestId,
-              userMessageId: claim.userMessageId,
-            },
-            claim.ownerToolAccess
-              ? {
-                foregroundOwnerToolTurn: {
-                  messageId: String(claim.userMessageId),
-                  assistantId: String(claim.assistantId),
-                  claimToken: claim.claimToken,
-                  toolNames: claim.ownerToolNames ?? [],
-                  ...(claim.ownerCalendarAndHubTodo ? { calendarAndHubTodo: true as const } : {}),
-                },
-              }
-              : undefined,
-            cancellationAbort,
-            privateFence.beforeTurn,
-            privateFence.onTurnRequestWritten,
-            privateFence.onTurnAccepted,
-            (stage) => {
-              if (stage === "codexAck") onStarted();
-              if (stages[stage] === undefined) stages[stage] = Date.now();
-            },
-          ));
-        } catch (error) {
-          if (error instanceof PrivateAttachmentFenceChangedError && privateFence.requestWasWritten?.()) {
-            throw new Error("private attachment admission became ambiguous");
-          }
-          throw error;
-        } finally {
-          await privateFence.cleanup?.().catch(() => undefined);
-        }
-      };
+      let contextReadyAt = contextStarted;
       let turn;
-      try {
-        turn = await runAttachedAttempt(attachments, imageInputs);
-      } catch (error) {
-        if (!(error instanceof PrivateAttachmentFenceChangedError)) throw error;
-        // A source changed after the post-materialization refresh but before
-        // `turn/start`. Rebuild once from durable state, then make a final
-        // attachment-free attempt if it changes again.
-        attachments = await refreshClaimAttachments(claim);
-        imageInputs = await materializeCodexChatImages(claim.userText, attachments, {
-          signal: cancellationAbort.signal,
+      if (claim.attachments.length === 0 && !claim.ownerToolAccess) {
+        // A claim that never carried an attachment has no private-source fence
+        // to acquire or revalidate. Keep a failed first live refresh on the
+        // existing fenced path: its second read can still recover the file.
+        // Start the static Codex thread immediately and let it overlap the
+        // bounded context/image preparation; user bytes still wait for both.
+        const pipelinedTurnInput = Promise.all([contextPromise, imageInputsPromise]).then(([baseContext, imageInputs]) => {
+          contextReadyAt = Date.now();
+          return {
+            context: [baseContext, researchContext, fileCatalog].filter(Boolean).join("\n\n"),
+            imageInputs,
+          };
         });
+        // If thread/start is rejected before it attaches its awaiter, retain a
+        // rejection observer while preserving the original error for the turn.
+        void pipelinedTurnInput.catch(() => undefined);
+        const codexConversationId = shouldUseLunaFastLane(visibleUserText, model)
+          ? `${claim.threadId}::luna-fast`
+          : claim.threadId;
+        turn = await session.runTurn((activeServer, onStarted) => runTurn(
+          activeServer,
+          codexConversationId,
+          claim.assistantId,
+          claim.claimToken,
+          claim.userText,
+          claim.history,
+          pipelinedTurnInput.then((input) => input.context),
+          pipelinedTurnInput.then((input) => input.imageInputs),
+          model,
+          false,
+          {
+            requestId: claim.requestId,
+            userMessageId: claim.userMessageId,
+          },
+          undefined,
+          cancellationAbort,
+          undefined,
+          undefined,
+          undefined,
+          (stage) => {
+            if (stage === "codexAck") onStarted();
+            if (stages[stage] === undefined) stages[stage] = Date.now();
+          },
+        ));
+      } else {
+        // Context snapshots and private image reads are independent. Image
+        // turns should pay the slower branch, not the sum of both branches.
+        const [baseContext, initialImageInputs] = await Promise.all([contextPromise, imageInputsPromise]);
+        // Refresh once after byte materialization, then pin the exact result in
+        // CodexAppServer.beforeTurn. The later mutation is the authoritative
+        // send boundary; this query lets us discard stale bytes early as well.
+        let attachments = await refreshClaimAttachments(claim);
+        let imageInputs = samePrivateAttachmentSources(attachmentsBeforeMaterialization, attachments)
+          ? initialImageInputs
+          : await materializeCodexChatImages(claim.userText, attachments, {
+            signal: cancellationAbort.signal,
+          });
+        contextReadyAt = Date.now();
+        const runAttachedAttempt = async (
+          turnAttachments: readonly PrivateClaimAttachment[],
+          turnImageInputs: NonNullable<CodexTurnInput["imageInputs"]>,
+        ) => {
+          const privateFence = createPrivateAttachmentFence(claim, turnAttachments);
+          const context = [
+            baseContext,
+            researchContext,
+            fileCatalog,
+            buildBoundedFileContext([...turnAttachments]),
+          ].filter(Boolean).join("\n\n");
+          const lunaFastLane = shouldUseLunaFastLane(visibleUserText, model)
+            && turnAttachments.length === 0
+            && !claim.ownerToolAccess;
+          const codexConversationId = lunaFastLane ? `${claim.threadId}::luna-fast` : claim.threadId;
+          try {
+            return await session.runTurn((activeServer, onStarted) => runTurn(
+              activeServer,
+              codexConversationId,
+              claim.assistantId,
+              claim.claimToken,
+              claim.userText,
+              claim.history,
+              context,
+              turnImageInputs,
+              model,
+              turnAttachments.length > 0,
+              {
+                requestId: claim.requestId,
+                userMessageId: claim.userMessageId,
+              },
+              claim.ownerToolAccess
+                ? {
+                  foregroundOwnerToolTurn: {
+                    messageId: String(claim.userMessageId),
+                    assistantId: String(claim.assistantId),
+                    claimToken: claim.claimToken,
+                    toolNames: claim.ownerToolNames ?? [],
+                    ...(claim.ownerCalendarAndHubTodo ? { calendarAndHubTodo: true as const } : {}),
+                  },
+                }
+                : undefined,
+              cancellationAbort,
+              privateFence.beforeTurn,
+              privateFence.onTurnRequestWritten,
+              privateFence.onTurnAccepted,
+              (stage) => {
+                if (stage === "codexAck") onStarted();
+                if (stages[stage] === undefined) stages[stage] = Date.now();
+              },
+            ));
+          } catch (error) {
+            if (error instanceof PrivateAttachmentFenceChangedError && privateFence.requestWasWritten?.()) {
+              throw new Error("private attachment admission became ambiguous");
+            }
+            throw error;
+          } finally {
+            await privateFence.cleanup?.().catch(() => undefined);
+          }
+        };
         try {
           turn = await runAttachedAttempt(attachments, imageInputs);
-        } catch (retryError) {
-          if (!(retryError instanceof PrivateAttachmentFenceChangedError)) throw retryError;
-          turn = await runAttachedAttempt([], await materializeCodexChatImages(claim.userText, [], {
+        } catch (error) {
+          if (!(error instanceof PrivateAttachmentFenceChangedError)) throw error;
+          // A source changed after the post-materialization refresh but before
+          // `turn/start`. Rebuild once from durable state, then make a final
+          // attachment-free attempt if it changes again.
+          attachments = await refreshClaimAttachments(claim);
+          imageInputs = await materializeCodexChatImages(claim.userText, attachments, {
             signal: cancellationAbort.signal,
-          }));
+          });
+          try {
+            turn = await runAttachedAttempt(attachments, imageInputs);
+          } catch (retryError) {
+            if (!(retryError instanceof PrivateAttachmentFenceChangedError)) throw retryError;
+            turn = await runAttachedAttempt([], await materializeCodexChatImages(claim.userText, [], {
+              signal: cancellationAbort.signal,
+            }));
+          }
         }
       }
       const modelFinishedAt = Date.now();

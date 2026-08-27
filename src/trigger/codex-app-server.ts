@@ -24,6 +24,7 @@ type PendingRequest = {
   resolve: (value: JsonObject) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  abortCleanup?: () => void;
 };
 export type CodexForegroundOwnerToolTurn = Readonly<{
   messageId: string;
@@ -426,9 +427,10 @@ export type CodexTurnInput = {
   conversationId: string;
   userText: string;
   history: Array<{ role: string; text: string }>;
-  contextBlock: string;
+  /** May resolve while thread/start is in flight; no user bytes are sent until it is ready. */
+  contextBlock: string | Promise<string>;
   /** Ephemeral, bounded inline image inputs. Never persist or log. */
-  imageInputs?: CodexImageInput[];
+  imageInputs?: CodexImageInput[] | Promise<CodexImageInput[]>;
   preamble: string;
   modelTier: string;
   reasoningEffort?: unknown;
@@ -452,6 +454,9 @@ export class CodexAppServer {
   private process: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
+  // A cancellation can arrive after a static request crossed JSONL. Its later
+  // response is authentic but no longer belongs to an active foreground turn.
+  private ignoredRequestResponses = new Set<number>();
   private active = new Map<string, ActiveTurn>();
   private threads = new Map<string, string>();
   private stderr = "";
@@ -581,7 +586,7 @@ export class CodexAppServer {
           }),
           ephemeral: this.options.ephemeral ?? false,
           dynamicTools: input.allowTools === false ? [] : this.options.dynamicTools,
-        }, 30_000);
+        }, 30_000, undefined, input.signal);
       } catch (error) {
         if (permissionProfile) {
           throw new CodexPermissionAttestationError("Codex thread permission attestation was unavailable");
@@ -601,6 +606,24 @@ export class CodexAppServer {
 
     if (input.signal?.aborted) throw new Error("Codex conversation turn was cancelled");
 
+    // `thread/start` carries only static instructions and capabilities. Start
+    // it before awaiting independently-prepared foreground context or inline
+    // images so a cold thread never serializes behind the bounded snapshot.
+    const [contextBlock, suppliedImageInputs] = await Promise.all([
+      Promise.resolve(input.contextBlock),
+      Promise.resolve(input.imageInputs ?? []),
+    ]).catch((error) => {
+      // A lazily supplied input can fail after the static thread was accepted.
+      // Do not retain that otherwise-empty cold thread: the next real turn
+      // must create a thread and seed its durable conversation history.
+      if (isNewThread) this.forgetConversation(input.conversationId);
+      throw error;
+    });
+    if (input.signal?.aborted) {
+      if (isNewThread) this.forgetConversation(input.conversationId);
+      throw new Error("Codex conversation turn was cancelled");
+    }
+
     const speaker = input.allowTools === false ? "Guest" : "Daniel";
     const history = isNewThread && input.history.length
       ? `Recent conversation:\n${input.history.map((item) => `${item.role === "user" ? speaker : "Jarvis"}: ${item.text}`).join("\n")}\n\n`
@@ -609,9 +632,9 @@ export class CodexAppServer {
     // Thread instructions hold static identity and policy. Fresh context is
     // deliberately present only in this one turn item so a cold thread does
     // not pay for the same snapshot in both protocol fields.
-    const text = `${history}Current live context (use only what is relevant):\n${input.contextBlock}\n\n${speaker}: ${cleanText}`;
+    const text = `${history}Current live context (use only what is relevant):\n${contextBlock}\n\n${speaker}: ${cleanText}`;
     const userInput: JsonObject[] = [{ type: "text", text }];
-    const imageInputs = boundedCodexImageInputs(input.imageInputs ?? []);
+    const imageInputs = boundedCodexImageInputs(suppliedImageInputs);
     for (const image of imageInputs) {
       if (image.status === "unavailable") {
         userInput.push({
@@ -790,9 +813,13 @@ export class CodexAppServer {
         throw new Error("invalid response error");
       }
       const pending = this.pending.get(message.id);
-      if (!pending) throw new Error("unexpected app-server response id");
+      if (!pending) {
+        if (this.ignoredRequestResponses.delete(message.id)) return;
+        throw new Error("unexpected app-server response id");
+      }
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
+      pending.abortCleanup?.();
       if (Object.prototype.hasOwnProperty.call(message, "error")) {
         pending.reject(new CodexRequestRejectedError(pending.method, this.errorText(message.error)));
       } else if (!isJsonRecord(message.result)) {
@@ -921,10 +948,12 @@ export class CodexAppServer {
     params: JsonObject,
     timeoutMs: number,
     onWritten?: () => void,
+    signal?: AbortSignal,
   ): Promise<JsonObject> {
     if (this.pending.size >= this.limits.pendingRequests || !Number.isSafeInteger(this.nextId)) {
       return Promise.reject(new Error("Codex app-server pending request limit reached"));
     }
+    if (signal?.aborted) return Promise.reject(new Error("Codex conversation turn was cancelled"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = {
@@ -933,20 +962,44 @@ export class CodexAppServer {
         resolve,
         reject,
         timer: setTimeout(() => {
+          if (this.pending.get(id) !== pending) return;
           this.pending.delete(id);
+          pending.abortCleanup?.();
           reject(pending.written
             ? new CodexRequestOutcomeUnknownError(method)
             : new Error(`${method} timed out before protocol write`));
         }, timeoutMs),
       };
       this.pending.set(id, pending);
+      if (signal) {
+        const onAbort = () => {
+          if (this.pending.get(id) !== pending) return;
+          this.pending.delete(id);
+          clearTimeout(pending.timer);
+          pending.abortCleanup?.();
+          if (pending.written) {
+            this.ignoredRequestResponses.add(id);
+            if (this.ignoredRequestResponses.size > this.limits.messages) {
+              const oldest = this.ignoredRequestResponses.values().next().value;
+              if (typeof oldest === "number") this.ignoredRequestResponses.delete(oldest);
+            }
+          }
+          reject(new Error("Codex conversation turn was cancelled"));
+        };
+        pending.abortCleanup = () => signal.removeEventListener("abort", onAbort);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }
       try {
+        if (this.pending.get(id) !== pending) return;
         this.write({ method, id, params });
         pending.written = true;
         onWritten?.();
       } catch (error) {
+        if (this.pending.get(id) !== pending) return;
         this.pending.delete(id);
         clearTimeout(pending.timer);
+        pending.abortCleanup?.();
         reject(error instanceof Error ? error : new Error(`${method} write failed`));
       }
     });
@@ -969,9 +1022,11 @@ export class CodexAppServer {
     const detail = new Error(`${error.message}${this.stderr ? `: ${this.stderr.slice(-400)}` : ""}`);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
+      pending.abortCleanup?.();
       pending.reject(pending.written ? new CodexRequestOutcomeUnknownError(pending.method) : detail);
     }
     this.pending.clear();
+    this.ignoredRequestResponses.clear();
     for (const active of this.active.values()) {
       clearTimeout(active.timer);
       active.abortCleanup?.();
