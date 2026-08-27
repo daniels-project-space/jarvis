@@ -1194,6 +1194,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       jobId: options.reservation.jobId,
       dispatchId: options.reservation.dispatchId,
       workerRunId: options.reservation.workerRunId,
+      heartbeatProtocolVersion: 2 as const,
       expectedAttempt: options.reservation.expectedAttempt,
       dispatchGeneration: options.reservation.dispatchGeneration,
       dispatchPhase: options.reservation.dispatchPhase,

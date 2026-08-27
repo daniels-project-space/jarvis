@@ -1025,6 +1025,7 @@ describe("production Trigger worker authority harness", () => {
       jobId: String(jobId),
       dispatchId: reservation.dispatchId,
       workerRunId: "trigger-authoritative-run",
+      heartbeatProtocolVersion: 2,
       expectedAttempt: 1,
       authorityDigest: reservation.authorityDigest,
       workOrderRevisionDigest: reservation.workOrderRevisionDigest,

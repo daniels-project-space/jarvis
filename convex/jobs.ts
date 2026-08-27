@@ -2720,6 +2720,9 @@ export const claimDispatched = mutation({
     jobId: v.id("jobs"),
     dispatchId: v.string(),
     workerRunId: v.string(),
+    // Version 2 means this claim requires the exact Trigger-run heartbeat
+    // fence. Optional only during the rolling-deploy bridge for older runs.
+    heartbeatProtocolVersion: v.optional(v.literal(2)),
     expectedAttempt: v.optional(v.number()),
     dispatchGeneration: v.optional(v.number()),
     dispatchPhase: v.optional(v.string()),
@@ -2913,6 +2916,9 @@ export const claimDispatched = mutation({
       nextRunAt: undefined,
       dispatchLeaseUntil: undefined,
       workerRunId: a.workerRunId.slice(0, 120),
+      // This belongs to the current claim, not the job forever. An older
+      // worker may legitimately claim a later retry during the rollout.
+      heartbeatProtocolVersion: a.heartbeatProtocolVersion,
       dispatchId: a.dispatchId,
       workerRuntime: "trigger",
       triggerObservedMachinePreset: a.triggerObservedMachinePreset,
@@ -2939,6 +2945,7 @@ export const claimDispatched = mutation({
       workerBranch: j.workerBranch,
       sessionId: a.workerRunId.slice(0, 120),
       workerRunId: a.workerRunId.slice(0, 120),
+      heartbeatProtocolVersion: a.heartbeatProtocolVersion,
       dispatchId: a.dispatchId,
       dispatchGeneration: dispatchReceipt.generation,
       dispatchPhase: dispatchReceipt.phase,
@@ -3920,18 +3927,24 @@ export const touchHeartbeat = mutation({
   args: {
     jobId: v.id("jobs"),
     expectedAttempt: v.number(),
-    workerRunId: v.string(),
+    workerRunId: v.optional(v.string()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
     const job = await ctx.db.get(a.jobId);
-    if (!job || job.status !== "running" || (job.attempt ?? 1) !== a.expectedAttempt
-      || job.workerRunId !== a.workerRunId
-      || !await claimedDispatchReceiptForRow(ctx, job, a.workerRunId)) return false;
+    if (!job || job.status !== "running" || (job.attempt ?? 1) !== a.expectedAttempt) return false;
     const runtime = await jobRuntimeFor(ctx, a.jobId);
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!runtime || !attempt || attempt.status !== "running") return false;
+    // The marker is bound to the current attempt. During the one
+    // rolling-deploy bridge, a versionless legacy claim may still send its
+    // historical no-ID heartbeat; supplying an ID always opts into the
+    // stricter exact-run fence.
+    const requiresExactFence = attempt.heartbeatProtocolVersion === 2 || typeof a.workerRunId === "string";
+    if (requiresExactFence && (typeof a.workerRunId !== "string"
+      || job.workerRunId !== a.workerRunId
+      || !await claimedDispatchReceiptForRow(ctx, job, a.workerRunId))) return false;
     const now = Date.now();
     await ctx.db.patch(runtime._id, { heartbeatAt: now, updatedAt: now });
     // Attempt rows are immutable evidence except for causal/terminal updates;

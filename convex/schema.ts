@@ -762,6 +762,10 @@ export default defineSchema({
     dispatchLeaseUntil: v.optional(v.number()),
     dispatchReason: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
+    // New Trigger claims opt into the exact heartbeat fence. Keep this
+    // optional for a short rolling-deploy handoff so an already-running
+    // legacy worker cannot be reaped merely because it predates the field.
+    heartbeatProtocolVersion: v.optional(v.literal(2)),
     workerRuntime: v.optional(v.string()),
     providerRunState: v.optional(v.string()),
     providerObservedAt: v.optional(v.number()),
@@ -1711,6 +1715,8 @@ export default defineSchema({
     integrationLineage: v.optional(v.string()),
     sessionId: v.optional(v.string()),
     workerRunId: v.optional(v.string()),
+    // Mirrors the job-level immutable claim protocol for audit and replay.
+    heartbeatProtocolVersion: v.optional(v.literal(2)),
     dispatchId: v.optional(v.string()),
     dispatchGeneration: v.optional(v.number()),
     dispatchPhase: v.optional(v.string()),

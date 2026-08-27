@@ -53,7 +53,7 @@ async function specialistFixture(policy: Policy = "manual", goalStage?: "validat
   const claim = await t.mutation(api.jobs.claimDispatched, {
     jobId, dispatchId: batch.reservations[0].dispatchId,
     ...triggerClaimAuthority(batch.reservations[0]),
-    workerRunId: "specialist-run", workerToken: WORKER,
+    workerRunId: "specialist-run", heartbeatProtocolVersion: 2, workerToken: WORKER,
   });
   expect(claim).toMatchObject({
     jobId, authorityDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
@@ -472,6 +472,11 @@ describe("real Convex specialist/controller race matrix", () => {
     expect(await f.t.mutation(api.jobs.touchHeartbeat, {
       jobId: f.jobId,
       expectedAttempt: 1,
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await f.t.mutation(api.jobs.touchHeartbeat, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
       workerRunId: "stale-trigger-run",
       workerToken: WORKER,
     })).toBe(false);
@@ -490,6 +495,80 @@ describe("real Convex specialist/controller race matrix", () => {
       const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", f.jobId)).first();
       return runtime?.heartbeatAt;
     })).toBe(Date.now());
+  });
+
+  it("keeps legacy no-ID heartbeats compatible without weakening a V2 claim", async () => {
+    const t = convexTest(schema, modules);
+    const admitted = await testMissionAdmission(t, {
+      key: "legacy-heartbeat-compat", workerToken: WORKER,
+      repository: "daniels-project-space/jarvis", sourceHeadSha: BASE,
+    });
+    const jobId = await t.mutation(api.jobs.enqueueV2, {
+      repo: "daniels-project-space/jarvis", task: "Publish verified repository work to the reviewed Git ref",
+      readonly: false, maxAttempts: 1, goalStage: "validating", missionId: String(admitted.missionId), workerToken: WORKER,
+    });
+    expect(await t.mutation(api.approvals.decide, {
+      jobId: String(jobId), decision: "approved", workerToken: WORKER,
+    })).toBe(true);
+    const [{ reservations }] = await Promise.all([
+      t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "legacy-heartbeat", workerToken: WORKER }),
+    ]);
+    const reservation = reservations[0]!;
+    const claim = await t.mutation(api.jobs.claimDispatched, {
+      jobId, dispatchId: reservation.dispatchId, ...triggerClaimAuthority(reservation),
+      workerRunId: "legacy-trigger-run", workerToken: WORKER,
+    });
+    expect(claim).toMatchObject({ jobId });
+    expect((await rows(t)).jobs[0]).not.toHaveProperty("heartbeatProtocolVersion");
+    expect(await t.mutation(api.jobs.touchHeartbeat, {
+      jobId, expectedAttempt: 1, workerToken: WORKER,
+    })).toBe(true);
+    // Passing an ID on a legacy claim opts into the same exact fence rather
+    // than allowing an arbitrary caller to extend that lease.
+    expect(await t.mutation(api.jobs.touchHeartbeat, {
+      jobId, expectedAttempt: 1, workerRunId: "different-trigger-run", workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.mutation(api.jobs.touchHeartbeat, {
+      jobId, expectedAttempt: 1, workerRunId: "legacy-trigger-run", workerToken: WORKER,
+    })).toBe(true);
+  });
+
+  it("persists the V2 heartbeat protocol and does not downgrade it on a replay", async () => {
+    const f = await specialistFixture();
+    const replay = await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId, dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation), workerRunId: "specialist-run", workerToken: WORKER,
+    });
+    expect(replay).toMatchObject({ jobId: f.jobId });
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({ heartbeatProtocolVersion: 2 });
+    expect(state.attempts[0]).toMatchObject({ heartbeatProtocolVersion: 2 });
+    expect(await f.t.mutation(api.jobs.touchHeartbeat, {
+      jobId: f.jobId, expectedAttempt: 1, workerToken: WORKER,
+    })).toBe(false);
+  });
+
+  it("clears the heartbeat protocol for a later legacy retry claim", async () => {
+    const f = await specialistFixture();
+    expect(await f.t.mutation(api.jobs.checkpointAndRequeue, {
+      jobId: f.jobId, expectedAttempt: 1, authorityDigest: f.authorityDigest,
+      workerRunId: "specialist-run", checkpoint: "retry with the same sealed scope", result: "retry", delayMs: 0,
+      workerToken: WORKER,
+    })).toMatchObject({ requeued: true, stale: false });
+    const [{ reservations }] = await Promise.all([
+      f.t.mutation(api.jobs.reserveDispatchBatch, { limit: 1, reason: "legacy-retry-claim", workerToken: WORKER }),
+    ]);
+    const reservation = reservations[0]!;
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId, dispatchId: reservation.dispatchId, ...triggerClaimAuthority(reservation),
+      workerRunId: "legacy-retry-run", workerToken: WORKER,
+    })).toMatchObject({ jobId: f.jobId, attempt: 2 });
+    const state = await rows(f.t);
+    expect(state.jobs[0]).not.toHaveProperty("heartbeatProtocolVersion");
+    expect(state.attempts.find((attempt) => attempt.attempt === 2)).not.toHaveProperty("heartbeatProtocolVersion");
+    expect(await f.t.mutation(api.jobs.touchHeartbeat, {
+      jobId: f.jobId, expectedAttempt: 2, workerToken: WORKER,
+    })).toBe(true);
   });
 
   it("commits one specialist receipt, replays response loss, and never creates another specialist execution", async () => {
