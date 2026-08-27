@@ -441,6 +441,41 @@ describe("travel_map tool", () => {
     expect(panel.calendarAdded).toBe(0);
   });
 
+  it("rejects invalid and non-overnight trip dates before opening a workspace or searching providers", async () => {
+    const impossibleDate = await executeTool("trip_plan", {
+      destination: "Paris",
+      dest_iata: "CDG",
+      depart_date: "2026-02-30",
+      return_date: "2026-03-04",
+      budget_total_gbp: 800,
+      include_flights: false,
+    });
+    expect(impossibleDate).toContain("I need destination");
+
+    const sameDayRange = await executeTool("trip_plan", {
+      destination: "Paris",
+      dest_iata: "CDG",
+      depart_date: "2026-03-04",
+      return_date: "2026-03-04",
+      budget_total_gbp: 800,
+      include_flights: false,
+    });
+    expect(sameDayRange).toContain("at least one overnight stay");
+
+    const reversedRange = await executeTool("trip_plan", {
+      destination: "Paris",
+      dest_iata: "CDG",
+      depart_date: "2026-03-04",
+      return_date: "2026-03-03",
+      budget_total_gbp: 800,
+      include_flights: false,
+    });
+    expect(reversedRange).toContain("at least one overnight stay");
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+    expect(mock.lookupBookings).not.toHaveBeenCalled();
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
   it("uses rate-limited OpenStreetMap without a paid-provider fallback", async () => {
     const result = await executeTool("travel_map", {
       location: "Sevilla",

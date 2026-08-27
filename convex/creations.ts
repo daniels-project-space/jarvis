@@ -781,8 +781,14 @@ export const remove = mutation({
   args: { id: v.id("creations"), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
+    const creation = await ctx.db.get(a.id);
+    // The browser may retry after R2 deletion completed but the response from
+    // this final metadata mutation was interrupted. Exact owner retries are
+    // therefore a successful no-op once this creation is already gone.
+    if (!creation) return true;
     const refs = await ctx.db.query("creationFileRefs").withIndex("by_creation", (q) => q.eq("creationId", a.id)).collect();
     for (const ref of refs) await ctx.db.delete(ref._id);
     await ctx.db.delete(a.id);
+    return true;
   },
 });
