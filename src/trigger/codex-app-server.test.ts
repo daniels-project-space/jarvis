@@ -206,6 +206,122 @@ describe("Codex app-server dynamic tools", () => {
     await expect(turnPromise).resolves.toMatchObject({ finalText: "done", threadId: "thread-1", code: 0 });
   });
 
+  it("starts a cold thread while lazy live inputs are still resolving", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+    let resolveContext!: (value: string) => void;
+    let resolveImages!: (value: []) => void;
+    const contextBlock = new Promise<string>((resolve) => { resolveContext = resolve; });
+    const imageInputs = new Promise<[]>((resolve) => { resolveImages = resolve; });
+
+    const turn = server.runTurn({
+      conversationId: "overlapped-cold-thread",
+      userText: "hello",
+      history: [],
+      contextBlock,
+      imageInputs,
+      preamble: "test",
+      modelTier: "luna",
+      onDelta: () => {},
+    });
+
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].method).toBe("thread/start");
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "overlapped-thread" } } }));
+    await Promise.resolve();
+    expect(writes).toHaveLength(1);
+
+    resolveContext("fresh context");
+    resolveImages([]);
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].method).toBe("turn/start");
+    expect(JSON.stringify(writes[1].params?.input)).toContain("fresh context");
+    internals.receive(JSON.stringify({ id: writes[1].id, result: { turn: { id: "overlapped-turn" } } }));
+    await Promise.resolve();
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "overlapped-turn", turn: { id: "overlapped-turn", status: "completed" } },
+    }));
+    await expect(turn).resolves.toMatchObject({ code: 0, threadId: "overlapped-thread" });
+  });
+
+  it("forgets a prestarted cold thread when lazy inputs fail before turn admission", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+    let rejectContext!: (error: Error) => void;
+    const contextBlock = new Promise<string>((_resolve, reject) => { rejectContext = reject; });
+    const failedTurn = server.runTurn({
+      conversationId: "lazy-input-failure",
+      userText: "hello",
+      history: [],
+      contextBlock,
+      preamble: "test",
+      modelTier: "luna",
+      onDelta: () => {},
+    });
+
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].method).toBe("thread/start");
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "discard-me" } } }));
+    rejectContext(new Error("context unavailable"));
+    await expect(failedTurn).rejects.toThrow("context unavailable");
+
+    const next = await admitTurn(server, internals, writes, {
+      conversationId: "lazy-input-failure",
+      threadId: "fresh-thread",
+      turnId: "fresh-turn",
+    });
+    expect(writes[1].method).toBe("thread/start");
+    internals.receive(JSON.stringify({
+      method: "turn/completed",
+      params: { turnId: "fresh-turn", turn: { id: "fresh-turn", status: "completed" } },
+    }));
+    await expect(next.completion).resolves.toMatchObject({ code: 0, threadId: "fresh-thread" });
+  });
+
+  it("cancels immediately while cold thread startup is still pending", async () => {
+    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
+    const writes: WrittenMessage[] = [];
+    const internals = server as unknown as AppServerInternals;
+    internals.process = {
+      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
+    };
+    internals.ready = Promise.resolve();
+    const abort = new AbortController();
+    const turn = server.runTurn({
+      conversationId: "cancel-pending-thread",
+      userText: "hello",
+      history: [],
+      contextBlock: "",
+      preamble: "test",
+      modelTier: "luna",
+      signal: abort.signal,
+      onDelta: () => {},
+    });
+
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].method).toBe("thread/start");
+    abort.abort();
+    await expect(turn).rejects.toThrow("Codex conversation turn was cancelled");
+    expect(writes.some((write) => write.method === "turn/start")).toBe(false);
+
+    // Settle the orphaned static protocol request; it cannot cache a thread
+    // because the cancelled turn has already unwound.
+    internals.receive(JSON.stringify({ id: writes[0].id, result: { thread: { id: "ignored-thread" } } }));
+    await Promise.resolve();
+    expect(writes).toHaveLength(1);
+  });
+
   it("interrupts the exact admitted turn and ignores every late event after cancellation", async () => {
     const onDynamicToolCall = vi.fn(async () => ({
       contentItems: [{ type: "inputText" as const, text: "must not run" }],
