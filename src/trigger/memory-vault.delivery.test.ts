@@ -79,9 +79,7 @@ describe("Obsidian memory-vault delivery checkpoint", () => {
   it("never advances the durable cursor when git staging fails", async () => {
     expect(memoryVault).toBeDefined();
     if (!harness.definition) throw new Error("memory-vault task was not registered");
-    const result = await harness.definition.run();
-
-    expect(result).toMatchObject({ error: "Obsidian mirror staging did not complete", pushed: false });
+    await expect(harness.definition.run()).rejects.toThrow("Obsidian mirror staging did not complete");
     expect(harness.gitCalls.some((args) => args.includes("diff"))).toBe(false);
     expect(harness.fetchPaths).toContain("memory:beginObsidianReconciliation");
     expect(harness.fetchPaths).toContain("memory:obsidianReconciliationPage");

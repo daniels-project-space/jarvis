@@ -90,7 +90,7 @@ export const memoryVault = schedules.task({
   maxDuration: 180,
   run: async () => {
     const token = process.env.GITHUB_TOKEN;
-    if (!token) return { error: "no GITHUB_TOKEN" };
+    if (!token) throw new Error("Obsidian mirror requires GITHUB_TOKEN");
     const dir = "/tmp/vault";
     rmSync(dir, { recursive: true, force: true });
     const url = githubRepoUrl(REPO);
@@ -103,7 +103,7 @@ export const memoryVault = schedules.task({
     mkdirSync(env.HOME, { recursive: true, mode: 0o700 });
     const gitEnv = githubGitEnv(env, token);
     await sh("git", ["clone", "--depth", "1", url, dir], gitEnv);
-    if (!existsSync(join(dir, ".git"))) return { error: "clone failed" };
+    if (!existsSync(join(dir, ".git"))) throw new Error("Obsidian mirror clone failed");
     await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
     await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
 
@@ -112,7 +112,7 @@ export const memoryVault = schedules.task({
     const cutoffAt = Number(reconciliation?.cutoffAt);
     const cursor = typeof reconciliation?.cursor === "string" ? reconciliation.cursor : undefined;
     if (!Number.isSafeInteger(cycle) || cycle < 1 || !Number.isFinite(cutoffAt)) {
-      return { error: "memory reconciliation unavailable" };
+      throw new Error("Obsidian memory reconciliation unavailable");
     }
     const reconciliationPage = await q("memory:obsidianReconciliationPage", {
       cycle,
@@ -124,7 +124,7 @@ export const memoryVault = schedules.task({
       ? reconciliationPage.continueCursor
       : undefined;
     if (!reconciliationPage || !Array.isArray(reconciliationPage.items) || (!isDone && !continueCursor)) {
-      return { error: "memory reconciliation page unavailable" };
+      throw new Error("Obsidian memory reconciliation page unavailable");
     }
     const mem = reconciliationPage.items as MemoryRow[];
     // The daily log stays a compact current summary. The resumable page above
@@ -220,20 +220,20 @@ export const memoryVault = schedules.task({
 
     const add = await sh("git", ["-C", dir, "add", "-A"], env);
     if (add.code !== 0) {
-      return { date, notes, attention: attention.length, pushed: false, error: "Obsidian mirror staging did not complete" };
+      throw new Error("Obsidian mirror staging did not complete");
     }
     // `git diff --cached --quiet` exits 0 only when staging is verified clean,
     // 1 when there is a commit-worthy page, and >1 on a Git failure. This is
     // stronger than parsing `git commit` text after a failed `git add`.
     const staged = await sh("git", ["-C", dir, "diff", "--cached", "--quiet"], env);
     if (staged.code !== 0 && staged.code !== 1) {
-      return { date, notes, attention: attention.length, pushed: false, error: "Obsidian mirror staging could not be verified" };
+      throw new Error("Obsidian mirror staging could not be verified");
     }
     let pushed = false;
     if (staged.code === 1) {
       const commit = await sh("git", ["-C", dir, "commit", "-m", `memory: consolidate ${date}`], env);
       if (commit.code !== 0) {
-        return { date, notes, attention: attention.length, pushed, error: "Obsidian mirror commit did not complete" };
+        throw new Error("Obsidian mirror commit did not complete");
       }
       const push = await sh("git", ["-C", dir, "push", url, "HEAD"], gitEnv);
       pushed = push.code === 0;
@@ -241,7 +241,7 @@ export const memoryVault = schedules.task({
     if (staged.code === 1 && !pushed) {
       // Do not advance: a retry may rewrite this page, but cannot leave a
       // canonical memory absent from the durable mirror.
-      return { date, notes, attention: attention.length, pushed, error: "Obsidian mirror push did not complete" };
+      throw new Error("Obsidian mirror push did not complete");
     }
     const checkpoint = await m("memory:advanceObsidianReconciliation", {
       cycle,
@@ -253,7 +253,7 @@ export const memoryVault = schedules.task({
     if (checkpoint?.ok !== true) {
       // The mirror is safe; retain the page cursor so a later run can replay
       // it rather than risking a skipped write after a transient API failure.
-      return { date, notes, attention: attention.length, pushed, error: "Obsidian mirror checkpoint did not complete" };
+      throw new Error("Obsidian mirror checkpoint did not complete");
     }
     return { date, notes, attention: attention.length, pushed, reconciliationComplete: isDone };
   },
