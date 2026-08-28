@@ -57,19 +57,18 @@ runs start while it drains.
    Verify in the Trigger dashboard/API that this version was built from the
    candidate SHA. It is safe for this bundle to be present while Convex is
    still old because its reserve-first producers decline before R2.
-5. Drain the old Trigger version before Convex changes. Cancel only queued,
-   delayed, or pending-version old-version runs. Do **not** cancel
-   `DEQUEUED` or `EXECUTING` producers as a shortcut—Trigger counts dequeued
-   work as executing. Treat a `WAITING` old-version run as a release blocker:
-   inspect it and obtain an explicit release-owner decision before cancellation
-   rather than assuming it cannot resume an old writer. Leave the queues paused
-   and let active/dequeued old runs finish naturally. `jarvis-agent-worker` has
-   the longest creator lifetime: **30 minutes**. Because Vercel activity can
-   still enqueue work while that queue is paused, re-list and cancel old queued
-   runs on every drain pass. Re-list until the old version has zero
-   nonterminal runs, then retain a 2-minute observation margin. If any
-   executing old producer cannot settle, keep the bridge and pause in place;
-   do not proceed to Convex.
+5. Drain the old Trigger version before Convex changes. Cancel old-version
+   `PENDING_VERSION`, `DELAYED`, `QUEUED`, and `WAITING` runs. Waiting does not
+   consume execution concurrency, but it can resume old code later; canceling
+   it stops the run and its children. Do **not** cancel `DEQUEUED` or
+   `EXECUTING` producers as a shortcut—Trigger counts dequeued work as
+   executing. Leave the queues paused and let active/dequeued old runs finish
+   naturally. `jarvis-agent-worker` has the longest creator lifetime:
+   **30 minutes**. Because Vercel activity can still enqueue work while that
+   queue is paused, re-list and cancel old nonexecuting runs on every drain
+   pass. Re-list until the old version has zero nonterminal runs, then retain
+   a 2-minute observation margin. If any executing old producer cannot settle,
+   keep the bridge and pause in place; do not proceed to Convex.
 
    The Trigger SDK/API evidence is a paginated `runs.list` filtered by the old
    deployment version and every nonterminal status (`PENDING_VERSION`,
