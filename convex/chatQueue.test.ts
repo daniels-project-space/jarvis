@@ -2,7 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
 import schema from "./schema";
-import { CHAT_PENDING_EXPIRY_MS, CHAT_TURN_STALE_MS, MAX_CHAT_RECOVERY_WAKES, MAX_CHAT_TURN_ATTEMPTS } from "./chatQueue";
+import {
+  CHAT_PENDING_EXPIRY_MS,
+  CHAT_TURN_STALE_MS,
+  boundedForegroundHistory,
+  FOREGROUND_HISTORY_MESSAGE_LIMIT,
+  FOREGROUND_HISTORY_OMISSION_MARKER,
+  FOREGROUND_HISTORY_TEXT_LIMIT,
+  FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT,
+  MAX_CHAT_RECOVERY_WAKES,
+  MAX_CHAT_TURN_ATTEMPTS,
+} from "./chatQueue";
 import {
   ForegroundConvexCallDeadlineError,
   settleAmbiguousForegroundFinalize,
@@ -234,6 +244,143 @@ describe("durable foreground chat recovery", () => {
     ]));
     expect(JSON.stringify(nextClaim?.history)).not.toContain(gmailReceipt);
     expect(JSON.stringify(nextClaim?.history)).not.toContain(calendarReceipt);
+  });
+
+  it("bounds cold history newest-first while replaying selected rows chronologically", () => {
+    const exact = (label: string) =>
+      `${label}${"x".repeat(FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT - label.length)}`;
+    const oversized = `newest-answer-start ${"y".repeat(FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT)} newest-answer-end`;
+    const newestFirstRows = [
+      { role: "user", text: exact("older-dropped") },
+      { role: "assistant", text: exact("anchor-1") },
+      { role: "user", text: exact("anchor-2") },
+      { role: "assistant", text: exact("anchor-3") },
+      { role: "user", text: exact("anchor-4") },
+      { role: "assistant", text: exact("anchor-5") },
+      { role: "user", text: oversized },
+    ];
+
+    const replay = boundedForegroundHistory(newestFirstRows);
+    expect(replay.map((row) => row.text.slice(0, 8))).toEqual([
+      "anchor-1",
+      "anchor-2",
+      "anchor-3",
+      "anchor-4",
+      "anchor-5",
+      "newest-a",
+    ]);
+    expect(replay.slice(0, 5).every((row) => row.text.length === FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT)).toBe(true);
+    expect(replay.at(-1)?.text).toContain("newest-answer-start");
+    expect(replay.at(-1)?.text).toContain("newest-answer-end");
+    expect(replay.at(-1)?.text).toContain(FOREGROUND_HISTORY_OMISSION_MARKER);
+    expect(replay.reduce((total, row) => total + row.text.length, 0)).toBe(FOREGROUND_HISTORY_TEXT_LIMIT);
+
+    const remainingForOldest = FOREGROUND_HISTORY_OMISSION_MARKER.length + 1;
+    const boundaryRows = [
+      { role: "user", text: `oldest ${"z".repeat(FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT)}` },
+      {
+        role: "assistant",
+        text: exact("near-total").slice(
+          0,
+          FOREGROUND_HISTORY_TEXT_LIMIT
+            - (FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT * 5)
+            - remainingForOldest,
+        ),
+      },
+      { role: "user", text: exact("recent-1") },
+      { role: "assistant", text: exact("recent-2") },
+      { role: "user", text: exact("recent-3") },
+      { role: "assistant", text: exact("recent-4") },
+      { role: "user", text: exact("recent-5") },
+    ];
+    const boundaryReplay = boundedForegroundHistory(boundaryRows);
+    expect(boundaryReplay.map((row) => row.role)).toEqual(boundaryRows.map((row) => row.role));
+    expect(boundaryReplay[0].text).toHaveLength(remainingForOldest);
+    expect(boundaryReplay[0].text).toContain(FOREGROUND_HISTORY_OMISSION_MARKER);
+    expect(boundaryReplay.reduce((total, row) => total + row.text.length, 0)).toBe(FOREGROUND_HISTORY_TEXT_LIMIT);
+  });
+
+  it("bounds cold-thread history while preserving the newest conversation anchors", async () => {
+    const t = convexTest(schema, modules);
+    for (let index = 0; index < 8; index += 1) {
+      const userId = await t.mutation(api.chatQueue.sendMessage, {
+        threadId: "main",
+        text: `user-${index} ${"u".repeat(8_000)}`,
+        requestId: `bounded-history-${index}`,
+        workerToken: WORKER,
+      });
+      const claim = await t.mutation(api.chatQueue.claimMessage, {
+        messageId: userId,
+        claimToken: `bounded-history-claim-${index}`,
+        workerToken: WORKER,
+      });
+      await expect(t.mutation(api.chatQueue.finalize, {
+        messageId: claim!.assistantId,
+        threadId: "main",
+        claimToken: `bounded-history-claim-${index}`,
+        status: "done",
+        finalText: `assistant-${index} ${"a".repeat(8_000)}`,
+        workerToken: WORKER,
+      })).resolves.toBe(true);
+      vi.advanceTimersByTime(10);
+    }
+
+    const finalUserId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "current follow-up",
+      requestId: "bounded-history-final",
+      workerToken: WORKER,
+    });
+    const finalClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: finalUserId,
+      claimToken: "bounded-history-final-claim",
+      workerToken: WORKER,
+    });
+    const history = finalClaim!.history;
+    const serialized = history.map((row) => row.text).join("\n");
+
+    expect(history.length).toBeLessThanOrEqual(FOREGROUND_HISTORY_MESSAGE_LIMIT);
+    expect(history.reduce((total, row) => total + row.text.length, 0)).toBeLessThanOrEqual(
+      FOREGROUND_HISTORY_TEXT_LIMIT,
+    );
+    expect(serialized).toContain("user-7");
+    expect(serialized).toContain("assistant-7");
+    expect(serialized).toContain("[earlier history omitted]");
+    expect(serialized).not.toContain("user-0");
+  });
+
+  it("does not revive private host context in bounded cold-history replay", async () => {
+    const t = convexTest(schema, modules);
+    const sourceUserId = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "[JARVIS_HOST_CONTEXT]private host evidence[/JARVIS_HOST_CONTEXT] explain the visible request",
+      requestId: "bounded-host-context-source",
+      workerToken: WORKER,
+    });
+    const sourceClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: sourceUserId,
+      claimToken: "bounded-host-context-source-claim",
+      workerToken: WORKER,
+    });
+    await expect(t.mutation(api.chatQueue.finalize, {
+      messageId: sourceClaim!.assistantId,
+      threadId: "main",
+      claimToken: "bounded-host-context-source-claim",
+      status: "done",
+      finalText: "Acknowledged.",
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+    vi.advanceTimersByTime(10);
+
+    const nextUserId = await createTurn(t, "bounded-host-context-next");
+    const nextClaim = await t.mutation(api.chatQueue.claimMessage, {
+      messageId: nextUserId,
+      claimToken: "bounded-host-context-next-claim",
+      workerToken: WORKER,
+    });
+    const serialized = JSON.stringify(nextClaim!.history);
+    expect(serialized).toContain("explain the visible request");
+    expect(serialized).not.toContain("private host evidence");
   });
 
   it("seals an authoritative cancellation fence before retry and rejects every late worker write", async () => {
