@@ -24,38 +24,60 @@ runs start while it drains.
 
 ## Required release sequence
 
-1. Record the candidate SHA. Before the bridge deployment, inspect the **old
-   production Vercel deployment** and record the effective function maximum
-   for `/api/client-mutation`. That old direct-R2-delete route has no
-   source-level `maxDuration`, so its bound comes from Vercel
-   project/function settings and must not be inferred from this repository or
-   plan defaults. Deploy the exact candidate Vercel build to the production
-   alias and verify the alias's source SHA in Vercel. Do not treat a Git push
-   as proof that the alias changed.
-2. Immediately select the bridge deployment in the Vercel dashboard and set
+1. Record the candidate SHA. Deploy the exact candidate Vercel build to the
+   production alias and verify the alias's source SHA in Vercel. Do not treat a
+   Git push as proof that the alias changed. The project has a 12-hour Skew
+   Protection maximum age, so an alias change alone does **not** fence an old
+   deployment-ID-routed request.
+2. Prove and then revoke the legacy Vercel routing paths. Use the harmless
+   canonical `/api/health` endpoint and the exact **old production deployment
+   ID**. Before setting the bridge deployment's Skew Protection Threshold, make
+   and retain the response from all three read-only probes:
+
+   ```text
+   GET https://<canonical-production-host>/api/health?dpl=<old-deployment-id>
+   GET https://<canonical-production-host>/api/health
+       x-deployment-id: <old-deployment-id>
+   GET https://<canonical-production-host>/api/health
+       Cookie: __vdpl=<old-deployment-id>
+   ```
+
+   Each pre-threshold response must prove that the legacy `7c44…` source SHA
+   was reached (using the health response's deployment identity). This is a
+   required baseline, not an optional smoke test. Also record that the old
+   unique production deployment URL returns a `308` redirect to the canonical
+   host; under the current proxy configuration it is therefore not a separate
+   direct-handler path. If it ever serves a handler directly, stop: this
+   runbook has no fence for that path.
+
+   Immediately select the bridge deployment in the Vercel dashboard and set
    its **Skew Protection Threshold**. Vercel documents this threshold as
    preventing deployments created before the selected deployment from resolving
    requests from outdated clients; this is the provider-side fence for old
    `dpl`, `x-deployment-id`, and `__vdpl`-pinned requests. Record the selected
    bridge deployment ID, threshold timestamp, and dashboard confirmation. Do
    not rely on the 12-hour maximum age, an alias switch, or merely disabling
-   Skew Protection: none is a substitute for this revocation threshold. If the
-   threshold control is unavailable or cannot be verified, this is a **NO-GO**.
+   Skew Protection: none is a substitute for this revocation threshold.
+
+   Repeat the same three probes after the threshold is set. Every response must
+   be attributable to the bridge/non-old deployment or be a `4xx`; no response
+   may execute the legacy `7c44…` code. Capture all six responses in the change
+   record. If any vector still returns the old SHA, if the threshold control is
+   unavailable, or if its effect cannot be verified, this is a **NO-GO**.
    Expect existing old browser sessions to reload/rebind; their private artifact
    writes and deletes fail closed on the bridge until Convex is released.
-3. After the alias and the revocation threshold are confirmed, keep the bridge
-   active for
-   `max(120 seconds, T_clientMutation) + 30 seconds`, where
-   `T_clientMutation` is that recorded old-deployment bound. This interval now
-   covers only old invocations already dispatched before the threshold; the
-   threshold blocks later legacy deployment routing. The 120-second floor
-   covers `/api/tools`, `/api/agent-tool`, and
-   `/api/foreground-owner-tool`; `/api/creation-export` is limited to
-   30 seconds. At the end of that interval, capture Vercel Monitoring evidence
-   for the threshold and function/log evidence that no old-alias invocation
-   remains active. If the effective bound or completion evidence cannot be
-   obtained from Vercel, this is a **NO-GO**; do not substitute a fixed
-   150-second wait. The new Vercel build is fail-closed throughout this bridge.
+3. Only after all three post-threshold probes pass, keep the bridge active for
+   a full **330 seconds**. This is the provider-audited current 300-second
+   maximum execution duration plus a 30-second margin, and covers only old
+   invocations already dispatched before the threshold; the threshold blocks
+   later legacy deployment routing. The 120-second Vercel creator routes and
+   30-second creation export route fit within that interval. Record the
+   post-threshold probe timestamps and the complete 330-second timer in the
+   change record. There is no active-invocation certificate API to substitute
+   for this fence-and-duration proof. If the Vercel execution limit or proxy
+   routing changes, repeat the provider audit and establish a new bound before
+   release; do not proceed on a fixed wait alone. The new Vercel build is
+   fail-closed throughout this bridge.
 4. In Trigger production, pause these queues before the old-version drain:
 
    - `{ type: "custom", name: "jarvis-background-agents" }` — owns
