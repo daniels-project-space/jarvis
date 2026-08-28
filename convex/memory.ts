@@ -1,10 +1,12 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { actorAuthArgs, requireActor, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { safeMemoryNote } from "../src/lib/memory-safety";
 import { memoryConfidence, memoryDedupeKey } from "../src/lib/memory-governance";
 
 const SOURCE_MESSAGE_ID = /^[A-Za-z0-9_-]{1,180}$/;
+const OBSIDIAN_RECONCILIATION_KEY = "obsidian-memory-vault-v1";
+const OBSIDIAN_RECONCILIATION_PAGE_SIZE = 30;
 
 function activeMemory(row: { expiresAt?: number }, now: number): boolean {
   return row.expiresAt === undefined || row.expiresAt > now;
@@ -89,6 +91,129 @@ export const recent = query({
     }
     const rows = await ctx.db.query("memory").withIndex("by_createdAt").order("desc").take(Math.min(lim * 3, 90));
     return rows.filter((row) => activeMemory(row, now)).slice(0, lim);
+  },
+});
+
+/**
+ * Begin (or resume) one bounded snapshot of canonical memory for the
+ * Git-backed Obsidian mirror. Trigger advances it only after Git has accepted
+ * the matching page, so a retry can repeat a page but cannot skip one.
+ */
+export const beginObsidianReconciliation = mutation({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const existing = await ctx.db
+      .query("memoryVaultReconciliations")
+      .withIndex("by_key", (q) => q.eq("key", OBSIDIAN_RECONCILIATION_KEY))
+      .first();
+    if (existing && !existing.complete) {
+      return {
+        cycle: existing.cycle,
+        cutoffAt: existing.cutoffAt,
+        ...(existing.cursor ? { cursor: existing.cursor } : {}),
+      };
+    }
+
+    const cutoffAt = Date.now();
+    if (existing) {
+      const cycle = existing.cycle + 1;
+      await ctx.db.patch(existing._id, { cycle, cutoffAt, cursor: undefined, complete: false, updatedAt: cutoffAt });
+      return { cycle, cutoffAt };
+    } else {
+      await ctx.db.insert("memoryVaultReconciliations", {
+        key: OBSIDIAN_RECONCILIATION_KEY,
+        cycle: 1,
+        cutoffAt,
+        complete: false,
+        updatedAt: cutoffAt,
+      });
+      return { cycle: 1, cutoffAt };
+    }
+  },
+});
+
+/** Read exactly the currently claimed reconciliation page. */
+export const obsidianReconciliationPage = query({
+  args: {
+    cycle: v.number(),
+    cutoffAt: v.number(),
+    cursor: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const state = await ctx.db
+      .query("memoryVaultReconciliations")
+      .withIndex("by_key", (q) => q.eq("key", OBSIDIAN_RECONCILIATION_KEY))
+      .first();
+    if (
+      !state ||
+      state.complete ||
+      state.cycle !== a.cycle ||
+      state.cutoffAt !== a.cutoffAt ||
+      (state.cursor ?? undefined) !== (a.cursor ?? undefined)
+    ) {
+      throw new Error("Obsidian reconciliation page is stale");
+    }
+
+    // The cutoff freezes this cycle's view. A row revised after it is handled
+    // in the following cycle instead of being lost behind a moving cursor.
+    const page = await ctx.db
+      .query("memory")
+      .withIndex("by_updatedAt", (q) => q.lte("updatedAt", state.cutoffAt))
+      .order("asc")
+      .paginate({
+        cursor: a.cursor ?? null,
+        numItems: OBSIDIAN_RECONCILIATION_PAGE_SIZE,
+        maximumRowsRead: OBSIDIAN_RECONCILIATION_PAGE_SIZE,
+      });
+    return {
+      items: page.page
+        .filter((row) => activeMemory(row, Date.now()))
+        .map(({ kind, title, body, tags }) => ({ kind, title, body, tags })),
+      isDone: page.isDone,
+      ...(!page.isDone ? { continueCursor: page.continueCursor } : {}),
+    };
+  },
+});
+
+/** Advance only the page that was actually claimed; successful retries are idempotent. */
+export const advanceObsidianReconciliation = mutation({
+  args: {
+    cycle: v.number(),
+    cutoffAt: v.number(),
+    fromCursor: v.optional(v.string()),
+    continueCursor: v.optional(v.string()),
+    complete: v.boolean(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    if (a.complete && a.continueCursor) throw new Error("Completed reconciliation cannot retain a cursor");
+    if (!a.complete && !a.continueCursor) throw new Error("Incomplete reconciliation requires a cursor");
+    const state = await ctx.db
+      .query("memoryVaultReconciliations")
+      .withIndex("by_key", (q) => q.eq("key", OBSIDIAN_RECONCILIATION_KEY))
+      .first();
+    if (!state || state.cycle !== a.cycle || state.cutoffAt !== a.cutoffAt) {
+      throw new Error("Obsidian reconciliation checkpoint is stale");
+    }
+
+    const currentCursor = state.cursor ?? undefined;
+    const nextCursor = a.complete ? undefined : a.continueCursor;
+    if (state.complete === a.complete && currentCursor === nextCursor) {
+      return { ok: true, idempotent: true, complete: state.complete };
+    }
+    if (state.complete || currentCursor !== (a.fromCursor ?? undefined)) {
+      throw new Error("Obsidian reconciliation checkpoint is stale");
+    }
+    await ctx.db.patch(state._id, {
+      cursor: nextCursor,
+      complete: a.complete,
+      updatedAt: Date.now(),
+    });
+    return { ok: true, idempotent: false, complete: a.complete };
   },
 });
 

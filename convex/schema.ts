@@ -170,8 +170,20 @@ export default defineSchema({
   })
     .index("by_kind", ["kind"])
     .index("by_createdAt", ["createdAt"])
+    .index("by_updatedAt", ["updatedAt"])
     .index("by_dedupeKey", ["dedupeKey"])
     .searchIndex("search_body", { searchField: "body", filterFields: ["kind"] }),
+
+  // A durable page cursor for the Git-backed Obsidian mirror. It advances only
+  // after the corresponding page has been committed and pushed by Trigger.
+  memoryVaultReconciliations: defineTable({
+    key: v.string(),
+    cycle: v.number(),
+    cutoffAt: v.number(),
+    cursor: v.optional(v.string()),
+    complete: v.boolean(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
 
   // Small, superseding facts needed on the very next turn (for example the
   // city Daniel is currently in). Raw chat stays private in chatMessages;
