@@ -60,6 +60,7 @@ import {
   LIVE_BARGE_SAMPLE_MS,
   advanceLiveVad,
   createLiveVadState,
+  isTrustedBrowserFinalQuestionEndpoint,
   shouldCloseLiveUtterance,
   shouldDeferLiveCapture,
   shouldStartLiveResearchPreview,
@@ -4959,11 +4960,24 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           currentVoiceAt: vad.lastVoice,
           sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
         }).source === "browser-final";
+        const trustedBrowserFinalQuestion = isTrustedBrowserFinalQuestionEndpoint(
+          browserPreview?.text,
+          trustedBrowserFinal,
+        );
+        const shouldCloseSpeech = shouldCloseLiveUtterance(
+          vad,
+          now,
+          browserPreview?.text,
+          trustedBrowserFinal,
+        );
         if (
-          shouldCloseLiveUtterance(vad, now, browserPreview?.text, trustedBrowserFinal)
+          shouldCloseSpeech
           || (!vad.spoke && now - t0 > 8000)
           || now - t0 > 25_000
         ) {
+          if (shouldCloseSpeech && trustedBrowserFinalQuestion) {
+            voiceTrace.endpointStrategy = "trusted-browser-final";
+          }
           clearInterval(poll);
           if (rec.state === "recording") rec.stop();
         }

@@ -136,14 +136,23 @@ export function shouldCloseLiveUtterance(
   trustedBrowserFinal = false,
 ): boolean {
   const transcript = normalizedTranscript(authoritativePartialTranscript);
-  const trustedQuestionFinal = trustedBrowserFinal
-    && !isUnfinishedPartial(transcript)
-    && isClearCompleteQuestion(transcript);
+  const trustedQuestionFinal = isTrustedBrowserFinalQuestionEndpoint(transcript, trustedBrowserFinal);
   const silenceMs = trustedQuestionFinal
     ? LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS
     : liveEndpointSilenceMs(transcript);
   return state.spoke
     && now - state.lastVoice > silenceMs;
+}
+
+/** True only for the narrow browser-final policy allowed to shorten a live turn. */
+export function isTrustedBrowserFinalQuestionEndpoint(
+  transcript: string | undefined,
+  trustedBrowserFinal: boolean,
+): boolean {
+  const normalized = normalizedTranscript(transcript);
+  return trustedBrowserFinal
+    && !isUnfinishedPartial(normalized)
+    && isClearCompleteQuestion(normalized);
 }
 
 const READ_ONLY_RESEARCH_INTENT = /\b(?:research|look up|find out|investigate|compare|explain|tell me about|what|why|how|who|where|when|which)\b/i;

@@ -22,6 +22,7 @@ import { POST } from "./route";
 const metric = {
   turnId: "voice-123",
   transcriptSource: "server",
+  endpointStrategy: "standard",
   researchState: "promoted",
   researchSourceCount: 3,
   outcome: "audible",
@@ -58,6 +59,12 @@ describe("voice metrics API", () => {
 
   it("rejects unexpected text fields before they can become telemetry", async () => {
     const response = await POST(request({ ...metric, transcript: "private speech" }));
+    expect(response.status).toBe(400);
+    expect(mock.controlMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts only the two endpoint categories used for latency comparison", async () => {
+    const response = await POST(request({ ...metric, endpointStrategy: "fingerprint-me" }));
     expect(response.status).toBe(400);
     expect(mock.controlMutation).not.toHaveBeenCalled();
   });

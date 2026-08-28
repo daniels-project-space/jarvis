@@ -12,6 +12,7 @@ export const VOICE_TURN_METRIC_POLICY = Object.freeze({
 });
 
 export type VoiceTranscriptSource = "browser-final" | "server";
+export type VoiceEndpointStrategy = "standard" | "trusted-browser-final";
 export type VoiceResearchState = "none" | "ready" | "discarded" | "promoted";
 export type VoiceTurnOutcome = "queued" | "audible" | "failed";
 
@@ -23,6 +24,7 @@ export type VoiceTurnTrace = {
   queuedAt?: number;
   firstAudioAt?: number;
   transcriptSource?: VoiceTranscriptSource;
+  endpointStrategy?: VoiceEndpointStrategy;
   researchState?: VoiceResearchState;
   researchSourceCount?: number;
 };
@@ -30,6 +32,7 @@ export type VoiceTurnTrace = {
 export type VoiceTurnMetric = {
   turnId: string;
   transcriptSource: VoiceTranscriptSource;
+  endpointStrategy: VoiceEndpointStrategy;
   researchState: VoiceResearchState;
   researchSourceCount: number;
   outcome: VoiceTurnOutcome;
@@ -75,6 +78,7 @@ export function buildVoiceTurnMetric(trace: VoiceTurnTrace, outcome: VoiceTurnOu
   return {
     turnId,
     transcriptSource: trace.transcriptSource ?? "server",
+    endpointStrategy: trace.endpointStrategy ?? "standard",
     researchState: trace.researchState ?? "none",
     researchSourceCount: boundedCount(trace.researchSourceCount),
     outcome,

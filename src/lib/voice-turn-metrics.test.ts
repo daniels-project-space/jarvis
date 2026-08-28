@@ -15,11 +15,13 @@ describe("voice-turn metrics", () => {
       queuedAt: 1_500,
       firstAudioAt: 2_100,
       transcriptSource: "browser-final",
+      endpointStrategy: "trusted-browser-final",
       researchState: "promoted",
       researchSourceCount: 20,
     }, "audible")).toEqual({
       turnId: "voice-1",
       transcriptSource: "browser-final",
+      endpointStrategy: "trusted-browser-final",
       researchState: "promoted",
       researchSourceCount: 12,
       outcome: "audible",
@@ -53,6 +55,7 @@ describe("voice-turn metrics", () => {
     const base: VoiceTurnMetric = {
       turnId: "voice-0",
       transcriptSource: "server",
+      endpointStrategy: "standard",
       researchState: "none",
       researchSourceCount: 0,
       outcome: "queued",

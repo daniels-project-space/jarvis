@@ -26,6 +26,7 @@ afterEach(() => {
 const metric = {
   turnId: "voice-1",
   transcriptSource: "server" as const,
+  endpointStrategy: "standard" as const,
   researchState: "promoted" as const,
   researchSourceCount: 3,
   outcome: "queued" as const,

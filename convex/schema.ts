@@ -205,6 +205,7 @@ export default defineSchema({
   voiceTurnMetrics: defineTable({
     turnId: v.string(),
     transcriptSource: v.union(v.literal("browser-final"), v.literal("server")),
+    endpointStrategy: v.optional(v.union(v.literal("standard"), v.literal("trusted-browser-final"))),
     researchState: v.union(v.literal("none"), v.literal("ready"), v.literal("discarded"), v.literal("promoted")),
     researchSourceCount: v.number(),
     outcome: v.union(v.literal("queued"), v.literal("audible"), v.literal("failed")),

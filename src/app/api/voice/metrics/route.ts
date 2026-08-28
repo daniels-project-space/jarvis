@@ -9,7 +9,7 @@ function parseMetric(value: unknown): VoiceTurnMetric | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const metric = value as Record<string, unknown>;
   const expected = [
-    "turnId", "transcriptSource", "researchState", "researchSourceCount", "outcome",
+    "turnId", "transcriptSource", "endpointStrategy", "researchState", "researchSourceCount", "outcome",
     "captureToSpeechClosedMs", "speechClosedToTranscriptMs", "transcriptToQueuedMs",
     "queuedToFirstAudioMs", "captureToFirstAudioMs",
   ];
@@ -17,6 +17,7 @@ function parseMetric(value: unknown): VoiceTurnMetric | null {
   if (
     typeof metric.turnId !== "string"
     || (metric.transcriptSource !== "browser-final" && metric.transcriptSource !== "server")
+    || (metric.endpointStrategy !== "standard" && metric.endpointStrategy !== "trusted-browser-final")
     || !["none", "ready", "discarded", "promoted"].includes(String(metric.researchState))
     || typeof metric.researchSourceCount !== "number"
     || !["queued", "audible", "failed"].includes(String(metric.outcome))
