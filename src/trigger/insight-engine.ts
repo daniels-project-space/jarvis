@@ -50,10 +50,11 @@ export const insightEngine = schedules.task({
       m("jobs:reapStale").catch(() => ({ requeued: [], abandoned: [] })),
       m("chatQueue:reapStuck").catch(() => ({ requeued: 0 })),
     ]);
-    const [state, pendingFiles, expiredUploads] = await Promise.all([
+    const [state, pendingFiles, expiredUploads, pendingCreationAssets] = await Promise.all([
       m("proactive:reconcile", { now: Date.now() }),
       q("files:pendingIngest", { limit: 4 }).catch(() => []),
       m("files:cleanupExpiredReservations", { limit: 2 }).catch(() => []),
+      q("creationAssetCleanup:pending", { limit: 4 }).catch(() => []),
     ]);
     const recoveryWindow = Math.floor(Date.now() / (2 * 60 * 60_000));
     const ingestRecoveries = [];
@@ -80,6 +81,17 @@ export const insightEngine = schedules.task({
         { idempotencyKey: `jarvis-file-cleanup-reconcile-${fileId}-${recoveryWindow}` },
       ).catch(() => null));
     }
+    const creationAssetCleanupRecoveries = [];
+    for (const item of Array.isArray(pendingCreationAssets) ? pendingCreationAssets.slice(0, 4) : []) {
+      const assetR2Key = typeof item?.assetR2Key === "string" ? item.assetR2Key : "";
+      const assetId = assetR2Key.split("/")[3] ?? "";
+      if (!assetR2Key || !assetId) continue;
+      creationAssetCleanupRecoveries.push(await tasks.trigger(
+        "jarvis-creation-asset-cleanup",
+        { assetR2Key },
+        { idempotencyKey: `jarvis-creation-asset-cleanup-reconcile-${assetId}-${recoveryWindow}` },
+      ).catch(() => null));
+    }
     const shouldWake =
       Number(state?.eligiblePending ?? 0) > 0 ||
       (Array.isArray(reaped?.requeued) && reaped.requeued.length > 0) ||
@@ -102,6 +114,7 @@ export const insightEngine = schedules.task({
       stalled: reaped?.stalled?.length ?? 0,
       fileIngestRecoveries: ingestRecoveries.filter(Boolean).length,
       fileCleanupRecoveries: cleanupRecoveries.filter(Boolean).length,
+      creationAssetCleanupRecoveries: creationAssetCleanupRecoveries.filter(Boolean).length,
     };
   },
 });

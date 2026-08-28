@@ -2523,7 +2523,33 @@ export default defineSchema({
     .index("by_thread", ["threadId", "updatedAt"])
     .index("by_url", ["url", "updatedAt"])
     .index("by_thumb", ["thumb", "updatedAt"])
+    .index("by_assetR2Key", ["assetR2Key"])
     .index("by_updatedAt", ["updatedAt"]),
+
+  // A private creation asset first receives a bounded writer lease before its
+  // R2 PUT. This is the transaction fence between object storage and creation
+  // metadata: a worker may only clean an expired lease, while an unreferenced
+  // record remains nonterminal for later R2 sweeps until a creation commits.
+  creationAssetCleanupIntents: defineTable({
+    assetR2Key: v.string(),
+    // `writerEpoch` fences one exact producer attempt. The durable intent is
+    // deliberately retained after cleanup because an accepted R2 PUT can
+    // emerge after the producer has stopped observing its request.
+    writerEpoch: v.optional(v.string()),
+    // Retained only for a rolling deployment with the earlier producer. They
+    // are advisory; cleanup never terminalizes based on either timestamp.
+    writerDeadlineAt: v.optional(v.number()),
+    writeRecoveryEndsAt: v.optional(v.number()),
+    recoveryKind: v.optional(v.string()), // write | deletion
+    state: v.string(), // writing | cleanup_ready | cleanup_claimed | cleanup_sweep; cleaned is legacy-reaped
+    nextActionAt: v.number(),
+    cleanupClaimToken: v.optional(v.string()),
+    cleanupClaimExpiresAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_assetR2Key", ["assetR2Key"])
+    .index("by_state_action", ["state", "nextActionAt"]),
 
   // Conversational travel remains deliberately separate from Daniel's saved
   // creations until he explicitly locks a reviewed plan. `data` is a bounded

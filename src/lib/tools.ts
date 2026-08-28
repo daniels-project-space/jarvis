@@ -10,10 +10,10 @@ import {
 } from "./hub-actions";
 import {
   creationMediaUrl,
-  deletePrivateCreationAsset,
   putPrivateCreationAsset,
   storePrivateCreationAssetFromUrl,
 } from "./creation-assets";
+import { writePrivateCreationAssetWithRecord } from "./private-creation-asset-write";
 import { listBrowserCredentials, runApprovedErrand } from "./browser-errand";
 import { renderMindMapSvg } from "./mind-map-artifact";
 import { privateR2Get } from "./private-r2";
@@ -3404,6 +3404,17 @@ async function deliberateTool(args: any): Promise<string> {
   );
 }
 
+function privateCreationAssetLifecycle() {
+  return {
+    reserve: async (assetR2Key: string, writerEpoch: string) => await convexMutation("creationAssetCleanup:reserve", { assetR2Key, writerEpoch }),
+    renewForWrite: async (assetR2Key: string, writerEpoch: string) => await convexMutation("creationAssetCleanup:renewForWrite", { assetR2Key, writerEpoch }),
+    markWritten: async (assetR2Key: string, writerEpoch: string) => await convexMutation("creationAssetCleanup:markWritten", { assetR2Key, writerEpoch }),
+    abandon: async (assetR2Key: string, writerEpoch: string) => await convexMutation("creationAssetCleanup:abandon", { assetR2Key, writerEpoch }),
+    complete: async (assetR2Key: string) => await convexMutation("creationAssetCleanup:complete", { assetR2Key }),
+    findCreationByAssetR2Key: async (assetR2Key: string) => await convexQuery("creations:getByAssetR2Key", { assetR2Key }),
+  };
+}
+
 // Z-Image Turbo via Novita — generated art is re-homed to R2 (provider URLs
 // die in 48h) and saved in the creations library.
 async function createImage(args: any): Promise<string> {
@@ -3437,32 +3448,26 @@ async function createImage(args: any): Promise<string> {
   }
   if (!imageUrl) return "Image generation timed out after 30s — try again.";
   const title = String(args.title ?? prompt.slice(0, 60));
-  let asset: Awaited<ReturnType<typeof storePrivateCreationAssetFromUrl>>;
-  try {
-    asset = await storePrivateCreationAssetFromUrl(imageUrl);
-  } catch (e: any) {
+  const filing = await creationFiling(args);
+  const saved = await writePrivateCreationAssetWithRecord({
+    writeAsset: async (assetId, beforeR2Write) => await storePrivateCreationAssetFromUrl(imageUrl, "asset", assetId, { beforeR2Write }),
+    persistCreation: async (asset, assetWriteEpoch) => await convexMutation("creations:create", {
+      kind: "image", title, assetR2Key: asset.key, assetContentType: asset.contentType, assetWriteEpoch, data: prompt, ...filing,
+    }),
+    lifecycle: privateCreationAssetLifecycle(),
+  });
+  if (!saved.ok) {
     // A provider URL is short-lived and must never be passed off as a saved
-    // Jarvis creation. Keep the incident signal, but fail the durable flow.
+    // Jarvis creation. The durable write intent will now reconcile the R2
+    // object instead of risking deletion after an ambiguous Convex commit.
     await convexMutation("incidents:report", {
       source: "tools",
-      signature: "private-r2:create-image-store",
-      message: `Private R2 re-home of generated image failed: ${String(e?.message ?? e).slice(0, 200)}`,
+      signature: `private-r2:create-image-${saved.stage}`,
+      message: `Generated image storage/creation was not verified: ${String(saved.error instanceof Error ? saved.error.message : saved.error).slice(0, 200)}`,
     }).catch(() => {});
-    return "Image generation completed, but durable storage failed. It was not saved to the creations library and no download card was posted.";
+    return "Image generation completed, but its creations-library record could not be verified. Private storage is fenced for safe recovery and no download card was posted.";
   }
-  const filing = await creationFiling(args);
-  let creationId: unknown;
-  try {
-    creationId = await convexMutation("creations:create", {
-      kind: "image", title, assetR2Key: asset.key, assetContentType: asset.contentType, data: prompt, ...filing,
-    });
-    if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
-  } catch {
-    // Only delete the fresh private object we just created. Without a library
-    // row it is undiscoverable and must not become a false "saved" artifact.
-    await deletePrivateCreationAsset(asset).catch(() => undefined);
-    return "Image generated, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
-  }
+  const creationId = saved.creationId;
   const mediaUrl = creationMediaUrl(creationId);
   const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
   let panelShown = true;
@@ -3490,20 +3495,18 @@ async function storeImage(args: any): Promise<string> {
   if (!/^https?:\/\//.test(url)) return "Give me a valid image URL.";
   const title = String(args.title ?? "stored image").slice(0, 80);
   try {
-    const asset = await storePrivateCreationAssetFromUrl(url);
     const filing = await creationFiling(args);
-    let creationId: unknown;
-    try {
-      creationId = await convexMutation("creations:create", {
-        kind: "image", title, assetR2Key: asset.key, assetContentType: asset.contentType, ...filing,
-      });
-      if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
-    } catch {
-      // The private object is fresh and undiscoverable without a library row;
-      // never leave it behind while claiming that this image was saved.
-      await deletePrivateCreationAsset(asset).catch(() => undefined);
-      return "The image was copied, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
+    const saved = await writePrivateCreationAssetWithRecord({
+      writeAsset: async (assetId, beforeR2Write) => await storePrivateCreationAssetFromUrl(url, "asset", assetId, { beforeR2Write }),
+      persistCreation: async (asset, assetWriteEpoch) => await convexMutation("creations:create", {
+        kind: "image", title, assetR2Key: asset.key, assetContentType: asset.contentType, assetWriteEpoch, ...filing,
+      }),
+      lifecycle: privateCreationAssetLifecycle(),
+    });
+    if (!saved.ok) {
+      return "The image was copied, but its creations-library record could not be verified. Private storage is fenced for safe recovery and no download card was posted.";
     }
+    const creationId = saved.creationId;
     const mediaUrl = creationMediaUrl(creationId);
     const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
     try {
@@ -3526,18 +3529,18 @@ async function createPdf(args: any): Promise<string> {
   try {
     const { markdownToPdf } = await import("./pdf");
     const bytes = await markdownToPdf(title, md.slice(0, 30_000));
-    const asset = await putPrivateCreationAsset(bytes, "application/pdf");
     const filing = await creationFiling(args);
-    let creationId: unknown;
-    try {
-      creationId = await convexMutation("creations:create", {
-        kind: "pdf", title, assetR2Key: asset.key, assetContentType: asset.contentType, data: md.slice(0, 20_000), ...filing,
-      });
-      if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
-    } catch {
-      await deletePrivateCreationAsset(asset).catch(() => undefined);
-      return "PDF was rendered, but its creations-library record could not be saved. The fresh storage object was cleaned up and no download card was posted.";
+    const saved = await writePrivateCreationAssetWithRecord({
+      writeAsset: async (assetId, beforeR2Write) => await putPrivateCreationAsset(bytes, "application/pdf", "asset", assetId, { beforeR2Write }),
+      persistCreation: async (asset, assetWriteEpoch) => await convexMutation("creations:create", {
+        kind: "pdf", title, assetR2Key: asset.key, assetContentType: asset.contentType, assetWriteEpoch, data: md.slice(0, 20_000), ...filing,
+      }),
+      lifecycle: privateCreationAssetLifecycle(),
+    });
+    if (!saved.ok) {
+      return "PDF was rendered, but its creations-library record could not be verified. Private storage is fenced for safe recovery and no download card was posted.";
     }
+    const creationId = saved.creationId;
     const mediaUrl = creationMediaUrl(creationId);
     const downloadUrl = `/api/creation-download?id=${encodeURIComponent(creationId)}`;
     let panelShown = true;
@@ -3711,27 +3714,26 @@ async function mindMap(args: any, invocationContext?: ToolInvocationContext): Pr
     } catch {
       panelShown = false;
     }
-    let asset: Awaited<ReturnType<typeof putPrivateCreationAsset>>;
-    try {
-      asset = await putPrivateCreationAsset(renderMindMapSvg(doc), "image/svg+xml");
-    } catch {
-      return `Mind map "${title}" is saved${panelShown ? " and live on screen" : ", but it could not be shown on screen"}, but its private image snapshot could not be created. No download card was posted.`;
-    }
-    let artifactId: unknown;
-    try {
-      artifactId = await convexMutation("creations:create", {
+    const saved = await writePrivateCreationAssetWithRecord({
+      writeAsset: async (assetId, beforeR2Write) => await putPrivateCreationAsset(renderMindMapSvg(doc), "image/svg+xml", "asset", assetId, { beforeR2Write }),
+      persistCreation: async (asset, assetWriteEpoch) => await convexMutation("creations:create", {
         kind: "image",
         title: `${title} · mind map`,
         data: JSON.stringify({ sourceCreationId: id, format: "svg", type: "mind_map_snapshot" }),
         assetR2Key: asset.key,
         assetContentType: asset.contentType,
+        assetWriteEpoch,
         ...filing,
-      });
-      if (typeof artifactId !== "string" || !artifactId) throw new Error("creation persistence returned no id");
-    } catch {
-      await deletePrivateCreationAsset(asset).catch(() => undefined);
-      return `Mind map "${title}" is saved${panelShown ? " and live on screen" : ", but it could not be shown on screen"}, but its image snapshot could not be saved. The fresh private image was cleaned up and no download card was posted.`;
+      }),
+      lifecycle: privateCreationAssetLifecycle(),
+    });
+    if (!saved.ok) {
+      const detail = saved.stage === "asset_write"
+        ? "its private image snapshot could not be created"
+        : "its image snapshot could not be verified";
+      return `Mind map "${title}" is saved${panelShown ? " and live on screen" : ", but it could not be shown on screen"}, but ${detail}. Private storage is fenced for safe recovery and no download card was posted.`;
     }
+    const artifactId = saved.creationId;
     const mediaUrl = creationMediaUrl(artifactId);
     const downloadUrl = `/api/creation-download?id=${encodeURIComponent(artifactId)}`;
     try {

@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { type Id } from "./_generated/dataModel";
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { inferCreationFiling } from "./creationFiling";
 import { linkExplicitFilesToCreation, linkMessageFilesToCreation } from "./fileHelpers";
@@ -21,8 +21,12 @@ function creationMediaUrl(id: Id<"creations">): string {
   return `/api/creation-media?id=${encodeURIComponent(String(id))}&variant=asset`;
 }
 
-function isPrivateCreationAssetKey(value: string | undefined): value is string {
+export function isPrivateCreationAssetKey(value: string | undefined): value is string {
   return Boolean(value && /^owners\/daniel\/creations\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/asset$/i.test(value));
+}
+
+function isCreationAssetWriterEpoch(value: string | undefined): value is string {
+  return Boolean(value && /^[a-zA-Z0-9_-]{16,120}$/.test(value));
 }
 
 export function viewerCreation(row: any) {
@@ -250,6 +254,25 @@ export const getForMedia = query({
   },
 });
 
+// This lookup is intentionally narrower than `getForMedia`: recovery needs
+// only a durable creation receipt, never the private object coordinate or the
+// rest of the library row. It is owner/worker-only so an opaque asset key is
+// never an unauthenticated existence oracle.
+export const getByAssetR2Key = query({
+  args: { assetR2Key: v.string(), ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    if (!isPrivateCreationAssetKey(a.assetR2Key)) {
+      throw new ConvexError({ code: "INVALID_CREATION_ASSET_KEY", message: "Private creation asset identity is invalid" });
+    }
+    const row = await ctx.db
+      .query("creations")
+      .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", a.assetR2Key))
+      .first();
+    return row ? String(row._id) : null;
+  },
+});
+
 // Find the most recently touched creation (optionally by kind/title match) —
 // lets the brain say "add X to the mind map" without tracking ids.
 export const latest = query({
@@ -276,6 +299,7 @@ export const create = mutation({
     thumb: v.optional(v.string()),
     assetR2Key: v.optional(v.string()),
     assetContentType: v.optional(v.string()),
+    assetWriteEpoch: v.optional(v.string()),
     category: v.optional(v.string()),
     folder: v.optional(v.string()),
     project: v.optional(v.string()),
@@ -293,6 +317,58 @@ export const create = mutation({
     if (a.assetContentType !== undefined && !a.assetR2Key) {
       throw new Error("private creation asset content type requires an asset key");
     }
+    if (a.assetWriteEpoch !== undefined && (!a.assetR2Key || !isCreationAssetWriterEpoch(a.assetWriteEpoch))) {
+      throw new Error("private creation asset writer epoch is invalid");
+    }
+    // A lost response is indistinguishable from a rejected request to a
+    // caller. For a private asset, the exact authenticated owner + opaque key
+    // is therefore the durable idempotency identity—not title, route, or any
+    // caller-controlled request body that could accidentally merge work.
+    if (a.assetR2Key) {
+      const existing = await ctx.db
+        .query("creations")
+        .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", a.assetR2Key))
+        .first();
+      if (existing) {
+        const staleIntent = await ctx.db
+          .query("creationAssetCleanupIntents")
+          .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", a.assetR2Key))
+          .first();
+        if (staleIntent) await ctx.db.delete(staleIntent._id);
+        return existing._id;
+      }
+    }
+    const now = Date.now();
+    const assetIntent = a.assetR2Key
+      ? await ctx.db
+        .query("creationAssetCleanupIntents")
+        .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", a.assetR2Key))
+        .first()
+      : null;
+    if (assetIntent) {
+      // Cleanup owns every state except a live writer lease. Refusing a late
+      // commit is what prevents a delayed request from creating a row after
+      // recovery has deleted its private object.
+      if (
+        assetIntent.state !== "writing"
+        || assetIntent.recoveryKind === "deletion"
+        || assetIntent.writerEpoch !== a.assetWriteEpoch
+        || Number(assetIntent.nextActionAt) <= now
+      ) {
+        throw new ConvexError({
+          code: "CREATION_ASSET_RECOVERY_OWNED",
+          message: "Private creation asset is no longer writable",
+        });
+      }
+    } else if (a.assetR2Key && a.assetWriteEpoch) {
+      // New producers never write without a reservation. Legacy producers
+      // omit the epoch during a staged Convex rollout and retain their old
+      // behavior; an epoch-bearing request fails closed if its fence vanished.
+      throw new ConvexError({
+        code: "CREATION_ASSET_RESERVATION_MISSING",
+        message: "Private creation asset reservation is unavailable",
+      });
+    }
     const filing = inferCreationFiling(a);
     const creationId = await ctx.db.insert("creations", {
       kind: a.kind,
@@ -305,11 +381,15 @@ export const create = mutation({
       ...filing,
       threadId: a.threadId?.slice(0, 120),
       sourceFiles: a.sourceFiles,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
     });
     await linkExplicitFilesToCreation(ctx, creationId, a.sourceFiles);
     await linkMessageFilesToCreation(ctx, creationId, a.sourceMessageId);
+    // The asset write intent and creation insert are one Convex transaction.
+    // A cleanup claim that races this mutation retries and observes either the
+    // committed creation or its own cleanup ownership, never a half-state.
+    if (assetIntent) await ctx.db.delete(assetIntent._id);
     return creationId;
   },
 });
@@ -788,6 +868,36 @@ export const remove = mutation({
     if (!creation) return true;
     const refs = await ctx.db.query("creationFileRefs").withIndex("by_creation", (q) => q.eq("creationId", a.id)).collect();
     for (const ref of refs) await ctx.db.delete(ref._id);
+    if (isPrivateCreationAssetKey(creation.assetR2Key)) {
+      // Deleting R2 before this metadata mutation can leave a committed row
+      // pointing to a missing asset when its response is lost. Put a durable
+      // cleanup intent in the same transaction as removal instead: from this
+      // point forward the worker may delete only after rechecking that no
+      // canonical creation still references the opaque key.
+      const now = Date.now();
+      const existingIntent = await ctx.db
+        .query("creationAssetCleanupIntents")
+        .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", creation.assetR2Key))
+        .first();
+      if (existingIntent) {
+        await ctx.db.patch(existingIntent._id, {
+          state: "cleanup_ready",
+          nextActionAt: now,
+          cleanupClaimToken: undefined,
+          cleanupClaimExpiresAt: undefined,
+          updatedAt: now,
+        });
+      } else {
+        await ctx.db.insert("creationAssetCleanupIntents", {
+          assetR2Key: creation.assetR2Key,
+          recoveryKind: "deletion",
+          state: "cleanup_ready",
+          nextActionAt: now,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
     await ctx.db.delete(a.id);
     return true;
   },

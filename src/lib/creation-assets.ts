@@ -13,7 +13,14 @@ export type PrivateCreationAsset = Readonly<{
   contentType: string;
 }>;
 
-type CreationAssetBody = Uint8Array | ArrayBuffer | string;
+export type CreationAssetBody = Uint8Array | ArrayBuffer | string;
+
+// The shared creation-record fence supplies this immediately before the R2
+// PUT—not before any provider download or rendering work—so Convex can fence
+// creation metadata if the writer loses its bounded lease.
+export type PrivateCreationAssetWriteFence = Readonly<{
+  beforeR2Write?: () => Promise<void>;
+}>;
 
 function bodySizeBytes(body: CreationAssetBody): number {
   if (typeof body === "string") return Buffer.byteLength(body, "utf8");
@@ -80,10 +87,13 @@ export async function putPrivateCreationAsset(
   body: CreationAssetBody,
   contentType: string,
   purpose: PrivateCreationObjectPurpose = "asset",
+  assetId: string = randomUUID(),
+  fence?: PrivateCreationAssetWriteFence,
 ): Promise<PrivateCreationAsset> {
   assertAssetSize(body);
-  const key = privateCreationObjectKey(randomUUID(), purpose);
+  const key = privateCreationObjectKey(assetId, purpose);
   const normalizedContentType = normalizeUploadMime(contentType);
+  await fence?.beforeR2Write?.();
   await privateR2Put(key, body, normalizedContentType);
   return { key, contentType: normalizedContentType };
 }
@@ -94,6 +104,8 @@ export async function putPrivateCreationAsset(
 export async function storePrivateCreationAssetFromUrl(
   sourceUrl: string,
   purpose: PrivateCreationObjectPurpose = "asset",
+  assetId: string = randomUUID(),
+  fence?: PrivateCreationAssetWriteFence,
 ): Promise<PrivateCreationAsset> {
   const source = externalHttpUrl(sourceUrl);
   // Do not follow a provider-controlled redirect into an unexpected network
@@ -106,7 +118,13 @@ export async function storePrivateCreationAssetFromUrl(
     throw new Error("creation asset too large (30MB cap)");
   }
   const bytes = await readResponseBodyWithinAssetLimit(response);
-  return await putPrivateCreationAsset(bytes, response.headers.get("content-type") ?? "application/octet-stream", purpose);
+  return await putPrivateCreationAsset(
+    bytes,
+    response.headers.get("content-type") ?? "application/octet-stream",
+    purpose,
+    assetId,
+    fence,
+  );
 }
 
 export async function deletePrivateCreationAsset(asset: PrivateCreationAsset | string): Promise<void> {

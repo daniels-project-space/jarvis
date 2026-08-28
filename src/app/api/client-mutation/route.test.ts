@@ -6,6 +6,7 @@ const mock = vi.hoisted(() => ({
   controlMutation: vi.fn(),
   controlQuery: vi.fn(),
   privateR2Delete: vi.fn(),
+  schedulePrivateCreationAssetCleanup: vi.fn(),
   controlActor: vi.fn(async () => ({ kind: "owner", authTokenHash: "owner-hash" })),
   credentials: vi.fn(() => ({ authTokenHash: "owner-hash" })),
   isOwner: vi.fn(() => true),
@@ -16,7 +17,12 @@ vi.mock("@/lib/control-session", () => ({
   controlQuery: mock.controlQuery,
   isSameOriginRequest: mock.sameOrigin,
 }));
-vi.mock("@/lib/private-r2", () => ({ privateR2Delete: mock.privateR2Delete }));
+vi.mock("@/lib/private-creation-asset-write", () => ({
+  schedulePrivateCreationAssetCleanup: mock.schedulePrivateCreationAssetCleanup,
+}));
+vi.mock("@/lib/private-r2", () => ({
+  privateR2Delete: mock.privateR2Delete,
+}));
 vi.mock("@/lib/request-auth", () => ({
   controlActor: mock.controlActor,
   controlCredentials: mock.credentials,
@@ -40,7 +46,13 @@ beforeEach(() => {
   mock.credentials.mockReturnValue({ authTokenHash: "owner-hash" });
   mock.isOwner.mockReturnValue(true);
   mock.controlMutation.mockResolvedValue(true);
-  mock.controlQuery.mockResolvedValue(null);
+  mock.controlQuery.mockImplementation(async (path: string) => {
+    if (path === "creationAssetCleanup:protocol") {
+      return { cleanupProtocol: "nonterminal-reaper-v1" };
+    }
+    return null;
+  });
+  mock.schedulePrivateCreationAssetCleanup.mockResolvedValue(undefined);
   mock.privateR2Delete.mockResolvedValue(undefined);
 });
 
@@ -70,9 +82,11 @@ describe("browser errand owner decision boundary", () => {
     expect(mock.controlMutation).not.toHaveBeenCalled();
   });
 
-  it("removes the exact authenticated private asset before finalizing a creation deletion", async () => {
+  it("atomically removes private-asset metadata before accelerating durable cleanup", async () => {
     const assetR2Key = "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset";
-    mock.controlQuery.mockResolvedValue({ assetR2Key });
+    mock.controlQuery.mockImplementation(async (path: string) => path === "creations:getForMedia"
+      ? { assetR2Key }
+      : { cleanupProtocol: "nonterminal-reaper-v1" });
 
     const response = await POST(request({
       path: "creations:remove",
@@ -85,26 +99,32 @@ describe("browser errand owner decision boundary", () => {
       id: "creation-1",
       authTokenHash: "owner-hash",
     });
-    expect(mock.privateR2Delete).toHaveBeenCalledWith(assetR2Key);
+    expect(mock.controlQuery).toHaveBeenCalledWith("creationAssetCleanup:protocol", {
+      authTokenHash: "owner-hash",
+    });
     expect(mock.controlMutation).toHaveBeenCalledWith("creations:remove", {
       id: "creation-1",
       authTokenHash: "owner-hash",
     });
+    expect(mock.schedulePrivateCreationAssetCleanup).toHaveBeenCalledWith(assetR2Key);
   });
 
-  it("keeps creation metadata intact when private asset deletion fails", async () => {
-    mock.controlQuery.mockResolvedValue({
-      assetR2Key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
-    });
-    mock.privateR2Delete.mockRejectedValue(new Error("R2 unavailable"));
+  it("keeps deletion durable when immediate cleanup dispatch is unavailable", async () => {
+    mock.controlQuery.mockImplementation(async (path: string) => path === "creations:getForMedia"
+      ? { assetR2Key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset" }
+      : { cleanupProtocol: "nonterminal-reaper-v1" });
+    mock.schedulePrivateCreationAssetCleanup.mockRejectedValue(new Error("Trigger unavailable"));
 
     const response = await POST(request({
       path: "creations:remove",
       args: { id: "creation-1" },
     }));
 
-    expect(response.status).toBe(409);
-    expect(mock.controlMutation).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(mock.controlMutation).toHaveBeenCalledWith("creations:remove", {
+      id: "creation-1",
+      authTokenHash: "owner-hash",
+    });
   });
 
   it("keeps legacy metadata-only creations removable without inventing an R2 key", async () => {
@@ -114,7 +134,7 @@ describe("browser errand owner decision boundary", () => {
     }));
 
     expect(response.status).toBe(200);
-    expect(mock.privateR2Delete).not.toHaveBeenCalled();
+    expect(mock.schedulePrivateCreationAssetCleanup).not.toHaveBeenCalled();
     expect(mock.controlMutation).toHaveBeenCalledWith("creations:remove", {
       id: "creation-legacy",
       authTokenHash: "owner-hash",
@@ -125,6 +145,7 @@ describe("browser errand owner decision boundary", () => {
     const assetR2Key = "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset";
     mock.controlQuery
       .mockResolvedValueOnce({ assetR2Key })
+      .mockResolvedValueOnce({ cleanupProtocol: "nonterminal-reaper-v1" })
       .mockResolvedValueOnce(null);
     // Model a connection loss after Convex applied the idempotent deletion.
     mock.controlMutation.mockRejectedValueOnce(new Error("response lost"));
@@ -136,9 +157,27 @@ describe("browser errand owner decision boundary", () => {
     const retry = await POST(request({ path: "creations:remove", args: { id: "creation-1" } }));
     expect(retry.status).toBe(200);
     await expect(retry.json()).resolves.toEqual({ ok: true, value: true });
-    expect(mock.privateR2Delete).toHaveBeenCalledOnce();
-    expect(mock.privateR2Delete).toHaveBeenCalledWith(assetR2Key);
+    expect(mock.schedulePrivateCreationAssetCleanup).not.toHaveBeenCalled();
     expect(mock.controlMutation).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed before deletion when Vercel reaches the old Convex contract", async () => {
+    const assetR2Key = "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset";
+    mock.controlQuery
+      .mockResolvedValueOnce({ assetR2Key })
+      // The old Convex deployment has no `creationAssetCleanup:protocol`
+      // function, so this capability request rejects before metadata changes.
+      .mockRejectedValueOnce(new Error("Could not find public function"));
+
+    const response = await POST(request({ path: "creations:remove", args: { id: "creation-1" } }));
+
+    expect(response.status).toBe(409);
+    expect(mock.controlMutation).not.toHaveBeenCalled();
+    expect(mock.schedulePrivateCreationAssetCleanup).not.toHaveBeenCalled();
+    // The current route has no direct R2 delete path. Keep this assertion so
+    // a future refactor cannot reintroduce the legacy delete-before-Convex
+    // sequence beneath the old-Convex capability bridge.
+    expect(mock.privateR2Delete).not.toHaveBeenCalled();
   });
 
   it("rejects a non-owner or cross-origin request before it reaches Convex", async () => {
