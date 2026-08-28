@@ -440,6 +440,8 @@ export async function scoutTrip(a: {
   reuseId?: string; // populate the exact already-open workspace only
   reuseStorage?: TripStorage;
   sourceMessageId?: string;
+  /** Trusted chat provenance for a newly opened workspace. */
+  threadId?: string;
 }): Promise<TripRecord> {
   const nights = Math.max(1, Math.round((Date.parse(a.returnDate) - Date.parse(a.departDate)) / 86_400_000));
   // Budget shaping: stays get ~45% of total budget unless caller overrides.
@@ -471,6 +473,7 @@ export async function scoutTrip(a: {
       departDate: a.departDate,
       returnDate: a.returnDate,
       sourceMessageId: a.sourceMessageId,
+      threadId: a.threadId,
     });
     id = opened.id;
     prior = opened.doc;
@@ -479,7 +482,9 @@ export async function scoutTrip(a: {
   if (!id) throw new Error("Trip workspace could not be created");
   const tripId = id;
   const priorActiveCity = prior ? activeTripCityContext(prior) : undefined;
-  const threadId = prior?.threadId || ((await convexQuery("ui:getActiveThread", {})) as string) || "main";
+  // A worker turn may finish after the owner has selected another chat. The
+  // turn's provenance, not that global UI selection, owns any new trip draft.
+  const threadId = prior?.threadId || a.threadId || ((await convexQuery("ui:getActiveThread", {})) as string) || "main";
   const preservePlan = Boolean(prior && prior.departDate === a.departDate && prior.returnDate === a.returnDate);
   const doc: TripDoc = {
     kind: "trip",

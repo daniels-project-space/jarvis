@@ -6,6 +6,8 @@ vi.mock("server-only", () => ({}));
 const mock = vi.hoisted(() => ({
   convexMutation: vi.fn(),
   convexQuery: vi.fn(),
+  openTrip: vi.fn(),
+  scoutTrip: vi.fn(),
   getTrip: vi.fn(),
   saveTrip: vi.fn(),
   computeTransfer: vi.fn(),
@@ -43,6 +45,8 @@ vi.mock("./google-calendar", () => ({
 vi.mock("./icloud-calendar", () => ({ createICloudEvent: vi.fn(), deleteICloudEvent: vi.fn(), findICloudEvents: vi.fn(), listICloudEvents: vi.fn() }));
 vi.mock("./openstreetmap", () => ({ searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces }));
 vi.mock("./travel", () => ({
+  openTrip: mock.openTrip,
+  scoutTrip: mock.scoutTrip,
   getTrip: mock.getTrip,
   saveTrip: mock.saveTrip,
   computeTransfer: mock.computeTransfer,
@@ -107,6 +111,12 @@ describe("trip itinerary tool actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
+    mock.openTrip.mockResolvedValue({ id: "draft-new", storage: "draft", doc: {} });
+    mock.scoutTrip.mockResolvedValue({
+      id: "draft-plan",
+      storage: "draft",
+      doc: { flights: [], stays: [], activities: [], providers: {} },
+    });
     mock.getTrip.mockResolvedValue({ id: "trip-1", doc });
     mock.scheduleTripDay.mockResolvedValue(routed);
     mock.addTripPlaceToDay.mockResolvedValue(routed);
@@ -147,6 +157,67 @@ describe("trip itinerary tool actions", () => {
       activityNames: ["Tile Museum", "Riverside Market"],
       times: ["10:00", "13:00"],
       mode: "walking",
+    }));
+  });
+
+  it("binds new trip workspaces to the triggering chat instead of the currently selected UI chat", async () => {
+    await executeTool("trip_open", { destination: "Tokyo", dest_iata: "HND" }, {
+      invocationContext: { threadId: "thread-origin", userMessageId: "message-origin" },
+    });
+    await executeTool("trip_plan", {
+      destination: "Tokyo",
+      dest_iata: "HND",
+      origin_iata: "LHR",
+      depart_date: "2030-09-10",
+      return_date: "2030-09-14",
+      adults: 1,
+      budget_total_gbp: 1500,
+      include_flights: true,
+    }, {
+      invocationContext: { threadId: "thread-origin", userMessageId: "message-origin" },
+    });
+
+    expect(mock.openTrip).toHaveBeenCalledWith(expect.objectContaining({
+      sourceMessageId: "message-origin",
+      threadId: "thread-origin",
+    }));
+    expect(mock.scoutTrip).toHaveBeenCalledWith(expect.objectContaining({
+      sourceMessageId: "message-origin",
+      threadId: "thread-origin",
+    }));
+  });
+
+  it("keeps a booking widget card in the triggering chat when the UI has moved elsewhere", async () => {
+    mock.convexQuery.mockImplementation(async (path: string) => path === "ui:getActiveThread" ? "thread-now-active" : null);
+    mock.convexMutation.mockResolvedValue(undefined);
+
+    await executeTool("bookings_check", { days: 30 }, {
+      invocationContext: { threadId: "thread-origin", userMessageId: "message-origin" },
+    });
+
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", expect.objectContaining({
+      threadId: "thread-origin",
+      type: "widget",
+    }));
+  });
+
+  it("keeps an existing trip's booking card in that trip's original chat", async () => {
+    const savedTrip = {
+      ...doc,
+      threadId: "thread-trip-origin",
+      departDate: "2030-09-10",
+      returnDate: "2030-09-14",
+    };
+    mock.getTrip.mockResolvedValueOnce({ id: "trip-1", doc: savedTrip, storage: "creation" });
+    mock.convexMutation.mockResolvedValue(undefined);
+
+    await executeTool("bookings_check", { creation_id: "trip-1", days: 30 }, {
+      invocationContext: { threadId: "thread-later-invocation", userMessageId: "message-later" },
+    });
+
+    expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", expect.objectContaining({
+      threadId: "thread-trip-origin",
+      type: "widget",
     }));
   });
 
@@ -342,7 +413,9 @@ describe("trip itinerary tool actions", () => {
     });
     vi.stubGlobal("fetch", hubFetch);
 
-    const result = await executeTool("travel_offline_maps_prepare", { draft_id: "draft-apple" });
+    const result = await executeTool("travel_offline_maps_prepare", { draft_id: "draft-apple" }, {
+      invocationContext: { threadId: "thread-origin", userMessageId: "message-origin" },
+    });
 
     expect(result).toContain("Apple Maps preflight is scheduled for Seville");
     expect(result).toContain("nothing has been written yet");
@@ -360,9 +433,10 @@ describe("trip itinerary tool actions", () => {
     });
     expect(mock.convexMutation).toHaveBeenCalledWith("reminders:add", expect.objectContaining({
       sourceKey: expect.stringMatching(/^[a-f0-9]{64}$/),
-      originThreadId: "thread-apple",
+      originThreadId: "thread-origin",
     }));
     expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", expect.objectContaining({
+      threadId: "thread-origin",
       type: "url",
       value: "https://maps.apple.com/search?query=Seville",
     }));
