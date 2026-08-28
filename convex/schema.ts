@@ -215,7 +215,8 @@ export default defineSchema({
     queuedToFirstAudioMs: v.optional(v.number()),
     captureToFirstAudioMs: v.optional(v.number()),
     updatedAt: v.number(),
-  }).index("by_turn", ["turnId"]),
+  }).index("by_turn", ["turnId"])
+    .index("by_updatedAt", ["updatedAt"]),
 
   // Storage-only archive from the pre-streaming chat transport (6 rows on the
   // canonical deployment at retirement). No runtime function reads/writes it;

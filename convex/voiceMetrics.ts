@@ -1,10 +1,11 @@
-import { mutation } from "./_generated/server";
+import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { actorAuthArgs, requireActor } from "./controlAuth";
+import { actorAuthArgs, requireActor, requireAdmin } from "./controlAuth";
 
 const TURN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const MAX_DURATION_MS = 10 * 60_000;
 const MAX_SOURCE_COUNT = 12;
+const SUMMARY_SAMPLE_LIMIT = 500;
 const OUTCOME_RANK = { queued: 0, failed: 1, audible: 2 } as const;
 
 const optionalDuration = v.optional(v.number());
@@ -24,6 +25,14 @@ const metricArgs = {
 
 function validDuration(value: number | undefined): boolean {
   return value === undefined || (Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= MAX_DURATION_MS);
+}
+
+function latencySummary(values: Array<number | undefined>) {
+  const sorted = values.filter((value): value is number => typeof value === "number").sort((a, b) => a - b);
+  const percentile = (fraction: number) => sorted.length === 0
+    ? null
+    : sorted[Math.ceil(sorted.length * fraction) - 1];
+  return { samples: sorted.length, p50Ms: percentile(0.5), p95Ms: percentile(0.95) };
 }
 
 /** Upserts privacy-safe performance counters for one owner voice turn. */
@@ -81,5 +90,45 @@ export const record = mutation({
       return existing._id;
     }
     return await ctx.db.insert("voiceTurnMetrics", incoming);
+  },
+});
+
+/**
+ * Owner-only, aggregate voice latency snapshot. It deliberately returns no
+ * turn IDs, timestamps, transcript text, source URLs, or device data.
+ */
+export const summary = query({
+  args: { authTokenHash: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.authTokenHash);
+    const rows = await ctx.db
+      .query("voiceTurnMetrics")
+      .withIndex("by_updatedAt")
+      .order("desc")
+      .take(SUMMARY_SAMPLE_LIMIT);
+    return {
+      sampleCount: rows.length,
+      sampleLimit: SUMMARY_SAMPLE_LIMIT,
+      outcomes: {
+        audible: rows.filter((row) => row.outcome === "audible").length,
+        failed: rows.filter((row) => row.outcome === "failed").length,
+        queued: rows.filter((row) => row.outcome === "queued").length,
+      },
+      transcriptSources: {
+        browserFinal: rows.filter((row) => row.transcriptSource === "browser-final").length,
+        server: rows.filter((row) => row.transcriptSource === "server").length,
+      },
+      endpointStrategies: {
+        standard: rows.filter((row) => row.endpointStrategy === "standard").length,
+        trustedBrowserFinal: rows.filter((row) => row.endpointStrategy === "trusted-browser-final").length,
+      },
+      latencies: {
+        captureToSpeechClosed: latencySummary(rows.map((row) => row.captureToSpeechClosedMs)),
+        speechClosedToTranscript: latencySummary(rows.map((row) => row.speechClosedToTranscriptMs)),
+        transcriptToQueued: latencySummary(rows.map((row) => row.transcriptToQueuedMs)),
+        queuedToFirstAudio: latencySummary(rows.map((row) => row.queuedToFirstAudioMs)),
+        captureToFirstAudio: latencySummary(rows.map((row) => row.captureToFirstAudioMs)),
+      },
+    };
   },
 });
