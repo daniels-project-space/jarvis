@@ -178,6 +178,7 @@ import {
   shouldRecordVoiceTurnMetric,
   type VoiceTurnTrace,
 } from "@/lib/voice-turn-metrics";
+import { stableSpeechDebounceMs } from "@/lib/voice-response-latency";
 
 const EMBED_COMMAND_TTL_MS = 30_000;
 const MAX_PENDING_EMBED_COMMANDS = 4;
@@ -2117,6 +2118,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     text: string;
     visibleText: string;
     fileIds: string[];
+    voice: boolean;
   } | null>(null);
   const durableSubmissionInFlight = useRef(false);
   const failedSubmissionRef = useRef<{
@@ -3131,6 +3133,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // then become one natural neural request rather than sentence-sized MP3s
     // with audible network/decode gaps. Long-running generations still begin
     // with their first stable paragraph instead of waiting indefinitely.
+    const activeTurn = activeDurableTurn.current;
+    const voiceTurn = latestAssistant.parentMessageId === activeTurn?.messageId
+      && activeTurn?.voice === true;
     streamState.timer = setTimeout(() => {
       const current = streamingSpeechRef.current;
       if (current.id !== latestAssistant._id) return;
@@ -3157,7 +3162,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         if (played && current.spokenChars === from) current.spokenChars = prefix.length;
         else if (!played) current.failed = true;
       });
-    }, 220);
+    }, stableSpeechDebounceMs({ voiceTurn, scheduledChars: streamState.scheduledChars }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
@@ -3186,6 +3191,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       text: recoverable.text,
       visibleText: visibleTurnText(recoverable.text),
       fileIds: messages.find((message) => message._id === recoverable.messageId)?.files?.map((file) => file.fileId) ?? [],
+      voice: false,
     };
     lastSubmittedParentId.current = recoverable.messageId;
     durableAutoRecoveries.current = 0;
@@ -3437,6 +3443,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         text,
         visibleText,
         fileIds: [...fileIds],
+        voice: Boolean(options.voiceTrace),
       };
       failedSubmissionRef.current = null;
       setSubmissionRetryReady(false);
