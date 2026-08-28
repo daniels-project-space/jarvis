@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import { controlMutation, isSameOriginRequest } from "@/lib/control-session";
+import { isFileIngestCutoverPaused } from "@/lib/file-ingest-wake";
 import { privateR2Delete } from "@/lib/private-r2";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
@@ -9,6 +10,12 @@ export async function POST(req: NextRequest) {
   const actor = await controlActor(req);
   if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
   if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
+  if (isFileIngestCutoverPaused()) {
+    return Response.json({ error: "upload cancellation is temporarily paused during the ingest protocol cutover" }, {
+      status: 503,
+      headers: { "retry-after": "60", "cache-control": "private, no-store" },
+    });
+  }
   const body = await req.json().catch(() => null) as { batchId?: unknown } | null;
   const batchId = String(body?.batchId ?? "");
   if (!batchId) return Response.json({ error: "upload batch is required" }, { status: 400 });

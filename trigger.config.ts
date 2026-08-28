@@ -34,7 +34,7 @@ export default defineConfig({
             // Managed ChatGPT state is fetched by the controller from the
             // codex-session vault service and persisted encrypted in its
             // private R2 bucket. Never fan auth.json into Trigger containers.
-            "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN",
+            "CONVEX_URL", "JARVIS_WORKER_TOKEN", "JARVIS_FILE_REHOME_TOKEN", "JARVIS_DISPATCH_TOKEN", "GITHUB_TOKEN", "VAULT_ACCESS_TOKEN",
             // Trigger refreshes only explicit saved-trip Gmail identities. It
             // needs the same server-side OAuth envelope inputs as Vercel; no
             // OAuth bearer is ever synced or written into a task payload.
@@ -48,6 +48,9 @@ export default defineConfig({
             "JARVIS_HUB_ACTIONS_TOKEN",
             "JARVIS_PRIVATE_R2_BUCKET",
             "JARVIS_CODEX_SESSION_SOURCE",
+            // Non-secret Vercel/Trigger cutover admission gate for private
+            // file ingest and its independent reconciliation producer.
+            "JARVIS_FILE_INGEST_WAKE_PAUSED",
             "JARVIS_MISSION_PROTOCOL_ROLLOUT",
             "JARVIS_MISSION_SUPERVISOR_ROLLOUT",
             // Exact non-secret origin allowlist for private media transcription.

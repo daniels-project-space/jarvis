@@ -1,7 +1,8 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
 import { paginationOptsValidator } from "convex/server";
-import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { actorAuthArgs, requireActor, requireFileDerivedArtifactRehome, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import {
   CHAT_FILE_LIMITS,
   FILE_READY_STATUSES,
@@ -13,6 +14,12 @@ import {
 } from "../src/lib/chat-files";
 import { visibleTurnText } from "../src/lib/host-context";
 import { messageFileManifests } from "./fileHelpers";
+import {
+  fileDerivedArtifactRehomeControl,
+  FILE_DERIVED_ARTIFACT_REHOME_RETRY_AFTER_MS,
+  rehomeBlocksNormalFileMutation,
+} from "./fileDerivedArtifactRehomeProtocol";
+import { assertFileDerivedArtifactRehomeReady } from "./fileDerivedArtifactRehomes";
 
 const uploadDescriptor = v.object({
   clientId: v.string(),
@@ -43,12 +50,52 @@ const extractedChunk = v.object({
 });
 
 const INGEST_CLAIM_STALE_MS = 90_000;
+export const INGEST_OUTPUT_PROTOCOL_V2 = 2;
+const INGEST_OUTPUT_PROTOCOL_V1 = 1;
+// Trigger's configured duration is intentionally not an R2 fence. This is a
+// compatibility drain only: V2 output paths are unique even if a legacy
+// worker wakes after this window. Known V1 paths remain sweepable instead of
+// being treated as absent merely because a clock elapsed.
+export const LEGACY_V1_OUTPUT_DRAIN_MS = 6 * 60_000;
+// This schedules recovery; it is deliberately not a proof that an accepted
+// private-R2 PUT cannot still land after the worker lease expires.
+export const INGEST_OUTPUT_PRODUCER_WINDOW_MS = 6 * 60_000;
+const INGEST_OUTPUT_CLEANUP_LEASE_MS = 60_000;
+const LEGACY_OUTPUT_SWEEP_INTERVAL_MS = 2 * 60 * 60_000;
+const INGEST_OUTPUT_ATTEMPT_ID = /^[a-zA-Z0-9_-]{16,180}$/;
+const INGEST_OUTPUT_PROTOCOL_ROLLOUT = "file-ingest-output-protocol-v2";
 // This fence only covers the final source validation through app-server model
 // admission. It is deliberately much shorter than a foreground turn and is
 // normally released as soon as `turn/start` is accepted.
 export const TURN_FILE_LEASE_MS = 120_000;
 const TURN_FILE_LEASE_ID = /^[a-zA-Z0-9_-]{16,120}$/;
 const TURN_FILE_SOURCE_KEY_MAX_CHARS = 1_024;
+
+/**
+ * During the V1-to-V2 artifact rehome, a normal mutation must not change a
+ * file tuple behind the migration CAS or hand a legacy source key to a direct
+ * cleanup task. The rehome module itself uses separate, narrowly-scoped
+ * mutations and capability; this guard intentionally applies only here.
+ */
+async function assertNormalFileMutationAllowed(ctx: { db: any }) {
+  const control = await fileDerivedArtifactRehomeControl(ctx);
+  if (rehomeBlocksNormalFileMutation(control)) {
+    throw new ConvexError({
+      code: "FILE_DERIVED_REHOME_ACTIVE",
+      message: "Private-file changes are temporarily frozen while derived artifacts are rehomed",
+    });
+  }
+}
+
+async function activeDerivedArtifactRehomeRetryAfter(ctx: { db: any }, file: any): Promise<number | null> {
+  if (!file?.derivedArtifactRehomeId) return null;
+  const rehome = await ctx.db.get(file.derivedArtifactRehomeId);
+  if (!rehome || rehome.state === "cutover") return null;
+  // Do not let generic file cleanup infer either a V1 source or an abandoned
+  // V2 generation while this row is migration-owned. A dedicated receipt
+  // cleanup owns targets, and the source is only swept after the pointer CAS.
+  return FILE_DERIVED_ARTIFACT_REHOME_RETRY_AFTER_MS;
+}
 
 function ownerThread(value: string | undefined): string {
   const threadId = value?.trim() || "main";
@@ -129,13 +176,299 @@ function publicFile(row: any) {
   };
 }
 
+function legacyOutputMayBeUncommitted(file: any): boolean {
+  if (
+    Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) !== INGEST_OUTPUT_PROTOCOL_V1
+    || Number(file.ingestAttempt ?? 0) < 1
+  ) return false;
+  if (["processing", "error", "quarantined"].includes(String(file.status))) return true;
+  if (file.status === "stored_only") {
+    return !file.extractedTextR2Key && !file.previewR2Key;
+  }
+  if (file.status === "deleting") {
+    const prior = String(file.deletePreviousStatus ?? "");
+    if (["processing", "error", "quarantined"].includes(prior)) return true;
+    if (prior === "stored_only") return !file.extractedTextR2Key && !file.previewR2Key;
+  }
+  return false;
+}
+
 function cleanupKeysForFile(file: any): string[] {
+  if (file?.derivedArtifactRehomeId) {
+    // A migration-owned file has an old V1 source plus a not-yet-referenced
+    // V2 target that this generic helper cannot reason about. Its dedicated
+    // protocol owns both; exposing either here would hand an old cleanup task
+    // a destructive key during a pointer migration.
+    return [];
+  }
   const prefix = `owners/daniel/files/${String(file._id)}/v${Number(file.ingestVersion)}`;
+  const legacyIngestMayWrite = legacyOutputMayBeUncommitted(file);
   return [...new Set([
     String(file.r2Key),
-    file.extractedTextR2Key ? String(file.extractedTextR2Key) : `${prefix}/extracted.txt`,
-    file.previewR2Key ? String(file.previewR2Key) : `${prefix}/preview.webp`,
-  ])];
+    legacyIngestMayWrite
+      ? undefined
+      : file.extractedTextR2Key
+      ? String(file.extractedTextR2Key)
+      : Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V1
+        ? `${prefix}/extracted.txt`
+        : undefined,
+    legacyIngestMayWrite
+      ? undefined
+      : file.previewR2Key
+      ? String(file.previewR2Key)
+      : Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V1
+        ? `${prefix}/preview.webp`
+        : undefined,
+  ].filter((key): key is string => Boolean(key)))];
+}
+
+type IngestCommitFile = Pick<
+  Doc<"files">,
+  "ingestVersion" | "status" | "extractedTextR2Key" | "previewR2Key" | "ingestOutputAttemptId"
+>;
+
+type DerivedOutputKeys = { extractedTextR2Key: string; previewR2Key: string };
+
+function outputAttemptId(ingestAttempt: number, claimToken: string): string {
+  const token = claimToken.trim();
+  if (!/^[a-zA-Z0-9_-]{16,120}$/.test(token) || !Number.isSafeInteger(ingestAttempt) || ingestAttempt < 1) {
+    throw new ConvexError({ code: "INGEST_OUTPUT_ATTEMPT", message: "V2 ingest output identity is invalid" });
+  }
+  const attemptId = `${ingestAttempt}-${token}`;
+  if (!INGEST_OUTPUT_ATTEMPT_ID.test(attemptId)) {
+    throw new ConvexError({ code: "INGEST_OUTPUT_ATTEMPT", message: "V2 ingest output identity is invalid" });
+  }
+  return attemptId;
+}
+
+function derivedOutputKeys(fileId: unknown, ingestVersion: number, outputProtocol: number, attemptId: string): DerivedOutputKeys {
+  const id = String(fileId).trim();
+  if (!/^[a-zA-Z0-9_-]+$/.test(id) || !Number.isSafeInteger(ingestVersion) || ingestVersion < 1) {
+    throw new ConvexError({ code: "INGEST_OUTPUT_KEY", message: "Derived output identity is invalid" });
+  }
+  if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V1) {
+    return {
+      extractedTextR2Key: `owners/daniel/files/${id}/v${ingestVersion}/extracted.txt`,
+      previewR2Key: `owners/daniel/files/${id}/v${ingestVersion}/preview.webp`,
+    };
+  }
+  if (outputProtocol !== INGEST_OUTPUT_PROTOCOL_V2 || !INGEST_OUTPUT_ATTEMPT_ID.test(attemptId)) {
+    throw new ConvexError({ code: "INGEST_OUTPUT_KEY", message: "Derived output identity is invalid" });
+  }
+  return {
+    extractedTextR2Key: `owners/daniel/files/${id}/v${ingestVersion}/a${attemptId}/extracted.txt`,
+    previewR2Key: `owners/daniel/files/${id}/v${ingestVersion}/a${attemptId}/preview.webp`,
+  };
+}
+
+function legacyBridgeAttemptId(file: any): string {
+  const token = String(file.ingestClaimToken ?? "unknown").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "unknown";
+  return `legacy-${Math.max(1, Number(file.ingestAttempt ?? 1))}-${token}`.slice(0, 180);
+}
+
+function legacyProducerMayWriteUntil(file: any, now: number): number {
+  const known = Number(file.ingestOutputMayWriteUntil ?? 0);
+  const lastProgressAt = Number(file.lastProgressAt ?? now);
+  const fromProgress = Number.isFinite(lastProgressAt)
+    ? lastProgressAt + LEGACY_V1_OUTPUT_DRAIN_MS
+    : now + LEGACY_V1_OUTPUT_DRAIN_MS;
+  return Math.max(known, fromProgress);
+}
+
+async function ingestOutputProtocolRollout(ctx: { db: any }) {
+  return await ctx.db
+    .query("workerProtocolRollouts")
+    .withIndex("by_key", (q: any) => q.eq("key", INGEST_OUTPUT_PROTOCOL_ROLLOUT))
+    .first();
+}
+
+async function pendingIngestWakeups(ctx: { db: any }, limit: number, now = Date.now()) {
+  const boundedLimit = Math.min(64, Math.max(1, Math.floor(limit)));
+  const [uploaded, failed, processing] = await Promise.all([
+    ctx.db.query("files").withIndex("by_status_updated", (q: any) => q.eq("status", "uploaded")).order("asc").take(boundedLimit),
+    ctx.db.query("files").withIndex("by_status_updated", (q: any) => q.eq("status", "error")).order("asc").take(boundedLimit),
+    ctx.db.query("files").withIndex("by_status_updated", (q: any) => q.eq("status", "processing")).order("asc").take(boundedLimit),
+  ]);
+  const staleBefore = now - INGEST_CLAIM_STALE_MS;
+  return [...uploaded, ...failed, ...processing]
+    .filter((file) => file.ingestAttempt < 3 && (file.status !== "processing" || Number(file.lastProgressAt ?? 0) <= staleBefore))
+    .slice(0, boundedLimit)
+    .map((file) => ({ fileId: String(file._id), ingestVersion: file.ingestVersion }));
+}
+
+function outboxOutputKeys(outbox: any): DerivedOutputKeys {
+  const expected = derivedOutputKeys(outbox.fileId, outbox.ingestVersion, outbox.outputProtocol, outbox.outputAttemptId);
+  if (
+    outbox.extractedTextR2Key !== expected.extractedTextR2Key
+    || outbox.previewR2Key !== expected.previewR2Key
+  ) {
+    // The worker capability must never become an arbitrary R2 deletion API,
+    // even if a malformed durable row somehow reaches the cleanup task.
+    throw new ConvexError({ code: "INGEST_OUTPUT_KEY", message: "Derived output cleanup key is invalid" });
+  }
+  return expected;
+}
+
+/**
+ * A V1 bridge records the exact roles ever handed to a legacy R2 DELETE
+ * worker. Historical rows without the fields are conservatively a full pair;
+ * only an explicit `false` proves that a role cannot be deleted by that
+ * bridge. This prevents a preview-only stale cleanup from later reaping a
+ * live text pointer that happens to share the same vN namespace.
+ */
+function outputAttemptCleanupKeys(outbox: any): string[] {
+  const keys = outboxOutputKeys(outbox);
+  if (outbox.outputProtocol !== INGEST_OUTPUT_PROTOCOL_V1) return Object.values(keys);
+  const cleanupKeys: string[] = [];
+  if (outbox.cleanupExtractedText !== false) cleanupKeys.push(keys.extractedTextR2Key);
+  if (outbox.cleanupPreview !== false) cleanupKeys.push(keys.previewR2Key);
+  return cleanupKeys;
+}
+
+function safeV1OutputAttemptCleanupKeys(file: any, outbox: any): string[] {
+  const keys = outputAttemptCleanupKeys(outbox);
+  if (
+    outbox.outputProtocol !== INGEST_OUTPUT_PROTOCOL_V1
+    || !file
+    || file.ingestVersion !== outbox.ingestVersion
+    || !["ready", "stored_only", "error", "quarantined"].includes(file.status)
+  ) return keys;
+  const referenced = new Set(
+    [file.extractedTextR2Key, file.previewR2Key].filter((key): key is string => Boolean(key)),
+  );
+  return keys.filter((key) => !referenced.has(key));
+}
+
+function legacyDerivedCleanupKeys(record: {
+  fileId: unknown;
+  ingestVersion: number;
+  extractedTextR2Key?: string;
+  previewR2Key?: string;
+}): string[] {
+  const expected = derivedOutputKeys(record.fileId, record.ingestVersion, INGEST_OUTPUT_PROTOCOL_V1, "legacy");
+  const keys: string[] = [];
+  if (record.extractedTextR2Key !== undefined) {
+    if (record.extractedTextR2Key !== expected.extractedTextR2Key) {
+      throw new ConvexError({ code: "INGEST_OUTPUT_KEY", message: "Legacy extracted cleanup key is invalid" });
+    }
+    keys.push(expected.extractedTextR2Key);
+  }
+  if (record.previewR2Key !== undefined) {
+    if (record.previewR2Key !== expected.previewR2Key) {
+      throw new ConvexError({ code: "INGEST_OUTPUT_KEY", message: "Legacy preview cleanup key is invalid" });
+    }
+    keys.push(expected.previewR2Key);
+  }
+  if (new Set(keys).size !== keys.length) {
+    throw new ConvexError({ code: "INGEST_OUTPUT_KEY", message: "Legacy cleanup key roles are duplicated" });
+  }
+  return keys;
+}
+
+async function outputAttemptsForVersion(ctx: { db: any }, fileId: any, ingestVersion: number): Promise<any[]> {
+  return await ctx.db
+    .query("fileIngestOutputAttempts")
+    .withIndex("by_file_version", (q: any) => q.eq("fileId", fileId).eq("ingestVersion", ingestVersion))
+    .take(8);
+}
+
+function legacyBridgeMarker(rows: any[]): any | null {
+  return rows.find((row) => row.outputProtocol === INGEST_OUTPUT_PROTOCOL_V1) ?? null;
+}
+
+function v2OutputAttempt(rows: any[], attemptId: string): any | null {
+  return rows.find((row) => row.outputProtocol === INGEST_OUTPUT_PROTOCOL_V2 && row.outputAttemptId === attemptId) ?? null;
+}
+
+async function startLegacyBridgeMarker(
+  ctx: { db: any },
+  file: any,
+  claimToken: string,
+  now: number,
+  cleanupKeys?: readonly string[],
+) {
+  const rows = await outputAttemptsForVersion(ctx, file._id, file.ingestVersion);
+  const existing = legacyBridgeMarker(rows);
+  if (existing) return existing;
+  const outputAttemptId = legacyBridgeAttemptId({ ...file, ingestClaimToken: claimToken });
+  const keys = derivedOutputKeys(file._id, file.ingestVersion, INGEST_OUTPUT_PROTOCOL_V1, outputAttemptId);
+  const cleanupSet = cleanupKeys ? new Set(cleanupKeys) : null;
+  const producerMayWriteUntil = legacyProducerMayWriteUntil(file, now);
+  const id = await ctx.db.insert("fileIngestOutputAttempts", {
+    fileId: file._id,
+    ingestVersion: file.ingestVersion,
+    outputProtocol: INGEST_OUTPUT_PROTOCOL_V1,
+    outputAttemptId,
+    claimToken,
+    extractedTextR2Key: keys.extractedTextR2Key,
+    previewR2Key: keys.previewR2Key,
+    producerMayWriteUntil,
+    state: "active",
+    writerHandoff: false,
+    writeStarted: false,
+    cleanupExtractedText: cleanupSet ? cleanupSet.has(keys.extractedTextR2Key) : true,
+    cleanupPreview: cleanupSet ? cleanupSet.has(keys.previewR2Key) : true,
+    nextCleanupAt: producerMayWriteUntil,
+    sweepCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return await ctx.db.get(id);
+}
+
+async function moveLegacyBridgeToSweep(ctx: { db: any }, outbox: any, now: number) {
+  if (outbox.outputProtocol !== INGEST_OUTPUT_PROTOCOL_V1 || outbox.state === "legacy_sweeping") return;
+  await ctx.db.patch(outbox._id, {
+    state: "legacy_sweeping",
+    // An ordinary V1 ingest attempt can have issued either deterministic
+    // role. Unlike a bridge created from a filtered stale cleanup pair, it
+    // carries no role-subset proof and must remain conservative.
+    cleanupExtractedText: true,
+    cleanupPreview: true,
+    cleanupClaimToken: undefined,
+    cleanupClaimExpiresAt: undefined,
+    nextCleanupAt: now,
+    updatedAt: now,
+  });
+}
+
+async function transferOutputAttemptToCleanup(ctx: { db: any }, file: any, now: number) {
+  const outputAttemptId = String(file.ingestOutputAttemptId ?? "");
+  const outputProtocol = Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1);
+  if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V2 && !outputAttemptId) return;
+  const attempts = await outputAttemptsForVersion(ctx, file._id, file.ingestVersion);
+  const outbox = outputProtocol === INGEST_OUTPUT_PROTOCOL_V2
+    ? v2OutputAttempt(attempts, outputAttemptId)
+    // V1 has no per-write receipt. A pre-compat worker can reach this new
+    // terminal mutation after an accepted R2 PUT response was lost, so mint
+    // the shared-pair bridge even when no prior V2-era marker exists.
+    : legacyBridgeMarker(attempts) ?? await startLegacyBridgeMarker(ctx, file, String(file.ingestClaimToken ?? "legacy"), now);
+  if (!outbox || outbox.state !== "active") return;
+  await ctx.db.patch(outbox._id, {
+    state: "cleanup",
+    // This path runs only after the exact worker made a terminal Convex
+    // callback. Unlike an expired lease, that is a durable no-more-writes
+    // handoff and lets cleanup consume the attempt after R2 deletion.
+    writerHandoff: true,
+    cleanupClaimToken: undefined,
+    cleanupClaimExpiresAt: undefined,
+    nextCleanupAt: now,
+    updatedAt: now,
+  });
+}
+
+function matchesIngestCommit(
+  file: IngestCommitFile | null,
+  expected: { ingestVersion: number; extractedTextR2Key?: string; previewR2Key?: string; outputAttemptId?: string },
+): boolean {
+  return Boolean(
+    file
+    && file.ingestVersion === expected.ingestVersion
+    && (file.status === "ready" || file.status === "stored_only")
+    && (file.extractedTextR2Key ?? undefined) === expected.extractedTextR2Key
+    && (file.previewR2Key ?? undefined) === expected.previewR2Key
+    && (expected.outputAttemptId === undefined || file.ingestOutputAttemptId === expected.outputAttemptId),
+  );
 }
 
 /**
@@ -143,10 +476,54 @@ function cleanupKeysForFile(file: any): string[] {
  * writing deterministic derived objects and recording them in Convex. Keep
  * the durable deletion outbox open until that claim can no longer write.
  */
-function activeIngestCleanupRetryAfter(file: any, now: number): number | null {
+async function activeIngestCleanupRetryAfter(ctx: { db: any }, file: any, now: number): Promise<number | null> {
   const isIngesting = file.status === "processing"
     || (file.status === "deleting" && file.deletePreviousStatus === "processing");
-  if (!isIngesting || !file.ingestClaimToken) return null;
+  if (!isIngesting && legacyOutputMayBeUncommitted(file)) {
+    // A terminal V1 error has no durable prewrite receipt. Its worker may
+    // have obtained an R2 PUT success after the callback that cleared the
+    // claim, so retain the exact shared pair as a permanent reaper before a
+    // V2 retry or file deletion exposes any direct cleanup keys.
+    let marker = legacyBridgeMarker(await outputAttemptsForVersion(ctx, file._id, file.ingestVersion));
+    marker = marker ?? await startLegacyBridgeMarker(ctx, file, String(file.ingestClaimToken ?? "legacy"), now);
+    if (marker) await moveLegacyBridgeToSweep(ctx, marker, now);
+    return null;
+  }
+  if (!isIngesting) return null;
+  if (
+    Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V2
+    && file.ingestOutputAttemptId
+  ) {
+    const attempts = await outputAttemptsForVersion(ctx, file._id, file.ingestVersion);
+    const outputAttempt = v2OutputAttempt(attempts, file.ingestOutputAttemptId);
+    if (outputAttempt) {
+      if (outputAttempt.state === "active" && outputAttempt.producerMayWriteUntil > now) {
+        return Math.max(1, outputAttempt.producerMayWriteUntil - now);
+      }
+      // The exact attempt outbox now owns cleanup. Once there is no live
+      // producer window, file deletion may finish without guessing a V1 vN
+      // path; the durable attempt row remains scheduled until it is safe to
+      // consume (or keeps sweeping after an uncertain producer expiry).
+      return null;
+    }
+  }
+  if (Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V1) {
+    // Legacy V1 workers can write the shared pair without a prewrite receipt.
+    // Before deletion exposes any cleanup, mint a durable bridge marker for
+    // that exact pair. It persists as a reaper after the file row is deleted;
+    // the old 90s heartbeat lease alone is never used as a physical R2 fence.
+    let marker = legacyBridgeMarker(await outputAttemptsForVersion(ctx, file._id, file.ingestVersion));
+    marker = marker ?? await startLegacyBridgeMarker(ctx, file, String(file.ingestClaimToken ?? "legacy"), now);
+    if (marker?.state === "active") {
+      if (marker.producerMayWriteUntil > now) return Math.max(1, marker.producerMayWriteUntil - now);
+      await moveLegacyBridgeToSweep(ctx, marker, now);
+    }
+    // Any cleanup/sweep marker now owns the shared vN pair. File deletion may
+    // continue without returning guessed derived keys; the marker is queued
+    // independently and is intentionally nonterminal for old V1 writers.
+    return null;
+  }
+  if (!file.ingestClaimToken) return null;
   const lastProgressAt = Number(file.lastProgressAt ?? 0);
   if (!Number.isFinite(lastProgressAt)) return null;
   const retryAfterMs = lastProgressAt + INGEST_CLAIM_STALE_MS - now;
@@ -182,14 +559,15 @@ async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired"
     const file = await ctx.db.get(fileId);
     if (!file || file.status === "deleted") continue;
     const claimActive = file.status === "uploading" && Number(file.uploadClaimExpiresAt ?? 0) > now;
-    const ingestRetryAfterMs = activeIngestCleanupRetryAfter(file, now);
+    const ingestRetryAfterMs = await activeIngestCleanupRetryAfter(ctx, file, now);
+    const rehomeRetryAfterMs = await activeDerivedArtifactRehomeRetryAfter(ctx, file);
     const turnLeaseRetryAfterMs = await activeTurnFileLeaseRetryAfter(ctx, file._id, now);
     await ctx.db.patch(fileId, claimActive ? {
       cancelRequestedAt: now,
       errorCode: `upload_${status}`,
       libraryVisible: false,
       updatedAt: now,
-    } : ingestRetryAfterMs !== null || turnLeaseRetryAfterMs !== null ? {
+    } : ingestRetryAfterMs !== null || rehomeRetryAfterMs !== null || turnLeaseRetryAfterMs !== null ? {
       status: "deleting",
       deletePreviousStatus: file.status === "processing"
         ? "processing"
@@ -216,7 +594,7 @@ async function retireUploadBatch(ctx: { db: any }, batch: any, status: "expired"
     cleanup.push({
       fileId: String(fileId),
       r2Keys: cleanupKeysForFile(file),
-      deferred: claimActive || ingestRetryAfterMs !== null || turnLeaseRetryAfterMs !== null,
+      deferred: claimActive || ingestRetryAfterMs !== null || rehomeRetryAfterMs !== null || turnLeaseRetryAfterMs !== null,
     });
     retired += 1;
   }
@@ -233,6 +611,7 @@ export const reserveBatch = mutation({
   },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const requestId = boundedRequestId(args.requestId);
     const threadId = ownerThread(args.threadId);
     if (!args.files.length || args.files.length > CHAT_FILE_LIMITS.maxFilesPerBatch) {
@@ -333,6 +712,7 @@ export const cleanupExpiredReservations = mutation({
   args: { limit: v.optional(v.number()), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const limit = Math.min(2, Math.max(1, Math.floor(args.limit ?? 2)));
     const now = Date.now();
     const [reserved, uploading] = await Promise.all([
@@ -350,6 +730,7 @@ export const cancelBatch = mutation({
   args: { batchId: v.id("uploadBatches"), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const batch = await ctx.db.get(args.batchId);
     if (!batch) return null;
     if (batch.status === "complete") {
@@ -370,6 +751,7 @@ export const claimUpload = mutation({
   },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const claimToken = args.claimToken.trim();
     if (!/^[a-zA-Z0-9_-]{16,120}$/.test(claimToken)) throw new ConvexError({ code: "INVALID_UPLOAD_CLAIM", message: "Upload claim is invalid" });
     const [batch, file] = await Promise.all([ctx.db.get(args.batchId), ctx.db.get(args.fileId)]);
@@ -421,6 +803,7 @@ export const releaseUploadClaim = mutation({
   args: { fileId: v.id("files"), claimToken: v.string(), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status !== "uploading" || file.uploadClaimToken !== args.claimToken) return false;
     const cancelled = Boolean(file.cancelRequestedAt);
@@ -440,12 +823,14 @@ export const claimCancelledUploadCleanup = mutation({
   args: { fileId: v.id("files"), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status === "deleted") return null;
     const now = Date.now();
     if (file.status === "deleting") {
       const retryAfterMs = earliestRetryAfter(
-        activeIngestCleanupRetryAfter(file, now),
+        await activeIngestCleanupRetryAfter(ctx, file, now),
+        await activeDerivedArtifactRehomeRetryAfter(ctx, file),
         await activeTurnFileLeaseRetryAfter(ctx, file._id, now),
       );
       return retryAfterMs === null
@@ -480,6 +865,7 @@ export const markUploaded = mutation({
   },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const [batch, file] = await Promise.all([ctx.db.get(args.batchId), ctx.db.get(args.fileId)]);
     if (!batch || !file || !batch.fileIds.some((fileId) => String(fileId) === String(args.fileId))) {
       throw new ConvexError({ code: "UPLOAD_NOT_RESERVED", message: "Upload reservation was not found" });
@@ -686,6 +1072,7 @@ export const setReviewState = mutation({
   args: { fileId: v.id("files"), reviewState: fileReviewState, ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status === "deleted" || file.status === "deleting") return null;
     const now = Date.now();
@@ -705,6 +1092,7 @@ export const setReviewStateForMessage = mutation({
   },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const message = await ctx.db.get(args.messageId);
     if (!message || message.role !== "user") {
       throw new ConvexError({ code: "INVALID_FILE_MESSAGE", message: "File review requires a user message" });
@@ -760,26 +1148,177 @@ export const unlinkFromThread = mutation({
   },
 });
 
+/**
+ * Explicitly completes the release cutover after the old Trigger deployment
+ * has been quiesced. The returned batch must be woken with a fresh V2
+ * idempotency namespace: earlier V2 tasks safely skipped before activation.
+ */
+export const activateIngestOutputProtocolV2 = mutation({
+  args: {
+    triggerDeploymentVersion: v.optional(v.string()),
+    rehomeToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    // This is deliberately not the generic worker capability. Activation is
+    // irreversible for the old shared V1 namespace and is authorized only by
+    // the migration controller after it has produced a durable server proof.
+    requireFileDerivedArtifactRehome(args.rehomeToken);
+    const existing = await ingestOutputProtocolRollout(ctx);
+    if (existing) {
+      return {
+        activated: false as const,
+        activatedAt: existing.activatedAt,
+        protocolVersion: existing.protocolVersion,
+        requeue: await pendingIngestWakeups(ctx, 64),
+      };
+    }
+    const control = await assertFileDerivedArtifactRehomeReady(ctx);
+    const now = Date.now();
+    const triggerDeploymentVersion = args.triggerDeploymentVersion?.trim().slice(0, 160);
+    await ctx.db.insert("workerProtocolRollouts", {
+      key: INGEST_OUTPUT_PROTOCOL_ROLLOUT,
+      protocolVersion: 2,
+      activatedAt: now,
+      activatedByDeploymentVersion: triggerDeploymentVersion || undefined,
+      updatedAt: now,
+    });
+    await ctx.db.patch(control._id, { phase: "active", updatedAt: now });
+    return {
+      activated: true as const,
+      activatedAt: now,
+      protocolVersion: 2 as const,
+      requeue: await pendingIngestWakeups(ctx, 64, now),
+    };
+  },
+});
+
 export const claimIngest = mutation({
-  args: { fileId: v.id("files"), ingestVersion: v.number(), claimToken: v.string(), ...actorAuthArgs },
+  args: {
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    claimToken: v.string(),
+    // Omitted means V1 so the already-deployed Trigger remains compatible
+    // while Convex is released first. V2 is opt-in and gets an output intent
+    // before it is allowed to write a derived R2 object.
+    outputProtocol: v.optional(v.union(v.literal(1), v.literal(2))),
+    ...actorAuthArgs,
+  },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.ingestVersion !== args.ingestVersion) return null;
+    const outputProtocol = args.outputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1;
+    const rollout = await ingestOutputProtocolRollout(ctx);
     const now = Date.now();
+    if (
+      (outputProtocol === INGEST_OUTPUT_PROTOCOL_V1 && rollout)
+      || (outputProtocol === INGEST_OUTPUT_PROTOCOL_V2 && !rollout)
+    ) return null;
     if (file.status === "processing" && Number(file.lastProgressAt ?? 0) > now - INGEST_CLAIM_STALE_MS) return null;
     if (!["uploaded", "error", "processing"].includes(file.status) || file.ingestAttempt >= 3) return null;
     const claimToken = args.claimToken.trim().slice(0, 160);
     if (!claimToken) return null;
+    if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V1) {
+      const legacyCleanup = await ctx.db
+        .query("fileIngestCleanupOutbox")
+        .withIndex("by_file_version", (q) => q.eq("fileId", file._id).eq("ingestVersion", args.ingestVersion))
+        .first();
+      if (legacyCleanup) return null;
+    }
+    const attempts = await outputAttemptsForVersion(ctx, file._id, args.ingestVersion);
+    let legacyMarker = legacyBridgeMarker(attempts);
+    const staleLegacyClaim = file.status === "processing" && Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V1;
+    let claimedIngestVersion = args.ingestVersion;
+    let ingestAttempt = file.ingestAttempt + 1;
+
+    // A pre-compat V1 worker may have claimed before this schema existed, so
+    // synthesize a durable marker the first time the new control plane sees
+    // it. A V2 worker never shares its paths, but waits through this bridge
+    // window before taking the file claim; the known V1 keys remain sweepable.
+    if (staleLegacyClaim) {
+      legacyMarker = legacyMarker ?? await startLegacyBridgeMarker(ctx, file, String(file.ingestClaimToken ?? claimToken), now);
+      if (Number(legacyMarker?.producerMayWriteUntil ?? 0) > now) return null;
+      if (legacyMarker) await moveLegacyBridgeToSweep(ctx, legacyMarker, now);
+      if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V1) return null;
+      // Never let V2 reuse the shared V1 version, even though its paths are
+      // already unique. The old worker is now permanently stale and can only
+      // ever write the prior version's bridge-swept pair.
+      claimedIngestVersion = args.ingestVersion + 1;
+      ingestAttempt = 1;
+    }
+
+    if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V2 && !staleLegacyClaim && legacyOutputMayBeUncommitted(file)) {
+      // A pre-compat V1 terminal error may have cleared its claim before an
+      // accepted shared-pair PUT became observable. Keep that known V1 pair
+      // permanently sweepable before this V2 attempt reuses the file row.
+      legacyMarker = legacyMarker ?? await startLegacyBridgeMarker(ctx, file, String(file.ingestClaimToken ?? claimToken), now);
+      if (legacyMarker) await moveLegacyBridgeToSweep(ctx, legacyMarker, now);
+    }
+
+    // Never hand the legacy shared vN pair to a second V1 worker while a
+    // bridge marker owns it. V2 can proceed because its generation is unique.
+    if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V1 && legacyMarker) return null;
+
+    let outputAttempt = "";
+    let outputKeys: DerivedOutputKeys | undefined;
+    let outputAttemptOutboxId: string | undefined;
+    let producerMayWriteUntil: number;
+    if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V2) {
+      outputAttempt = outputAttemptId(ingestAttempt, claimToken);
+      outputKeys = derivedOutputKeys(file._id, claimedIngestVersion, outputProtocol, outputAttempt);
+      producerMayWriteUntil = now + INGEST_OUTPUT_PRODUCER_WINDOW_MS;
+      outputAttemptOutboxId = String(await ctx.db.insert("fileIngestOutputAttempts", {
+        fileId: file._id,
+        ingestVersion: claimedIngestVersion,
+        outputProtocol,
+        outputAttemptId: outputAttempt,
+        claimToken,
+        extractedTextR2Key: outputKeys.extractedTextR2Key,
+        previewR2Key: outputKeys.previewR2Key,
+        producerMayWriteUntil,
+        state: "active",
+        writerHandoff: false,
+        writeStarted: false,
+        nextCleanupAt: producerMayWriteUntil,
+        sweepCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      }));
+    } else {
+      // This is a bridge sweep marker, not a V2 publish intent. The old
+      // Trigger ignores it and continues using its deterministic V1 keys.
+      const marker = await startLegacyBridgeMarker(
+        ctx,
+        { ...file, ingestAttempt, ingestClaimToken: claimToken, lastProgressAt: now },
+        claimToken,
+        now,
+      );
+      outputAttempt = String(marker?.outputAttemptId ?? "");
+      producerMayWriteUntil = Number(marker?.producerMayWriteUntil ?? now + LEGACY_V1_OUTPUT_DRAIN_MS);
+    }
     await ctx.db.patch(file._id, {
       status: "processing",
-      ingestAttempt: file.ingestAttempt + 1,
+      ingestVersion: claimedIngestVersion,
+      ingestAttempt,
       ingestClaimToken: claimToken,
+      ingestOutputProtocol: outputProtocol,
+      ingestOutputAttemptId: outputAttempt || undefined,
+      ingestOutputMayWriteUntil: producerMayWriteUntil,
       lastProgressAt: now,
       errorCode: undefined,
       updatedAt: now,
     });
-    return { ...file, status: "processing", ingestAttempt: file.ingestAttempt + 1, ingestClaimToken: claimToken };
+    return {
+      ...file,
+      status: "processing",
+      ingestVersion: claimedIngestVersion,
+      ingestAttempt,
+      ingestClaimToken: claimToken,
+      ingestOutputProtocol: outputProtocol,
+      ingestOutputAttemptId: outputAttempt || undefined,
+      ...(outputKeys ? { derivedOutput: { ...outputKeys, outputAttemptOutboxId } } : {}),
+    };
   },
 });
 
@@ -787,10 +1326,72 @@ export const heartbeatIngest = mutation({
   args: { fileId: v.id("files"), ingestVersion: v.number(), claimToken: v.string(), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status !== "processing" || file.ingestVersion !== args.ingestVersion || file.ingestClaimToken !== args.claimToken) return false;
     const now = Date.now();
+    if (
+      Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V1
+      && await ingestOutputProtocolRollout(ctx)
+      && legacyProducerMayWriteUntil(file, now) <= now
+    ) {
+      const marker = await startLegacyBridgeMarker(ctx, file, args.claimToken, now);
+      if (marker) await moveLegacyBridgeToSweep(ctx, marker, now);
+      await ctx.db.patch(file._id, {
+        status: "error",
+        errorCode: "legacy_ingest_output_drain_expired",
+        ingestClaimToken: undefined,
+        ingestOutputMayWriteUntil: undefined,
+        lastProgressAt: now,
+        updatedAt: now,
+      });
+      return false;
+    }
     await ctx.db.patch(file._id, { lastProgressAt: now, updatedAt: now });
+    return true;
+  },
+});
+
+/**
+ * Durable prewrite fence for an exact V2 output attempt. The Trigger must
+ * obtain this acknowledgement before it issues an R2 PUT. If the PUT response
+ * is lost after the provider accepts it, `writeStarted` keeps the attempt in
+ * the nonterminal sweep set instead of treating a later worker callback as a
+ * physical R2 fence.
+ */
+export const beginIngestOutputWrite = mutation({
+  args: {
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    claimToken: v.string(),
+    outputAttemptId: v.id("fileIngestOutputAttempts"),
+    purpose: v.union(v.literal("extracted.txt"), v.literal("preview.webp")),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
+    const [file, outbox] = await Promise.all([ctx.db.get(args.fileId), ctx.db.get(args.outputAttemptId)]);
+    if (
+      !file
+      || !outbox
+      || outbox.fileId !== args.fileId
+      || outbox.ingestVersion !== args.ingestVersion
+      || outbox.outputProtocol !== INGEST_OUTPUT_PROTOCOL_V2
+      || outbox.claimToken !== args.claimToken
+      || outbox.state !== "active"
+      || file.status !== "processing"
+      || file.ingestVersion !== args.ingestVersion
+      || file.ingestClaimToken !== args.claimToken
+      || file.ingestOutputProtocol !== INGEST_OUTPUT_PROTOCOL_V2
+      || file.ingestOutputAttemptId !== outbox.outputAttemptId
+    ) return false;
+    // Reconstruct the exact path as a defense-in-depth validation of the
+    // purpose token. No caller-supplied R2 key reaches this mutation.
+    const keys = outboxOutputKeys(outbox);
+    if (args.purpose === "extracted.txt" && !keys.extractedTextR2Key) return false;
+    if (args.purpose === "preview.webp" && !keys.previewR2Key) return false;
+    await ctx.db.patch(outbox._id, { writeStarted: true, updatedAt: Date.now() });
     return true;
   },
 });
@@ -820,6 +1421,7 @@ export const completeIngest = mutation({
     summary: v.optional(v.string()),
     extractedTextR2Key: v.optional(v.string()),
     previewR2Key: v.optional(v.string()),
+    outputAttemptId: v.optional(v.string()),
     extractedChars: v.number(),
     pageCount: v.optional(v.number()),
     sheetNames: v.optional(v.array(v.string())),
@@ -828,6 +1430,7 @@ export const completeIngest = mutation({
   },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     // A deletion keeps the active claim only while the worker might still
     // write a derived object. Once that exact worker has reached its terminal
@@ -841,8 +1444,13 @@ export const completeIngest = mutation({
       && file.ingestClaimToken === args.claimToken
     ) {
       const now = Date.now();
+      await transferOutputAttemptToCleanup(ctx, file, now);
+      // Do not consume a legacy bridge here. An old V1 Trigger can still have
+      // an accepted shared-pair PUT (or its inline delete) in flight; the
+      // marker remains the exact nonterminal reaper after file deletion.
       await ctx.db.patch(file._id, {
         ingestClaimToken: undefined,
+        ingestOutputMayWriteUntil: undefined,
         lastProgressAt: now,
         updatedAt: now,
       });
@@ -851,8 +1459,77 @@ export const completeIngest = mutation({
     if (!file || file.status !== "processing" || file.ingestVersion !== args.ingestVersion || file.ingestClaimToken !== args.claimToken) {
       return { ok: false, reason: "stale_claim" as const };
     }
+    const outputProtocol = Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1);
+    const nowForLegacyDrain = Date.now();
+    if (
+      outputProtocol === INGEST_OUTPUT_PROTOCOL_V1
+      && await ingestOutputProtocolRollout(ctx)
+      && legacyProducerMayWriteUntil(file, nowForLegacyDrain) <= nowForLegacyDrain
+    ) {
+      const marker = await startLegacyBridgeMarker(ctx, file, args.claimToken, nowForLegacyDrain);
+      if (marker) await moveLegacyBridgeToSweep(ctx, marker, nowForLegacyDrain);
+      await ctx.db.patch(file._id, {
+        status: "error",
+        errorCode: "legacy_ingest_output_drain_expired",
+        ingestClaimToken: undefined,
+        ingestOutputMayWriteUntil: undefined,
+        lastProgressAt: nowForLegacyDrain,
+        updatedAt: nowForLegacyDrain,
+      });
+      return { ok: false, reason: "legacy_output_drain_expired" as const };
+    }
+    let outputAttempt: any | null = null;
+    if (outputProtocol === INGEST_OUTPUT_PROTOCOL_V2) {
+      const outputAttemptIdValue = args.outputAttemptId?.trim() ?? "";
+      if (!outputAttemptIdValue || file.ingestOutputAttemptId !== outputAttemptIdValue) {
+        return { ok: false, reason: "output_attempt_mismatch" as const };
+      }
+      const attempts = await outputAttemptsForVersion(ctx, file._id, args.ingestVersion);
+      outputAttempt = v2OutputAttempt(attempts, outputAttemptIdValue);
+      if (
+        !outputAttempt
+        || outputAttempt.claimToken !== args.claimToken
+        || outputAttempt.state !== "active"
+      ) {
+        return { ok: false, reason: "output_attempt_mismatch" as const };
+      }
+      const expected = outboxOutputKeys(outputAttempt);
+      if (
+        (args.extractedTextR2Key !== undefined && args.extractedTextR2Key !== expected.extractedTextR2Key)
+        || (args.previewR2Key !== undefined && args.previewR2Key !== expected.previewR2Key)
+      ) {
+        return { ok: false, reason: "output_key_mismatch" as const };
+      }
+    } else {
+      if (args.outputAttemptId !== undefined) {
+        // A V1 worker cannot accidentally complete a V2 generation by
+        // smuggling an attempt id into the old compatibility path.
+        return { ok: false, reason: "output_attempt_mismatch" as const };
+      }
+      // The old Trigger only knows the exact shared V1 pair. Enforce that
+      // narrow shape during the bridge so an old worker capability cannot
+      // persist or later inline-delete an arbitrary V2/private R2 path.
+      const expected = derivedOutputKeys(file._id, args.ingestVersion, INGEST_OUTPUT_PROTOCOL_V1, "legacy");
+      if (
+        (args.extractedTextR2Key !== undefined && args.extractedTextR2Key !== expected.extractedTextR2Key)
+        || (args.previewR2Key !== undefined && args.previewR2Key !== expected.previewR2Key)
+      ) {
+        return { ok: false, reason: "output_key_mismatch" as const };
+      }
+    }
     const sha256 = normalizeUploadSha256(args.sha256);
     if (!sha256 || sha256 !== file.expectedSha256) {
+      if (outputAttempt) {
+        const now = Date.now();
+        await ctx.db.patch(outputAttempt._id, {
+          state: "cleanup",
+          writerHandoff: true,
+          cleanupClaimToken: undefined,
+          cleanupClaimExpiresAt: undefined,
+          nextCleanupAt: now,
+          updatedAt: now,
+        });
+      }
       await ctx.db.patch(file._id, {
         status: "quarantined",
         errorCode: "content_digest_mismatch",
@@ -898,11 +1575,547 @@ export const completeIngest = mutation({
       pageCount: args.pageCount,
       sheetNames: args.sheetNames?.slice(0, 50).map((name) => name.slice(0, 120)),
       ingestClaimToken: undefined,
+      ingestOutputMayWriteUntil: undefined,
       lastProgressAt: now,
       errorCode: undefined,
       updatedAt: now,
     });
+    if (outputAttempt) {
+      // This is the critical atomic consume: either the terminal file row and
+      // its pointers commit together with removal of the V2 intent, or neither
+      // does. A lost response can therefore reconcile by attempt identity.
+      await ctx.db.delete(outputAttempt._id);
+    } else {
+      const attempts = await outputAttemptsForVersion(ctx, file._id, args.ingestVersion);
+      const legacyMarker = legacyBridgeMarker(attempts);
+      if (legacyMarker && legacyMarker.claimToken === args.claimToken) await ctx.db.delete(legacyMarker._id);
+    }
     return { ok: true, status: args.status };
+  },
+});
+
+/**
+ * Reconcile an ambiguous completeIngest response without ever replaying the
+ * terminal mutation. The receipt is intentionally exact: a later retry may
+ * reuse the file id but must not make an older worker believe its derived
+ * objects are still authoritative.
+ */
+export const ingestCommitReceipt = query({
+  args: {
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    extractedTextR2Key: v.optional(v.string()),
+    previewR2Key: v.optional(v.string()),
+    outputAttemptId: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const file = await ctx.db.get(args.fileId);
+    if (
+      !file
+      || file.ingestVersion !== args.ingestVersion
+      || (file.status !== "ready" && file.status !== "stored_only")
+      || (file.extractedTextR2Key ?? undefined) !== args.extractedTextR2Key
+      || (file.previewR2Key ?? undefined) !== args.previewR2Key
+      || (args.outputAttemptId !== undefined && file.ingestOutputAttemptId !== args.outputAttemptId)
+    ) {
+      return { committed: false as const };
+    }
+    return { committed: true as const, status: file.status };
+  },
+});
+
+/**
+ * Atomically turn an ambiguous completeIngest outcome into either a confirmed
+ * commit or an exact durable cleanup item. A same-version active claim is
+ * fenced before it can race the cleanup worker's R2 DELETE.
+ */
+export const enqueueIngestDerivedCleanup = mutation({
+  args: {
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    claimToken: v.string(),
+    extractedTextR2Key: v.optional(v.string()),
+    previewR2Key: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    await assertNormalFileMutationAllowed(ctx);
+    const r2Keys = legacyDerivedCleanupKeys(args);
+    const file = await ctx.db.get(args.fileId);
+    const existing = await ctx.db
+      .query("fileIngestCleanupOutbox")
+      .withIndex("by_file_version", (q) => q.eq("fileId", args.fileId).eq("ingestVersion", args.ingestVersion))
+      .first();
+    if (file && Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V2) {
+      return { committed: false as const, conflict: true as const };
+    }
+    if (file && matchesIngestCommit(file, args)) {
+      if (existing) await ctx.db.delete(existing._id);
+      return { committed: true as const, status: file.status as "ready" | "stored_only" };
+    }
+    const exactActiveClaim = Boolean(
+      file
+      && file.ingestVersion === args.ingestVersion
+      && file.status === "processing"
+      && file.ingestClaimToken === args.claimToken,
+    );
+    if (file?.ingestVersion === args.ingestVersion && file.status === "processing" && !exactActiveClaim) {
+      // A newer worker owns these deterministic keys. Wait for its durable
+      // terminal state rather than scheduling a cleanup that could delete it.
+      return { committed: false as const, waiting: true as const };
+    }
+    if (file && exactActiveClaim) {
+      const now = Date.now();
+      // Keep a legacy bridge sweep alongside the historical one-shot outbox:
+      // an old worker may have an accepted V1 PUT after its response-loss
+      // path, and the bridge is the durable reaper for that shared pair.
+      await transferOutputAttemptToCleanup(ctx, file, now);
+      await ctx.db.patch(file._id, {
+        status: "error",
+        errorCode: "ingest_completion_outcome_unknown",
+        ingestClaimToken: undefined,
+        lastProgressAt: now,
+        updatedAt: now,
+      });
+    }
+    if (!r2Keys.length) return { committed: false as const, enqueued: false as const };
+    if (existing) {
+      if (
+        (existing.extractedTextR2Key ?? undefined) !== args.extractedTextR2Key
+        || (existing.previewR2Key ?? undefined) !== args.previewR2Key
+      ) {
+        return { committed: false as const, conflict: true as const };
+      }
+      return { committed: false as const, outboxId: existing._id };
+    }
+    const now = Date.now();
+    const outboxId = await ctx.db.insert("fileIngestCleanupOutbox", {
+      fileId: args.fileId,
+      ingestVersion: args.ingestVersion,
+      extractedTextR2Key: args.extractedTextR2Key,
+      previewR2Key: args.previewR2Key,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { committed: false as const, outboxId };
+  },
+});
+
+/** Worker-only fallback sweep for cleanup items whose immediate Trigger call was lost. */
+export const pendingIngestDerivedCleanup = query({
+  args: { limit: v.optional(v.number()), workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const limit = Math.min(12, Math.max(1, Math.floor(args.limit ?? 8)));
+    const rows = await ctx.db.query("fileIngestCleanupOutbox").withIndex("by_createdAt").take(limit);
+    return rows.map((row) => ({ outboxId: row._id, fileId: String(row.fileId), ingestVersion: row.ingestVersion }));
+  },
+});
+
+/** Recheck the durable receipt immediately before an external R2 DELETE. */
+export const claimIngestDerivedCleanup = mutation({
+  args: {
+    outboxId: v.id("fileIngestCleanupOutbox"),
+    cleanupClaimToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    await assertNormalFileMutationAllowed(ctx);
+    const cleanupClaimToken = args.cleanupClaimToken.trim().slice(0, 160);
+    if (!cleanupClaimToken) throw new ConvexError({ code: "INGEST_OUTPUT_CLEANUP", message: "Legacy cleanup claim identity is invalid" });
+    const outbox = await ctx.db.get(args.outboxId);
+    if (!outbox) return null;
+    const now = Date.now();
+    if (
+      outbox.cleanupClaimToken
+      && outbox.cleanupClaimToken !== cleanupClaimToken
+      && Number(outbox.cleanupClaimExpiresAt ?? 0) > now
+    ) {
+      return { ready: false as const, retryAfterMs: Number(outbox.cleanupClaimExpiresAt) - now };
+    }
+    const file = await ctx.db.get(outbox.fileId);
+    const keys = legacyDerivedCleanupKeys(outbox);
+    let cleanupKeys = keys;
+    if (matchesIngestCommit(file, outbox)) {
+      await ctx.db.delete(outbox._id);
+      return { ready: false as const, committed: true as const };
+    }
+    if (
+      file
+      && file.ingestVersion === outbox.ingestVersion
+      && ["ready", "stored_only", "error", "quarantined"].includes(file.status)
+    ) {
+      // Old V1 rows share the vN names. Preserve every pointer the terminal
+      // file currently owns—even when its result is a different text/preview
+      // subset than the stale legacy cleanup pair.
+      const referenced = new Set([file.extractedTextR2Key, file.previewR2Key].filter((key): key is string => Boolean(key)));
+      cleanupKeys = keys.filter((key) => !referenced.has(key));
+      if (!cleanupKeys.length) {
+        await ctx.db.delete(outbox._id);
+        return { ready: false as const, committed: true as const };
+      }
+    }
+    if (file && file.ingestVersion === outbox.ingestVersion && file.status === "processing") {
+      return { ready: false as const, retryAfterMs: 15_000 };
+    }
+    if (!cleanupKeys.length) {
+      await ctx.db.delete(outbox._id);
+      return { ready: false as const, committed: true as const };
+    }
+    // Persist the exact V1 role subset before returning keys to an external
+    // DELETE worker. `finish` intentionally leaves this marker sweeping
+    // forever: an accepted delete can complete after the worker
+    // response/liveness lease has been lost, and rehome start must see that
+    // physical uncertainty rather than invent a clean drain. Do not widen a
+    // preview-only stale delete into a full shared pair; that would let the
+    // later reaper erase a terminal text pointer it never owned.
+    const bridgeFile = file ?? {
+      _id: outbox.fileId,
+      ingestVersion: outbox.ingestVersion,
+      ingestAttempt: 1,
+      lastProgressAt: now,
+      ingestClaimToken: cleanupClaimToken,
+    };
+    let bridge = legacyBridgeMarker(await outputAttemptsForVersion(ctx, outbox.fileId, outbox.ingestVersion));
+    bridge = bridge ?? await startLegacyBridgeMarker(ctx, bridgeFile, cleanupClaimToken, now, cleanupKeys);
+    if (bridge) {
+      const bridgeKeys = outboxOutputKeys(bridge);
+      await ctx.db.patch(bridge._id, {
+        state: "legacy_sweeping",
+        // The marker now records that a V1 external delete may be in flight,
+        // not merely that an old writer might PUT. Its exact pair remains a
+        // reaper and a migration-start safety fence.
+        writeStarted: true,
+        // Missing flags mean a pre-compat full-pair history, so preserve that
+        // conservative interpretation while unioning any new subset.
+        cleanupExtractedText: bridge.cleanupExtractedText !== false || cleanupKeys.includes(bridgeKeys.extractedTextR2Key),
+        cleanupPreview: bridge.cleanupPreview !== false || cleanupKeys.includes(bridgeKeys.previewR2Key),
+        cleanupClaimToken: undefined,
+        cleanupClaimExpiresAt: undefined,
+        nextCleanupAt: now,
+        updatedAt: now,
+      });
+    }
+    await ctx.db.patch(outbox._id, {
+      cleanupClaimToken,
+      cleanupClaimExpiresAt: now + INGEST_OUTPUT_CLEANUP_LEASE_MS,
+      deleteStarted: true,
+      updatedAt: now,
+    });
+    return { ready: true as const, r2Keys: cleanupKeys };
+  },
+});
+
+export const finishIngestDerivedCleanup = mutation({
+  args: {
+    outboxId: v.id("fileIngestCleanupOutbox"),
+    cleanupClaimToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    await assertNormalFileMutationAllowed(ctx);
+    const outbox = await ctx.db.get(args.outboxId);
+    if (!outbox) return true;
+    if (outbox.cleanupClaimToken !== args.cleanupClaimToken.trim()) return false;
+    await ctx.db.delete(outbox._id);
+    return true;
+  },
+});
+
+/**
+ * V2 workers transfer only their Convex-allocated output attempt. They never
+ * submit R2 keys, which keeps the shared worker capability from becoming an
+ * arbitrary private-object deletion primitive.
+ */
+export const retireIngestOutputAttempt = mutation({
+  args: {
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    claimToken: v.string(),
+    outputAttemptId: v.id("fileIngestOutputAttempts"),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    await assertNormalFileMutationAllowed(ctx);
+    const [file, outbox] = await Promise.all([ctx.db.get(args.fileId), ctx.db.get(args.outputAttemptId)]);
+    if (!outbox) {
+      // completeIngest atomically consumes a successful V2 row. With no row
+      // left, the persisted V2 attempt id is the receipt for a lost response;
+      // this branch has no cleanup side effect.
+      if (
+        file
+        && file.ingestVersion === args.ingestVersion
+        && file.ingestOutputProtocol === INGEST_OUTPUT_PROTOCOL_V2
+        && (file.status === "ready" || file.status === "stored_only")
+        && file.ingestOutputAttemptId
+      ) {
+        return { committed: true as const, status: file.status };
+      }
+      return { committed: false as const, missing: true as const };
+    }
+    if (
+      outbox.fileId !== args.fileId
+      || outbox.ingestVersion !== args.ingestVersion
+      || outbox.outputProtocol !== INGEST_OUTPUT_PROTOCOL_V2
+      || outbox.claimToken !== args.claimToken
+    ) return { committed: false as const, missing: true as const };
+
+    // Verify the exact durable pair before this worker can either consume its
+    // own receipt or hand it to a deletion task. In particular, a worker must
+    // never be able to retire another file's attempt by passing its row ID.
+    const keys = outboxOutputKeys(outbox);
+    if (matchesIngestCommit(file, {
+      ingestVersion: outbox.ingestVersion,
+      extractedTextR2Key: keys.extractedTextR2Key,
+      previewR2Key: keys.previewR2Key,
+      outputAttemptId: outbox.outputAttemptId,
+    })) {
+      await ctx.db.delete(outbox._id);
+      return { committed: true as const, status: file!.status };
+    }
+    const now = Date.now();
+    const ownsCurrentClaim = Boolean(
+      file
+      && file.status === "processing"
+      && file.ingestVersion === args.ingestVersion
+      && file.ingestClaimToken === args.claimToken
+      && file.ingestOutputProtocol === INGEST_OUTPUT_PROTOCOL_V2
+      && file.ingestOutputAttemptId === outbox.outputAttemptId,
+    );
+    if (ownsCurrentClaim && file) {
+      await ctx.db.patch(file._id, {
+        status: "error",
+        errorCode: "ingest_completion_outcome_unknown",
+        ingestClaimToken: undefined,
+        ingestOutputMayWriteUntil: undefined,
+        lastProgressAt: now,
+        updatedAt: now,
+      });
+    }
+    await ctx.db.patch(outbox._id, {
+      state: "cleanup",
+      // The worker reached this explicit retirement callback after its
+      // complete response was lost, so it has handed off future writes.
+      writerHandoff: true,
+      cleanupClaimToken: undefined,
+      cleanupClaimExpiresAt: undefined,
+      nextCleanupAt: now,
+      updatedAt: now,
+    });
+    return { committed: false as const, outputAttemptId: outbox._id };
+  },
+});
+
+/** Worker-only recovery sweep for V2 intents and V1 bridge markers. */
+export const pendingIngestOutputCleanup = query({
+  args: { limit: v.optional(v.number()), workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const limit = Math.min(12, Math.max(1, Math.floor(args.limit ?? 8)));
+    const now = Date.now();
+    // Do not scan by creation time: nonterminal sweep rows intentionally live
+    // forever, and a handful of future-scheduled old rows must not starve a
+    // newly due cleanup attempt behind them. The state/next-cleanup index
+    // gives every durable phase a bounded, due-first slice.
+    const states = ["active", "cleanup", "sweeping", "legacy_sweeping", "deleting"] as const;
+    const rows = (await Promise.all(states.map(async (state) => await ctx.db
+      .query("fileIngestOutputAttempts")
+      .withIndex("by_state_cleanup", (q) => q.eq("state", state).lte("nextCleanupAt", now))
+      .take(limit)))).flat();
+    return rows
+      .filter((row) => row.state !== "deleting" || Number(row.cleanupClaimExpiresAt ?? 0) <= now)
+      .sort((left, right) => left.nextCleanupAt - right.nextCleanupAt || left.createdAt - right.createdAt)
+      .slice(0, limit)
+      .map((row) => ({ outputAttemptId: row._id, fileId: String(row.fileId), ingestVersion: row.ingestVersion }));
+  },
+});
+
+export const claimIngestOutputCleanup = mutation({
+  args: {
+    outputAttemptId: v.id("fileIngestOutputAttempts"),
+    cleanupClaimToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const cleanupClaimToken = args.cleanupClaimToken.trim().slice(0, 160);
+    if (!cleanupClaimToken) throw new ConvexError({ code: "INGEST_OUTPUT_CLEANUP", message: "Cleanup claim identity is invalid" });
+    const outbox = await ctx.db.get(args.outputAttemptId);
+    if (!outbox) return null;
+    const keys = outboxOutputKeys(outbox);
+    const now = Date.now();
+    const file = await ctx.db.get(outbox.fileId);
+    const rehomes = await ctx.db
+      .query("fileDerivedArtifactRehomes")
+      .withIndex("by_file", (q: any) => q.eq("fileId", outbox.fileId))
+      .take(4);
+    const rehomeControl = await fileDerivedArtifactRehomeControl(ctx);
+    const v1SourceAlreadyCutOver = rehomes.some((rehome: any) =>
+      rehome.state === "cutover" && rehome.sourceIngestVersion === outbox.ingestVersion);
+    if (
+      outbox.outputProtocol === INGEST_OUTPUT_PROTOCOL_V1
+      && rehomeBlocksNormalFileMutation(rehomeControl)
+      && !v1SourceAlreadyCutOver
+    ) {
+      // Before inventory has placed a per-file migration lock, an old
+      // cleanup row still knows the shared V1 paths. The durable global freeze
+      // must fence it too: otherwise an already-due cleanup can erase a V1
+      // source between freeze and its manifest snapshot. A post-CAS source
+      // sweeper is the deliberate exception: its manifest proves the file no
+      // longer references that V1 version, so it keeps reaping late V1 PUTs.
+      return { ready: false as const, retryAfterMs: FILE_DERIVED_ARTIFACT_REHOME_RETRY_AFTER_MS };
+    }
+    const activeRehomeTarget = rehomes.find((rehome: any) =>
+      rehome.targetOutputAttemptOutboxId === outbox._id
+      && ["copying", "verified"].includes(rehome.state));
+    if (activeRehomeTarget) {
+      // A generic worker must never delete the current rehome generation. The
+      // rehome worker either commits it atomically or retires this exact
+      // receipt first, at which point it is no longer an active target.
+      return { ready: false as const, retryAfterMs: FILE_DERIVED_ARTIFACT_REHOME_RETRY_AFTER_MS };
+    }
+    if (
+      outbox.outputProtocol === INGEST_OUTPUT_PROTOCOL_V1
+      && file?.derivedArtifactRehomeId
+    ) {
+      // This shared V1 pair is still the migration source. It is swept only
+      // after the pointer CAS clears the file lock; no normal cleanup gets to
+      // race the full-copy/readback proof.
+      return { ready: false as const, retryAfterMs: FILE_DERIVED_ARTIFACT_REHOME_RETRY_AFTER_MS };
+    }
+    if (
+      outbox.outputProtocol === INGEST_OUTPUT_PROTOCOL_V2
+      && matchesIngestCommit(file, {
+        ingestVersion: outbox.ingestVersion,
+        extractedTextR2Key: keys.extractedTextR2Key,
+        previewR2Key: keys.previewR2Key,
+        outputAttemptId: outbox.outputAttemptId,
+      })
+    ) {
+      await ctx.db.delete(outbox._id);
+      return { ready: false as const, committed: true as const };
+    }
+    if (
+      outbox.state === "deleting"
+      && outbox.cleanupClaimToken !== cleanupClaimToken
+      && Number(outbox.cleanupClaimExpiresAt ?? 0) > now
+    ) {
+      return { ready: false as const, retryAfterMs: Number(outbox.cleanupClaimExpiresAt) - now };
+    }
+    if (outbox.state === "active") {
+      if (outbox.producerMayWriteUntil > now) {
+        return { ready: false as const, retryAfterMs: outbox.producerMayWriteUntil - now };
+      }
+      if (
+        outbox.outputProtocol === INGEST_OUTPUT_PROTOCOL_V2
+        && file
+        && file.status === "processing"
+        && file.ingestVersion === outbox.ingestVersion
+        && file.ingestOutputProtocol === INGEST_OUTPUT_PROTOCOL_V2
+        && file.ingestOutputAttemptId === outbox.outputAttemptId
+        && file.ingestClaimToken === outbox.claimToken
+      ) {
+        // Its hard producer window is over. Fence the exact stale producer
+        // before handing its unique paths to R2 cleanup.
+        await ctx.db.patch(file._id, {
+          status: "error",
+          errorCode: "ingest_output_attempt_expired",
+          ingestClaimToken: undefined,
+          ingestOutputMayWriteUntil: undefined,
+          lastProgressAt: now,
+          updatedAt: now,
+        });
+      }
+      if (outbox.outputProtocol === INGEST_OUTPUT_PROTOCOL_V1) {
+        await moveLegacyBridgeToSweep(ctx, outbox, now);
+      } else {
+        // The logical producer lease is not a physical R2 fence. Preserve a
+        // nonterminal exact attempt after expiry and sweep it repeatedly in
+        // case an accepted PUT completes after this cleanup pass.
+        await ctx.db.patch(outbox._id, {
+          state: "sweeping",
+          writerHandoff: false,
+          nextCleanupAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+    const refreshed = await ctx.db.get(args.outputAttemptId);
+    if (!refreshed) return null;
+    if (
+      (refreshed.state === "legacy_sweeping" || refreshed.state === "sweeping")
+      && refreshed.nextCleanupAt > now
+    ) {
+      return { ready: false as const, retryAfterMs: refreshed.nextCleanupAt - now };
+    }
+    const cleanupKeys = safeV1OutputAttemptCleanupKeys(file, refreshed);
+    if (!cleanupKeys.length) {
+      // Retain the V1 bridge as durable physical-delete history, but never
+      // issue a no-op full-pair delete when the only recorded role is still
+      // referenced by a ready/stored-only file.
+      if (refreshed.outputProtocol === INGEST_OUTPUT_PROTOCOL_V1) {
+        await ctx.db.patch(refreshed._id, {
+          state: "legacy_sweeping",
+          cleanupClaimToken: undefined,
+          cleanupClaimExpiresAt: undefined,
+          nextCleanupAt: now + LEGACY_OUTPUT_SWEEP_INTERVAL_MS,
+          updatedAt: now,
+        });
+      }
+      return { ready: false as const, committed: true as const };
+    }
+    await ctx.db.patch(refreshed._id, {
+      state: "deleting",
+      cleanupClaimToken,
+      cleanupClaimExpiresAt: now + INGEST_OUTPUT_CLEANUP_LEASE_MS,
+      updatedAt: now,
+    });
+    return { ready: true as const, r2Keys: cleanupKeys };
+  },
+});
+
+export const finishIngestOutputCleanup = mutation({
+  args: {
+    outputAttemptId: v.id("fileIngestOutputAttempts"),
+    cleanupClaimToken: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const outbox = await ctx.db.get(args.outputAttemptId);
+    if (!outbox) return true;
+    if (outbox.state !== "deleting" || outbox.cleanupClaimToken !== args.cleanupClaimToken.trim()) return false;
+    if (
+      outbox.outputProtocol === INGEST_OUTPUT_PROTOCOL_V1
+      || !outbox.writerHandoff
+      // An explicit Convex handoff cannot prove a previously-issued R2 PUT
+      // did not reach the provider after its client response was lost. Only a
+      // durable prewrite record of `false` permits V2 consumption here.
+      || outbox.writeStarted !== false
+    ) {
+      // Keep the known shared V1 pair sweepable through the compatibility
+      // bridge. V2 does the same when its producer lease expired without an
+      // explicit terminal handoff: elapsed time cannot prove a late accepted
+      // R2 PUT will never land, so the exact path remains reaped.
+      const now = Date.now();
+      await ctx.db.patch(outbox._id, {
+        state: outbox.outputProtocol === INGEST_OUTPUT_PROTOCOL_V1 ? "legacy_sweeping" : "sweeping",
+        cleanupClaimToken: undefined,
+        cleanupClaimExpiresAt: undefined,
+        nextCleanupAt: now + LEGACY_OUTPUT_SWEEP_INTERVAL_MS,
+        sweepCount: outbox.sweepCount + 1,
+        updatedAt: now,
+      });
+      return true;
+    }
+    await ctx.db.delete(outbox._id);
+    return true;
   },
 });
 
@@ -917,6 +2130,7 @@ export const failIngest = mutation({
   },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     // See completeIngest above. A worker that has reached its terminal error
     // path cannot write another derivative, so release only its exact
@@ -929,8 +2143,10 @@ export const failIngest = mutation({
       && file.ingestClaimToken === args.claimToken
     ) {
       const now = Date.now();
+      await transferOutputAttemptToCleanup(ctx, file, now);
       await ctx.db.patch(file._id, {
         ingestClaimToken: undefined,
+        ingestOutputMayWriteUntil: undefined,
         lastProgressAt: now,
         updatedAt: now,
       });
@@ -938,10 +2154,14 @@ export const failIngest = mutation({
     }
     if (!file || file.status !== "processing" || file.ingestVersion !== args.ingestVersion || file.ingestClaimToken !== args.claimToken) return false;
     const now = Date.now();
+    await transferOutputAttemptToCleanup(ctx, file, now);
+    // See completeIngest's delete-deferred branch: V1 markers stay durable
+    // after terminal callbacks because the old worker has no prewrite fence.
     await ctx.db.patch(file._id, {
       status: args.quarantined ? "quarantined" : "error",
       errorCode: args.errorCode.trim().slice(0, 120) || "ingest_failed",
       ingestClaimToken: undefined,
+      ingestOutputMayWriteUntil: undefined,
       lastProgressAt: now,
       updatedAt: now,
     });
@@ -953,16 +2173,25 @@ export const retryIngest = mutation({
   args: { fileId: v.id("files"), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     const staleProcessing = file?.status === "processing" && Number(file.lastProgressAt ?? 0) <= Date.now() - INGEST_CLAIM_STALE_MS;
     if (!file || (!staleProcessing && !["uploaded", "error", "stored_only"].includes(file.status))) return null;
     const now = Date.now();
+    if (legacyOutputMayBeUncommitted(file)) {
+      const marker = await startLegacyBridgeMarker(ctx, file, String(file.ingestClaimToken ?? "legacy"), now);
+      if (staleProcessing && marker && marker.producerMayWriteUntil > now) return null;
+      if (marker) await moveLegacyBridgeToSweep(ctx, marker, now);
+    }
     const ingestVersion = file.ingestVersion + 1;
     await ctx.db.patch(file._id, {
       status: "uploaded",
       ingestVersion,
       ingestAttempt: 0,
       ingestClaimToken: undefined,
+      ingestOutputProtocol: undefined,
+      ingestOutputAttemptId: undefined,
+      ingestOutputMayWriteUntil: undefined,
       errorCode: undefined,
       lastProgressAt: now,
       updatedAt: now,
@@ -975,17 +2204,7 @@ export const pendingIngest = query({
   args: { limit: v.optional(v.number()), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
-    const limit = Math.min(12, Math.max(1, Math.floor(args.limit ?? 8)));
-    const [uploaded, failed, processing] = await Promise.all([
-      ctx.db.query("files").withIndex("by_status_updated", (q) => q.eq("status", "uploaded")).order("asc").take(limit),
-      ctx.db.query("files").withIndex("by_status_updated", (q) => q.eq("status", "error")).order("asc").take(limit),
-      ctx.db.query("files").withIndex("by_status_updated", (q) => q.eq("status", "processing")).order("asc").take(limit),
-    ]);
-    const staleBefore = Date.now() - INGEST_CLAIM_STALE_MS;
-    return [...uploaded, ...failed, ...processing]
-      .filter((file) => file.ingestAttempt < 3 && (file.status !== "processing" || Number(file.lastProgressAt ?? 0) <= staleBefore))
-      .slice(0, limit)
-      .map((file) => ({ fileId: String(file._id), ingestVersion: file.ingestVersion }));
+    return await pendingIngestWakeups(ctx, Math.min(12, Math.max(1, Math.floor(args.limit ?? 8))));
   },
 });
 
@@ -1019,6 +2238,7 @@ export const acquireTurnFileLeases = mutation({
   },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const threadId = ownerThread(args.threadId);
     const leaseId = boundedTurnLeaseId(args.leaseId);
     if (args.sources.length > CHAT_FILE_LIMITS.maxFilesPerMessage) {
@@ -1384,12 +2604,14 @@ export const beginDelete = mutation({
   args: { fileId: v.id("files"), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status === "deleted") return null;
     const now = Date.now();
     if (file.status === "deleting") {
       const retryAfterMs = earliestRetryAfter(
-        activeIngestCleanupRetryAfter(file, now),
+        await activeIngestCleanupRetryAfter(ctx, file, now),
+        await activeDerivedArtifactRehomeRetryAfter(ctx, file),
         await activeTurnFileLeaseRetryAfter(ctx, file._id, now),
       );
       return {
@@ -1403,6 +2625,16 @@ export const beginDelete = mutation({
     const reference = await ctx.db.query("creationFileRefs").withIndex("by_file", (q) => q.eq("fileId", file._id)).first();
     if (reference) return { ok: false as const, reason: "creation_reference" as const };
     const turnLeaseRetryAfterMs = await activeTurnFileLeaseRetryAfter(ctx, file._id, now);
+    const rehomeRetryAfterMs = await activeDerivedArtifactRehomeRetryAfter(ctx, file);
+    if (rehomeRetryAfterMs !== null) {
+      return {
+        ok: true as const,
+        deferred: true as const,
+        retryAfterMs: rehomeRetryAfterMs,
+        r2Keys: [],
+        idempotent: false as const,
+      };
+    }
     if (turnLeaseRetryAfterMs !== null) {
       await ctx.db.patch(file._id, {
         status: "deleting",
@@ -1433,7 +2665,7 @@ export const beginDelete = mutation({
         idempotent: false as const,
       };
     }
-    const ingestRetryAfterMs = activeIngestCleanupRetryAfter(file, now);
+    const ingestRetryAfterMs = await activeIngestCleanupRetryAfter(ctx, file, now);
     if (ingestRetryAfterMs !== null) {
       await ctx.db.patch(file._id, {
         status: "deleting",
@@ -1475,13 +2707,26 @@ export const finishDelete = mutation({
   args: { fileId: v.id("files"), ...actorAuthArgs },
   handler: async (ctx, args) => {
     await requireActor(ctx, args);
+    await assertNormalFileMutationAllowed(ctx);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.status !== "deleting") return false;
     const now = Date.now();
     if (earliestRetryAfter(
-      activeIngestCleanupRetryAfter(file, now),
+      await activeIngestCleanupRetryAfter(ctx, file, now),
+      await activeDerivedArtifactRehomeRetryAfter(ctx, file),
       await activeTurnFileLeaseRetryAfter(ctx, file._id, now),
     ) !== null) return false;
+    if (
+      Number(file.ingestOutputProtocol ?? INGEST_OUTPUT_PROTOCOL_V1) === INGEST_OUTPUT_PROTOCOL_V1
+      && Number(file.ingestAttempt ?? 0) > 0
+    ) {
+      // The file is about to lose any V1 pointers/direct-delete visibility.
+      // Keep its historical shared pair as a nonterminal reaper after the
+      // deletion commits: an old accepted PUT is not fenced by this callback.
+      let marker = legacyBridgeMarker(await outputAttemptsForVersion(ctx, file._id, file.ingestVersion));
+      marker = marker ?? await startLegacyBridgeMarker(ctx, file, String(file.ingestClaimToken ?? "legacy"), now);
+      if (marker) await moveLegacyBridgeToSweep(ctx, marker, now);
+    }
     const [chunks, threadLinks] = await Promise.all([
       ctx.db.query("fileChunks").withIndex("by_file_ordinal", (q) => q.eq("fileId", file._id)).collect(),
       ctx.db.query("threadFiles").withIndex("by_file", (q) => q.eq("fileId", file._id)).collect(),

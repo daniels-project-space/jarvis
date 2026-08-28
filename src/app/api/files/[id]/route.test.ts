@@ -106,6 +106,24 @@ describe("private file controls", () => {
     expect(mock.trigger).toHaveBeenCalledWith("jarvis-file-cleanup", { fileId: "file-1" });
   });
 
+  it("freezes direct deletion during the V1-to-V2 cutover", async () => {
+    process.env.JARVIS_FILE_INGEST_WAKE_PAUSED = "1";
+    try {
+      const response = await DELETE(new NextRequest("https://jarvis.example/api/files/file-1", {
+        method: "DELETE",
+        headers: { origin: "https://jarvis.example" },
+      }), { params: Promise.resolve({ id: "file-1" }) });
+
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("60");
+      expect(mock.controlMutation).not.toHaveBeenCalled();
+      expect(mock.privateR2Delete).not.toHaveBeenCalled();
+      expect(mock.trigger).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.JARVIS_FILE_INGEST_WAKE_PAUSED;
+    }
+  });
+
   it.each(["favorite", "review_remove", "unreviewed"] as const)("writes %s as a reversible review label without scheduling private storage work", async (reviewState) => {
     mock.controlMutation.mockResolvedValueOnce({ fileId: "file-1", reviewState });
     const request = new NextRequest("https://jarvis.example/api/files/file-1", {

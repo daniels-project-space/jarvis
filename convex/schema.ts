@@ -382,6 +382,17 @@ export default defineSchema({
     ingestVersion: v.number(),
     ingestAttempt: v.number(),
     ingestClaimToken: v.optional(v.string()),
+    // V2 claims publish to a unique generation allocated by Convex before the
+    // worker can write a derived R2 object. V1 remains only as a temporary
+    // rollout bridge for an already-deployed Trigger, and never shares these
+    // attempt-scoped paths.
+    ingestOutputProtocol: v.optional(v.number()),
+    ingestOutputAttemptId: v.optional(v.string()),
+    ingestOutputMayWriteUntil: v.optional(v.number()),
+    // A migration-owned lock while a terminal V1 derivative is copied into a
+    // unique V2 generation. Normal upload/ingest/delete mutators must defer
+    // while it is present; only the rehome CAS may clear it.
+    derivedArtifactRehomeId: v.optional(v.id("fileDerivedArtifactRehomes")),
     lastProgressAt: v.optional(v.number()),
     summary: v.optional(v.string()),
     searchText: v.string(),
@@ -488,6 +499,188 @@ export default defineSchema({
   })
     .index("by_file_ordinal", ["fileId", "ordinal"])
     .searchIndex("search_text", { searchField: "text", filterFields: ["fileKey"] }),
+
+  // Exact private R2 derivatives that may only be deleted after a lost
+  // completeIngest response has been reconciled against Convex. Keeping this
+  // separate from file metadata makes cleanup survive another worker response
+  // Legacy response-loss cleanup rows. Keep this shape drainable while the
+  // V2 attempt protocol rolls out; newly claimed V2 output never uses this
+  // shared-version table.
+  fileIngestCleanupOutbox: defineTable({
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    extractedTextR2Key: v.optional(v.string()),
+    previewR2Key: v.optional(v.string()),
+    // A legacy V1 cleanup claim is recorded before it is handed any shared
+    // R2 keys. The companion V1 bridge survives finish so migration start can
+    // detect a physically late DELETE rather than trusting a missing row.
+    cleanupClaimToken: v.optional(v.string()),
+    cleanupClaimExpiresAt: v.optional(v.number()),
+    deleteStarted: v.optional(v.boolean()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_file_version", ["fileId", "ingestVersion"])
+    .index("by_createdAt", ["createdAt"]),
+
+  // A V2 derived-output generation is allocated before its first R2 PUT. A
+  // successful `completeIngest` consumes it atomically. V1 entries are only
+  // compatibility sweep markers for known shared-version paths.
+  fileIngestOutputAttempts: defineTable({
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    outputProtocol: v.union(v.literal(1), v.literal(2)),
+    outputAttemptId: v.string(),
+    claimToken: v.string(),
+    // These are derived by Convex from the attempt identity, never accepted
+    // from a cleanup caller.
+    extractedTextR2Key: v.string(),
+    previewR2Key: v.string(),
+    producerMayWriteUntil: v.number(),
+    state: v.union(
+      v.literal("active"),
+      v.literal("cleanup"),
+      v.literal("deleting"),
+      // The producer lease elapsed without an explicit worker handoff. Keep
+      // the exact attempt durable and sweep it repeatedly: time alone cannot
+      // prove an already-accepted R2 PUT will not arrive late.
+      v.literal("sweeping"),
+      v.literal("legacy_sweeping"),
+    ),
+    // True only after this exact worker reaches a terminal Convex handoff
+    // (fail/retire/digest mismatch). A V2 row without that proof is never
+    // consumed merely because one cleanup delete succeeded.
+    writerHandoff: v.boolean(),
+    // Set before the worker issues either derived R2 PUT. Missing is treated
+    // as true by cleanup for conservative compatibility with any partially
+    // rolled-out V2 row: an accepted PUT may finish after its response fails.
+    writeStarted: v.optional(v.boolean()),
+    // V1 compatibility markers can represent a text-only or preview-only
+    // external DELETE. Missing means the historical row may have deleted the
+    // full pair; explicit false is the only proof a role was never returned
+    // to a legacy cleanup worker.
+    cleanupExtractedText: v.optional(v.boolean()),
+    cleanupPreview: v.optional(v.boolean()),
+    cleanupClaimToken: v.optional(v.string()),
+    cleanupClaimExpiresAt: v.optional(v.number()),
+    // A dedicated migration operator may acknowledge an exact historical V1
+    // cleanup risk only to copy it into a unique V2 target. This never
+    // activates V2 by itself; the full source/target readback + CAS/audit is
+    // still required before the global rollout can advance.
+    cleanupHistoryAcknowledgedRehomeId: v.optional(v.id("fileDerivedArtifactRehomes")),
+    cleanupHistoryAcknowledgedAt: v.optional(v.number()),
+    nextCleanupAt: v.number(),
+    sweepCount: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_file_version", ["fileId", "ingestVersion"])
+    .index("by_file_attempt", ["fileId", "outputAttemptId"])
+    .index("by_createdAt", ["createdAt"])
+    .index("by_state_cleanup", ["state", "nextCleanupAt"])
+    .index("by_protocol_state", ["outputProtocol", "state"]),
+
+  // One durable, server-controlled migration control row freezes normal file
+  // mutation while legacy V1 derived pointers are inventoried and rehomed.
+  // It is intentionally additive: it never repurposes a legacy cleanup row.
+  fileDerivedArtifactRehomeControls: defineTable({
+    key: v.string(),
+    phase: v.union(
+      v.literal("frozen"),
+      v.literal("inventorying"),
+      v.literal("rehoming"),
+      v.literal("ready"),
+      v.literal("active"),
+      v.literal("blocked"),
+    ),
+    inventoryStatus: v.union(
+      v.literal("ready"),
+      v.literal("stored_only"),
+      v.literal("error"),
+      v.literal("quarantined"),
+      v.literal("deleted"),
+      v.literal("complete"),
+    ),
+    inventoryCursor: v.optional(v.string()),
+    scannedCount: v.number(),
+    // Before inventory, scan every historic V1 cleanup record under the same
+    // global freeze. A physical DELETE may outlive its logical lease, so this
+    // is a durable paginated preflight rather than a fixed-size lookup.
+    cleanupPreflightStatus: v.optional(v.union(
+      v.literal("pending"),
+      v.literal("scanning"),
+      v.literal("complete"),
+      v.literal("blocked"),
+    )),
+    cleanupPreflightCursor: v.optional(v.string()),
+    cleanupPreflightScannedCount: v.optional(v.number()),
+    cleanupPreflightFailureFileId: v.optional(v.id("files")),
+    cleanupPreflightFailureOutputAttemptId: v.optional(v.id("fileIngestOutputAttempts")),
+    cleanupPreflightFailureCode: v.optional(v.string()),
+    // A second, durable full-library assertion runs after all manifests have
+    // cut over. It is paginated rather than capped so historical deleted rows
+    // cannot make V2 activation permanently impossible.
+    auditStatus: v.optional(v.union(
+      v.literal("pending"),
+      v.literal("scanning"),
+      v.literal("complete"),
+      v.literal("blocked"),
+    )),
+    auditCursor: v.optional(v.string()),
+    auditScannedCount: v.optional(v.number()),
+    auditFailureFileId: v.optional(v.id("files")),
+    auditFailureCode: v.optional(v.string()),
+    snapshotCount: v.number(),
+    cutoverCount: v.number(),
+    blockedCount: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  // A V1 terminal pointer is copied only through this manifest. It snapshots
+  // the exact source tuple and owns a fresh V2 output receipt for every copy
+  // generation; an expired/ambiguous worker never gets to reuse that target
+  // path. Successful cutover creates a permanent V1 source sweeper instead
+  // of deleting a source inline.
+  fileDerivedArtifactRehomes: defineTable({
+    controlKey: v.string(),
+    fileId: v.id("files"),
+    sourceIngestVersion: v.number(),
+    sourceFileUpdatedAt: v.number(),
+    sourceStatus: v.string(),
+    sourceExtractedTextR2Key: v.optional(v.string()),
+    sourcePreviewR2Key: v.optional(v.string()),
+    targetGeneration: v.number(),
+    targetOutputAttemptId: v.optional(v.string()),
+    targetOutputAttemptOutboxId: v.optional(v.id("fileIngestOutputAttempts")),
+    targetExtractedTextR2Key: v.optional(v.string()),
+    targetPreviewR2Key: v.optional(v.string()),
+    state: v.union(
+      v.literal("planned"),
+      v.literal("copying"),
+      v.literal("verified"),
+      v.literal("cutover"),
+      v.literal("blocked"),
+    ),
+    claimToken: v.optional(v.string()),
+    claimExpiresAt: v.optional(v.number()),
+    extractedTextWriteStarted: v.optional(v.boolean()),
+    previewWriteStarted: v.optional(v.boolean()),
+    sourceExtractedTextSha256: v.optional(v.string()),
+    sourcePreviewSha256: v.optional(v.string()),
+    targetExtractedTextSha256: v.optional(v.string()),
+    targetPreviewSha256: v.optional(v.string()),
+    sourceExtractedTextBytes: v.optional(v.number()),
+    sourcePreviewBytes: v.optional(v.number()),
+    targetExtractedTextBytes: v.optional(v.number()),
+    targetPreviewBytes: v.optional(v.number()),
+    failureCode: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_file", ["fileId"])
+    .index("by_control_state", ["controlKey", "state"])
+    .index("by_state_updated", ["state", "updatedAt"]),
 
   // Stable citations let maps/charts/boards show where a value came from and
   // prevent permanent deletion while a saved creation still depends on it.

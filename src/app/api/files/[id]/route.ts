@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import { controlMutation, controlQuery, isSameOriginRequest } from "@/lib/control-session";
+import { isFileIngestCutoverPaused } from "@/lib/file-ingest-wake";
 import { privateR2Delete, privateR2Get } from "@/lib/private-r2";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
@@ -106,6 +107,12 @@ export async function DELETE(req: NextRequest, context: { params: Promise<{ id: 
   const actor = await controlActor(req);
   if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
   if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
+  if (isFileIngestCutoverPaused()) {
+    return Response.json({ error: "private file deletion is temporarily paused during the ingest protocol cutover" }, {
+      status: 503,
+      headers: { "retry-after": "60", "cache-control": "private, no-store" },
+    });
+  }
   const { id: fileId } = await context.params;
   const credentials = controlCredentials(actor);
   const begun = await controlMutation("files:beginDelete", { fileId, ...credentials }).catch(() => null) as {

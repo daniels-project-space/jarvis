@@ -1,6 +1,7 @@
 import { schedules, tasks } from "@trigger.dev/sdk/v3";
 import { sendPush } from "./push-send";
 import { wakeAgentFleet } from "../lib/agent-fleet-dispatch";
+import { isFileIngestWakePaused } from "../lib/file-ingest-wake";
 
 // Evidence-first proactive supervision. Trigger owns only bounded state
 // reconciliation; all diagnosis and implementation remains in isolated,
@@ -45,15 +46,20 @@ export const insightEngine = schedules.task({
   cron: "0 */2 * * *",
   maxDuration: 60,
   run: async () => {
+    // During the V1-to-V2 cutover the Vercel bridge owns admission. Do not
+    // let this independent recovery schedule a task behind that gate.
+    const fileIngestWakePaused = isFileIngestWakePaused();
     // Recovery must not depend on the worker that may itself have disappeared.
     const [reaped, stuck] = await Promise.all([
       m("jobs:reapStale").catch(() => ({ requeued: [], abandoned: [] })),
       m("chatQueue:reapStuck").catch(() => ({ requeued: 0 })),
     ]);
-    const [state, pendingFiles, expiredUploads] = await Promise.all([
+    const [state, pendingFiles, expiredUploads, pendingDerivedCleanup, pendingOutputCleanup] = await Promise.all([
       m("proactive:reconcile", { now: Date.now() }),
-      q("files:pendingIngest", { limit: 4 }).catch(() => []),
+      fileIngestWakePaused ? Promise.resolve([]) : q("files:pendingIngest", { limit: 4 }).catch(() => []),
       m("files:cleanupExpiredReservations", { limit: 2 }).catch(() => []),
+      q("files:pendingIngestDerivedCleanup", { limit: 4 }).catch(() => []),
+      q("files:pendingIngestOutputCleanup", { limit: 4 }).catch(() => []),
     ]);
     const recoveryWindow = Math.floor(Date.now() / (2 * 60 * 60_000));
     const ingestRecoveries = [];
@@ -80,6 +86,25 @@ export const insightEngine = schedules.task({
         { idempotencyKey: `jarvis-file-cleanup-reconcile-${fileId}-${recoveryWindow}` },
       ).catch(() => null));
     }
+    const derivedCleanupRecoveries = [];
+    for (const item of Array.isArray(pendingDerivedCleanup) ? pendingDerivedCleanup.slice(0, 4) : []) {
+      const outboxId = String(item?.outboxId ?? "");
+      if (!outboxId) continue;
+      derivedCleanupRecoveries.push(await tasks.trigger(
+        "jarvis-file-ingest-derived-cleanup",
+        { outboxId },
+        { idempotencyKey: `jarvis-file-ingest-derived-cleanup-reconcile-${outboxId}-${recoveryWindow}` },
+      ).catch(() => null));
+    }
+    for (const item of Array.isArray(pendingOutputCleanup) ? pendingOutputCleanup.slice(0, 4) : []) {
+      const outputAttemptId = String(item?.outputAttemptId ?? "");
+      if (!outputAttemptId) continue;
+      derivedCleanupRecoveries.push(await tasks.trigger(
+        "jarvis-file-ingest-derived-cleanup",
+        { outputAttemptId },
+        { idempotencyKey: `jarvis-file-ingest-output-cleanup-reconcile-${outputAttemptId}-${recoveryWindow}` },
+      ).catch(() => null));
+    }
     const shouldWake =
       Number(state?.eligiblePending ?? 0) > 0 ||
       (Array.isArray(reaped?.requeued) && reaped.requeued.length > 0) ||
@@ -101,7 +126,9 @@ export const insightEngine = schedules.task({
       abandoned: reaped?.abandoned?.length ?? 0,
       stalled: reaped?.stalled?.length ?? 0,
       fileIngestRecoveries: ingestRecoveries.filter(Boolean).length,
+      fileIngestWakePaused,
       fileCleanupRecoveries: cleanupRecoveries.filter(Boolean).length,
+      fileDerivedCleanupRecoveries: derivedCleanupRecoveries.filter(Boolean).length,
     };
   },
 });

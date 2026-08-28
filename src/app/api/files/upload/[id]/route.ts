@@ -4,6 +4,7 @@ import type { NextRequest } from "next/server";
 import { CHAT_FILE_LIMITS, normalizeUploadMime, normalizeUploadSha256 } from "@/lib/chat-files";
 import { controlMutation, isSameOriginRequest } from "@/lib/control-session";
 import { reportIncident } from "@/lib/context";
+import { isFileIngestWakePaused } from "@/lib/file-ingest-wake";
 import { privateFileObjectKey, privateR2Delete, privateR2Put } from "@/lib/private-r2";
 import { actorAdminHash, controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
@@ -116,26 +117,30 @@ export async function PUT(req: NextRequest, context: { params: Promise<{ id: str
       return Response.json({ error: "upload was cancelled" }, { status: 409 });
     }
     const ingestVersion = Number(completed?.ingestVersion ?? claim.ingestVersion);
-    const handle = await tasks.trigger(
-      "jarvis-file-ingest",
-      { fileId, ingestVersion },
-      { idempotencyKey: `jarvis-file-${fileId}-v${ingestVersion}` },
-    ).catch(async (error) => {
-      await reportIncident(
-        "api/files/upload",
-        `file-ingest-trigger:${fileId}:v${ingestVersion}`,
-        `Private file was durably uploaded but its immediate ingest wake-up failed: ${String(error).slice(0, 240)}`,
-        "jarvis",
-        actorAdminHash(actor),
-      );
-      return null;
-    });
+    const wakePaused = isFileIngestWakePaused();
+    const handle = wakePaused
+      ? null
+      : await tasks.trigger(
+        "jarvis-file-ingest",
+        { fileId, ingestVersion },
+        { idempotencyKey: `jarvis-file-${fileId}-v${ingestVersion}` },
+      ).catch(async (error) => {
+        await reportIncident(
+          "api/files/upload",
+          `file-ingest-trigger:${fileId}:v${ingestVersion}`,
+          `Private file was durably uploaded but its immediate ingest wake-up failed: ${String(error).slice(0, 240)}`,
+          "jarvis",
+          actorAdminHash(actor),
+        );
+        return null;
+      });
     return Response.json({
       ok: true,
       fileId,
       status: "uploaded",
       processingScheduled: Boolean(handle),
       retryAvailable: !handle,
+      ...(wakePaused ? { processingWakePaused: true } : {}),
     }, { status: 201, headers: { "cache-control": "private, no-store" } });
   } catch (error) {
     if (!stored) await controlMutation("files:releaseUploadClaim", { fileId, claimToken, ...credentials }).catch(() => undefined);
