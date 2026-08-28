@@ -42,7 +42,9 @@ import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat, type VoiceCaptureOutcome } from "@/lib/voice-loop";
 import {
+  coalesceLiveVoiceStart,
   liveVoiceRetryDelay,
+  loadLiveVoiceStartupDependency,
   scheduleAutoLiveBootstrap,
   shouldAutoStartLiveVoice,
   speechServiceRetryDelay,
@@ -2122,6 +2124,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const sttAbortRef = useRef<AbortController | null>(null);
   const lastVoiceInput = useRef<{ text: string; at: number } | null>(null);
   const liveRef = useRef(false);
+  // `toggleLive` has one async module boundary before it can set `liveRef`.
+  // Treat that handoff as live too: a visibility/host cancellation or standby
+  // re-arm in that gap must not race an about-to-open microphone.
+  const liveStartPendingRef = useRef(false);
+  const liveStartPromiseRef = useRef<Promise<boolean> | null>(null);
+  const liveCaptureIsActiveOrStarting = () => liveRef.current || liveStartPendingRef.current;
   const me = useRef("");
   const [standbyClient] = useState(() => createStandbyListenerClientId());
   const standbyLeaseRef = useRef<StandbyListenerLease | null>(null);
@@ -2304,7 +2312,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     let stopWatching: () => void = () => undefined;
     void watchMicrophonePermission((microphone) => {
       setPermissions((current) => ({ ...current, microphone }));
-      if (microphone === "denied" && liveRef.current) endFreeVoiceSession();
+      if (microphone === "denied" && liveCaptureIsActiveOrStarting()) endFreeVoiceSession();
       if (microphone === "granted") liveAutoStarted.current = false;
     }).then((stop) => {
       if (disposed) stop();
@@ -2595,7 +2603,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       client: standbyClient,
       eligible: standbyIsEligible(),
       hidden: document.hidden,
-      live: liveRef.current,
+      live: liveCaptureIsActiveOrStarting(),
     })) {
       releaseStandbyListener();
       return;
@@ -2643,7 +2651,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           client: standbyClient,
           eligible: standbyIsEligible(),
           hidden: document.hidden,
-          live: liveRef.current,
+          live: liveCaptureIsActiveOrStarting(),
         })
       ) {
         // Never stop the global recognizer from a stale async branch. If a
@@ -2659,7 +2667,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (wakeOwnedByHost()) {
         postToParent({ jarvis: "host-listener-grant" });
       } else {
-        const m = await import("../lib/wakeword");
+        const m = await import("../lib/wakeword").catch(() => null);
+        if (!m) {
+          if (isCurrentStandbyLease(lease)) releaseStandbyListener();
+          else revokeStandbyLease(lease);
+          return;
+        }
         if (
           epoch !== standbyEpochRef.current
           || !standbyLeaseOwnedRef.current
@@ -2669,7 +2682,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             client: standbyClient,
             eligible: standbyIsEligible(),
             hidden: document.hidden,
-            live: liveRef.current,
+            live: liveCaptureIsActiveOrStarting(),
           })
         ) {
           if (isCurrentStandbyLease(lease)) releaseStandbyListener();
@@ -2784,9 +2797,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       }
       if (message.jarvis === "host-mute-set" && typeof message.muted === "boolean") {
         setAudioMutedPreference(message.muted);
-        if (message.muted && liveRef.current) void toggleLive();
+        if (message.muted && liveCaptureIsActiveOrStarting()) void toggleLive();
       }
-      if (message.jarvis === "host-hide" && liveRef.current) void toggleLive();
+      if (message.jarvis === "host-hide" && liveCaptureIsActiveOrStarting()) void toggleLive();
       if (message.jarvis === "host-wake-state") setWake(message.listening === true);
       if ((message.jarvis === "host-context" || message.jarvis === "context-response") && message.context) {
         hostContextRef.current = message.context as JarvisHostContext;
@@ -4185,6 +4198,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, speaking]);
   function closePersistentLiveMic() {
+    liveStartPendingRef.current = false;
     liveSessionEpoch.current += 1;
     sttAbortRef.current?.abort();
     sttAbortRef.current = null;
@@ -4236,6 +4250,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   releaseLiveOnUnmountRef.current = releaseLive;
 
   function endFreeVoiceSession() {
+    // Visibility, permission and device-ended paths can cancel an opening
+    // start without going through `toggleLive(false)`. Do not make the next
+    // force-start await that now-stale promise.
+    liveStartPromiseRef.current = null;
     liveSessionEpoch.current += 1;
     freeLoop.current = false;
     cancelFreeRearm();
@@ -4249,13 +4267,43 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     rearmWake();
   }
 
-  async function toggleLive(forceStart = false, captureImmediately = true): Promise<boolean> {
+  function toggleLive(forceStart = false, captureImmediately = true): Promise<boolean> {
+    const stopping = !forceStart && (
+      liveRef.current || live !== "off" || liveStartPendingRef.current
+    );
+    if (stopping) {
+      // A subsequent force-start is a new request after an explicit stop, not
+      // a waiter on the cancelled start below.
+      liveStartPromiseRef.current = null;
+      return runToggleLive(forceStart, captureImmediately);
+    }
+    const existingStart = liveStartPromiseRef.current;
+    if (existingStart) return existingStart;
+    if (liveRef.current) {
+      // The normal path has a shared promise while connecting. Fail closed if
+      // a non-promise opening state is ever observed rather than pretend ready.
+      return Promise.resolve(liveStartPendingRef.current ? false : true);
+    }
+    const start = coalesceLiveVoiceStart(
+      existingStart,
+      () => runToggleLive(forceStart, captureImmediately),
+    );
+    liveStartPromiseRef.current = start;
+    const clear = () => {
+      if (liveStartPromiseRef.current === start) liveStartPromiseRef.current = null;
+    };
+    void start.then(clear, clear);
+    return start;
+  }
+
+  async function runToggleLive(forceStart = false, captureImmediately = true): Promise<boolean> {
     const sessionEpoch = ++liveSessionEpoch.current;
-    if (!forceStart && (liveRef.current || live !== "off")) {
+    if (!forceStart && (liveRef.current || live !== "off" || liveStartPendingRef.current)) {
       liveManuallyStopped.current = true;
       resumeLiveWhenVisible.current = false;
       freeLoop.current = false;
       cancelFreeRearm();
+      liveStartPendingRef.current = false;
       if (recRef.current?.state === "recording") recRef.current.stop();
       liveRef.current = false;
       setLive("off");
@@ -4264,7 +4312,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       rearmWake();
       return false;
     }
-    if (liveRef.current) return true;
+    // Set this before the dynamic import below. The wakeword/host/visibility
+    // paths can run while that chunk is loading, and must treat this as an
+    // in-flight microphone session rather than re-arm standby recognition.
+    liveStartPendingRef.current = true;
     liveManuallyStopped.current = false;
     const remoteLease = createLiveRemoteLease();
     unlockSpeechPlayback();
@@ -4275,9 +4326,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // Stop the browser wake recognizer before taking the global live lease.
     // The winner opens persistent capture only after Convex fences every other
     // document; per-document in-memory mic guards cannot prevent dual capture.
-    const { stopWake } = await import("../lib/wakeword");
+    const wakeword = await loadLiveVoiceStartupDependency({
+      load: () => import("../lib/wakeword"),
+      isStillCurrent: () => sessionEpoch === liveSessionEpoch.current,
+      onFailure: () => {
+        liveStartPendingRef.current = false;
+        freeLoop.current = false;
+        liveRef.current = false;
+        setLive("off");
+        rearmWake();
+      },
+    });
+    if (!wakeword) return false;
     if (sessionEpoch !== liveSessionEpoch.current) return false;
-    stopWake();
+    wakeword.stopWake();
     setWake(false);
     freeLoop.current = true;
     liveRef.current = true;
@@ -4361,11 +4423,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       releaseLiveLease: releaseStartLease,
       isStillWanted: () => liveRef.current && sessionEpoch === liveSessionEpoch.current,
       shouldCloseCancelledMicrophone: () => (
-        sessionEpoch === liveSessionEpoch.current || !liveRef.current
+        sessionEpoch === liveSessionEpoch.current
+        || (!liveRef.current && !liveStartPendingRef.current)
       ),
       closeMicrophone: () => closePersistentLiveMic(),
     });
+    const clearPendingStart = () => {
+      // A newer start owns this shared ref after an epoch change.
+      if (sessionEpoch === liveSessionEpoch.current) liveStartPendingRef.current = false;
+    };
     if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
+      clearPendingStart();
       if (
         started.status === "ready"
         && (sessionEpoch === liveSessionEpoch.current || !liveRef.current)
@@ -4374,6 +4442,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       return false;
     }
     if (started.status === "not-owned" || (started.status === "failed" && started.stage === "lease")) {
+      clearPendingStart();
       freeLoop.current = false;
       liveRef.current = false;
       setLive("off");
@@ -4387,8 +4456,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       rearmWake();
       return false;
     }
-    if (started.status === "cancelled") return false;
+    if (started.status === "cancelled") {
+      clearPendingStart();
+      return false;
+    }
     if (started.status === "failed") {
+      clearPendingStart();
       freeLoop.current = false;
       liveRef.current = false;
       setLive("off");
@@ -4406,7 +4479,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     void ownVoice();
     import("../lib/tts").then((m) => m.stopSpeaking());
-    if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) return false;
+    if (sessionEpoch !== liveSessionEpoch.current || !liveRef.current) {
+      clearPendingStart();
+      return false;
+    }
+    clearPendingStart();
     setLive("live");
     void refreshPermissions();
     if (liveBeat.current) clearInterval(liveBeat.current);
@@ -4448,7 +4525,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
       releaseStandbyListener();
-      if (!liveRef.current) return;
+      if (!liveCaptureIsActiveOrStarting()) return;
       resumeLiveWhenVisible.current = !liveManuallyStopped.current;
       endFreeVoiceSession();
     };

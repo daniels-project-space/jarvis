@@ -7,6 +7,36 @@ export type LiveVoiceLeaseStart<T> =
   | { status: "failed"; stage: "lease" | "microphone"; error: unknown };
 
 /**
+ * A live start begins before its lazy browser-voice module is guaranteed to
+ * be available. Keep a failed import from leaving the caller's pending-start
+ * fence set forever, but never let an old failed start clean up a replacement.
+ */
+export async function loadLiveVoiceStartupDependency<T>({
+  load,
+  isStillCurrent,
+  onFailure,
+}: {
+  load: () => Promise<T>;
+  isStillCurrent: () => boolean;
+  onFailure: () => void;
+}): Promise<T | null> {
+  try {
+    return await load();
+  } catch {
+    if (isStillCurrent()) onFailure();
+    return null;
+  }
+}
+
+/** Share one in-flight live start; a second force-start must not supersede it. */
+export function coalesceLiveVoiceStart<T>(
+  current: Promise<T> | null,
+  start: () => Promise<T>,
+): Promise<T> {
+  return current ?? start();
+}
+
+/**
  * Fence microphone startup behind a shared live-voice lease. Browser documents
  * cannot share their in-memory getUserMedia promise, so this ordering is the
  * only boundary that prevents a main page and an embedded surface from opening

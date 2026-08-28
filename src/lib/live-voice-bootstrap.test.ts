@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
+  coalesceLiveVoiceStart,
   liveVoiceRetryDelay,
+  loadLiveVoiceStartupDependency,
   scheduleAutoLiveBootstrap,
   shouldAutoStartLiveVoice,
   speechServiceRetryDelay,
@@ -47,6 +49,61 @@ describe("live voice bootstrap policy", () => {
     expect(speechServiceRetryDelay(2, 90_000)).toBe(30_000);
   });
 
+  it("cleans up a current pending start when its lazy voice module fails, without touching a replacement", async () => {
+    const failure = new Error("offline module");
+    const onCurrentFailure = vi.fn();
+    const current = await loadLiveVoiceStartupDependency({
+      load: async () => { throw failure; },
+      isStillCurrent: () => true,
+      onFailure: onCurrentFailure,
+    });
+    expect(current).toBeNull();
+    expect(onCurrentFailure).toHaveBeenCalledTimes(1);
+
+    const onStaleFailure = vi.fn();
+    const stale = await loadLiveVoiceStartupDependency({
+      load: async () => { throw failure; },
+      isStillCurrent: () => false,
+      onFailure: onStaleFailure,
+    });
+    expect(stale).toBeNull();
+    expect(onStaleFailure).not.toHaveBeenCalled();
+  });
+
+  it("coalesces concurrent force-start waiters onto one lease and microphone startup", async () => {
+    const pending = deferred<boolean>();
+    const begin = vi.fn(() => pending.promise);
+
+    const first = coalesceLiveVoiceStart(null, begin);
+    const second = coalesceLiveVoiceStart(first, begin);
+
+    expect(second).toBe(first);
+    expect(begin).toHaveBeenCalledTimes(1);
+    pending.resolve(true);
+    await expect(second).resolves.toBe(true);
+  });
+
+  it("does not reuse a cancelled start when visibility resumes before it settles", async () => {
+    const firstPending = deferred<boolean>();
+    const firstBegin = vi.fn(() => firstPending.promise);
+    const first = coalesceLiveVoiceStart(null, firstBegin);
+    let current: Promise<boolean> | null = first;
+
+    // `endFreeVoiceSession` invalidates the coalescing slot before a hidden
+    // tab can become visible and request a replacement start.
+    current = null;
+    const secondPending = deferred<boolean>();
+    const secondBegin = vi.fn(() => secondPending.promise);
+    const resumed = coalesceLiveVoiceStart(current, secondBegin);
+
+    expect(resumed).not.toBe(first);
+    expect(firstBegin).toHaveBeenCalledTimes(1);
+    expect(secondBegin).toHaveBeenCalledTimes(1);
+    secondPending.resolve(true);
+    await expect(resumed).resolves.toBe(true);
+    firstPending.resolve(false);
+  });
+
   it("releases the bootstrap fence when a remembered grant arrives before the startup timer", async () => {
     vi.useFakeTimers();
     try {
@@ -85,7 +142,7 @@ describe("live voice bootstrap policy", () => {
       source.indexOf("function releaseLive"),
     );
     const toggleLive = source.slice(
-      source.indexOf("async function toggleLive"),
+      source.indexOf("async function runToggleLive"),
       source.indexOf("async function enableMicrophone"),
     );
     expect(ensureMic).toContain("if (liveMicOpeningRef.current) return liveMicOpeningRef.current");
@@ -95,13 +152,13 @@ describe("live voice bootstrap policy", () => {
     expect(toggleLive).toContain("openMicrophone: ensurePersistentLiveMic");
     expect(toggleLive).not.toContain("const microphone = ensurePersistentLiveMic");
     expect(toggleLive).toContain("shouldCloseCancelledMicrophone:");
-    expect(toggleLive).toContain("sessionEpoch === liveSessionEpoch.current || !liveRef.current");
+    expect(toggleLive).toContain("|| (!liveRef.current && !liveStartPendingRef.current)");
   });
 
   it("takes an origin-wide browser lease before a guest or overlay can open capture", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
     const toggleLive = source.slice(
-      source.indexOf("async function toggleLive"),
+      source.indexOf("async function runToggleLive"),
       source.indexOf("async function enableMicrophone"),
     );
     expect(toggleLive).toContain("await tryAcquireBrowserVoiceLease({");
@@ -119,7 +176,7 @@ describe("live voice bootstrap policy", () => {
     expect(source).toContain("standbyLeaseFence.clear()");
   });
 
-  it("does not re-arm standby recognition while persistent live capture is active", () => {
+  it("does not re-arm standby recognition while persistent live capture is active or opening", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
     const rearmWake = source.slice(
       source.indexOf("rearmWake = () =>"),
@@ -127,10 +184,40 @@ describe("live voice bootstrap policy", () => {
     );
 
     expect(rearmWake).toContain("shouldArmStandbyListener({");
-    expect(rearmWake).toContain("live: liveRef.current");
+    expect(rearmWake).toContain("live: liveCaptureIsActiveOrStarting()");
     // Both asynchronous handoffs re-check this policy: a live session can
     // start while the remote lease or the wakeword module is still loading.
-    expect(rearmWake.match(/live: liveRef\.current/g)).toHaveLength(3);
+    expect(rearmWake.match(/live: liveCaptureIsActiveOrStarting\(\)/g)).toHaveLength(3);
+    expect(source).toContain("const liveStartPendingRef = useRef(false);");
+  });
+
+  it("cancels an opening live start and clears a failed lazy-module fence", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    const toggleLive = source.slice(
+      source.indexOf("async function runToggleLive"),
+      source.indexOf("async function enableMicrophone"),
+    );
+
+    expect(toggleLive).toContain("liveStartPendingRef.current = true;");
+    expect(toggleLive).toContain("liveStartPendingRef.current = false;");
+    expect(toggleLive).toContain("liveRef.current || live !== \"off\" || liveStartPendingRef.current");
+    expect(toggleLive).toContain("loadLiveVoiceStartupDependency({");
+    expect(toggleLive).toContain("onFailure: () => {");
+    expect(toggleLive).toContain("rearmWake();");
+    const toggleLiveWrapper = source.slice(
+      source.indexOf("function toggleLive"),
+      source.indexOf("async function runToggleLive"),
+    );
+    expect(toggleLiveWrapper).toContain("const existingStart = liveStartPromiseRef.current;");
+    expect(toggleLiveWrapper).toContain("if (existingStart) return existingStart;");
+    expect(toggleLiveWrapper).toContain("coalesceLiveVoiceStart(");
+    const endFreeVoiceSession = source.slice(
+      source.indexOf("function endFreeVoiceSession"),
+      source.indexOf("function toggleLive"),
+    );
+    expect(endFreeVoiceSession).toContain("liveStartPromiseRef.current = null;");
+    expect(source).toContain("if (message.jarvis === \"host-hide\" && liveCaptureIsActiveOrStarting()) void toggleLive();");
+    expect(source).toContain("if (!liveCaptureIsActiveOrStarting()) return;");
   });
 
   it("keeps the single spoken transcript slightly smaller and lower than the orb", () => {
@@ -251,7 +338,7 @@ describe("live voice bootstrap policy", () => {
       source.indexOf("function releaseLive()"),
       source.indexOf("function endFreeVoiceSession"),
     );
-    const unmountStart = source.indexOf("useEffect(() => () => {", source.indexOf("async function toggleLive"));
+    const unmountStart = source.indexOf("useEffect(() => () => {", source.indexOf("async function runToggleLive"));
     const unmount = source.slice(unmountStart, source.indexOf("  }, []);", unmountStart));
 
     expect(source).toContain("const releaseLiveOnUnmountRef = useRef<() => void>(() => {});");

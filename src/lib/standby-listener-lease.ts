@@ -37,6 +37,8 @@ export function shouldArmStandbyListener({
   client: string | null;
   eligible: boolean;
   hidden: boolean;
+  // `live` includes the short async handoff before the microphone stream is
+  // open, so standby never re-arms beside a pending live start.
   live: boolean;
 }): boolean {
   return !guest && !!client && eligible && !hidden && !live;
