@@ -22,6 +22,42 @@ The same reserve-first library is used by the Trigger tool producers. Deploy a
 new Trigger version before the Convex cutover, but do not let old producer
 runs start while it drains.
 
+## Current release gate: **NO-GO**
+
+The Vercel threshold plus the 330-second duration proof fences *new routing* to
+the legacy deployment. It does not prove that an old unconditional R2 operation
+which R2 accepted before that fence will not commit later. The legacy
+`privateR2Delete` is an ordinary signed `DELETE` with no provider-side
+completion fence or cancellation contract.
+
+Credential rotation/revocation is **not** a substitute for that fence. R2
+authenticates a request at its Gateway before it routes, writes storage data,
+and commits metadata; R2 documents IAM permission changes as eventually
+consistent (up to one minute), but does not document cancellation or rollback
+of an operation that was already authenticated. Revoking a parent token also
+makes derived temporary credentials stop working, which protects future
+authentication only. See Cloudflare's [R2 write flow](https://developers.cloudflare.com/r2/how-r2-works/),
+[consistency model](https://developers.cloudflare.com/r2/reference/consistency/),
+and [temporary credential guidance](https://developers.cloudflare.com/r2/api/s3/temporary-credentials/).
+
+Do **not** run the release sequence below until one of these is independently
+approved:
+
+- Cloudflare provides a written, applicable guarantee that revocation or another
+  control atomically prevents an already accepted R2 object mutation from
+  committing; or
+- a separately reviewed architecture gives the new live asset data an R2-side
+  isolation/fence that legacy credentials cannot affect; or
+- the release owner explicitly accepts the residual risk of a late legacy R2
+  mutation.
+
+R2 Bucket Locks are not an implicit exception: although they prevent later
+deletion/overwrite for a matching prefix, the public documentation does not
+give an atomic ordering guarantee against a mutation already accepted before a
+lock configuration change. They would also block normal cleanup under that
+prefix. Treat any lock-based design as a separate provider-backed protocol,
+not as a timing or credential-rotation workaround.
+
 ## Required release sequence
 
 1. Record the candidate SHA. Deploy the exact candidate Vercel build to the
