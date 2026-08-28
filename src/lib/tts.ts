@@ -2,6 +2,7 @@
 
 import { viewerFetch } from "./viewer-request";
 import { planVoiceDelivery, voiceDeliveryCacheKey } from "./voice-delivery";
+import { supportsProgressiveMpegPlayback } from "./progressive-mpeg";
 
 // One speech route and one queue: free streamed en-GB-RyanNeural. The browser
 // only decodes audio; it never loads a model or falls back to SpeechSynthesis.
@@ -27,6 +28,11 @@ class SpeechPlaybackBlockedError extends Error {
 }
 
 type AudioResult = { audio: ArrayBuffer };
+type SpeechResponse = {
+  response: Response;
+  release: () => void;
+};
+type PlaybackHandle = { stop: () => void };
 
 const ECHO_GUARD_TAIL_MS = 45_000;
 const REQUEST_TIMEOUT_MS = 4_000;
@@ -48,7 +54,7 @@ let ttsEngine = "edge-neural-ryan-gb";
 
 let generation = 0;
 let audioContext: AudioContext | null = null;
-let currentSource: AudioBufferSourceNode | null = null;
+let currentSource: PlaybackHandle | null = null;
 let finishCurrentPlayback: (() => void) | null = null;
 let draining = false;
 let activeBatch: SpeechBatch | null = null;
@@ -292,12 +298,16 @@ export function speechPauseMs(text: string): number {
   return 0;
 }
 
-async function requestAudio(text: string, expectedGeneration: number): Promise<AudioResult> {
+async function requestSpeechResponse(text: string, expectedGeneration: number): Promise<SpeechResponse> {
   if (expectedGeneration !== generation) throw new Error("speech cancelled");
   const controller = new AbortController();
   pendingRequests.add(controller);
   if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsRequestMs = String(Math.round(performance.now()));
   const timeout = window.setTimeout(() => controller.abort("TTS timed out"), REQUEST_TIMEOUT_MS);
+  const release = () => {
+    window.clearTimeout(timeout);
+    pendingRequests.delete(controller);
+  };
   try {
     const delivery = planVoiceDelivery(text);
     const response = await viewerFetch("/api/tts", {
@@ -313,12 +323,21 @@ async function requestAudio(text: string, expectedGeneration: number): Promise<A
     }
     const engine = response.headers.get("x-jarvis-tts-engine")?.trim();
     if (engine) ttsEngine = engine;
-    const audio = await response.arrayBuffer();
+    return { response, release };
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
+
+async function requestAudio(text: string, expectedGeneration: number): Promise<AudioResult> {
+  const speech = await requestSpeechResponse(text, expectedGeneration);
+  try {
+    const audio = await speech.response.arrayBuffer();
     if (audio.byteLength < 512) throw new Error("TTS returned empty audio");
     return { audio };
   } finally {
-    window.clearTimeout(timeout);
-    pendingRequests.delete(controller);
+    speech.release();
   }
 }
 
@@ -333,8 +352,25 @@ function rememberAudio(key: string, result: AudioResult): AudioResult {
   return result;
 }
 
+function speechCacheKey(text: string): string {
+  return `${ttsEngine}:${voiceDeliveryCacheKey(planVoiceDelivery(text))}:${text}`;
+}
+
+type ProgressiveSpeech = {
+  cached?: AudioResult;
+  cacheKey: string;
+  response?: SpeechResponse;
+};
+
+async function prepareProgressiveSpeech(text: string, expectedGeneration: number): Promise<ProgressiveSpeech> {
+  const cacheKey = speechCacheKey(text);
+  const cached = audioCache.get(cacheKey);
+  if (cached) return { cacheKey, cached };
+  return { cacheKey, response: await requestSpeechResponse(text, expectedGeneration) };
+}
+
 async function synthesize(text: string, expectedGeneration: number): Promise<AudioResult> {
-  const key = `${ttsEngine}:${voiceDeliveryCacheKey(planVoiceDelivery(text))}:${text}`;
+  const key = speechCacheKey(text);
   const cached = audioCache.get(key);
   if (cached) return cached;
   const existing = synthesisInFlight.get(key);
@@ -345,6 +381,228 @@ async function synthesize(text: string, expectedGeneration: number): Promise<Aud
     return await request;
   } finally {
     if (synthesisInFlight.get(key) === request) synthesisInFlight.delete(key);
+  }
+}
+
+function concatAudioChunks(chunks: Uint8Array[], totalBytes: number): ArrayBuffer {
+  const audio = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    audio.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return audio.buffer;
+}
+
+function waitForSourceOpen(mediaSource: MediaSource): Promise<void> {
+  if (mediaSource.readyState === "open") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onOpen = () => {
+      mediaSource.removeEventListener("sourceclose", onClose);
+      resolve();
+    };
+    const onClose = () => {
+      mediaSource.removeEventListener("sourceopen", onOpen);
+      reject(new Error("Progressive audio source closed before it opened"));
+    };
+    mediaSource.addEventListener("sourceopen", onOpen, { once: true });
+    mediaSource.addEventListener("sourceclose", onClose, { once: true });
+  });
+}
+
+function waitForSourceBufferIdle(sourceBuffer: SourceBuffer): Promise<void> {
+  if (!sourceBuffer.updating) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onUpdate = () => {
+      sourceBuffer.removeEventListener("error", onError);
+      resolve();
+    };
+    const onError = () => {
+      sourceBuffer.removeEventListener("updateend", onUpdate);
+      reject(new Error("Progressive audio buffer rejected a chunk"));
+    };
+    sourceBuffer.addEventListener("updateend", onUpdate, { once: true });
+    sourceBuffer.addEventListener("error", onError, { once: true });
+  });
+}
+
+async function appendProgressiveMpegChunk(sourceBuffer: SourceBuffer, chunk: Uint8Array): Promise<void> {
+  await waitForSourceBufferIdle(sourceBuffer);
+  await new Promise<void>((resolve, reject) => {
+    const onUpdate = () => {
+      sourceBuffer.removeEventListener("error", onError);
+      resolve();
+    };
+    const onError = () => {
+      sourceBuffer.removeEventListener("updateend", onUpdate);
+      reject(new Error("Progressive audio buffer rejected a chunk"));
+    };
+    sourceBuffer.addEventListener("updateend", onUpdate, { once: true });
+    sourceBuffer.addEventListener("error", onError, { once: true });
+    try {
+      const buffer = new Uint8Array(chunk.byteLength);
+      buffer.set(chunk);
+      sourceBuffer.appendBuffer(buffer.buffer);
+    } catch (error) {
+      sourceBuffer.removeEventListener("updateend", onUpdate);
+      sourceBuffer.removeEventListener("error", onError);
+      reject(error);
+    }
+  });
+}
+
+async function endProgressiveMpeg(mediaSource: MediaSource, sourceBuffer: SourceBuffer): Promise<void> {
+  await waitForSourceBufferIdle(sourceBuffer);
+  if (mediaSource.readyState === "open") mediaSource.endOfStream();
+}
+
+async function playProgressiveMpeg(
+  speech: SpeechResponse,
+  expectedGeneration: number,
+  onEnergy: (energy: number) => void,
+  onStart?: () => void,
+): Promise<{ played: boolean; audio: AudioResult }> {
+  const stream = speech.response.body;
+  if (!stream) {
+    speech.release();
+    throw new Error("TTS returned no audio stream");
+  }
+  if (expectedGeneration !== generation) {
+    speech.release();
+    throw new Error("speech cancelled");
+  }
+  const context = ensureAudioContext();
+  if (context.state === "suspended") {
+    try {
+      await context.resume();
+    } catch (error) {
+      speech.release();
+      if (isPlaybackBlocked(error)) throw new SpeechPlaybackBlockedError();
+      throw error;
+    }
+    if (context.state === "suspended") {
+      speech.release();
+      throw new SpeechPlaybackBlockedError();
+    }
+  }
+
+  const mediaSource = new MediaSource();
+  const audio = new Audio();
+  audio.preload = "auto";
+  audio.setAttribute("playsinline", "");
+  const objectUrl = URL.createObjectURL(mediaSource);
+  const source = context.createMediaElementSource(audio);
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 128;
+  source.connect(analyser);
+  analyser.connect(context.destination);
+  audio.src = objectUrl;
+
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let energyTimer: number | null = null;
+  let started = false;
+  let startPlayback: Promise<void> | null = null;
+  let stopped = false;
+  let settled = false;
+  let finishPlayback: (played: boolean) => void = () => {};
+  let failPlayback: (error: unknown) => void = () => {};
+  const playback = new Promise<boolean>((resolve, reject) => {
+    finishPlayback = resolve;
+    failPlayback = reject;
+  });
+  const playbackHandle: PlaybackHandle = {
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      void reader?.cancel("speech cancelled").catch(() => {});
+      try { audio.pause(); } catch { /* best effort */ }
+      settle(false);
+    },
+  };
+
+  const cleanup = () => {
+    if (energyTimer) window.clearInterval(energyTimer);
+    onEnergy(0);
+    if (currentSource === playbackHandle) currentSource = null;
+    if (finishCurrentPlayback === playbackHandle.stop) finishCurrentPlayback = null;
+    audio.onended = null;
+    audio.onerror = null;
+    try { source.disconnect(); } catch { /* already disconnected */ }
+    try { analyser.disconnect(); } catch { /* already disconnected */ }
+    audio.removeAttribute("src");
+    try { audio.load(); } catch { /* best effort */ }
+    URL.revokeObjectURL(objectUrl);
+  };
+  const settle = (played: boolean, error?: unknown) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (error) failPlayback(error);
+    else finishPlayback(played);
+  };
+
+  currentSource = playbackHandle;
+  finishCurrentPlayback = playbackHandle.stop;
+  audio.onended = () => settle(true);
+  audio.onerror = () => settle(false, new Error("Progressive audio playback failed"));
+
+  try {
+    await waitForSourceOpen(mediaSource);
+    const sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+    reader = stream.getReader();
+    while (!stopped && expectedGeneration === generation) {
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = new Uint8Array(next.value);
+      chunks.push(chunk);
+      totalBytes += chunk.byteLength;
+      await appendProgressiveMpegChunk(sourceBuffer, chunk);
+      if (!startPlayback) {
+        // Do not await play() here. An MP3's first network frame can contain
+        // only metadata; waiting for playback before appending later frames
+        // would deadlock the very stream intended to reduce latency.
+        startPlayback = audio.play().then(() => {
+          if (expectedGeneration !== generation || stopped) return;
+          started = true;
+          if (typeof document !== "undefined") document.documentElement.dataset.jarvisTtsFirstPlayableMs = String(Math.round(performance.now()));
+          energyTimer = window.setInterval(() => {
+            const levels = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(levels);
+            const mean = levels.reduce((sum, value) => sum + value, 0) / Math.max(1, levels.length);
+            onEnergy(Math.min(1, mean / 110));
+          }, 48);
+          setTtsStatus("speaking");
+          onStart?.();
+        }).catch((error: unknown) => {
+          if (expectedGeneration !== generation || stopped) return;
+          if (isPlaybackBlocked(error)) throw new SpeechPlaybackBlockedError();
+          throw error;
+        });
+      }
+    }
+    if (!stopped && expectedGeneration === generation) {
+      if (totalBytes < 512) throw new Error("TTS returned empty audio");
+      await endProgressiveMpeg(mediaSource, sourceBuffer);
+      if (!startPlayback) throw new Error("TTS returned no playable audio");
+      await startPlayback;
+    } else {
+      playbackHandle.stop();
+    }
+    const played = await playback;
+    return { played, audio: { audio: concatAudioChunks(chunks, totalBytes) } };
+  } catch (error) {
+    if (stopped || expectedGeneration !== generation) {
+      return { played: false, audio: { audio: concatAudioChunks(chunks, totalBytes) } };
+    }
+    stopped = true;
+    void reader?.cancel("progressive audio failed").catch(() => {});
+    try { audio.pause(); } catch { /* best effort */ }
+    settle(false, error);
+    throw error;
+  } finally {
+    speech.release();
   }
 }
 
@@ -487,28 +745,49 @@ async function drainSpeechQueue(): Promise<void> {
       activeBatch = batch;
       void import("./wakeword").then((module) => module.setSuppressed?.(true, /jarvis/i.test(batch.text))).catch(() => {});
       let started = false;
-      let next = batch.segments[0] ? synthesize(batch.segments[0], batch.generation) : null;
+      const firstSegment = batch.segments[0];
+      // Chrome can begin emitting a streamed Edge MP3 before its final bytes
+      // arrive. Keep all non-supporting browsers on the proven Web Audio path.
+      const progressiveFirst = firstSegment && supportsProgressiveMpegPlayback()
+        ? prepareProgressiveSpeech(firstSegment, batch.generation)
+        : null;
+      let next = progressiveFirst || !firstSegment
+        ? null
+        : synthesize(firstSegment, batch.generation);
       try {
-        for (let index = 0; next && index < batch.segments.length; index++) {
+        for (let index = 0; index < batch.segments.length; index++) {
           if (batch.generation !== generation) break;
           setTtsStatus("buffering");
-          const audio = await next;
-          if (batch.generation !== generation) break;
-          next = batch.segments[index + 1]
-            ? synthesize(batch.segments[index + 1], batch.generation)
-            : null;
-          const played = await playAudio(
-            audio,
-            batch.generation,
-            batch.onEnergy,
-            !started
-              ? () => {
-                  started = true;
-                  trackUtterance(batch.text, Math.min(90_000, batch.text.length * 70));
-                  batch.onStart?.();
-                }
-              : undefined,
-          );
+          const announceStart = !started
+            ? () => {
+                started = true;
+                trackUtterance(batch.text, Math.min(90_000, batch.text.length * 70));
+                batch.onStart?.();
+              }
+            : undefined;
+          let played: boolean;
+          if (index === 0 && progressiveFirst) {
+            const first = await progressiveFirst;
+            if (batch.generation !== generation) break;
+            next = batch.segments[1] ? synthesize(batch.segments[1], batch.generation) : null;
+            if (first.cached) {
+              played = await playAudio(first.cached, batch.generation, batch.onEnergy, announceStart);
+            } else if (first.response) {
+              const streamed = await playProgressiveMpeg(first.response, batch.generation, batch.onEnergy, announceStart);
+              if (streamed.audio.audio.byteLength >= 512) rememberAudio(first.cacheKey, streamed.audio);
+              played = streamed.played;
+            } else {
+              throw new Error("TTS did not produce a playable response");
+            }
+          } else {
+            if (!next) break;
+            const audio = await next;
+            if (batch.generation !== generation) break;
+            next = batch.segments[index + 1]
+              ? synthesize(batch.segments[index + 1], batch.generation)
+              : null;
+            played = await playAudio(audio, batch.generation, batch.onEnergy, announceStart);
+          }
           if (!played && batch.generation === generation) throw new Error("Audio playback ended before completion");
           if (!played || batch.generation !== generation) break;
           const pause = index + 1 < batch.segments.length

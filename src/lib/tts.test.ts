@@ -39,6 +39,78 @@ class FakeAnalyser {
   getByteFrequencyData(levels: Uint8Array) { levels.fill(32); }
 }
 
+class FakeMediaElementSource {
+  connect() {}
+  disconnect() {}
+}
+
+class FakeSourceBuffer extends EventTarget {
+  updating = false;
+  chunks: ArrayBuffer[] = [];
+
+  appendBuffer(chunk: ArrayBuffer) {
+    this.updating = true;
+    this.chunks.push(chunk);
+    if (this.chunks.length === 2) FakeAudioElement.resolveDeferredPlay?.();
+    queueMicrotask(() => {
+      this.updating = false;
+      this.dispatchEvent(new Event("updateend"));
+    });
+  }
+}
+
+class FakeMediaSource extends EventTarget {
+  static instances: FakeMediaSource[] = [];
+  readyState: "closed" | "open" | "ended" = "closed";
+  sourceBuffer = new FakeSourceBuffer();
+
+  constructor() {
+    super();
+    FakeMediaSource.instances.push(this);
+  }
+
+  static isTypeSupported(mime: string) { return mime === "audio/mpeg"; }
+  addSourceBuffer(mime: string) {
+    if (mime !== "audio/mpeg") throw new Error("Unexpected media type");
+    return this.sourceBuffer;
+  }
+  open() {
+    this.readyState = "open";
+    this.dispatchEvent(new Event("sourceopen"));
+  }
+  endOfStream() {
+    this.readyState = "ended";
+    queueMicrotask(() => FakeAudioElement.instances.at(-1)?.finish());
+  }
+}
+
+class FakeAudioElement extends EventTarget {
+  static instances: FakeAudioElement[] = [];
+  static onPlay: (() => void) | null = null;
+  static deferPlayUntilSecondChunk = false;
+  static resolveDeferredPlay: (() => void) | null = null;
+  preload = "";
+  src = "";
+  onended: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  play = vi.fn(() => {
+    FakeAudioElement.onPlay?.();
+    if (!FakeAudioElement.deferPlayUntilSecondChunk) return Promise.resolve();
+    return new Promise<void>((resolve) => { FakeAudioElement.resolveDeferredPlay = resolve; });
+  });
+
+  constructor() {
+    super();
+    FakeAudioElement.instances.push(this);
+  }
+
+  setAttribute() {}
+  removeAttribute() {}
+  load() {}
+  pause() {}
+  finish() { this.onended?.(); }
+}
+
 class FakeAudioContext {
   static instances: FakeAudioContext[] = [];
   state = "running";
@@ -48,6 +120,7 @@ class FakeAudioContext {
   decodeAudioData = vi.fn(async () => ({ duration: 1.2 }));
   createBufferSource() { return new FakeSource(); }
   createAnalyser() { return new FakeAnalyser(); }
+  createMediaElementSource() { return new FakeMediaElementSource(); }
 
   constructor() {
     FakeAudioContext.instances.push(this);
@@ -61,6 +134,9 @@ describe("single Edge neural speech queue", () => {
     synthesisCount = 0;
     warmCount = 0;
     resumeAllowed = true;
+    FakeAudioElement.onPlay = null;
+    FakeAudioElement.deferPlayUntilSecondChunk = false;
+    FakeAudioElement.resolveDeferredPlay = null;
     const existingContext = FakeAudioContext.instances.at(-1);
     if (existingContext) existingContext.state = "running";
     vi.stubGlobal("window", {
@@ -68,6 +144,8 @@ describe("single Edge neural speech queue", () => {
       location: { origin: "https://jarvis.test" },
       setTimeout,
       clearTimeout,
+      setInterval,
+      clearInterval,
     });
     vi.stubGlobal("document", { documentElement: { dataset: {} } });
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -94,6 +172,7 @@ describe("single Edge neural speech queue", () => {
   afterEach(() => {
     stopSpeaking();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("keeps an ordinary multi-sentence reply in one neural generation", () => {
@@ -208,6 +287,120 @@ describe("single Edge neural speech queue", () => {
     expect(browserSpeak).not.toHaveBeenCalled();
     FakeSource.instances[0].onended?.();
     await reply;
+  });
+
+  it("begins supported MP3 playback before the streamed response closes", async () => {
+    FakeMediaSource.instances = [];
+    FakeAudioElement.instances = [];
+    let secondChunkScheduled = false;
+    let releaseSecondChunk: () => void = () => { throw new Error("Second stream chunk was not scheduled"); };
+    let firstPlayback!: () => void;
+    const firstPlaybackStarted = new Promise<void>((resolve) => { firstPlayback = resolve; });
+    FakeAudioElement.onPlay = firstPlayback;
+    vi.stubGlobal("MediaSource", FakeMediaSource);
+    vi.stubGlobal("Audio", FakeAudioElement);
+    vi.stubGlobal("URL", {
+      createObjectURL: (mediaSource: FakeMediaSource) => {
+        queueMicrotask(() => mediaSource.open());
+        return "blob:jarvis-test";
+      },
+      revokeObjectURL: vi.fn(),
+    });
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/tts" || init?.method !== "POST") return Response.json({ ok: true });
+      synthesisCount += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(700));
+          releaseSecondChunk = () => {
+            controller.enqueue(new Uint8Array(700));
+            controller.close();
+          };
+          secondChunkScheduled = true;
+        },
+      });
+      return Promise.resolve(new Response(stream, { status: 200, headers: { "content-type": "audio/mpeg" } }));
+    }));
+
+    let settled = false;
+    const reply = speak("Start this streamed voice answer.", () => {}).then((played) => {
+      settled = true;
+      return played;
+    });
+    await firstPlaybackStarted;
+    expect(synthesisCount).toBe(1);
+    expect(FakeMediaSource.instances).toHaveLength(1);
+    expect(FakeMediaSource.instances[0].sourceBuffer.chunks).toHaveLength(1);
+    expect(settled).toBe(false);
+    expect(secondChunkScheduled).toBe(true);
+
+    releaseSecondChunk();
+    await expect(reply).resolves.toBe(true);
+    expect(FakeMediaSource.instances[0].sourceBuffer.chunks).toHaveLength(2);
+  });
+
+  it("keeps appending while the browser waits for enough streamed MP3 data to start", async () => {
+    FakeMediaSource.instances = [];
+    FakeAudioElement.instances = [];
+    FakeAudioElement.deferPlayUntilSecondChunk = true;
+    let releaseSecondChunk: () => void = () => { throw new Error("Second stream chunk was not scheduled"); };
+    vi.stubGlobal("MediaSource", FakeMediaSource);
+    vi.stubGlobal("Audio", FakeAudioElement);
+    vi.stubGlobal("URL", {
+      createObjectURL: (mediaSource: FakeMediaSource) => {
+        queueMicrotask(() => mediaSource.open());
+        return "blob:jarvis-test";
+      },
+      revokeObjectURL: vi.fn(),
+    });
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/tts" || init?.method !== "POST") return Response.json({ ok: true });
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(700));
+          releaseSecondChunk = () => {
+            controller.enqueue(new Uint8Array(700));
+            controller.close();
+          };
+        },
+      });
+      return Promise.resolve(new Response(stream, { status: 200, headers: { "content-type": "audio/mpeg" } }));
+    }));
+
+    const reply = speak("Keep reading the streamed MP3 while startup buffers.", () => {});
+    await vi.waitFor(() => expect(FakeMediaSource.instances[0]?.sourceBuffer.chunks).toHaveLength(1));
+    releaseSecondChunk();
+    await expect(reply).resolves.toBe(true);
+    expect(FakeMediaSource.instances[0].sourceBuffer.chunks).toHaveLength(2);
+  });
+
+  it("cancels a progressive response while its browser startup is still buffering", async () => {
+    FakeMediaSource.instances = [];
+    FakeAudioElement.instances = [];
+    FakeAudioElement.deferPlayUntilSecondChunk = true;
+    vi.stubGlobal("MediaSource", FakeMediaSource);
+    vi.stubGlobal("Audio", FakeAudioElement);
+    vi.stubGlobal("URL", {
+      createObjectURL: (mediaSource: FakeMediaSource) => {
+        queueMicrotask(() => mediaSource.open());
+        return "blob:jarvis-test";
+      },
+      revokeObjectURL: vi.fn(),
+    });
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/tts" || init?.method !== "POST") return Response.json({ ok: true });
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(700));
+        },
+      });
+      return Promise.resolve(new Response(stream, { status: 200, headers: { "content-type": "audio/mpeg" } }));
+    }));
+
+    const reply = speak("Cancel this progressive voice response.", () => {});
+    await vi.waitFor(() => expect(FakeMediaSource.instances[0]?.sourceBuffer.chunks).toHaveLength(1));
+    stopSpeaking();
+    await expect(reply).resolves.toBe(false);
   });
 
   it("keeps an autoplay-blocked reply queued and resumes it on the next gesture", async () => {
