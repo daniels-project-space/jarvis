@@ -1,13 +1,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { runs, tasks } from "@trigger.dev/sdk/v3";
 import { NextResponse, type NextRequest } from "next/server";
+import { BACKGROUND_READINESS_CONFIRMATION } from "@/lib/background-readiness-contract";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
 import type { backgroundReadiness } from "@/trigger/background-readiness";
 
 export const runtime = "nodejs";
-
-export const BACKGROUND_READINESS_CONFIRMATION = "run_background_readiness";
 
 const TICKET_COOKIE = "jarvis_background_readiness";
 const TICKET_TTL_SECONDS = 10 * 60;

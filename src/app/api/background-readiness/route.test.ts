@@ -18,7 +18,8 @@ vi.mock("@/lib/request-auth", () => ({
   isOwnerActor: (actor: { kind?: string }) => actor.kind === "owner",
 }));
 
-import { BACKGROUND_READINESS_CONFIRMATION, GET, POST } from "./route";
+import { BACKGROUND_READINESS_CONFIRMATION } from "@/lib/background-readiness-contract";
+import { GET, POST } from "./route";
 
 const owner = { kind: "owner", authTokenHash: "session-only-owner-hash" };
 

@@ -1,9 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { BACKGROUND_READINESS_CONFIRMATION } from "@/lib/background-readiness-contract";
 import { viewerFetchWithTimeout } from "@/lib/viewer-request";
 
-const CONFIRMATION = "run_background_readiness";
 const MAX_STATUS_POLLS = 30;
 const STATUS_POLL_MS = 2_000;
 
@@ -68,7 +68,7 @@ export function BackgroundReadinessControl() {
       const res = await viewerFetchWithTimeout("/api/background-readiness", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ confirm: CONFIRMATION }),
+        body: JSON.stringify({ confirm: BACKGROUND_READINESS_CONFIRMATION }),
       }, 10_000);
       const payload = await res.json().catch(() => null) as { ok?: unknown; status?: unknown } | null;
       if (!res.ok || payload?.ok !== true || payload.status !== "queued") {
