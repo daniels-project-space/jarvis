@@ -29,10 +29,16 @@ import { exactTextWorkOrder } from "./work-order";
 import { resolveHostProjectContext } from "./host-project-context";
 import { withHostContext } from "./host-context";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
-import { iCloudCalendarConfigured, listICloudEvents } from "./icloud-calendar";
+import {
+  iCloudCalendarConfigured,
+  listICloudEvents,
+  resolveICloudTravelCalendar,
+  type ICloudCalendar,
+} from "./icloud-calendar";
 import {
   iCloudCalendarApprovalMarker,
   issueICloudCalendarApproval,
+  issueICloudCalendarTravelApproval,
   type ICloudCalendarApprovalEvent,
 } from "./icloud-calendar-approval.server";
 import {
@@ -675,7 +681,7 @@ export const TOOL_DEFS = [
   {
     name: "travel_offline_maps_prepare",
     description:
-      "For an exact Jarvis trip with an upcoming confirmed Gmail flight, schedule Jarvis's one-day-before Apple Maps offline preflight: a durable to-do, push/spoken reminder, and an Apple Maps city handoff. It never downloads or deletes an Apple offline map—only the owner can do that in Maps. It creates a protected Google Calendar approval card only when Google Calendar is connected; do not claim the Calendar item is written until Daniel approves it. Use after Daniel has asked for this travel automation, never for an unverified or implicit trip.",
+      "For an exact Jarvis trip with an upcoming confirmed Gmail flight, schedule Jarvis's one-day-before Apple Maps offline preflight: a durable to-do, push/spoken reminder, and an Apple Maps city handoff. It never downloads or deletes an Apple offline map—only the owner can do that in Maps. For a saved trip, use the configured iCloud Calendar first and prepare a protected owner approval card bound to that exact saved preflight; otherwise retain the protected Google Calendar fallback. Do not claim the Calendar item is written until Daniel approves it. Use after Daniel has asked for this travel automation, never for an unverified or implicit trip.",
     parameters: {
       type: "object",
       properties: {
@@ -683,6 +689,7 @@ export const TOOL_DEFS = [
         creation_id: { type: "string", description: "Exact saved trip id" },
         trip_id: { type: "string", description: "Legacy exact saved trip id only" },
         flight_id: { type: "string", description: "Opaque Gmail flight choice returned by a prior Apple Maps preflight prompt; required only when several confirmed flights match the trip window" },
+        calendar: { type: "string", description: "Optional exact iCloud Calendar name or URL for a saved trip; otherwise Jarvis preserves the selected/default iCloud calendar" },
         days: { type: "number", description: "Gmail confirmation lookback, 7-730 days; default 365" },
       },
     },
@@ -2686,6 +2693,18 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
 
 type OfflineMapCalendarStatus = "approval_required" | "needs_connection" | "needs_reconnect";
 
+type OfflineMapCalendarPlan =
+  | { provider: "icloud"; status: OfflineMapCalendarStatus; calendar?: ICloudCalendar }
+  | { provider: "google"; status: OfflineMapCalendarStatus };
+
+type StoredICloudTravelCalendarEvent = {
+  calendarUrl: string;
+  eventUrl: string;
+  etag: string;
+  revision: number;
+  nonce: string;
+};
+
 async function offlineMapCalendarStatus(): Promise<OfflineMapCalendarStatus> {
   try {
     const status = await convexQuery("googleAuth:getConnectionStatus", {}) as {
@@ -2696,6 +2715,62 @@ async function offlineMapCalendarStatus(): Promise<OfflineMapCalendarStatus> {
     return status.capabilities?.calendar ? "approval_required" : "needs_reconnect";
   } catch {
     return "needs_connection";
+  }
+}
+
+/**
+ * A saved TripDoc gets iCloud-first Calendar approval when that account is
+ * configured. Drafts deliberately keep the existing Google-only behavior:
+ * there is no durable registry row against which an iCloud receipt could be
+ * revalidated at click time.
+ */
+async function offlineMapCalendarPlan(
+  storage: "draft" | "creation",
+  requestedCalendar: unknown,
+): Promise<OfflineMapCalendarPlan> {
+  if (storage === "creation" && iCloudCalendarConfigured()) {
+    try {
+      const requested = typeof requestedCalendar === "string" ? requestedCalendar.trim() || undefined : undefined;
+      return {
+        provider: "icloud",
+        status: "approval_required",
+        calendar: await resolveICloudTravelCalendar(requested),
+      };
+    } catch {
+      // An iCloud-enabled saved trip must not silently fall through to Google:
+      // the owner asked for one specific provider and needs a fresh iCloud
+      // connection/calendar choice before an approval can be sealed.
+      return { provider: "icloud", status: "needs_connection" };
+    }
+  }
+  return { provider: "google", status: await offlineMapCalendarStatus() };
+}
+
+function storedICloudTravelCalendarEvent(value: unknown): StoredICloudTravelCalendarEvent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const event = value as Record<string, unknown>;
+  if (typeof event.calendarUrl !== "string" || typeof event.eventUrl !== "string" || typeof event.etag !== "string"
+    || typeof event.nonce !== "string" || typeof event.revision !== "number" || !Number.isSafeInteger(event.revision) || event.revision <= 0
+    || event.calendarUrl.length > 2_000 || event.eventUrl.length > 2_000 || event.etag.length > 512
+    || !/^[A-Za-z0-9_-]{16,64}$/.test(event.nonce)) return null;
+  try {
+    const calendar = new URL(event.calendarUrl);
+    if (!calendar.pathname.endsWith("/")) calendar.pathname = `${calendar.pathname}/`;
+    const calendarPath = calendar.pathname.endsWith("/") ? calendar.pathname : `${calendar.pathname}/`;
+    const eventUrl = new URL(event.eventUrl);
+    if (calendar.protocol !== "https:" || calendar.username || calendar.password || calendar.search || calendar.hash
+      || eventUrl.protocol !== "https:" || eventUrl.username || eventUrl.password || eventUrl.search || eventUrl.hash
+      || eventUrl.origin !== calendar.origin || !eventUrl.pathname.startsWith(calendarPath) || !eventUrl.pathname.endsWith(".ics")
+      || /[\u0000-\u001f\u007f]/.test(event.etag)) return null;
+    return {
+      calendarUrl: calendar.toString(),
+      eventUrl: eventUrl.toString(),
+      etag: event.etag,
+      revision: event.revision,
+      nonce: event.nonce,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -2896,8 +2971,10 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   }
   const todoStatus = await upsertAppleMapsOfflineTodo(preflight);
 
-  let calendarStatus = await offlineMapCalendarStatus();
+  const calendarPlan = await offlineMapCalendarPlan(workspace.storage, args.calendar);
+  let calendarStatus = calendarPlan.status;
   let calendarApprovalMarker = "";
+  let registeredICloudCalendarEvent: unknown;
 
   // Background maintenance is opt-in and saved-trip only. It never lists the
   // travel library: each registry row contains the exact Gmail flight and stay
@@ -2931,7 +3008,12 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
             cityProof,
             nextRefreshAt,
           });
-          automaticRefresh = registered?.ok ? "scheduled" : "pending_registry";
+          if (registered?.ok) {
+            automaticRefresh = "scheduled";
+            registeredICloudCalendarEvent = registered.iCloudCalendarEvent;
+          } else {
+            automaticRefresh = "pending_registry";
+          }
         } catch {
           automaticRefresh = "pending_registry";
         }
@@ -2950,6 +3032,7 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     sourceKey: preflight.sourceKey,
     todoStatus,
     reminderStatus: "scheduled",
+    calendarProvider: calendarPlan.provider,
     calendarStatus,
     refreshState: automaticRefresh,
     ...(automaticRefresh === "scheduled" && nextRefreshAt !== null
@@ -2961,7 +3044,71 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     } : {}),
     updatedAt: now,
   };
-  if (calendarStatus === "approval_required") {
+  if (calendarPlan.provider === "icloud" && calendarStatus === "approval_required") {
+    const stored = storedICloudTravelCalendarEvent(registeredICloudCalendarEvent);
+    const hasStoredBinding = registeredICloudCalendarEvent !== undefined && registeredICloudCalendarEvent !== null;
+    let selectedCalendar = calendarPlan.calendar;
+    // Once an event is managed, preserve its selected calendar by default.
+    // A default-calendar switch must not turn a harmless re-prepare into a
+    // duplicate event in a different CalDAV collection.
+    if (stored && (typeof args.calendar !== "string" || !args.calendar.trim())) {
+      try {
+        selectedCalendar = await resolveICloudTravelCalendar(stored.calendarUrl);
+      } catch {
+        selectedCalendar = undefined;
+      }
+    }
+    if (workspace.storage !== "creation" || automaticRefresh !== "scheduled" || !selectedCalendar || (hasStoredBinding && !stored)) {
+      // A v2 receipt is usable only after the saved-trip registry exists. Do
+      // not offer a generic iCloud create while persistence is unavailable or
+      // a historical row is malformed.
+      calendarStatus = "needs_connection";
+      trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
+    } else if (stored && stored.calendarUrl !== selectedCalendar.url) {
+      // Moving a managed event to another calendar would create a second
+      // reminder. Keep the existing event's calendar as an explicit owner
+      // choice rather than silently duplicating it.
+      calendarStatus = "needs_reconnect";
+      trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
+    } else {
+      try {
+        const event: Omit<ICloudCalendarApprovalEvent, "calendar"> = {
+          title: `Apple Maps offline · ${preflight.city}`,
+          start: preflight.at,
+          end: preflight.at + 30 * 60_000,
+          allDay: false,
+          location: preflight.city,
+          notes: `Before ${preflight.flightTitle}: open the Apple Maps handoff, download ${preflight.city} for offline use, then remove an old unused map in Maps > Offline Maps. Jarvis cannot download or delete Apple offline maps.`,
+          reminderMinutesBefore: 5,
+        };
+        const appleMapsOfflinePreflight = {
+          tripId: trip.id,
+          storage: "creation" as const,
+          updatedAt: trip.doc.offlineMapPreflight.updatedAt,
+          sourceKey: preflight.sourceKey,
+          calendarUrl: selectedCalendar.url,
+        };
+        const approval = stored
+          ? issueICloudCalendarTravelApproval({
+            action: "update",
+            event,
+            eventUrl: stored.eventUrl,
+            expectedEtag: stored.etag,
+            appleMapsOfflinePreflight,
+          })
+          : issueICloudCalendarTravelApproval({
+            action: "create",
+            event,
+            appleMapsOfflinePreflight,
+          });
+        calendarApprovalMarker = iCloudCalendarApprovalMarker(approval);
+      } catch {
+        calendarStatus = "needs_connection";
+        trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
+      }
+    }
+  }
+  if (calendarPlan.provider === "google" && calendarStatus === "approval_required") {
     try {
       const event: GoogleCalendarCreateInput = {
         title: `Apple Maps offline · ${preflight.city}`,
@@ -3017,11 +3164,18 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     : todoStatus === "existing"
       ? "The matching Hub to-do already exists."
       : "The Hub to-do needs a retry; the saved trip card keeps that state visible.";
-  const calendarNote = calendarStatus === "approval_required"
-    ? "Google Calendar is ready for your protected one-click approval below; nothing has been written yet."
-    : calendarStatus === "needs_reconnect"
-      ? "Google Calendar needs a reconnect with Calendar access; ask Jarvis to prepare this exact trip again after reconnecting."
-      : "Google Calendar is not connected yet; ask Jarvis to prepare this exact trip again after connecting it.";
+  const calendarName = calendarPlan.provider === "icloud" ? "iCloud Calendar" : "Google Calendar";
+  const calendarNote = calendarApprovalMarker
+    ? `${calendarName} is ready for your protected one-click approval below; nothing has been written yet.`
+    : calendarPlan.provider === "google"
+      ? calendarStatus === "needs_reconnect"
+        ? "Google Calendar needs a reconnect with Calendar access; ask Jarvis to prepare this exact trip again after reconnecting."
+        : "Google Calendar is not connected yet; ask Jarvis to prepare this exact trip again after connecting it."
+      : calendarStatus === "needs_reconnect"
+        ? "iCloud Calendar needs a fresh calendar choice before Jarvis can update the existing reminder; prepare this exact trip again after choosing it."
+        : calendarStatus === "needs_connection"
+          ? "iCloud Calendar is not ready for a protected approval yet; prepare this exact trip again after the connection or saved-trip registry is ready."
+          : "iCloud Calendar approval is waiting for the durable saved-trip preflight; nothing has been written.";
   const refreshNote = automaticRefresh === "scheduled"
     ? "Jarvis will now refresh only this saved trip's exact Gmail flight and booked-stay sources, and update its existing reminder/to-do if that itinerary changes."
     : automaticRefresh === "too_late"

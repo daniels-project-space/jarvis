@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { actorAuthArgs, requireActor, requireWorker } from "./controlAuth";
+import { actorAuthArgs, requireActor, requireAdmin, requireWorker } from "./controlAuth";
 
 const MAX_TEXT = 500;
 const REFRESH_STATES = [
@@ -63,6 +63,14 @@ const preflightValidator = v.object({
   reminderText: v.string(),
 });
 
+const iCloudCalendarEventValidator = v.object({
+  calendarUrl: v.string(),
+  eventUrl: v.string(),
+  etag: v.string(),
+  revision: v.number(),
+  nonce: v.string(),
+});
+
 function bounded(value: unknown, max = MAX_TEXT, min = 1): boolean {
   return typeof value === "string" && value.length >= min && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -90,6 +98,24 @@ function validPreflight(value: any): boolean {
     && bounded(value?.timeZone, 80) && bounded(value?.mapUrl, 1_000) && bounded(value?.todoText, 500) && bounded(value?.reminderText, 500)
     && [value.flightStart, value.at].every(Number.isFinite)
     && /^https:\/\/maps\.apple\.com\//.test(value.mapUrl);
+}
+
+function validICloudCalendarEvent(value: any): boolean {
+  if (!bounded(value?.calendarUrl, 2_000) || !bounded(value?.eventUrl, 2_000)
+    || !bounded(value?.etag, 512) || !validSourceKey(value?.sourceKey ?? "")
+    || !Number.isSafeInteger(value?.revision) || value.revision <= 0
+    || !/^[A-Za-z0-9_-]{16,64}$/.test(String(value?.nonce ?? ""))) return false;
+  try {
+    const calendar = new URL(value.calendarUrl);
+    const event = new URL(value.eventUrl);
+    const calendarPath = calendar.pathname.endsWith("/") ? calendar.pathname : `${calendar.pathname}/`;
+    return calendar.protocol === "https:" && event.protocol === "https:"
+      && !calendar.username && !calendar.password && !calendar.search && !calendar.hash
+      && !event.username && !event.password && !event.search && !event.hash
+      && event.origin === calendar.origin && event.pathname.startsWith(calendarPath) && event.pathname.endsWith(".ics");
+  } catch {
+    return false;
+  }
 }
 
 function validRefreshState(value: unknown): value is RefreshState {
@@ -120,14 +146,16 @@ function patchTripPreflight(creation: any, changes: Record<string, unknown>): st
  * must not rotate that receipt: it has not changed the Calendar event the
  * owner reviewed. Keep a separate registry timestamp for worker concurrency.
  */
-function calendarApprovalState(creation: any): { revision?: number; refreshRequired: boolean } {
+function calendarApprovalState(creation: any): { sourceKey?: string; revision?: number; refreshRequired: boolean } {
   if (creation?.kind !== "trip" || typeof creation.data !== "string") return { refreshRequired: false };
   try {
     const doc = JSON.parse(creation.data);
     const preflight = doc?.offlineMapPreflight;
     const updatedAt = Number(preflight?.updatedAt);
+    const sourceKey = validSourceKey(preflight?.sourceKey) ? preflight.sourceKey : undefined;
     return {
-      ...(Number.isFinite(updatedAt) ? { revision: updatedAt } : {}),
+      ...(sourceKey ? { sourceKey } : {}),
+      ...(Number.isSafeInteger(updatedAt) && updatedAt > 0 ? { revision: updatedAt } : {}),
       refreshRequired: preflight?.calendarRefreshRequired === true,
     };
   } catch {
@@ -177,10 +205,159 @@ export const upsert = mutation({
     };
     if (existing) {
       await ctx.db.patch(existing._id, record);
-      return { ok: true as const, id: existing._id, created: false as const };
+      return {
+        ok: true as const,
+        id: existing._id,
+        created: false as const,
+        ...(existing.iCloudCalendarEvent ? { iCloudCalendarEvent: existing.iCloudCalendarEvent } : {}),
+      };
     }
     const id = await ctx.db.insert("appleMapsOfflinePreflights", { ...record, createdAt: now });
     return { ok: true as const, id, created: true as const };
+  },
+});
+
+/**
+ * Route-only pre-write gate for a sealed iCloud travel receipt. This reads one
+ * saved trip and its one opt-in registry row; it never enumerates a library or
+ * treats a generic Calendar receipt as permission to write a travel event.
+ */
+export const validateICloudCalendarApproval = query({
+  args: {
+    creationId: v.id("creations"),
+    sourceKey: v.string(),
+    expectedPreflightUpdatedAt: v.number(),
+    calendarUrl: v.string(),
+    action: v.union(v.literal("create"), v.literal("update")),
+    nonce: v.string(),
+    expectedEtag: v.optional(v.string()),
+    eventUrl: v.optional(v.string()),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
+    if (!validSourceKey(a.sourceKey) || !Number.isSafeInteger(a.expectedPreflightUpdatedAt) || a.expectedPreflightUpdatedAt <= 0
+      || !bounded(a.calendarUrl, 2_000) || !/^[A-Za-z0-9_-]{16,64}$/.test(a.nonce)) {
+      return { ok: false as const, reason: "invalid" as const };
+    }
+    const row = await ctx.db
+      .query("appleMapsOfflinePreflights")
+      .withIndex("by_creationId", (q) => q.eq("creationId", a.creationId))
+      .unique();
+    if (!row || row.sourceKey !== a.sourceKey) return { ok: false as const, reason: "not_registered" as const };
+    const creation = await ctx.db.get(a.creationId);
+    const state = calendarApprovalState(creation);
+    if (state.sourceKey !== a.sourceKey || state.revision !== a.expectedPreflightUpdatedAt || state.refreshRequired) {
+      return { ok: false as const, reason: "stale" as const };
+    }
+    const existing = row.iCloudCalendarEvent;
+    if (existing && !validICloudCalendarEvent({ ...existing, sourceKey: a.sourceKey })) {
+      return { ok: false as const, reason: "conflict" as const };
+    }
+    if (a.action === "create") {
+      // The same sealed receipt may retry a lost response. A different nonce
+      // on an already-managed event must obtain a fresh update receipt.
+      if (existing && (existing.calendarUrl !== a.calendarUrl || existing.revision !== a.expectedPreflightUpdatedAt || existing.nonce !== a.nonce)) {
+        return { ok: false as const, reason: "conflict" as const };
+      }
+    } else {
+      const retryOfCommittedReceipt = existing
+        && existing.calendarUrl === a.calendarUrl
+        && existing.eventUrl === a.eventUrl
+        && existing.revision === a.expectedPreflightUpdatedAt
+        && existing.nonce === a.nonce;
+      if (!retryOfCommittedReceipt && (
+        !existing
+        || existing.calendarUrl !== a.calendarUrl
+        || existing.eventUrl !== a.eventUrl
+        || existing.etag !== a.expectedEtag
+      )) {
+        return { ok: false as const, reason: "conflict" as const };
+      }
+    }
+    return { ok: true as const };
+  },
+});
+
+/**
+ * Persist a confirmed CalDAV result only while the exact owner-reviewed
+ * preflight revision is still current. Both the durable row and owner-visible
+ * TripDoc update in this one Convex transaction.
+ */
+export const commitICloudCalendarApproval = mutation({
+  args: {
+    creationId: v.id("creations"),
+    sourceKey: v.string(),
+    expectedPreflightUpdatedAt: v.number(),
+    calendarUrl: v.string(),
+    action: v.union(v.literal("create"), v.literal("update")),
+    calendarEvent: iCloudCalendarEventValidator,
+    expectedEtag: v.optional(v.string()),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, a) => {
+    await requireAdmin(ctx, a.authTokenHash);
+    const candidate = {
+      ...a.calendarEvent,
+      sourceKey: a.sourceKey,
+      revision: a.expectedPreflightUpdatedAt,
+    };
+    if (!validSourceKey(a.sourceKey) || !Number.isSafeInteger(a.expectedPreflightUpdatedAt) || a.expectedPreflightUpdatedAt <= 0
+      || !bounded(a.calendarUrl, 2_000) || a.calendarUrl !== a.calendarEvent.calendarUrl
+      || !validICloudCalendarEvent(candidate)
+      || candidate.revision !== a.calendarEvent.revision
+      || (a.action === "update" && !bounded(a.expectedEtag, 512))) {
+      return { ok: false as const, reason: "invalid" as const };
+    }
+    const row = await ctx.db
+      .query("appleMapsOfflinePreflights")
+      .withIndex("by_creationId", (q) => q.eq("creationId", a.creationId))
+      .unique();
+    if (!row || row.sourceKey !== a.sourceKey) return { ok: false as const, reason: "not_registered" as const };
+    const creation = await ctx.db.get(a.creationId);
+    const state = calendarApprovalState(creation);
+    if (state.sourceKey !== a.sourceKey || state.revision !== a.expectedPreflightUpdatedAt || state.refreshRequired) {
+      return { ok: false as const, reason: "stale" as const };
+    }
+    const existing = row.iCloudCalendarEvent;
+    if (a.action === "update") {
+      const retryOfCommittedReceipt = existing
+        && existing.calendarUrl === a.calendarEvent.calendarUrl
+        && existing.eventUrl === a.calendarEvent.eventUrl
+        && existing.revision === a.expectedPreflightUpdatedAt
+        && existing.nonce === a.calendarEvent.nonce;
+      if (!retryOfCommittedReceipt && (
+        !existing
+        || existing.calendarUrl !== a.calendarEvent.calendarUrl
+        || existing.eventUrl !== a.calendarEvent.eventUrl
+        || existing.etag !== a.expectedEtag
+      )) {
+        return { ok: false as const, reason: "conflict" as const };
+      }
+    }
+    if (a.action === "create" && existing && (
+      existing.calendarUrl !== a.calendarEvent.calendarUrl
+      || existing.eventUrl !== a.calendarEvent.eventUrl
+      || existing.revision !== a.expectedPreflightUpdatedAt
+      || existing.nonce !== a.calendarEvent.nonce
+    )) {
+      return { ok: false as const, reason: "conflict" as const };
+    }
+    const data = patchTripPreflight(creation, {
+      calendarProvider: "icloud",
+      calendarStatus: "scheduled",
+      calendarRefreshRequired: false,
+      iCloudCalendarUrl: a.calendarEvent.calendarUrl,
+      iCloudCalendarEventUrl: a.calendarEvent.eventUrl,
+    });
+    if (!data || !creation) return { ok: false as const, reason: "trip_missing" as const };
+    const committedAt = Date.now();
+    await ctx.db.patch(creation._id, { data, updatedAt: committedAt });
+    await ctx.db.patch(row._id, {
+      iCloudCalendarEvent: { ...a.calendarEvent, committedAt },
+      updatedAt: committedAt,
+    });
+    return { ok: true as const };
   },
 });
 

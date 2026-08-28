@@ -231,7 +231,9 @@ export type TripDoc = {
     sourceKey: string;
     todoStatus: "created" | "existing" | "needs_retry";
     reminderStatus: "scheduled";
-    calendarStatus: "approval_required" | "needs_connection" | "needs_reconnect";
+    /** Calendar provider selected for the protected approval, when any. */
+    calendarProvider?: "google" | "icloud";
+    calendarStatus: "approval_required" | "scheduled" | "needs_connection" | "needs_reconnect";
     /** Saved-trip-only background state; never implies an Apple Maps device action. */
     refreshState?: "scheduled" | "pending_refresh" | "pending_google" | "needs_flight_confirmation" | "needs_city_confirmation" | "too_late" | "trip_missing" | "draft_manual_only" | "pending_city_identity" | "pending_registry";
     refreshError?: string;

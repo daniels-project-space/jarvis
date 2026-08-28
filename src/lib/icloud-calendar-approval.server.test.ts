@@ -4,7 +4,9 @@ vi.mock("server-only", () => ({}));
 
 import {
   issueICloudCalendarApproval,
+  issueICloudCalendarTravelApproval,
   verifyICloudCalendarApproval,
+  verifyICloudCalendarTravelApproval,
 } from "./icloud-calendar-approval.server";
 
 const originalAppleId = process.env.ICLOUD_CALENDAR_APPLE_ID;
@@ -16,6 +18,13 @@ const event = {
   allDay: false,
   location: "Studio",
   reminderMinutesBefore: 15,
+};
+const travelBinding = {
+  tripId: "j7k3m2n9p4q6r8s1t5u0v2w4x6y8z0ab",
+  storage: "creation" as const,
+  sourceKey: "a".repeat(64),
+  updatedAt: 1_780_000_000_123,
+  calendarUrl: "https://caldav.icloud.com/123/calendars/home/",
 };
 
 beforeEach(() => {
@@ -54,5 +63,59 @@ describe("iCloud Calendar approval receipts", () => {
     delete process.env.ICLOUD_CALENDAR_APP_PASSWORD;
 
     expect(() => issueICloudCalendarApproval(event, 1_000)).toThrow(/not configured/i);
+  });
+
+  it("seals a saved-trip preflight revision and selected iCloud calendar separately from generic creates", () => {
+    const token = issueICloudCalendarTravelApproval({
+      action: "create",
+      event,
+      appleMapsOfflinePreflight: travelBinding,
+    }, 1_000);
+    const verified = verifyICloudCalendarTravelApproval(token, 1_001);
+
+    expect(verified).toEqual(expect.objectContaining({
+      expiresAt: 601_000,
+      nonce: expect.stringMatching(/^[A-Za-z0-9_-]{16,64}$/),
+      proposal: {
+        action: "create",
+        event,
+        appleMapsOfflinePreflight: travelBinding,
+      },
+    }));
+    expect(() => verifyICloudCalendarApproval(token, 1_001)).toThrow(/invalid or expired/i);
+    expect(() => verifyICloudCalendarTravelApproval(issueICloudCalendarApproval(event, 1_000), 1_001)).toThrow(/invalid or expired/i);
+  });
+
+  it("binds an update to the exact existing CalDAV resource and ETag", () => {
+    const eventUrl = "https://caldav.icloud.com/123/calendars/home/jarvis-apple-maps-a.ics";
+    const token = issueICloudCalendarTravelApproval({
+      action: "update",
+      event,
+      eventUrl,
+      expectedEtag: '"revision-7"',
+      appleMapsOfflinePreflight: travelBinding,
+    }, 1_000);
+
+    expect(verifyICloudCalendarTravelApproval(token, 1_001).proposal).toEqual({
+      action: "update",
+      event,
+      eventUrl,
+      expectedEtag: '"revision-7"',
+      appleMapsOfflinePreflight: travelBinding,
+    });
+    expect(() => issueICloudCalendarTravelApproval({
+      action: "update",
+      event,
+      eventUrl: "https://caldav.icloud.com/another-calendar/other.ics",
+      expectedEtag: '"revision-7"',
+      appleMapsOfflinePreflight: travelBinding,
+    }, 1_000)).toThrow(/invalid/i);
+    expect(() => issueICloudCalendarTravelApproval({
+      action: "update",
+      event,
+      eventUrl,
+      expectedEtag: '"revision-7"\nIf-Match: injected',
+      appleMapsOfflinePreflight: travelBinding,
+    }, 1_000)).toThrow(/invalid/i);
   });
 });

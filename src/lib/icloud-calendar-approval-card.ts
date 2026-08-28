@@ -13,7 +13,9 @@ export type ICloudCalendarApprovalCardState = "ready" | "approving" | "completed
  * itself was rejected or expired, so a new owner-approved proposal is needed.
  */
 export function iCloudCalendarApprovalFailureState(status: number): ICloudCalendarApprovalCardState {
-  return status === 400 ? "expired" : "error";
+  // A 409 means a revision-bound travel receipt is stale. Retrying that same
+  // button cannot become safe again; request a fresh protected approval.
+  return status === 400 || status === 409 ? "expired" : "error";
 }
 
 export function canSubmitICloudCalendarApproval(state: ICloudCalendarApprovalCardState): boolean {

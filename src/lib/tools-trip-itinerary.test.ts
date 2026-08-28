@@ -29,6 +29,8 @@ const mock = vi.hoisted(() => ({
   searchOpenStreetMapPlaces: vi.fn(),
   getManagedGooglePrimaryCalendarEventForSourceKey: vi.fn(),
   listGooglePrimaryCalendarEvents: vi.fn(),
+  iCloudCalendarConfigured: vi.fn(),
+  resolveICloudTravelCalendar: vi.fn(),
 }));
 
 vi.mock("./context", () => ({ convexMutation: mock.convexMutation, convexQuery: mock.convexQuery }));
@@ -42,7 +44,14 @@ vi.mock("./google-calendar", () => ({
   getManagedGooglePrimaryCalendarEventForSourceKey: mock.getManagedGooglePrimaryCalendarEventForSourceKey,
   listGooglePrimaryCalendarEvents: mock.listGooglePrimaryCalendarEvents,
 }));
-vi.mock("./icloud-calendar", () => ({ createICloudEvent: vi.fn(), deleteICloudEvent: vi.fn(), findICloudEvents: vi.fn(), listICloudEvents: vi.fn() }));
+vi.mock("./icloud-calendar", () => ({
+  createICloudEvent: vi.fn(),
+  deleteICloudEvent: vi.fn(),
+  findICloudEvents: vi.fn(),
+  listICloudEvents: vi.fn(),
+  iCloudCalendarConfigured: mock.iCloudCalendarConfigured,
+  resolveICloudTravelCalendar: mock.resolveICloudTravelCalendar,
+}));
 vi.mock("./openstreetmap", () => ({ searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces }));
 vi.mock("./travel", () => ({
   openTrip: mock.openTrip,
@@ -66,7 +75,7 @@ vi.mock("./travel", () => ({
   verifyTripCityBookingReference: mock.verifyTripCityBookingReference,
 }));
 
-import { extractGoogleCalendarApproval } from "./sanitize";
+import { extractGoogleCalendarApproval, extractICloudCalendarApproval } from "./sanitize";
 import { executeTool } from "./tools";
 
 const APPROVAL_KEY = Buffer.alloc(32, 9).toString("base64");
@@ -138,6 +147,8 @@ describe("trip itinerary tool actions", () => {
     }]);
     mock.getManagedGooglePrimaryCalendarEventForSourceKey.mockResolvedValue(null);
     mock.listGooglePrimaryCalendarEvents.mockResolvedValue([]);
+    mock.iCloudCalendarConfigured.mockReturnValue(false);
+    mock.resolveICloudTravelCalendar.mockResolvedValue({ name: "Calendar", url: "https://caldav.icloud.com/123/calendars/home/" });
   });
 
   it("saves an ordered day through the exact trip id and reports only real route facts", async () => {
@@ -538,6 +549,136 @@ describe("trip itinerary tool actions", () => {
       },
     });
     expect(mock.getManagedGooglePrimaryCalendarEventForSourceKey).toHaveBeenCalledWith(sourceKey);
+  });
+
+  it("issues saved-trip iCloud create and update receipts only after the durable preflight registry is ready", async () => {
+    vi.stubEnv("ICLOUD_CALENDAR_APPLE_ID", "calendar-owner@example.test");
+    vi.stubEnv("ICLOUD_CALENDAR_APP_PASSWORD", "test-app-password");
+    const sourceKey = "f".repeat(64);
+    const calendarUrl = "https://caldav.icloud.com/123/calendars/home/";
+    const eventUrl = `${calendarUrl}jarvis-apple-maps-${sourceKey}@jarvis.ics`;
+    const flight = {
+      id: "gmail-flight-icloud",
+      marker: "jarvis-gmail-booking:gmail-flight-icloud",
+      kind: "flight" as const,
+      title: "✈ Iberia 432 · confirmed",
+      provider: "Iberia",
+      start: Date.parse("2030-09-18T09:15:00+02:00"),
+      allDay: false,
+      timeZone: "Europe/Madrid",
+    };
+    const stay = {
+      id: "gmail-stay-icloud",
+      marker: "jarvis-gmail-booking:gmail-stay-icloud",
+      kind: "stay" as const,
+      title: "Hotel Seville · confirmed",
+      provider: "Booking",
+      start: Date.parse("2030-09-18T12:00:00+02:00"),
+      end: Date.parse("2030-09-21T12:00:00+02:00"),
+      allDay: false,
+      timeZone: "Europe/Madrid",
+      location: "Seville, Spain",
+    };
+    const savedTrip = {
+      ...doc,
+      destination: "Seville",
+      departDate: "2030-09-18",
+      returnDate: "2030-09-21",
+      offlineMapPreflight: { sourceKey, calendarRefreshRequired: true },
+      cityContexts: [{
+        id: "city:seville",
+        city: "Seville",
+        source: "destination",
+        center: { lat: 37.389, lng: -5.984 },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        bookingReference: {
+          city: "Seville",
+          title: "Hotel Seville · confirmed",
+          location: "Seville, Spain",
+          start: Date.parse("2030-09-18T12:00:00+02:00"),
+          end: Date.parse("2030-09-21T12:00:00+02:00"),
+          lat: 37.389,
+          lng: -5.984,
+          distanceKm: 0.2,
+          state: "upcoming",
+          verifiedAt: Date.now(),
+        },
+      }],
+    };
+    mock.iCloudCalendarConfigured.mockReturnValue(true);
+    mock.resolveICloudTravelCalendar.mockResolvedValue({ name: "Home", url: calendarUrl });
+    mock.getTrip.mockResolvedValue({ id: "creation-icloud", doc: savedTrip, storage: "creation" });
+    mock.scanGmailBookingConfirmations.mockResolvedValue([flight, stay]);
+    mock.bookingsForTripWindow.mockReturnValue([flight, stay]);
+    mock.convexQuery.mockImplementation(async (path: string) => path === "ui:getActiveThread" ? "thread-icloud" : null);
+    let registryWrites = 0;
+    mock.convexMutation.mockImplementation(async (path: string) => {
+      if (path !== "appleMapsOfflinePreflights:upsert") return undefined;
+      registryWrites += 1;
+      return registryWrites === 1
+        ? { ok: true }
+        : {
+          ok: true,
+          iCloudCalendarEvent: {
+            calendarUrl,
+            eventUrl,
+            etag: '"etag-1"',
+            revision: 1_780_000_000_000,
+            nonce: "priorReceiptNonce_123456",
+            committedAt: 1_780_000_000_000,
+          },
+        };
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/query") return new Response(JSON.stringify({ value: [] }), { headers: { "content-type": "application/json" } });
+      if (url.pathname === "/api/mutation") return new Response(JSON.stringify({ value: "todo-icloud" }), { headers: { "content-type": "application/json" } });
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+
+    const first = await executeTool("travel_offline_maps_prepare", { creation_id: "creation-icloud", calendar: "Home" });
+    const { verifyICloudCalendarTravelApproval } = await import("./icloud-calendar-approval.server");
+    const create = verifyICloudCalendarTravelApproval(extractICloudCalendarApproval(first)!);
+    expect(create.proposal).toMatchObject({
+      action: "create",
+      appleMapsOfflinePreflight: {
+        tripId: "creation-icloud",
+        storage: "creation",
+        sourceKey,
+        updatedAt: expect.any(Number),
+        calendarUrl,
+      },
+    });
+    expect(first).toContain("iCloud Calendar is ready for your protected one-click approval");
+    expect(extractGoogleCalendarApproval(first)).toBeNull();
+    expect(mock.getManagedGooglePrimaryCalendarEventForSourceKey).not.toHaveBeenCalled();
+
+    const second = await executeTool("travel_offline_maps_prepare", { creation_id: "creation-icloud" });
+    const update = verifyICloudCalendarTravelApproval(extractICloudCalendarApproval(second)!);
+    expect(update.proposal).toMatchObject({
+      action: "update",
+      eventUrl,
+      expectedEtag: '"etag-1"',
+      appleMapsOfflinePreflight: {
+        tripId: "creation-icloud",
+        storage: "creation",
+        sourceKey,
+        updatedAt: expect.any(Number),
+        calendarUrl,
+      },
+    });
+    expect(mock.convexMutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:upsert", expect.objectContaining({
+      creationId: "creation-icloud",
+      sourceKey,
+    }));
+    expect(mock.resolveICloudTravelCalendar).toHaveBeenLastCalledWith(calendarUrl);
+    expect(mock.saveTrip).toHaveBeenLastCalledWith("creation-icloud", expect.objectContaining({
+      offlineMapPreflight: expect.objectContaining({
+        calendarProvider: "icloud",
+        calendarStatus: "approval_required",
+      }),
+    }), true, expect.objectContaining({ storage: "creation" }));
   });
 
   it("keeps a durable retry state when Google Calendar is not connected", async () => {

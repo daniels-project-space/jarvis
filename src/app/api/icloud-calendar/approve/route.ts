@@ -1,8 +1,19 @@
 import type { NextRequest } from "next/server";
 import { hasExactKeys, isJsonRecord, parseStrictJson } from "@/lib/bounded-json";
 import { isSameOriginRequest } from "@/lib/control-session";
-import { createICloudEvent, iCloudCalendarConfigured } from "@/lib/icloud-calendar";
-import { verifyICloudCalendarApproval } from "@/lib/icloud-calendar-approval.server";
+import { withAdminSession } from "@/lib/control-context";
+import { convexMutation, convexQuery } from "@/lib/context";
+import {
+  createICloudEvent,
+  ICloudCalendarConflictError,
+  iCloudCalendarConfigured,
+  writeICloudTravelCalendarEvent,
+} from "@/lib/icloud-calendar";
+import {
+  verifyICloudCalendarApproval,
+  verifyICloudCalendarTravelApproval,
+  type VerifiedICloudCalendarTravelApproval,
+} from "@/lib/icloud-calendar-approval.server";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
 
 export const runtime = "nodejs";
@@ -19,6 +30,85 @@ class ApprovalRequestError extends Error {
 
 function eventResponse(event: { title: string; start: number; end?: number; allDay: boolean }) {
   return { title: event.title, start: event.start, end: event.end, allDay: event.allDay };
+}
+
+function staleTravelApproval() {
+  return Response.json({
+    ok: false,
+    error: "That Apple Maps itinerary changed before approval. Prepare a fresh protected iCloud Calendar approval.",
+  }, { status: 409, headers: PRIVATE_HEADERS });
+}
+
+async function redeemTravelApproval(
+  approval: VerifiedICloudCalendarTravelApproval,
+  authTokenHash: string | undefined,
+) {
+  const proposal = approval.proposal;
+  const binding = proposal.appleMapsOfflinePreflight;
+  const preflightIsCurrent = await withAdminSession(authTokenHash, () => convexQuery(
+    "appleMapsOfflinePreflights:validateICloudCalendarApproval",
+    {
+      creationId: binding.tripId,
+      sourceKey: binding.sourceKey,
+      expectedPreflightUpdatedAt: binding.updatedAt,
+      calendarUrl: binding.calendarUrl,
+      action: proposal.action,
+      nonce: approval.nonce,
+      ...(proposal.action === "update" ? {
+        eventUrl: proposal.eventUrl,
+        expectedEtag: proposal.expectedEtag,
+      } : {}),
+    },
+  )).catch(() => null) as { ok?: boolean } | null;
+  if (preflightIsCurrent?.ok !== true) return staleTravelApproval();
+
+  try {
+    const event = await writeICloudTravelCalendarEvent({
+      action: proposal.action,
+      calendarUrl: binding.calendarUrl,
+      sourceKey: binding.sourceKey,
+      revision: binding.updatedAt,
+      nonce: approval.nonce,
+      event: proposal.event,
+      ...(proposal.action === "update" ? {
+        eventUrl: proposal.eventUrl,
+        expectedEtag: proposal.expectedEtag,
+      } : {}),
+    });
+    const committed = await withAdminSession(authTokenHash, () => convexMutation(
+      "appleMapsOfflinePreflights:commitICloudCalendarApproval",
+      {
+        creationId: binding.tripId,
+        sourceKey: binding.sourceKey,
+        expectedPreflightUpdatedAt: binding.updatedAt,
+        calendarUrl: binding.calendarUrl,
+        action: proposal.action,
+        calendarEvent: {
+          calendarUrl: event.calendarUrl,
+          eventUrl: event.eventUrl,
+          etag: event.etag,
+          revision: binding.updatedAt,
+          nonce: approval.nonce,
+        },
+        ...(proposal.action === "update" ? { expectedEtag: proposal.expectedEtag } : {}),
+      },
+    )).catch(() => null) as { ok?: boolean } | null;
+    if (committed?.ok !== true) return staleTravelApproval();
+    return Response.json({
+      ok: true,
+      action: proposal.action,
+      created: event.created,
+      event: eventResponse(event),
+    }, { headers: PRIVATE_HEADERS });
+  } catch (error) {
+    if (error instanceof ICloudCalendarConflictError) return staleTravelApproval();
+    // CalDAV responses can contain private event/account details. Never
+    // reflect them into chat; the card already contains the safe preview.
+    return Response.json({
+      ok: false,
+      error: "iCloud Calendar could not apply that Apple Maps update. Check the iCloud Calendar connection, then prepare a fresh approval.",
+    }, { status: 502, headers: PRIVATE_HEADERS });
+  }
 }
 
 /** Read the small one-field receipt body without trusting Content-Length. */
@@ -97,6 +187,15 @@ export async function POST(req: NextRequest) {
       { status, headers: PRIVATE_HEADERS },
     );
   }
+  let travelApproval: VerifiedICloudCalendarTravelApproval | undefined;
+  try {
+    travelApproval = verifyICloudCalendarTravelApproval(token);
+  } catch {
+    // Versioned travel receipts deliberately fail generic parsing and vice
+    // versa. Try the legacy generic create shape only after this strict form.
+  }
+  if (travelApproval) return await redeemTravelApproval(travelApproval, actor.authTokenHash);
+
   let approval;
   try {
     approval = verifyICloudCalendarApproval(token);

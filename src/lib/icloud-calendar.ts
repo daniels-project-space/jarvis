@@ -40,6 +40,29 @@ export type ICloudEventInput = {
 
 export type ICloudEventWriteResult = ICloudEvent & { created: boolean };
 
+/**
+ * Saved Apple Maps preflights use one deterministic CalDAV resource per
+ * source key. Unlike the generic owner-approved event path, this lets a
+ * refreshed itinerary update the same event without trusting a broad calendar
+ * search or accidentally creating a second handoff reminder.
+ */
+export type ICloudTravelCalendarEventInput = {
+  action: "create" | "update";
+  calendarUrl: string;
+  sourceKey: string;
+  revision: number;
+  nonce: string;
+  event: Omit<ICloudEventInput, "calendar" | "idempotencyKey">;
+  eventUrl?: string;
+  expectedEtag?: string;
+};
+
+export type ICloudTravelCalendarEventWriteResult = Omit<ICloudEventWriteResult, "etag"> & {
+  calendarUrl: string;
+  revision: number;
+  etag: string;
+};
+
 type XmlRecord = Record<string, unknown>;
 
 let calendarHomeCache: { value: string; expiresAt: number } | null = null;
@@ -52,6 +75,9 @@ const parser = new XMLParser({
 });
 
 export class ICloudCalendarError extends Error {}
+
+/** A conditional CalDAV write found a different external revision. */
+export class ICloudCalendarConflictError extends ICloudCalendarError {}
 
 export function iCloudCalendarConfigured(): boolean {
   return Boolean(
@@ -314,6 +340,223 @@ export async function createICloudEvent(input: ICloudEventInput): Promise<ICloud
     calendarName: calendar.name,
     source: "icloud",
     created: response.status !== 412,
+  };
+}
+
+function normalizedTravelCalendarUrl(value: unknown): string {
+  if (typeof value !== "string" || value.length > 2_000) {
+    throw new ICloudCalendarError("iCloud Calendar URL is invalid.");
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ICloudCalendarError("iCloud Calendar URL is invalid.");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new ICloudCalendarError("iCloud Calendar URL is invalid.");
+  }
+  if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
+  return url.toString();
+}
+
+function travelEventUrlBelongsToCalendar(calendarUrl: string, eventUrl: unknown): string {
+  if (typeof eventUrl !== "string" || eventUrl.length > 2_000) {
+    throw new ICloudCalendarError("iCloud Calendar event URL is invalid.");
+  }
+  let event: URL;
+  try {
+    event = new URL(eventUrl);
+  } catch {
+    throw new ICloudCalendarError("iCloud Calendar event URL is invalid.");
+  }
+  const calendar = new URL(calendarUrl);
+  if (
+    event.protocol !== "https:"
+    || event.username
+    || event.password
+    || event.search
+    || event.hash
+    || event.origin !== calendar.origin
+    || !event.pathname.startsWith(calendar.pathname)
+    || !event.pathname.endsWith(".ics")
+  ) {
+    throw new ICloudCalendarError("iCloud Calendar event URL is invalid.");
+  }
+  return event.toString();
+}
+
+function validTravelSourceKey(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function validTravelNonce(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(value);
+}
+
+function validTravelRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function validEtag(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function travelEventUid(sourceKey: string): string {
+  return `jarvis-apple-maps-${sourceKey}@jarvis`;
+}
+
+function deterministicTravelEventUrl(calendarUrl: string, sourceKey: string): string {
+  return new URL(`${travelEventUid(sourceKey)}.ics`, calendarUrl).toString();
+}
+
+function travelEventIcs(input: ICloudTravelCalendarEventInput, uid: string): string {
+  const allDay = input.event.allDay === true;
+  const end = input.event.end ?? input.event.start + (allDay ? 86_400_000 : 60 * 60_000);
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//JARVIS//iCloud Calendar//EN",
+    "CALSCALE:GREGORIAN",
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    `DTSTAMP:${toIcalUtc(Date.now())}`,
+  ];
+  if (allDay) {
+    lines.push(`DTSTART;VALUE=DATE:${toLondonDate(input.event.start)}`, `DTEND;VALUE=DATE:${toLondonDate(end)}`);
+  } else {
+    lines.push(`DTSTART:${toIcalUtc(input.event.start)}`, `DTEND:${toIcalUtc(end)}`);
+  }
+  lines.push(
+    `SUMMARY:${icalEscape(input.event.title)}`,
+    `X-JARVIS-APPLE-MAPS-SOURCE-KEY:${input.sourceKey}`,
+    `X-JARVIS-APPLE-MAPS-REVISION:${input.revision}`,
+    `X-JARVIS-APPLE-MAPS-NONCE:${input.nonce}`,
+  );
+  if (input.event.location) lines.push(`LOCATION:${icalEscape(input.event.location)}`);
+  if (input.event.notes) lines.push(`DESCRIPTION:${icalEscape(input.event.notes)}`);
+  if (input.event.reminderMinutesBefore && input.event.reminderMinutesBefore > 0) {
+    lines.push(
+      "BEGIN:VALARM",
+      "ACTION:DISPLAY",
+      `DESCRIPTION:${icalEscape(input.event.title)}`,
+      `TRIGGER:-PT${Math.min(14 * 24 * 60, Math.round(input.event.reminderMinutesBefore))}M`,
+      "END:VALARM",
+    );
+  }
+  lines.push("END:VEVENT", "END:VCALENDAR", "");
+  return lines.join("\r\n");
+}
+
+type ICloudTravelEventMarker = {
+  sourceKey: string;
+  revision: number;
+  nonce: string;
+};
+
+function iCalendarProperty(body: string, name: string): string | undefined {
+  const unfolded = body.replace(/\r?\n[ \t]/g, "");
+  const match = new RegExp(`(?:^|\\n)${name}:([^\\r\\n]+)`, "i").exec(unfolded);
+  return match?.[1]?.trim() || undefined;
+}
+
+function travelEventMarker(body: string): ICloudTravelEventMarker | null {
+  const sourceKey = iCalendarProperty(body, "X-JARVIS-APPLE-MAPS-SOURCE-KEY");
+  const revision = Number(iCalendarProperty(body, "X-JARVIS-APPLE-MAPS-REVISION"));
+  const nonce = iCalendarProperty(body, "X-JARVIS-APPLE-MAPS-NONCE");
+  if (!validTravelSourceKey(sourceKey) || !validTravelRevision(revision) || !validTravelNonce(nonce)) return null;
+  return { sourceKey, revision, nonce };
+}
+
+function sameTravelEventMarker(left: ICloudTravelEventMarker | null, right: Pick<ICloudTravelCalendarEventInput, "sourceKey" | "revision" | "nonce">): boolean {
+  return left !== null
+    && left.sourceKey === right.sourceKey
+    && left.revision === right.revision
+    && left.nonce === right.nonce;
+}
+
+async function readTravelEvent(eventUrl: string): Promise<{ eventUrl: string; etag?: string; marker: ICloudTravelEventMarker | null } | null> {
+  const { response, url } = await caldavRequest("GET", eventUrl, { allowedStatuses: [404] });
+  if (response.status === 404) return null;
+  const etag = response.headers.get("etag") ?? undefined;
+  return { eventUrl: url, ...(etag ? { etag } : {}), marker: travelEventMarker(await response.text()) };
+}
+
+async function resolvedTravelCalendar(calendarUrl: string): Promise<ICloudCalendar> {
+  const calendar = await resolveCalendar(calendarUrl);
+  if (normalizedTravelCalendarUrl(calendar.url) !== calendarUrl) {
+    throw new ICloudCalendarConflictError("The selected iCloud Calendar changed before approval.");
+  }
+  return calendar;
+}
+
+/** Resolve a user-selected iCloud calendar once, before sealing a travel receipt. */
+export async function resolveICloudTravelCalendar(requested?: string): Promise<ICloudCalendar> {
+  const calendar = await resolveCalendar(requested);
+  return { ...calendar, url: normalizedTravelCalendarUrl(calendar.url) };
+}
+
+/**
+ * Conditional iCloud write for a saved Apple Maps preflight. The event URL is
+ * deterministic for the stable source key; a retry can therefore distinguish
+ * this receipt's lost response from someone else's existing Calendar event.
+ */
+export async function writeICloudTravelCalendarEvent(
+  input: ICloudTravelCalendarEventInput,
+): Promise<ICloudTravelCalendarEventWriteResult> {
+  if (!validTravelSourceKey(input.sourceKey) || !validTravelRevision(input.revision) || !validTravelNonce(input.nonce)) {
+    throw new ICloudCalendarError("iCloud travel calendar approval is invalid.");
+  }
+  const calendarUrl = normalizedTravelCalendarUrl(input.calendarUrl);
+  const calendar = await resolvedTravelCalendar(calendarUrl);
+  const uid = travelEventUid(input.sourceKey);
+  const eventUrl = input.action === "create"
+    ? deterministicTravelEventUrl(calendarUrl, input.sourceKey)
+    : travelEventUrlBelongsToCalendar(calendarUrl, input.eventUrl);
+  if (input.action === "update" && !validEtag(input.expectedEtag)) {
+    throw new ICloudCalendarError("iCloud Calendar event revision is invalid.");
+  }
+
+  const { response, url } = await caldavRequest("PUT", eventUrl, {
+    body: travelEventIcs(input, uid),
+    headers: {
+      "Content-Type": "text/calendar; charset=utf-8",
+      ...(input.action === "create" ? { "If-None-Match": "*" } : { "If-Match": input.expectedEtag! }),
+    },
+    // A 412 is never silently treated as success. It is safe only when a
+    // follow-up read proves this exact receipt nonce and preflight revision won
+    // a prior write whose HTTP response was lost.
+    allowedStatuses: [412],
+  });
+  const resolvedEventUrl = travelEventUrlBelongsToCalendar(calendarUrl, url);
+  let created = response.status !== 412;
+  let etag = response.headers.get("etag") ?? undefined;
+  if (response.status === 412 || !validEtag(etag)) {
+    const existing = await readTravelEvent(resolvedEventUrl);
+    if (!sameTravelEventMarker(existing?.marker ?? null, input)) {
+      throw new ICloudCalendarConflictError("The Jarvis-managed iCloud Calendar event changed before approval.");
+    }
+    if (!validEtag(existing?.etag)) {
+      throw new ICloudCalendarError("iCloud Calendar did not return an event revision.");
+    }
+    created = false;
+    etag = existing.etag;
+  }
+  return {
+    uid,
+    title: input.event.title,
+    start: input.event.start,
+    end: input.event.end,
+    allDay: input.event.allDay === true,
+    ...(input.event.location ? { location: input.event.location } : {}),
+    ...(input.event.notes ? { notes: input.event.notes } : {}),
+    eventUrl: resolvedEventUrl,
+    etag,
+    calendarName: calendar.name,
+    source: "icloud",
+    created,
+    calendarUrl,
+    revision: input.revision,
   };
 }
 
