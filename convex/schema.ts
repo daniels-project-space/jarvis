@@ -681,6 +681,28 @@ export default defineSchema({
       nonce: v.string(),
       committedAt: v.number(),
     })),
+    // A CalDAV PUT and a Convex transaction cannot share one atomic commit.
+    // Keep the exact owner-approved attempt durable across that boundary so a
+    // stale TripDoc revision or lost response can be reconciled safely rather
+    // than turning the deterministic resource into an orphan.
+    iCloudCalendarAttempt: v.optional(v.object({
+      sourceKey: v.string(),
+      calendarUrl: v.string(),
+      eventUrl: v.string(),
+      revision: v.number(),
+      nonce: v.string(),
+      action: v.union(v.literal("create"), v.literal("update")),
+      expectedEtag: v.optional(v.string()),
+      observedEtag: v.optional(v.string()),
+      observedAt: v.optional(v.number()),
+      missingAt: v.optional(v.number()),
+      recovery: v.optional(v.object({
+        revision: v.number(),
+        nonce: v.string(),
+        etag: v.string(),
+      })),
+      startedAt: v.number(),
+    })),
     refreshState: v.union(
       v.literal("scheduled"),
       v.literal("pending_refresh"),

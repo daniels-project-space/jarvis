@@ -155,6 +155,17 @@ function normalizedUrl(value: unknown, label: string): string {
   return url.toString();
 }
 
+function normalizedICloudCalendarUrl(value: unknown, label: string): string {
+  const normalized = normalizedUrl(value, label);
+  const url = new URL(normalized);
+  const hostname = url.hostname.toLowerCase();
+  if (url.port || (hostname !== "caldav.icloud.com" && !/^p\d+-caldav\.icloud\.com$/.test(hostname))) {
+    throw new ICloudCalendarApprovalError(`${label} is invalid.`);
+  }
+  if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
+  return url.toString();
+}
+
 function normalizedTravelBinding(value: unknown): ICloudCalendarTravelApprovalBinding {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ICloudCalendarApprovalError("Calendar approval is invalid.");
@@ -171,7 +182,7 @@ function normalizedTravelBinding(value: unknown): ICloudCalendarTravelApprovalBi
     storage: "creation",
     sourceKey,
     updatedAt: updatedAt as number,
-    calendarUrl: normalizedUrl(input.calendarUrl, "Calendar URL"),
+    calendarUrl: normalizedICloudCalendarUrl(input.calendarUrl, "Calendar URL"),
   };
 }
 
@@ -188,7 +199,9 @@ function normalizedTravelEventUrl(value: unknown, calendarUrl: string): string {
 
 function normalizedTravelEtag(value: unknown): string {
   const etag = boundedText(value, "Calendar event revision", 512, true)!;
-  if (/[\u0000-\u001f\u007f]/.test(etag)) {
+  // If-Match uses strong comparison. A wildcard or weak entity tag would
+  // weaken (or deterministically fail) this exact-revision approval.
+  if (!/^"[^"\u0000-\u001f\u007f]*"$/.test(etag)) {
     throw new ICloudCalendarApprovalError("Calendar event revision is invalid.");
   }
   return etag;

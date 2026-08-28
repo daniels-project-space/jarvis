@@ -14,7 +14,7 @@ const WORKER = "apple-preflight-worker";
 const SOURCE_KEY = "b".repeat(64);
 const OWNER = "c".repeat(64);
 const ICLOUD_CALENDAR_URL = "https://caldav.icloud.com/123/calendars/home/";
-const ICLOUD_EVENT_URL = `${ICLOUD_CALENDAR_URL}jarvis-apple-maps-${SOURCE_KEY}.ics`;
+const ICLOUD_EVENT_URL = `${ICLOUD_CALENDAR_URL}jarvis-apple-maps-${SOURCE_KEY}@jarvis.ics`;
 const preflight = {
   city: "Seville", flightMarker: "jarvis-gmail-booking:flight-1", flightTitle: "✈ Iberia · confirmed",
   flightStart: 1_900_000_000_000, at: 1_899_913_600_000, timeZone: "Europe/Madrid",
@@ -347,6 +347,18 @@ describe("saved Apple Maps offline preflight registry", () => {
       authTokenHash: OWNER,
     };
     await expect(t.query(registry.validateICloudCalendarApproval, createReceipt)).resolves.toEqual({ ok: true });
+    await expect(t.mutation(registry.beginICloudCalendarApproval, createReceipt)).resolves.toEqual({ ok: true, committed: false });
+    const createCalendarEvent = {
+      calendarUrl: ICLOUD_CALENDAR_URL,
+      eventUrl: ICLOUD_EVENT_URL,
+      etag: '"etag-1"',
+      revision: 99,
+      nonce: createReceipt.nonce,
+    };
+    await expect(t.mutation(registry.observeICloudCalendarApproval, {
+      ...createReceipt,
+      calendarEvent: createCalendarEvent,
+    })).resolves.toEqual({ ok: true, current: true });
     await expect(t.mutation(registry.commitICloudCalendarApproval, {
       creationId,
       sourceKey: SOURCE_KEY,
@@ -354,13 +366,7 @@ describe("saved Apple Maps offline preflight registry", () => {
       calendarUrl: ICLOUD_CALENDAR_URL,
       action: "create",
       authTokenHash: OWNER,
-      calendarEvent: {
-        calendarUrl: ICLOUD_CALENDAR_URL,
-        eventUrl: ICLOUD_EVENT_URL,
-        etag: '"etag-1"',
-        revision: 99,
-        nonce: createReceipt.nonce,
-      },
+      calendarEvent: createCalendarEvent,
     })).resolves.toEqual({ ok: true });
 
     const savedAfterCreate = await t.query(api.creations.get, { id: creationId, workerToken: WORKER });
@@ -380,6 +386,18 @@ describe("saved Apple Maps offline preflight registry", () => {
       nonce: createReceipt.nonce,
       committedAt: expect.any(Number),
     });
+    // The same receipt is idempotent only at its original exact entity tag.
+    // An external edit can keep Jarvis's X-properties, so marker equality
+    // alone must not overwrite the durable revision on a retry.
+    await expect(t.mutation(registry.commitICloudCalendarApproval, {
+      creationId,
+      sourceKey: SOURCE_KEY,
+      expectedPreflightUpdatedAt: 99,
+      calendarUrl: ICLOUD_CALENDAR_URL,
+      action: "create",
+      authTokenHash: OWNER,
+      calendarEvent: { ...createCalendarEvent, etag: '"external-create-edit"' },
+    })).resolves.toEqual({ ok: false, reason: "conflict" });
     // A lost HTTP response can retry its exact nonce/revision, but no sibling
     // receipt can claim the deterministic resource as a generic create.
     await expect(t.query(registry.validateICloudCalendarApproval, createReceipt)).resolves.toEqual({ ok: true });
@@ -409,10 +427,22 @@ describe("saved Apple Maps offline preflight registry", () => {
       authTokenHash: OWNER,
     };
     await expect(t.query(registry.validateICloudCalendarApproval, updateReceipt)).resolves.toEqual({ ok: true });
+    await expect(t.mutation(registry.beginICloudCalendarApproval, updateReceipt)).resolves.toEqual({ ok: true, committed: false });
     await expect(t.query(registry.validateICloudCalendarApproval, {
       ...updateReceipt,
       expectedEtag: '"wrong-etag"',
     })).resolves.toEqual({ ok: false, reason: "conflict" });
+    const updateCalendarEvent = {
+      calendarUrl: ICLOUD_CALENDAR_URL,
+      eventUrl: ICLOUD_EVENT_URL,
+      etag: '"etag-2"',
+      revision: 100,
+      nonce: updateReceipt.nonce,
+    };
+    await expect(t.mutation(registry.observeICloudCalendarApproval, {
+      ...updateReceipt,
+      calendarEvent: updateCalendarEvent,
+    })).resolves.toEqual({ ok: true, current: true });
     await expect(t.mutation(registry.commitICloudCalendarApproval, {
       creationId,
       sourceKey: SOURCE_KEY,
@@ -421,14 +451,18 @@ describe("saved Apple Maps offline preflight registry", () => {
       action: "update",
       expectedEtag: updateReceipt.expectedEtag,
       authTokenHash: OWNER,
-      calendarEvent: {
-        calendarUrl: ICLOUD_CALENDAR_URL,
-        eventUrl: ICLOUD_EVENT_URL,
-        etag: '"etag-2"',
-        revision: 100,
-        nonce: updateReceipt.nonce,
-      },
+      calendarEvent: updateCalendarEvent,
     })).resolves.toEqual({ ok: true });
+    await expect(t.mutation(registry.commitICloudCalendarApproval, {
+      creationId,
+      sourceKey: SOURCE_KEY,
+      expectedPreflightUpdatedAt: 100,
+      calendarUrl: ICLOUD_CALENDAR_URL,
+      action: "update",
+      expectedEtag: updateReceipt.expectedEtag,
+      authTokenHash: OWNER,
+      calendarEvent: { ...updateCalendarEvent, etag: '"external-update-edit"' },
+    })).resolves.toEqual({ ok: false, reason: "conflict" });
 
     const [rowAfterUpdate] = await t.query(registry.due, { now: 100, limit: 1, workerToken: WORKER });
     await expect(t.mutation(registry.markPending, {
@@ -450,5 +484,124 @@ describe("saved Apple Maps offline preflight registry", () => {
     const [rowAfterRefresh] = await t.query(registry.due, { now: 200, limit: 1, workerToken: WORKER });
     expect(rowAfterRefresh.iCloudCalendarEvent).toMatchObject({ etag: '"etag-2"', revision: 100, nonce: updateReceipt.nonce });
     await expect(t.query(registry.validateICloudCalendarApproval, updateReceipt)).resolves.toEqual({ ok: false, reason: "stale" });
+  });
+
+  it("reconciles a post-PUT stale or response-loss create into a fresh owner-approved update", async () => {
+    const t = convexTest(schema, modules);
+    const registry = (api as any).appleMapsOfflinePreflights;
+    const creationId = await t.mutation(api.creations.create, {
+      kind: "trip", title: "Seville", data: JSON.stringify({
+        kind: "trip", title: "Seville", destination: "Seville",
+        offlineMapPreflight: { sourceKey: SOURCE_KEY, updatedAt: 99, calendarRefreshRequired: false },
+      }), workerToken: WORKER,
+    });
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      await ctx.db.insert("adminSessions", { tokenHash: OWNER, enrolledAt: now, createdAt: now, expiresAt: now + 60_000 });
+    });
+    await t.mutation(registry.upsert, {
+      creationId, sourceKey: SOURCE_KEY, preflight, flightIdentity: identity,
+      cityProofIdentity: { ...identity, messageId: "stay-1", marker: "jarvis-gmail-booking:stay-1", selectionId: "stay-opaque", kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+      cityProof: proof, nextRefreshAt: 100, workerToken: WORKER,
+    });
+    const original = {
+      creationId, sourceKey: SOURCE_KEY, expectedPreflightUpdatedAt: 99, calendarUrl: ICLOUD_CALENDAR_URL,
+      action: "create" as const, nonce: "orphanCreateNonce_123456", authTokenHash: OWNER,
+    };
+    await expect(t.mutation(registry.beginICloudCalendarApproval, original)).resolves.toEqual({ ok: true, committed: false });
+
+    // Apple accepted the deterministic PUT, but the exact TripDoc revision
+    // changed before the provider result could be promoted. This is also the
+    // response-loss recovery path: the subsequent exact GET reports the old
+    // marker and ETag back into the durable pending attempt.
+    await t.run(async (ctx) => {
+      const creation = await ctx.db.get(creationId);
+      const doc = JSON.parse(String(creation?.data));
+      doc.offlineMapPreflight.updatedAt = 100;
+      doc.offlineMapPreflight.calendarRefreshRequired = false;
+      await ctx.db.patch(creationId, { data: JSON.stringify(doc), updatedAt: 100 });
+    });
+    await expect(t.mutation(registry.reconcileICloudCalendarAttempt, {
+      creationId, sourceKey: SOURCE_KEY, calendarUrl: ICLOUD_CALENDAR_URL, eventUrl: ICLOUD_EVENT_URL,
+      revision: 99, nonce: original.nonce, state: "present", etag: '"orphan-etag-1"', authTokenHash: OWNER,
+    })).resolves.toEqual({ ok: true, state: "present" });
+
+    const replacement = {
+      creationId, sourceKey: SOURCE_KEY, expectedPreflightUpdatedAt: 100, calendarUrl: ICLOUD_CALENDAR_URL,
+      action: "update" as const, eventUrl: ICLOUD_EVENT_URL, expectedEtag: '"orphan-etag-1"',
+      nonce: "recoveredUpdateNonce_123456", authTokenHash: OWNER,
+    };
+    await expect(t.mutation(registry.beginICloudCalendarApproval, replacement)).resolves.toEqual({ ok: true, committed: false });
+    const recoveredEvent = {
+      calendarUrl: ICLOUD_CALENDAR_URL, eventUrl: ICLOUD_EVENT_URL, etag: '"recovered-etag-2"',
+      revision: 100, nonce: replacement.nonce,
+    };
+    await expect(t.mutation(registry.observeICloudCalendarApproval, {
+      ...replacement, calendarEvent: recoveredEvent,
+    })).resolves.toEqual({ ok: true, current: true });
+    await expect(t.mutation(registry.commitICloudCalendarApproval, {
+      creationId, sourceKey: SOURCE_KEY, expectedPreflightUpdatedAt: 100, calendarUrl: ICLOUD_CALENDAR_URL,
+      action: "update", expectedEtag: replacement.expectedEtag, authTokenHash: OWNER, calendarEvent: recoveredEvent,
+    })).resolves.toEqual({ ok: true });
+    const [row] = await t.query(registry.due, { now: 100, limit: 1, workerToken: WORKER });
+    expect(row.iCloudCalendarEvent).toMatchObject({ etag: '"recovered-etag-2"', revision: 100, nonce: replacement.nonce });
+    expect(row.iCloudCalendarAttempt).toBeUndefined();
+  });
+
+  it("allows a known no-PUT pending create to restart only after its exact resource is missing", async () => {
+    const t = convexTest(schema, modules);
+    const registry = (api as any).appleMapsOfflinePreflights;
+    const creationId = await t.mutation(api.creations.create, {
+      kind: "trip", title: "Seville", data: JSON.stringify({
+        kind: "trip", title: "Seville", destination: "Seville",
+        offlineMapPreflight: { sourceKey: SOURCE_KEY, updatedAt: 99, calendarRefreshRequired: false },
+      }), workerToken: WORKER,
+    });
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      await ctx.db.insert("adminSessions", { tokenHash: OWNER, enrolledAt: now, createdAt: now, expiresAt: now + 60_000 });
+    });
+    await t.mutation(registry.upsert, {
+      creationId, sourceKey: SOURCE_KEY, preflight, flightIdentity: identity,
+      cityProofIdentity: { ...identity, messageId: "stay-1", marker: "jarvis-gmail-booking:stay-1", selectionId: "stay-opaque", kind: "stay", provider: "Booking", confirmationCode: "STAY123" },
+      cityProof: proof, nextRefreshAt: 100, workerToken: WORKER,
+    });
+    const first = {
+      creationId, sourceKey: SOURCE_KEY, expectedPreflightUpdatedAt: 99, calendarUrl: ICLOUD_CALENDAR_URL,
+      action: "create" as const, nonce: "noPutCreateNonce_123456", authTokenHash: OWNER,
+    };
+    await t.mutation(registry.beginICloudCalendarApproval, first);
+    await expect(t.mutation(registry.reconcileICloudCalendarAttempt, {
+      creationId, sourceKey: SOURCE_KEY, calendarUrl: ICLOUD_CALENDAR_URL, eventUrl: ICLOUD_EVENT_URL,
+      revision: 99, nonce: first.nonce, state: "missing", authTokenHash: OWNER,
+    })).resolves.toEqual({ ok: true, state: "missing" });
+    // The original click may still arrive after the 404 observation. Its
+    // successful provider response must clear the missing marker before any
+    // later stale-revision recovery, otherwise the pending record becomes
+    // structurally invalid and strands the deterministic resource.
+    await expect(t.mutation(registry.beginICloudCalendarApproval, first)).resolves.toEqual({ ok: true, committed: false });
+    const restoredEvent = {
+      calendarUrl: ICLOUD_CALENDAR_URL, eventUrl: ICLOUD_EVENT_URL, etag: '"restored-etag-1"',
+      revision: 99, nonce: first.nonce,
+    };
+    await expect(t.mutation(registry.observeICloudCalendarApproval, {
+      ...first, calendarEvent: restoredEvent,
+    })).resolves.toEqual({ ok: true, current: true });
+    await t.run(async (ctx) => {
+      const creation = await ctx.db.get(creationId);
+      const doc = JSON.parse(String(creation?.data));
+      doc.offlineMapPreflight.updatedAt = 100;
+      doc.offlineMapPreflight.calendarRefreshRequired = false;
+      await ctx.db.patch(creationId, { data: JSON.stringify(doc), updatedAt: 100 });
+    });
+    await expect(t.mutation(registry.reconcileICloudCalendarAttempt, {
+      creationId, sourceKey: SOURCE_KEY, calendarUrl: ICLOUD_CALENDAR_URL, eventUrl: ICLOUD_EVENT_URL,
+      revision: 99, nonce: first.nonce, state: "present", etag: '"restored-etag-1"', authTokenHash: OWNER,
+    })).resolves.toEqual({ ok: true, state: "present" });
+    await expect(t.mutation(registry.beginICloudCalendarApproval, {
+      creationId, sourceKey: SOURCE_KEY, expectedPreflightUpdatedAt: 100, calendarUrl: ICLOUD_CALENDAR_URL,
+      action: "update", eventUrl: ICLOUD_EVENT_URL, expectedEtag: '"restored-etag-1"',
+      nonce: "restartedUpdateNonce_123456", authTokenHash: OWNER,
+    })).resolves.toEqual({ ok: true, committed: false });
   });
 });

@@ -53,7 +53,12 @@ beforeEach(() => {
   mock.verify.mockReturnValue({ event, nonce: "signedReceiptNonce_123456" });
   mock.create.mockResolvedValue({ ...event, uid: "uid", eventUrl: "https://calendar.test/uid.ics", calendarName: "Home", source: "icloud", created: true });
   mock.query.mockResolvedValue({ ok: true });
-  mock.mutation.mockResolvedValue({ ok: true });
+  mock.mutation.mockImplementation(async (path: string) => {
+    if (path === "appleMapsOfflinePreflights:beginICloudCalendarApproval") return { ok: true, committed: false };
+    if (path === "appleMapsOfflinePreflights:observeICloudCalendarApproval") return { ok: true, current: true };
+    if (path === "appleMapsOfflinePreflights:commitICloudCalendarApproval") return { ok: true };
+    return { ok: true };
+  });
   mock.writeTravel.mockResolvedValue({
     ...event,
     uid: "travel-uid",
@@ -178,7 +183,7 @@ describe("iCloud Calendar owner approval route", () => {
 
   it("rechecks the exact owner-sealed saved preflight before an iCloud travel write", async () => {
     mock.verifyTravel.mockReturnValue(travelApproval);
-    mock.query.mockResolvedValueOnce({ ok: false, reason: "stale" });
+    mock.mutation.mockResolvedValueOnce({ ok: false, reason: "stale" });
 
     const response = await POST(request({ token: "travel-receipt" }));
 
@@ -188,7 +193,7 @@ describe("iCloud Calendar owner approval route", () => {
       error: expect.stringMatching(/itinerary changed/i),
     }));
     expect(mock.withAdminSession).toHaveBeenCalledWith("owner", expect.any(Function));
-    expect(mock.query).toHaveBeenCalledWith("appleMapsOfflinePreflights:validateICloudCalendarApproval", {
+    expect(mock.mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:beginICloudCalendarApproval", {
       creationId: travelApproval.proposal.appleMapsOfflinePreflight.tripId,
       sourceKey: travelApproval.proposal.appleMapsOfflinePreflight.sourceKey,
       expectedPreflightUpdatedAt: travelApproval.proposal.appleMapsOfflinePreflight.updatedAt,
@@ -197,7 +202,7 @@ describe("iCloud Calendar owner approval route", () => {
       nonce: travelApproval.nonce,
     });
     expect(mock.writeTravel).not.toHaveBeenCalled();
-    expect(mock.mutation).not.toHaveBeenCalled();
+    expect(mock.mutation).toHaveBeenCalledTimes(1);
   });
 
   it("writes and atomically commits only the receipt-bound create", async () => {
@@ -214,12 +219,21 @@ describe("iCloud Calendar owner approval route", () => {
       nonce: travelApproval.nonce,
       event,
     });
-    expect(mock.mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:commitICloudCalendarApproval", {
+    expect(mock.mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:beginICloudCalendarApproval", {
       creationId: travelApproval.proposal.appleMapsOfflinePreflight.tripId,
       sourceKey: travelApproval.proposal.appleMapsOfflinePreflight.sourceKey,
       expectedPreflightUpdatedAt: travelApproval.proposal.appleMapsOfflinePreflight.updatedAt,
       calendarUrl: travelApproval.proposal.appleMapsOfflinePreflight.calendarUrl,
       action: "create",
+      nonce: travelApproval.nonce,
+    });
+    expect(mock.mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:observeICloudCalendarApproval", {
+      creationId: travelApproval.proposal.appleMapsOfflinePreflight.tripId,
+      sourceKey: travelApproval.proposal.appleMapsOfflinePreflight.sourceKey,
+      expectedPreflightUpdatedAt: travelApproval.proposal.appleMapsOfflinePreflight.updatedAt,
+      calendarUrl: travelApproval.proposal.appleMapsOfflinePreflight.calendarUrl,
+      action: "create",
+      nonce: travelApproval.nonce,
       calendarEvent: {
         calendarUrl: "https://caldav.icloud.com/123/calendars/home/",
         eventUrl: "https://caldav.icloud.com/123/calendars/home/travel.ics",
@@ -228,6 +242,37 @@ describe("iCloud Calendar owner approval route", () => {
         nonce: travelApproval.nonce,
       },
     });
+    expect(mock.mutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:commitICloudCalendarApproval", expect.objectContaining({
+      action: "create",
+      calendarEvent: expect.objectContaining({ etag: '"etag-2"' }),
+    }));
+  });
+
+  it("does not replay CalDAV when the exact receipt was already durably promoted", async () => {
+    mock.verifyTravel.mockReturnValue(travelApproval);
+    mock.mutation.mockResolvedValueOnce({ ok: true, committed: true });
+
+    const response = await POST(request({ token: "same-travel-receipt" }));
+
+    await expect(response.json()).resolves.toMatchObject({ ok: true, action: "create", created: false, event: { title: "Planning" } });
+    expect(mock.writeTravel).not.toHaveBeenCalled();
+    expect(mock.mutation).toHaveBeenCalledTimes(1);
+  });
+
+  it("records the provider ETag before rejecting a post-PUT stale revision", async () => {
+    mock.verifyTravel.mockReturnValue(travelApproval);
+    mock.mutation
+      .mockResolvedValueOnce({ ok: true, committed: false })
+      .mockResolvedValueOnce({ ok: false, reason: "stale" });
+
+    const response = await POST(request({ token: "stale-after-put" }));
+
+    expect(response.status).toBe(409);
+    expect(mock.writeTravel).toHaveBeenCalledTimes(1);
+    expect(mock.mutation).toHaveBeenNthCalledWith(2, "appleMapsOfflinePreflights:observeICloudCalendarApproval", expect.objectContaining({
+      calendarEvent: expect.objectContaining({ etag: '"etag-2"' }),
+    }));
+    expect(mock.mutation).toHaveBeenCalledTimes(2);
   });
 
   it("uses the sealed ETag for updates and treats a CalDAV 412 conflict as stale", async () => {
@@ -251,12 +296,15 @@ describe("iCloud Calendar owner approval route", () => {
       eventUrl: "https://caldav.icloud.com/123/calendars/home/travel.ics",
       expectedEtag: '"etag-1"',
     }));
-    expect(mock.mutation).not.toHaveBeenCalled();
+    expect(mock.mutation).toHaveBeenCalledTimes(1);
   });
 
   it("returns stale when the durable commit loses its exact preflight revision", async () => {
     mock.verifyTravel.mockReturnValue(travelApproval);
-    mock.mutation.mockResolvedValueOnce({ ok: false, reason: "stale" });
+    mock.mutation
+      .mockResolvedValueOnce({ ok: true, committed: false })
+      .mockResolvedValueOnce({ ok: true, current: true })
+      .mockResolvedValueOnce({ ok: false, reason: "stale" });
 
     const response = await POST(request({ token: "travel-receipt" }));
 

@@ -84,6 +84,11 @@ describe("iCloud Calendar approval receipts", () => {
     }));
     expect(() => verifyICloudCalendarApproval(token, 1_001)).toThrow(/invalid or expired/i);
     expect(() => verifyICloudCalendarTravelApproval(issueICloudCalendarApproval(event, 1_000), 1_001)).toThrow(/invalid or expired/i);
+    expect(() => issueICloudCalendarTravelApproval({
+      action: "create",
+      event,
+      appleMapsOfflinePreflight: { ...travelBinding, calendarUrl: "https://attacker.example/calendar/" },
+    }, 1_000)).toThrow(/invalid/i);
   });
 
   it("binds an update to the exact existing CalDAV resource and ETag", () => {
@@ -117,5 +122,14 @@ describe("iCloud Calendar approval receipts", () => {
       expectedEtag: '"revision-7"\nIf-Match: injected',
       appleMapsOfflinePreflight: travelBinding,
     }, 1_000)).toThrow(/invalid/i);
+    for (const expectedEtag of ["*", 'W/"revision-7"']) {
+      expect(() => issueICloudCalendarTravelApproval({
+        action: "update",
+        event,
+        eventUrl,
+        expectedEtag,
+        appleMapsOfflinePreflight: travelBinding,
+      }, 1_000)).toThrow(/invalid/i);
+    }
   });
 });

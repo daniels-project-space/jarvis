@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { hasExactKeys, isJsonRecord, parseStrictJson } from "@/lib/bounded-json";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { withAdminSession } from "@/lib/control-context";
-import { convexMutation, convexQuery } from "@/lib/context";
+import { convexMutation } from "@/lib/context";
 import {
   createICloudEvent,
   ICloudCalendarConflictError,
@@ -45,8 +45,8 @@ async function redeemTravelApproval(
 ) {
   const proposal = approval.proposal;
   const binding = proposal.appleMapsOfflinePreflight;
-  const preflightIsCurrent = await withAdminSession(authTokenHash, () => convexQuery(
-    "appleMapsOfflinePreflights:validateICloudCalendarApproval",
+  const claim = await withAdminSession(authTokenHash, () => convexMutation(
+    "appleMapsOfflinePreflights:beginICloudCalendarApproval",
     {
       creationId: binding.tripId,
       sourceKey: binding.sourceKey,
@@ -59,8 +59,16 @@ async function redeemTravelApproval(
         expectedEtag: proposal.expectedEtag,
       } : {}),
     },
-  )).catch(() => null) as { ok?: boolean } | null;
-  if (preflightIsCurrent?.ok !== true) return staleTravelApproval();
+  )).catch(() => null) as { ok?: boolean; committed?: boolean } | null;
+  if (claim?.ok !== true) return staleTravelApproval();
+  if (claim.committed) {
+    return Response.json({
+      ok: true,
+      action: proposal.action,
+      created: false,
+      event: eventResponse(proposal.event),
+    }, { headers: PRIVATE_HEADERS });
+  }
 
   try {
     const event = await writeICloudTravelCalendarEvent({
@@ -75,6 +83,30 @@ async function redeemTravelApproval(
         expectedEtag: proposal.expectedEtag,
       } : {}),
     });
+    const calendarEvent = {
+      calendarUrl: event.calendarUrl,
+      eventUrl: event.eventUrl,
+      etag: event.etag,
+      revision: binding.updatedAt,
+      nonce: approval.nonce,
+    };
+    const observed = await withAdminSession(authTokenHash, () => convexMutation(
+      "appleMapsOfflinePreflights:observeICloudCalendarApproval",
+      {
+        creationId: binding.tripId,
+        sourceKey: binding.sourceKey,
+        expectedPreflightUpdatedAt: binding.updatedAt,
+        calendarUrl: binding.calendarUrl,
+        action: proposal.action,
+        nonce: approval.nonce,
+        calendarEvent,
+        ...(proposal.action === "update" ? {
+          eventUrl: proposal.eventUrl,
+          expectedEtag: proposal.expectedEtag,
+        } : {}),
+      },
+    )).catch(() => null) as { ok?: boolean; current?: boolean } | null;
+    if (observed?.ok !== true || observed.current !== true) return staleTravelApproval();
     const committed = await withAdminSession(authTokenHash, () => convexMutation(
       "appleMapsOfflinePreflights:commitICloudCalendarApproval",
       {
@@ -83,13 +115,7 @@ async function redeemTravelApproval(
         expectedPreflightUpdatedAt: binding.updatedAt,
         calendarUrl: binding.calendarUrl,
         action: proposal.action,
-        calendarEvent: {
-          calendarUrl: event.calendarUrl,
-          eventUrl: event.eventUrl,
-          etag: event.etag,
-          revision: binding.updatedAt,
-          nonce: approval.nonce,
-        },
+        calendarEvent,
         ...(proposal.action === "update" ? { expectedEtag: proposal.expectedEtag } : {}),
       },
     )).catch(() => null) as { ok?: boolean } | null;

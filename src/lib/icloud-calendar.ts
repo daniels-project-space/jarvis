@@ -10,6 +10,12 @@ const ICLOUD_CALDAV_URL = "https://caldav.icloud.com/";
 const LONDON = "Europe/London";
 const XML = '<?xml version="1.0" encoding="utf-8"?>';
 
+// Apple redirects CalDAV discovery to numbered iCloud CalDAV shards. Do not
+// let a provider-controlled Location or DAV href turn into an authenticated
+// request anywhere else: every CalDAV request carries the app password.
+const ICLOUD_CALDAV_HOST = "caldav.icloud.com";
+const ICLOUD_CALDAV_SHARD = /^p\d+-caldav\.icloud\.com$/;
+
 export type ICloudCalendar = { name: string; url: string; color?: string };
 export type ICloudEvent = {
   uid: string;
@@ -130,6 +136,28 @@ function authHeader(): string {
   return `Basic ${Buffer.from(`${appleId}:${appPassword}`).toString("base64")}`;
 }
 
+function trustedICloudCalDavUrl(value: string, base?: string): string {
+  let url: URL;
+  try {
+    url = base ? new URL(value, base) : new URL(value);
+  } catch {
+    throw new ICloudCalendarError("iCloud returned an invalid Calendar location.");
+  }
+  const hostname = url.hostname.toLowerCase();
+  if (
+    url.protocol !== "https:"
+    || url.port
+    || url.username
+    || url.password
+    || url.search
+    || url.hash
+    || (hostname !== ICLOUD_CALDAV_HOST && !ICLOUD_CALDAV_SHARD.test(hostname))
+  ) {
+    throw new ICloudCalendarError("iCloud returned a Calendar location outside its CalDAV service.");
+  }
+  return url.toString();
+}
+
 async function caldavRequest(
   method: string,
   url: string,
@@ -138,9 +166,18 @@ async function caldavRequest(
     depth?: "0" | "1";
     headers?: HeadersInit;
     allowedStatuses?: readonly number[];
+    /** Saved-trip resources must never follow a redirect to another child. */
+    expectedUrl?: string;
   } = {},
 ): Promise<{ response: Response; url: string }> {
-  let current = url;
+  // Validate before building Authorization, not merely before following a
+  // redirect. This is the credential boundary for every caller, including
+  // provider-discovered principal, home, calendar, and event URLs.
+  let current = trustedICloudCalDavUrl(url);
+  const expectedUrl = options.expectedUrl ? trustedICloudCalDavUrl(options.expectedUrl) : undefined;
+  if (expectedUrl && current !== expectedUrl) {
+    throw new ICloudCalendarConflictError("iCloud changed the sealed Calendar event location before approval.");
+  }
   for (let attempt = 0; attempt < 6; attempt += 1) {
     const headers = new Headers({
       Authorization: authHeader(),
@@ -161,7 +198,14 @@ async function caldavRequest(
     if ([301, 302, 307, 308].includes(response.status)) {
       const location = response.headers.get("location");
       if (!location) throw new ICloudCalendarError("iCloud redirected without a calendar location.");
-      current = new URL(location, current).toString();
+      const redirected = trustedICloudCalDavUrl(location, current);
+      // Check before the next authenticated fetch. A final-url assertion after
+      // fetch is too late because PUT would already have changed a different
+      // resource.
+      if (expectedUrl && redirected !== expectedUrl) {
+        throw new ICloudCalendarConflictError("iCloud changed the sealed Calendar event location before approval.");
+      }
+      current = redirected;
       continue;
     }
     if ([401, 403].includes(response.status)) throw new ICloudCalendarError("iCloud rejected the calendar credential.");
@@ -198,12 +242,12 @@ async function calendarHome(): Promise<string> {
   if (!home) {
     const principal = href(property(row, "current-user-principal"));
     if (!principal) throw new ICloudCalendarError("iCloud did not return a calendar principal.");
-    ({ response, url } = await caldavRequest("PROPFIND", new URL(principal, url).toString(), { body, depth: "0" }));
+    ({ response, url } = await caldavRequest("PROPFIND", trustedICloudCalDavUrl(principal, url), { body, depth: "0" }));
     row = responseRows(await response.text())[0] ?? {};
     home = href(property(row, "calendar-home-set"));
   }
   if (!home) throw new ICloudCalendarError("iCloud did not return a calendar home.");
-  const value = new URL(home, url).toString();
+  const value = trustedICloudCalDavUrl(home, url);
   calendarHomeCache = { value, expiresAt: Date.now() + 5 * 60_000 };
   return value;
 }
@@ -223,7 +267,7 @@ export async function listICloudCalendars(): Promise<ICloudCalendar[]> {
       const calendarUrl = href(row.href);
       return {
         name: text(property(row, "displayname")) || "Unnamed calendar",
-        url: new URL(calendarUrl, home).toString(),
+        url: trustedICloudCalDavUrl(calendarUrl, home),
         color: text(property(row, "calendar-color")) || undefined,
       };
     })
@@ -288,7 +332,7 @@ export async function listICloudEvents(start: number, end: number, requestedCale
         const data = text(property(row, "calendar-data"));
         const resource = href(row.href);
         if (!data || !resource) continue;
-        events.push(...parseIcsEvents(data, new URL(resource, calendar.url).toString(), calendar.name, text(property(row, "getetag")) || undefined));
+        events.push(...parseIcsEvents(data, trustedICloudCalDavUrl(resource, calendar.url), calendar.name, text(property(row, "getetag")) || undefined));
       }
       return events;
     }),
@@ -348,12 +392,7 @@ function normalizedTravelCalendarUrl(value: unknown): string {
     throw new ICloudCalendarError("iCloud Calendar URL is invalid.");
   }
   let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new ICloudCalendarError("iCloud Calendar URL is invalid.");
-  }
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+  try { url = new URL(trustedICloudCalDavUrl(value)); } catch {
     throw new ICloudCalendarError("iCloud Calendar URL is invalid.");
   }
   if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
@@ -366,11 +405,11 @@ function travelEventUrlBelongsToCalendar(calendarUrl: string, eventUrl: unknown)
   }
   let event: URL;
   try {
-    event = new URL(eventUrl);
+    event = new URL(trustedICloudCalDavUrl(eventUrl));
   } catch {
     throw new ICloudCalendarError("iCloud Calendar event URL is invalid.");
   }
-  const calendar = new URL(calendarUrl);
+  const calendar = new URL(trustedICloudCalDavUrl(calendarUrl));
   if (
     event.protocol !== "https:"
     || event.username
@@ -399,7 +438,13 @@ function validTravelRevision(value: unknown): value is number {
 }
 
 function validEtag(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value);
+  // `*` is a special If-Match wildcard, not an event revision. Only pass a
+  // concrete entity tag through to the conditional CalDAV update.
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 512
+    && value !== "*"
+    && /^"[^"\u0000-\u001f\u007f]*"$/.test(value);
 }
 
 function travelEventUid(sourceKey: string): string {
@@ -476,10 +521,50 @@ function sameTravelEventMarker(left: ICloudTravelEventMarker | null, right: Pick
 }
 
 async function readTravelEvent(eventUrl: string): Promise<{ eventUrl: string; etag?: string; marker: ICloudTravelEventMarker | null } | null> {
-  const { response, url } = await caldavRequest("GET", eventUrl, { allowedStatuses: [404] });
+  const { response, url } = await caldavRequest("GET", eventUrl, { allowedStatuses: [404], expectedUrl: eventUrl });
   if (response.status === 404) return null;
   const etag = response.headers.get("etag") ?? undefined;
   return { eventUrl: url, ...(etag ? { etag } : {}), marker: travelEventMarker(await response.text()) };
+}
+
+export type ICloudTravelCalendarAttemptMarker = {
+  revision: number;
+  nonce: string;
+};
+
+export type ICloudTravelCalendarAttemptInspection =
+  | { state: "missing" }
+  | { state: "present"; revision: number; nonce: string; etag: string };
+
+/**
+ * Read one previously sealed deterministic resource while recovering a lost
+ * CalDAV/Convex hand-off. This never searches a calendar and accepts a result
+ * only if its source key plus one durable attempt marker match exactly.
+ */
+export async function inspectICloudTravelCalendarAttempt(input: {
+  calendarUrl: string;
+  eventUrl: string;
+  sourceKey: string;
+  markers: readonly ICloudTravelCalendarAttemptMarker[];
+}): Promise<ICloudTravelCalendarAttemptInspection> {
+  if (!validTravelSourceKey(input.sourceKey) || !Array.isArray(input.markers) || input.markers.length < 1 || input.markers.length > 2
+    || input.markers.some((marker) => !validTravelRevision(marker.revision) || !validTravelNonce(marker.nonce))) {
+    throw new ICloudCalendarError("iCloud Calendar recovery attempt is invalid.");
+  }
+  const calendarUrl = normalizedTravelCalendarUrl(input.calendarUrl);
+  const eventUrl = travelEventUrlBelongsToCalendar(calendarUrl, input.eventUrl);
+  const existing = await readTravelEvent(eventUrl);
+  if (!existing) return { state: "missing" };
+  if (existing.eventUrl !== eventUrl || !validEtag(existing.etag)) {
+    throw new ICloudCalendarConflictError("The Jarvis-managed iCloud Calendar event changed before approval.");
+  }
+  const matched = input.markers.find((marker) => sameTravelEventMarker(existing.marker, {
+    sourceKey: input.sourceKey,
+    revision: marker.revision,
+    nonce: marker.nonce,
+  }));
+  if (!matched) throw new ICloudCalendarConflictError("The Jarvis-managed iCloud Calendar event changed before approval.");
+  return { state: "present", revision: matched.revision, nonce: matched.nonce, etag: existing.etag };
 }
 
 async function resolvedTravelCalendar(calendarUrl: string): Promise<ICloudCalendar> {
@@ -527,19 +612,29 @@ export async function writeICloudTravelCalendarEvent(
     // follow-up read proves this exact receipt nonce and preflight revision won
     // a prior write whose HTTP response was lost.
     allowedStatuses: [412],
+    expectedUrl: eventUrl,
   });
   const resolvedEventUrl = travelEventUrlBelongsToCalendar(calendarUrl, url);
+  if (resolvedEventUrl !== eventUrl) {
+    throw new ICloudCalendarConflictError("iCloud changed the sealed Calendar event location before approval.");
+  }
   let created = response.status !== 412;
   let etag = response.headers.get("etag") ?? undefined;
   if (response.status === 412 || !validEtag(etag)) {
     const existing = await readTravelEvent(resolvedEventUrl);
+    if (existing?.eventUrl !== resolvedEventUrl) {
+      throw new ICloudCalendarConflictError("iCloud changed the sealed Calendar event location before approval.");
+    }
     if (!sameTravelEventMarker(existing?.marker ?? null, input)) {
       throw new ICloudCalendarConflictError("The Jarvis-managed iCloud Calendar event changed before approval.");
     }
     if (!validEtag(existing?.etag)) {
       throw new ICloudCalendarError("iCloud Calendar did not return an event revision.");
     }
-    created = false;
+    // A missing ETag on a successful PUT still needs an exact verification
+    // GET, but it did not make the create idempotent. Keep the owner-visible
+    // result truthful; only an actual 412 proves a prior write won.
+    if (response.status === 412) created = false;
     etag = existing.etag;
   }
   return {
@@ -562,8 +657,8 @@ export async function writeICloudTravelCalendarEvent(
 
 function eventUrlIsOwned(url: string, home: string): boolean {
   try {
-    const candidate = new URL(url);
-    const account = new URL(home);
+    const candidate = new URL(trustedICloudCalDavUrl(url));
+    const account = new URL(trustedICloudCalDavUrl(home));
     return candidate.protocol === "https:" && candidate.origin === account.origin && candidate.pathname.startsWith(account.pathname);
   } catch {
     return false;

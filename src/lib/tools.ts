@@ -31,6 +31,7 @@ import { withHostContext } from "./host-context";
 import { findHostApp, type JarvisHostAction, type JarvisHostActionName } from "./host-actions";
 import {
   iCloudCalendarConfigured,
+  inspectICloudTravelCalendarAttempt,
   listICloudEvents,
   resolveICloudTravelCalendar,
   type ICloudCalendar,
@@ -2705,6 +2706,42 @@ type StoredICloudTravelCalendarEvent = {
   nonce: string;
 };
 
+type StoredICloudTravelCalendarAttempt = {
+  sourceKey: string;
+  calendarUrl: string;
+  eventUrl: string;
+  revision: number;
+  nonce: string;
+  action: "create" | "update";
+  expectedEtag?: string;
+  observedEtag?: string;
+  recovery?: { revision: number; nonce: string; etag: string };
+  missingAt?: number;
+};
+
+function storedICloudTravelCalendarUrl(value: unknown, trailingSlash = false): string | null {
+  if (typeof value !== "string" || value.length < 1 || value.length > 2_000 || /[\u0000-\u001f\u007f]/.test(value)) return null;
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || url.port || url.username || url.password || url.search || url.hash
+      || (hostname !== "caldav.icloud.com" && !/^p\d+-caldav\.icloud\.com$/.test(hostname))) return null;
+    if (trailingSlash && !url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function storedICloudTravelCalendarMarker(value: unknown): { revision: number; nonce: string; etag?: string } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const marker = value as Record<string, unknown>;
+  if (typeof marker.revision !== "number" || !Number.isSafeInteger(marker.revision) || marker.revision <= 0
+    || typeof marker.nonce !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(marker.nonce)
+    || (marker.etag !== undefined && (typeof marker.etag !== "string" || !/^"[^"\u0000-\u001f\u007f]*"$/.test(marker.etag)))) return null;
+  return { revision: marker.revision, nonce: marker.nonce, ...(typeof marker.etag === "string" ? { etag: marker.etag } : {}) };
+}
+
 async function offlineMapCalendarStatus(): Promise<OfflineMapCalendarStatus> {
   try {
     const status = await convexQuery("googleAuth:getConnectionStatus", {}) as {
@@ -2754,17 +2791,16 @@ function storedICloudTravelCalendarEvent(value: unknown): StoredICloudTravelCale
     || event.calendarUrl.length > 2_000 || event.eventUrl.length > 2_000 || event.etag.length > 512
     || !/^[A-Za-z0-9_-]{16,64}$/.test(event.nonce)) return null;
   try {
-    const calendar = new URL(event.calendarUrl);
-    if (!calendar.pathname.endsWith("/")) calendar.pathname = `${calendar.pathname}/`;
-    const calendarPath = calendar.pathname.endsWith("/") ? calendar.pathname : `${calendar.pathname}/`;
-    const eventUrl = new URL(event.eventUrl);
-    if (calendar.protocol !== "https:" || calendar.username || calendar.password || calendar.search || calendar.hash
-      || eventUrl.protocol !== "https:" || eventUrl.username || eventUrl.password || eventUrl.search || eventUrl.hash
-      || eventUrl.origin !== calendar.origin || !eventUrl.pathname.startsWith(calendarPath) || !eventUrl.pathname.endsWith(".ics")
-      || /[\u0000-\u001f\u007f]/.test(event.etag)) return null;
+    const calendarUrl = storedICloudTravelCalendarUrl(event.calendarUrl, true);
+    const normalizedEventUrl = storedICloudTravelCalendarUrl(event.eventUrl);
+    if (!calendarUrl || !normalizedEventUrl || !/^"[^"\u0000-\u001f\u007f]*"$/.test(event.etag)) return null;
+    const calendar = new URL(calendarUrl);
+    const eventUrl = new URL(normalizedEventUrl);
+    if (calendarUrl !== event.calendarUrl || normalizedEventUrl !== event.eventUrl
+      || eventUrl.origin !== calendar.origin || !eventUrl.pathname.startsWith(calendar.pathname) || !eventUrl.pathname.endsWith(".ics")) return null;
     return {
-      calendarUrl: calendar.toString(),
-      eventUrl: eventUrl.toString(),
+      calendarUrl,
+      eventUrl: normalizedEventUrl,
       etag: event.etag,
       revision: event.revision,
       nonce: event.nonce,
@@ -2772,6 +2808,39 @@ function storedICloudTravelCalendarEvent(value: unknown): StoredICloudTravelCale
   } catch {
     return null;
   }
+}
+
+function storedICloudTravelCalendarAttempt(value: unknown, sourceKey: string): StoredICloudTravelCalendarAttempt | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const attempt = value as Record<string, unknown>;
+  const calendarUrl = storedICloudTravelCalendarUrl(attempt.calendarUrl, true);
+  const eventUrl = storedICloudTravelCalendarUrl(attempt.eventUrl);
+  const marker = storedICloudTravelCalendarMarker(attempt);
+  if (!calendarUrl || !eventUrl || !marker || attempt.sourceKey !== sourceKey
+    || (attempt.action !== "create" && attempt.action !== "update")
+    || (attempt.action === "create" && attempt.expectedEtag !== undefined)
+    || (attempt.action === "update" && (typeof attempt.expectedEtag !== "string" || !/^"[^"\u0000-\u001f\u007f]*"$/.test(attempt.expectedEtag)))
+    || (attempt.observedEtag !== undefined && (typeof attempt.observedEtag !== "string" || !/^"[^"\u0000-\u001f\u007f]*"$/.test(attempt.observedEtag)))
+    || (attempt.missingAt !== undefined && (!Number.isSafeInteger(attempt.missingAt) || Number(attempt.missingAt) <= 0))
+    || (attempt.missingAt !== undefined && attempt.observedEtag !== undefined)) return null;
+  const calendar = new URL(calendarUrl);
+  const resource = new URL(eventUrl);
+  if (calendarUrl !== attempt.calendarUrl || eventUrl !== attempt.eventUrl
+    || resource.origin !== calendar.origin || !resource.pathname.startsWith(calendar.pathname) || !resource.pathname.endsWith(".ics")) return null;
+  const recovery = attempt.recovery === undefined ? undefined : storedICloudTravelCalendarMarker(attempt.recovery);
+  if (attempt.recovery !== undefined && (!recovery || !recovery.etag)) return null;
+  return {
+    sourceKey,
+    calendarUrl,
+    eventUrl,
+    revision: marker.revision,
+    nonce: marker.nonce,
+    action: attempt.action,
+    ...(typeof attempt.expectedEtag === "string" ? { expectedEtag: attempt.expectedEtag } : {}),
+    ...(typeof attempt.observedEtag === "string" ? { observedEtag: attempt.observedEtag } : {}),
+    ...(recovery?.etag ? { recovery: { revision: recovery.revision, nonce: recovery.nonce, etag: recovery.etag } } : {}),
+    ...(attempt.missingAt !== undefined ? { missingAt: Number(attempt.missingAt) } : {}),
+  };
 }
 
 /**
@@ -2975,6 +3044,7 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   let calendarStatus = calendarPlan.status;
   let calendarApprovalMarker = "";
   let registeredICloudCalendarEvent: unknown;
+  let registeredICloudCalendarAttempt: unknown;
 
   // Background maintenance is opt-in and saved-trip only. It never lists the
   // travel library: each registry row contains the exact Gmail flight and stay
@@ -3011,6 +3081,7 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
           if (registered?.ok) {
             automaticRefresh = "scheduled";
             registeredICloudCalendarEvent = registered.iCloudCalendarEvent;
+            registeredICloudCalendarAttempt = registered.iCloudCalendarAttempt;
           } else {
             automaticRefresh = "pending_registry";
           }
@@ -3046,28 +3117,71 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   };
   if (calendarPlan.provider === "icloud" && calendarStatus === "approval_required") {
     const stored = storedICloudTravelCalendarEvent(registeredICloudCalendarEvent);
+    const storedAttempt = storedICloudTravelCalendarAttempt(registeredICloudCalendarAttempt, preflight.sourceKey);
     const hasStoredBinding = registeredICloudCalendarEvent !== undefined && registeredICloudCalendarEvent !== null;
+    const hasStoredAttempt = registeredICloudCalendarAttempt !== undefined && registeredICloudCalendarAttempt !== null;
     let selectedCalendar = calendarPlan.calendar;
     // Once an event is managed, preserve its selected calendar by default.
     // A default-calendar switch must not turn a harmless re-prepare into a
     // duplicate event in a different CalDAV collection.
-    if (stored && (typeof args.calendar !== "string" || !args.calendar.trim())) {
+    if ((stored || storedAttempt) && (typeof args.calendar !== "string" || !args.calendar.trim())) {
       try {
-        selectedCalendar = await resolveICloudTravelCalendar(stored.calendarUrl);
+        selectedCalendar = await resolveICloudTravelCalendar((stored ?? storedAttempt)!.calendarUrl);
       } catch {
         selectedCalendar = undefined;
       }
     }
-    if (workspace.storage !== "creation" || automaticRefresh !== "scheduled" || !selectedCalendar || (hasStoredBinding && !stored)) {
+    let recoveredPending: { eventUrl: string; etag: string } | undefined;
+    let safeMissingPending = false;
+    if (storedAttempt && selectedCalendar?.url === storedAttempt.calendarUrl) {
+      try {
+        const inspection = await inspectICloudTravelCalendarAttempt({
+          calendarUrl: storedAttempt.calendarUrl,
+          eventUrl: storedAttempt.eventUrl,
+          sourceKey: storedAttempt.sourceKey,
+          markers: [
+            { revision: storedAttempt.revision, nonce: storedAttempt.nonce },
+            ...(storedAttempt.recovery ? [{ revision: storedAttempt.recovery.revision, nonce: storedAttempt.recovery.nonce }] : []),
+          ],
+        });
+        const reconciled = await convexMutation("appleMapsOfflinePreflights:reconcileICloudCalendarAttempt", {
+          creationId: trip.id,
+          sourceKey: storedAttempt.sourceKey,
+          calendarUrl: storedAttempt.calendarUrl,
+          eventUrl: storedAttempt.eventUrl,
+          revision: inspection.state === "present" ? inspection.revision : storedAttempt.revision,
+          nonce: inspection.state === "present" ? inspection.nonce : storedAttempt.nonce,
+          state: inspection.state,
+          ...(inspection.state === "present" ? { etag: inspection.etag } : {}),
+        });
+        if (reconciled?.ok !== true) throw new Error("pending Calendar attempt changed");
+        if (inspection.state === "missing") {
+          // Only an unbound pending create may restart as create. An official
+          // event going missing needs an explicit owner repair, never a blind
+          // duplicate.
+          if (stored) throw new Error("managed Calendar event is missing");
+          safeMissingPending = true;
+        } else {
+          recoveredPending = { eventUrl: storedAttempt.eventUrl, etag: inspection.etag };
+        }
+      } catch {
+        calendarStatus = "needs_reconnect";
+        trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
+      }
+    }
+    const effectiveStored = recoveredPending ?? stored;
+    if (workspace.storage !== "creation" || automaticRefresh !== "scheduled" || !selectedCalendar
+      || (hasStoredBinding && !stored) || (hasStoredAttempt && !storedAttempt)) {
       // A v2 receipt is usable only after the saved-trip registry exists. Do
       // not offer a generic iCloud create while persistence is unavailable or
       // a historical row is malformed.
       calendarStatus = "needs_connection";
       trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
-    } else if (stored && stored.calendarUrl !== selectedCalendar.url) {
+    } else if ((effectiveStored && (stored ?? storedAttempt)!.calendarUrl !== selectedCalendar.url)
+      || (storedAttempt && !recoveredPending && !safeMissingPending)) {
       // Moving a managed event to another calendar would create a second
-      // reminder. Keep the existing event's calendar as an explicit owner
-      // choice rather than silently duplicating it.
+      // reminder. A pending orphan also must be reconciled from its exact
+      // Calendar resource before a new receipt may touch it.
       calendarStatus = "needs_reconnect";
       trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
     } else {
@@ -3088,12 +3202,12 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
           sourceKey: preflight.sourceKey,
           calendarUrl: selectedCalendar.url,
         };
-        const approval = stored
+        const approval = effectiveStored
           ? issueICloudCalendarTravelApproval({
             action: "update",
             event,
-            eventUrl: stored.eventUrl,
-            expectedEtag: stored.etag,
+            eventUrl: effectiveStored.eventUrl,
+            expectedEtag: effectiveStored.etag,
             appleMapsOfflinePreflight,
           })
           : issueICloudCalendarTravelApproval({

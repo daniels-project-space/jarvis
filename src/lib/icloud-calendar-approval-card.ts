@@ -28,3 +28,9 @@ export function iCloudCalendarApprovalButtonLabel(state: ICloudCalendarApprovalC
   if (state === "expired") return "Approval expired";
   return "Approve iCloud event";
 }
+
+/** Keep the completed card truthful for both signed create and update receipts. */
+export function iCloudCalendarApprovalSuccessDetail(action: unknown, created: unknown): string {
+  if (action === "update") return "Updated iCloud Calendar.";
+  return created === false ? "Already present in iCloud Calendar." : "Added to iCloud Calendar.";
+}
