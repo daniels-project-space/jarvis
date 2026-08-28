@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { AUTO_MOOD_HOLD_MS, freshAutomaticOrbMood, inferConversationMood, isOrbMood } from "./conversation-mood";
+import {
+  AUTO_MOOD_HOLD_MS,
+  freshAutomaticOrbMood,
+  inferConversationMood,
+  isOrbMood,
+  sanitizedVisibleUserMoodText,
+} from "./conversation-mood";
 
 describe("inferConversationMood", () => {
   it("makes urgent failures immediately visible", () => {
@@ -14,6 +20,17 @@ describe("inferConversationMood", () => {
     expect(inferConversationMood("audit and fix the deploy")).toBe("focused");
     expect(inferConversationMood("let's imagine a cinematic film world")).toBe("dreamy");
     expect(inferConversationMood("that joke was funny lol")).toBe("playful");
+  });
+
+  it("keeps an urgent fast-dispatch register while excluding hidden context and credentials", () => {
+    const visible = sanitizedVisibleUserMoodText(
+      "URGENT: launch Paul to deploy the current release.\n[JARVIS_HOST_CONTEXT]\naccess_token=host-secret-value-123\n[/JARVIS_HOST_CONTEXT]\napi_key=dispatch-secret-value-123",
+    );
+
+    expect(visible).toContain("URGENT: launch Paul to deploy the current release.");
+    expect(visible).not.toContain("host-secret-value-123");
+    expect(visible).not.toContain("dispatch-secret-value-123");
+    expect(inferConversationMood(visible)).toBe("alert");
   });
 
   it("accepts only a fresh model-selected mood and then returns control to the local conversation", () => {

@@ -37,7 +37,7 @@ import {
   type CompactWorkCache,
   type CompactWorkSnapshot,
 } from "@/lib/active-work";
-import { MOOD_COLORS } from "@/lib/conversation-mood";
+import { MOOD_COLORS, sanitizedVisibleUserMoodText } from "@/lib/conversation-mood";
 import { useConversationMood } from "@/lib/use-conversation-mood";
 import { instantSocialReply } from "@/lib/quick-replies";
 import { isPanelFollowUp } from "@/lib/panel-relevance";
@@ -3962,6 +3962,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setInput("");
     const backgroundDispatch = admission === "background-dispatch";
     if (fastDispatch) {
+      // Fast handoffs return before the ordinary submit path reaches its
+      // local-first mood update. Keep typed, STT, and live requests visually
+      // consistent while excluding hidden host context and credential-shaped
+      // text from this presentation-only signal.
+      updateConversationMood(sanitizedVisibleUserMoodText(visibleText));
       void openFastAgentDispatch(fastDispatch, t, {
         background: backgroundDispatch,
         requireHostProject: !explicitFastDispatch && projectFastDispatch !== null,
