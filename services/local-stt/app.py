@@ -3,17 +3,17 @@ from __future__ import annotations
 import os
 import secrets
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="Jarvis local STT", version="1.0")
-
 MODEL_NAME = os.environ.get("STT_MODEL", "turbo")
 MODEL_DEVICE = os.environ.get("STT_DEVICE", "auto")
 MODEL_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")
+MODEL_DOWNLOAD_ROOT = os.environ.get("STT_MODEL_DIR", "/models")
 SHARED_SECRET = os.environ.get("STT_SHARED_SECRET", "")
 MAX_AUDIO_BYTES = int(os.environ.get("STT_MAX_AUDIO_BYTES", str(20 * 1024 * 1024)))
 
@@ -34,11 +34,24 @@ def whisper_model() -> WhisperModel:
     with _model_lock:
         if _model is None:
             _model = WhisperModel(
-                MODEL_NAME,
-                device=MODEL_DEVICE,
-                compute_type=MODEL_COMPUTE_TYPE,
-            )
+            MODEL_NAME,
+            device=MODEL_DEVICE,
+            compute_type=MODEL_COMPUTE_TYPE,
+            download_root=MODEL_DOWNLOAD_ROOT,
+        )
         return _model
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # A recognizer that accepts traffic before loading Whisper turns the first
+    # voice request into a cold-start timeout. Keep the container unready until
+    # the model is present and warm; /models is a persistent Docker volume.
+    whisper_model()
+    yield
+
+
+app = FastAPI(title="Jarvis local STT", version="1.1", lifespan=lifespan)
 
 
 @app.get("/healthz")

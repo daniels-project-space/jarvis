@@ -8,10 +8,17 @@ services:
       STT_MODEL: turbo
       STT_DEVICE: auto
       STT_COMPUTE_TYPE: int8
+      STT_MODEL_DIR: /models
       # Set this in the host shell or a protected compose override, never commit it.
       STT_SHARED_SECRET: ${LOCAL_STT_SHARED_SECRET:?set_LOCAL_STT_SHARED_SECRET}
     volumes:
       - jarvis-stt-models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5m
 
 volumes:
   jarvis-stt-models:

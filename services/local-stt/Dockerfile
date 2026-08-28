@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/models \
-    XDG_CACHE_HOME=/models
+    XDG_CACHE_HOME=/models \
+    STT_MODEL_DIR=/models
 
 RUN useradd --create-home --uid 10001 jarvis \
   && mkdir -p /app /models \

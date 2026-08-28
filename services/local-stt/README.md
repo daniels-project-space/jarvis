@@ -7,8 +7,10 @@ silently choosing a smaller model.
 
 It uses the machine's CPU by default (`int8`). A CUDA-capable host can set
 `STT_DEVICE=cuda` and an appropriate `STT_COMPUTE_TYPE` in a protected compose
-override. The first start downloads the model into the named Docker volume;
-later starts reuse it.
+override. Startup eagerly loads the model before the health endpoint becomes
+available, so the first real voice turn is not a model-download or model-load
+timeout. The model lives in the named Docker volume and is reused on later
+starts.
 
 ## Start on a machine Jarvis can reach
 
