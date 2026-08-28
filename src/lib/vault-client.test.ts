@@ -57,7 +57,7 @@ describe("vault client transport boundary", () => {
   it("accepts only bounded, duplicate-free success envelopes from the exact origin", async () => {
     vi.stubEnv("VAULT_ACCESS_TOKEN", "vault-capability");
     const endpoint = `${TRUSTED_VAULT}/api/query`;
-    const fetcher = vi.fn(async () => responseAt(endpoint, JSON.stringify({
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => responseAt(endpoint, JSON.stringify({
       status: "success",
       value: [{ keyName: "R2_BUCKET", value: "private-bucket" }],
     }), { status: 200, headers: { "content-type": "application/json" } }));
@@ -79,6 +79,33 @@ describe("vault client transport boundary", () => {
     }));
     const oversizedClient = await import("./vault-client");
     await expect(oversizedClient.vaultService("codex-session")).rejects.toThrow("Vault request unavailable");
+  });
+
+  it("accepts the fixed legacy Apple Calendar service name without widening the request shape", async () => {
+    vi.stubEnv("VAULT_ACCESS_TOKEN", "vault-capability");
+    const endpoint = `${TRUSTED_VAULT}/api/query`;
+    let requestBody = "";
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = String(init?.body ?? "");
+      return responseAt(endpoint, JSON.stringify({
+        status: "success",
+        value: [
+          { keyName: "APPLE_ID", value: "owner@example.com" },
+          { keyName: "APPLE_APP_PASSWORD", value: "app-password" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const { vaultService } = await import("./vault-client");
+
+    await expect(vaultService("apple_calendar")).resolves.toEqual({
+      APPLE_ID: "owner@example.com",
+      APPLE_APP_PASSWORD: "app-password",
+    });
+    expect(JSON.parse(requestBody)).toMatchObject({
+      path: "secrets:listByService",
+      args: { service: "apple_calendar" },
+    });
   });
 
   it("aborts a stalled vault body instead of holding controller work forever", async () => {

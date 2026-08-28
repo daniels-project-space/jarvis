@@ -391,7 +391,7 @@ export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPr
     // A corrupted historic time zone must never prevent the saved travel plan
     // from reopening; the server uses a validated zone when creating it.
   }
-  const calendarName = preflight?.calendarProvider === "icloud" ? "iCloud Calendar" : "Google Calendar";
+  const calendarName = "iCloud Calendar";
   const calendar = preflight?.calendarRefreshRequired === true
     ? "The itinerary changed, so prepare a fresh protected Calendar approval before adding or changing it."
     : preflight?.calendarStatus === "approval_required"
@@ -399,7 +399,7 @@ export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPr
     : preflight?.calendarStatus === "scheduled"
       ? `The ${calendarName} reminder is scheduled.`
     : preflight?.calendarStatus === "needs_reconnect"
-      ? `Reconnect ${calendarName} with Calendar access to prepare the calendar reminder.`
+      ? `Reconnect ${calendarName} to prepare the calendar reminder.`
       : `Connect ${calendarName} to prepare the calendar reminder.`;
   const todo = preflight?.todoStatus === "needs_retry"
     ? "Hub to-do needs a retry."
@@ -1845,7 +1845,7 @@ export default function TripView({ value, initialBookingNow = 0 }: { value: stri
                     >
                       finalize reviewed plan · calendar untouched
                     </button>
-                    <div className="mt-1 text-center text-[10px] text-slate">Individual Google Calendar events can be prepared separately for protected approval.</div>
+                    <div className="mt-1 text-center text-[10px] text-slate">Individual iCloud Calendar events can be prepared separately for protected approval.</div>
                     {doc.includeFlights !== false && (doc.flights ?? []).length > 0 && !doc.locked?.flight && (
                       <div className="mt-1 text-center text-[10px] text-amber">Lock a specific flight before finalizing.</div>
                     )}

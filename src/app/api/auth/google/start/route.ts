@@ -16,9 +16,8 @@ export const runtime = "nodejs";
 const STATE_COOKIE = "__Host-jarvis_google_oauth_state";
 const STATE_MAX_AGE_SECONDS = 600; // 10 minutes — plenty for a consent-screen round trip.
 
-// Exact scopes for the Gmail foreground lane and the separately named,
-// primary-calendar-only Google Calendar lane. Calendar access is never a
-// replacement for iCloud's default calendar actions.
+// Exact scopes for the Gmail foreground lane. Calendar access is handled
+// separately through iCloud CalDAV.
 
 export async function GET(req: NextRequest) {
   const authTokenHash = await adminSessionHash(req);

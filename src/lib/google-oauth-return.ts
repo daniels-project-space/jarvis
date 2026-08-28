@@ -12,7 +12,7 @@ export function googleOAuthReturnNotice(search: string): GoogleOAuthReturnNotice
   const params = new URLSearchParams(search);
   const status = params.get("google_oauth");
   if (status === "connected") {
-    return { tone: "success", message: "Google account connected. Checking Gmail and Google Calendar access…" };
+    return { tone: "success", message: "Google account connected. Checking Gmail access…" };
   }
   if (status !== "error") return null;
   if (params.get("google_oauth_detail") === "not_configured") {

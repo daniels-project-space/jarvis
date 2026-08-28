@@ -42,14 +42,6 @@ import {
   issueICloudCalendarTravelApproval,
   type ICloudCalendarApprovalEvent,
 } from "./icloud-calendar-approval.server";
-import {
-  getManagedGooglePrimaryCalendarEvent,
-  getManagedGooglePrimaryCalendarEventForSourceKey,
-  listGooglePrimaryCalendarEvents,
-  type GoogleCalendarCreateInput,
-} from "./google-calendar";
-import { googleCalendarApprovalMarker, issueGoogleCalendarApproval, issueGoogleCalendarApprovalProposal } from "./google-calendar-approval.server";
-import { googleOAuthStoredConnectionReadiness } from "./google-oauth";
 import { lookupGmailBookingsReadOnly, scanGmailBookingConfirmations, type ConfirmedBooking } from "./booking-email";
 import {
   buildAppleMapsOfflinePreflight,
@@ -589,68 +581,6 @@ export const TOOL_DEFS = [
     },
   },
   {
-    name: "google_calendar_list",
-    description:
-      "Read the explicitly connected Google Calendar primary calendar only. This is read-only and never replaces the default iCloud Calendar tools: use it only when Daniel specifically asks about Google Calendar. The window is capped at 31 days and 50 events.",
-    parameters: {
-      type: "object",
-      properties: {
-        date: { type: "string", description: "YYYY-MM-DD start date in Europe/London; default today" },
-        days: { type: "number", description: "Window length, 1-31 days; default 7" },
-        max_results: { type: "number", description: "Maximum events, 1-50; default 20" },
-      },
-    },
-  },
-  {
-    name: "google_calendar_create",
-    description:
-      "Prepare exactly one event on Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar — never as a fallback for iCloud. It cannot add attendees, Google Meet links, attachments, or send invitations/updates. It only renders an owner-only approval button; the event is not written until Daniel clicks that protected button.",
-    parameters: {
-      type: "object",
-      properties: {
-        title: { type: "string" },
-        date: { type: "string", description: "YYYY-MM-DD" },
-        time: { type: "string", description: "HH:MM 24h; omit for an all-day event" },
-        end_time: { type: "string", description: "HH:MM 24h; default one hour after a timed event" },
-        location: { type: "string" },
-        notes: { type: "string" },
-        reminder_minutes_before: { type: "number", description: "Optional popup reminder, 1-40320 minutes before" },
-      },
-      required: ["title", "date"],
-    },
-  },
-  {
-    name: "google_calendar_update",
-    description:
-      "Prepare a time, date, or detail change for exactly one Jarvis-managed event on Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar and supplies the Jarvis-managed event ID from a prior Google Calendar listing. It cannot alter manual, shared, iCloud, or foreign events. It only renders an owner-only approval button; the change is not written until Daniel clicks it, and it is rejected if the event changed first.",
-    parameters: {
-      type: "object",
-      properties: {
-        event_id: { type: "string", description: "Exact Jarvis-managed event ID shown by google_calendar_list" },
-        title: { type: "string" },
-        date: { type: "string", description: "YYYY-MM-DD" },
-        time: { type: "string", description: "HH:MM 24h; omit for an all-day event" },
-        end_time: { type: "string", description: "HH:MM 24h; default one hour after a timed event" },
-        location: { type: "string" },
-        notes: { type: "string" },
-        reminder_minutes_before: { type: "number", description: "Optional popup reminder, 1-40320 minutes before" },
-      },
-      required: ["event_id", "title", "date"],
-    },
-  },
-  {
-    name: "google_calendar_delete",
-    description:
-      "Prepare removal of exactly one Jarvis-managed event from Daniel's explicitly connected Google Calendar primary calendar. Use only when he specifically names Google Calendar and supplies the Jarvis-managed event ID from a prior Google Calendar listing. It cannot remove manual, shared, iCloud, or foreign events. It only renders an owner-only approval button; nothing is removed until Daniel clicks it, and it is rejected if the event changed first.",
-    parameters: {
-      type: "object",
-      properties: {
-        event_id: { type: "string", description: "Exact Jarvis-managed event ID shown by google_calendar_list" },
-      },
-      required: ["event_id"],
-    },
-  },
-  {
     name: "bookings_lookup",
     description:
       "Read Daniel's connected Gmail for confirmed travel bookings without changing Gmail, Calendar, trips, or any external state. Use proactively when an address, hotel base, check-in/out, confirmation, or itinerary should come from his email. Prefer this over bookings_check unless Daniel explicitly asks to import/sync confirmations into Calendar.",
@@ -674,7 +604,7 @@ export const TOOL_DEFS = [
         draft_id: { type: "string", description: "Optional exact live conversation draft id to refresh" },
         creation_id: { type: "string", description: "Optional exact permanent trip id to refresh" },
         trip_id: { type: "string", description: "Legacy optional permanent trip id only; do not use for a live draft" },
-        sync_calendar: { type: "boolean", description: "Prepare one Google Calendar import for owner approval. No Calendar event is written by this tool." },
+        sync_calendar: { type: "boolean", description: "Prepare one iCloud Calendar import for owner approval. No Calendar event is written by this tool." },
         booking_id: { type: "string", description: "Opaque booking selection ID returned when several dated confirmations need a choice; use only with sync_calendar=true" },
       },
     },
@@ -682,7 +612,7 @@ export const TOOL_DEFS = [
   {
     name: "travel_offline_maps_prepare",
     description:
-      "For an exact Jarvis trip with an upcoming confirmed Gmail flight, schedule Jarvis's one-day-before Apple Maps offline preflight: a durable to-do, push/spoken reminder, and an Apple Maps city handoff. It never downloads or deletes an Apple offline map—only the owner can do that in Maps. For a saved trip, use the configured iCloud Calendar first and prepare a protected owner approval card bound to that exact saved preflight; otherwise retain the protected Google Calendar fallback. Do not claim the Calendar item is written until Daniel approves it. Use after Daniel has asked for this travel automation, never for an unverified or implicit trip.",
+      "For an exact saved Jarvis trip with an upcoming confirmed Gmail flight, schedule Jarvis's one-day-before Apple Maps offline preflight: a durable to-do, push/spoken reminder, and an Apple Maps city handoff. It never downloads or deletes an Apple offline map—only the owner can do that in Maps. When iCloud Calendar is configured, prepare a protected owner approval card bound to that exact saved preflight. Do not claim the Calendar item is written until Daniel approves it. Use after Daniel has asked for this travel automation, never for an unverified or implicit trip.",
     parameters: {
       type: "object",
       properties: {
@@ -2213,40 +2143,6 @@ function isExactLondonDateTime(epochMs: number, date: string, time: string): boo
   return `${parts.year}-${parts.month}-${parts.day}` === date && `${hour}:${parts.minute}` === time;
 }
 
-async function googleCalendarList(args: any): Promise<string> {
-  const requestedDate = args.date == null ? "" : String(args.date);
-  if (requestedDate && !isCalendarDate(requestedDate)) return "I need a real Google Calendar start date as YYYY-MM-DD.";
-  const date = requestedDate || londonDateStr(Date.now());
-  const days = args.days == null ? 7 : Number(args.days);
-  const maxResults = args.max_results == null ? 20 : Number(args.max_results);
-  if (!Number.isInteger(days) || days < 1 || days > 31) return "Google Calendar reads are limited to 1-31 days.";
-  if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 50) return "Google Calendar reads are limited to 1-50 events.";
-  const start = londonMs(date, "00:00");
-  const end = londonMs(addDateDays(date, days), "00:00");
-  const events = await listGooglePrimaryCalendarEvents({ start, end, maxResults });
-  if (!events.length) return `Google Calendar has nothing scheduled from ${date} for the next ${days} day${days === 1 ? "" : "s"}.`;
-  const when = (event: (typeof events)[number]) =>
-    event.allDay
-      ? event.start
-      : new Intl.DateTimeFormat("en-GB", {
-          timeZone: event.timeZone ?? "Europe/London",
-          weekday: "short",
-          day: "numeric",
-          month: "short",
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: false,
-        }).format(new Date(event.start));
-  const lines = events.map((event) => `- ${when(event)} · ${event.title}${event.location ? ` @ ${event.location}` : ""}${event.managed ? ` [Jarvis-managed: ${event.id}]` : ""}`);
-  return `Google Calendar primary (${date}, ${days} day${days === 1 ? "" : "s"}):\n${lines.join("\n")}`;
-}
-
-type PreparedGoogleCalendarEvent = {
-  event: GoogleCalendarCreateInput;
-  date: string;
-  time: string | null;
-};
-
 type PreparedICloudCalendarEvent = {
   event: ICloudCalendarApprovalEvent;
   date: string;
@@ -2299,115 +2195,10 @@ function prepareICloudCalendarEvent(args: any): PreparedICloudCalendarEvent | st
   };
 }
 
-function prepareGoogleCalendarEvent(args: any): PreparedGoogleCalendarEvent | string {
-  const title = String(args.title ?? "").trim();
-  const date = String(args.date ?? "");
-  if (!title || !isCalendarDate(date)) return "I need a title and a real date (YYYY-MM-DD).";
-  if (args.time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.time))) return "I need the start time as HH:MM (24-hour).";
-  if (args.end_time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(args.end_time))) return "I need the end time as HH:MM (24-hour).";
-  const allDay = !args.time;
-  const start = allDay ? londonMs(date, "00:00") : londonMs(date, String(args.time));
-  if (!allDay && !isExactLondonDateTime(start, date, String(args.time))) {
-    return "That local time does not exist in Europe/London because of the daylight-saving change. Choose another time.";
-  }
-  let end: number;
-  if (allDay) {
-    end = londonMs(addDateDays(date, 1), "00:00");
-  } else if (args.end_time) {
-    let endDate = date;
-    end = londonMs(endDate, String(args.end_time));
-    if (end <= start) {
-      endDate = addDateDays(date, 1);
-      end = londonMs(endDate, String(args.end_time));
-    }
-    if (!isExactLondonDateTime(end, endDate, String(args.end_time))) {
-      return "That local end time does not exist in Europe/London because of the daylight-saving change. Choose another time.";
-    }
-  } else {
-    end = start + 60 * 60_000;
-  }
-  const reminderMinutesBefore = args.reminder_minutes_before == null ? undefined : Number(args.reminder_minutes_before);
-  if (reminderMinutesBefore != null && (!Number.isInteger(reminderMinutesBefore) || reminderMinutesBefore < 1 || reminderMinutesBefore > 40_320)) {
-    return "The Google Calendar popup reminder must be a whole number from 1 to 40320 minutes before the event.";
-  }
-  const event: GoogleCalendarCreateInput = {
-    title: title.slice(0, 140),
-    start,
-    end,
-    allDay,
-    location: args.location ? String(args.location).slice(0, 140) : undefined,
-    notes: args.notes ? String(args.notes).slice(0, 500) : undefined,
-    reminderMinutesBefore,
-  };
-  return { event, date, time: args.time ? String(args.time) : null };
-}
-
-type GoogleCalendarApprovalReadiness =
-  | "ready"
-  | "not_configured"
-  | "missing"
-  | "needs_reconnect"
-  | "unavailable";
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (value == null || typeof value !== "object") return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-/**
- * Checks only Jarvis's local Google connection state and the trusted Convex
- * record. Preparing an owner approval must not call Google's API, but it also
- * must not render a receipt that the approval endpoint is known to be unable
- * to execute.
- */
-async function googleCalendarApprovalReadiness(): Promise<GoogleCalendarApprovalReadiness> {
-  const storedConnection = await googleOAuthStoredConnectionReadiness();
-  if (storedConnection !== "readable") return storedConnection;
-
-  try {
-    const status: unknown = await convexQuery("googleAuth:getConnectionStatus", {});
-    // `convexQuery` intentionally collapses transport and auth failures to
-    // null. This status query itself always returns an object, so a missing or
-    // malformed result is not evidence that Daniel disconnected Google.
-    if (!isPlainObject(status) || typeof status.connected !== "boolean") return "unavailable";
-    if (!status.connected) return "missing";
-    if (!isPlainObject(status.capabilities) || typeof status.capabilities.calendar !== "boolean") return "unavailable";
-    return status.capabilities.calendar ? "ready" : "needs_reconnect";
-  } catch {
-    return "unavailable";
-  }
-}
-
-function googleCalendarApprovalUnavailableMessage(readiness: Exclude<GoogleCalendarApprovalReadiness, "ready">): string {
-  switch (readiness) {
-    case "not_configured":
-      return "Google Calendar is not configured in this Jarvis environment, so no approval receipt was created.";
-    case "missing":
-      return "Google Calendar is not connected yet. Connect it from Options with limited Calendar access, then ask again; no approval receipt was created.";
-    case "needs_reconnect":
-      return "Google Calendar needs a reconnect with limited Calendar access before an event can be prepared; no approval receipt was created.";
-    case "unavailable":
-      return "Google Calendar readiness could not be verified right now, so no approval receipt was created. Try again shortly.";
-  }
-}
-
-async function googleCalendarCreate(args: any): Promise<string> {
-  const prepared = prepareGoogleCalendarEvent(args);
-  if (typeof prepared === "string") return prepared;
-  const readiness = await googleCalendarApprovalReadiness();
-  if (readiness !== "ready") return googleCalendarApprovalUnavailableMessage(readiness);
-  // A model can prepare an event, but cannot infer an owner click from a
-  // page, email, or file. The route behind the rendered button verifies this
-  // short-lived signed receipt before it writes to Google's API.
-  const approval = issueGoogleCalendarApproval(prepared.event);
-  return `Ready for your approval: Google Calendar event "${prepared.event.title}" on ${prepared.date}${prepared.time ? ` at ${prepared.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
-}
-
 async function iCloudCalendarCreate(args: any): Promise<string> {
   const prepared = prepareICloudCalendarEvent(args);
   if (typeof prepared === "string") return prepared;
-  if (!iCloudCalendarConfigured()) {
+  if (!await iCloudCalendarConfigured()) {
     return "iCloud Calendar is not configured in this Jarvis environment, so no approval receipt was created.";
   }
   // A model can prepare an event, but it cannot infer an owner click. The
@@ -2419,47 +2210,6 @@ async function iCloudCalendarCreate(args: any): Promise<string> {
     return "iCloud Calendar readiness could not be verified right now, so no approval receipt was created. Try again shortly.";
   }
   return `Ready for your approval: iCloud Calendar event "${prepared.event.title}" on ${prepared.date}${prepared.time ? ` at ${prepared.time}` : " (all day)"}. Nothing has been added yet; use the protected Approve iCloud event button below within 10 minutes. No invitations or updates will be sent.\n${iCloudCalendarApprovalMarker(approval)}`;
-}
-
-async function googleCalendarUpdate(args: any): Promise<string> {
-  const eventId = String(args.event_id ?? "").trim();
-  if (!/^jarvis[a-v0-9]{5,1018}$/.test(eventId)) {
-    return "I need the exact Jarvis-managed Google Calendar event ID from a Google Calendar listing.";
-  }
-  const prepared = prepareGoogleCalendarEvent(args);
-  if (typeof prepared === "string") return prepared;
-  let existing: Awaited<ReturnType<typeof getManagedGooglePrimaryCalendarEvent>>;
-  try {
-    existing = await getManagedGooglePrimaryCalendarEvent(eventId);
-  } catch {
-    return "I can only revise a current Jarvis-managed Google Calendar event. Check the Google Calendar listing and request a fresh plan change.";
-  }
-  const approval = issueGoogleCalendarApprovalProposal({
-    action: "update",
-    eventId,
-    expectedEtag: existing.etag,
-    event: prepared.event,
-  });
-  return `Ready for your approval: update Jarvis-managed Google Calendar event "${existing.event.title}" to "${prepared.event.title}" on ${prepared.date}${prepared.time ? ` at ${prepared.time}` : " (all day)"}. The change is sealed to the current event revision and will be rejected if it changes before you approve. No invitations or updates will be sent.\n${googleCalendarApprovalMarker(approval)}`;
-}
-
-async function googleCalendarDelete(args: any): Promise<string> {
-  const eventId = String(args.event_id ?? "").trim();
-  if (!/^jarvis[a-v0-9]{5,1018}$/.test(eventId)) {
-    return "I need the exact Jarvis-managed Google Calendar event ID from a Google Calendar listing.";
-  }
-  let existing: Awaited<ReturnType<typeof getManagedGooglePrimaryCalendarEvent>>;
-  try {
-    existing = await getManagedGooglePrimaryCalendarEvent(eventId);
-  } catch {
-    return "I can only remove a current Jarvis-managed Google Calendar event. Check the Google Calendar listing and request a fresh plan change.";
-  }
-  const approval = issueGoogleCalendarApprovalProposal({
-    action: "delete",
-    eventId,
-    expectedEtag: existing.etag,
-  });
-  return `Ready for your approval: remove Jarvis-managed Google Calendar event "${existing.event.title}". The removal is sealed to the current event revision and will be rejected if it changes before you approve. Nothing is removed until you use the protected approval button below.\n${googleCalendarApprovalMarker(approval)}`;
 }
 
 async function calendarRemove(_args: any): Promise<string> {
@@ -2584,7 +2334,7 @@ function bookingCalendarSelectionId(booking: ConfirmedBooking): string {
   return `booking-${bookingSourceDedupeKey(booking).slice(0, 16)}`;
 }
 
-function bookingCalendarEvent(booking: ConfirmedBooking): GoogleCalendarCreateInput | null {
+function bookingCalendarEvent(booking: ConfirmedBooking): ICloudCalendarApprovalEvent | null {
   if (typeof booking.start !== "number" || !Number.isFinite(booking.start)) return null;
   const start = booking.start;
   const end = typeof booking.end === "number" && Number.isFinite(booking.end) && booking.end > start
@@ -2597,10 +2347,8 @@ function bookingCalendarEvent(booking: ConfirmedBooking): GoogleCalendarCreateIn
     start,
     end,
     allDay: booking.allDay,
-    ...(booking.timeZone ? { timeZone: booking.timeZone } : {}),
     ...(location ? { location } : {}),
     notes: `Confirmed ${booking.kind} imported from Gmail.`,
-    sourceDedupeKey: bookingSourceDedupeKey(booking),
   };
 }
 
@@ -2689,10 +2437,16 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
         .map(({ booking }) => `${bookingCalendarSelectionId(booking)} (${String(booking.title).slice(0, 100)})`)
         .join("; ");
       calendarNote = ` Calendar import needs one explicit booking_id because ${importable.length} dated confirmations are available: ${choices}. Nothing was added.`;
+    } else if (!await iCloudCalendarConfigured()) {
+      calendarNote = " Calendar import was not prepared because iCloud Calendar is unavailable. Nothing was added.";
     } else {
-      const approval = issueGoogleCalendarApprovalProposal({ action: "create", event: selected.event });
-      calendarNote = ` Ready for your approval: add Gmail confirmation \"${selected.event.title}\" to Google Calendar${selected.booking.timeZone ? ` in ${selected.booking.timeZone}` : ""}. Nothing has been added yet; use the protected Approve event button below within 10 minutes. No invitations or updates will be sent.`;
-      calendarApprovalMarker = googleCalendarApprovalMarker(approval);
+      try {
+        const approval = issueICloudCalendarApproval(selected.event);
+        calendarNote = ` Ready for your approval: add Gmail confirmation \"${selected.event.title}\" to iCloud Calendar. Nothing has been added yet; use the protected Approve iCloud event button below within 10 minutes. No invitations or updates will be sent.`;
+        calendarApprovalMarker = iCloudCalendarApprovalMarker(approval);
+      } catch {
+        calendarNote = " Calendar import was not prepared because iCloud Calendar readiness could not be verified. Nothing was added.";
+      }
     }
   }
   return `Found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"} in Gmail.${calendarNote}${tripNote} Speak one short summary and leave the full booking board on screen.${calendarApprovalMarker ? `\n${calendarApprovalMarker}` : ""}`;
@@ -2700,9 +2454,7 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
 
 type OfflineMapCalendarStatus = "approval_required" | "needs_connection" | "needs_reconnect";
 
-type OfflineMapCalendarPlan =
-  | { provider: "icloud"; status: OfflineMapCalendarStatus; calendar?: ICloudCalendar }
-  | { provider: "google"; status: OfflineMapCalendarStatus };
+type OfflineMapCalendarPlan = { provider: "icloud"; status: OfflineMapCalendarStatus; calendar?: ICloudCalendar };
 
 type StoredICloudTravelCalendarEvent = {
   calendarUrl: string;
@@ -2748,45 +2500,27 @@ function storedICloudTravelCalendarMarker(value: unknown): { revision: number; n
   return { revision: marker.revision, nonce: marker.nonce, ...(typeof marker.etag === "string" ? { etag: marker.etag } : {}) };
 }
 
-async function offlineMapCalendarStatus(): Promise<OfflineMapCalendarStatus> {
-  try {
-    const status = await convexQuery("googleAuth:getConnectionStatus", {}) as {
-      connected?: boolean;
-      capabilities?: { calendar?: boolean };
-    } | null;
-    if (!status?.connected) return "needs_connection";
-    return status.capabilities?.calendar ? "approval_required" : "needs_reconnect";
-  } catch {
-    return "needs_connection";
-  }
-}
-
 /**
- * A saved TripDoc gets iCloud-first Calendar approval when that account is
- * configured. Drafts deliberately keep the existing Google-only behavior:
- * there is no durable registry row against which an iCloud receipt could be
- * revalidated at click time.
+ * Only saved TripDocs can prepare an iCloud Calendar write because their
+ * durable registry row is revalidated at the protected approval click.
  */
 async function offlineMapCalendarPlan(
   storage: "draft" | "creation",
   requestedCalendar: unknown,
 ): Promise<OfflineMapCalendarPlan> {
-  if (storage === "creation" && iCloudCalendarConfigured()) {
-    try {
-      const requested = typeof requestedCalendar === "string" ? requestedCalendar.trim() || undefined : undefined;
-      return {
-        provider: "icloud",
-        status: "approval_required",
-        calendar: await resolveICloudTravelCalendar(requested),
-      };
-    } catch {
-      // An iCloud-enabled saved trip must not silently fall through to Google:
-      // the owner asked for one specific provider and needs a fresh iCloud
-      // connection/calendar choice before an approval can be sealed.
-      return { provider: "icloud", status: "needs_connection" };
-    }
+  if (storage !== "creation" || !await iCloudCalendarConfigured()) {
+    return { provider: "icloud", status: "needs_connection" };
   }
-  return { provider: "google", status: await offlineMapCalendarStatus() };
+  try {
+    const requested = typeof requestedCalendar === "string" ? requestedCalendar.trim() || undefined : undefined;
+    return {
+      provider: "icloud",
+      status: "approval_required",
+      calendar: await resolveICloudTravelCalendar(requested),
+    };
+  } catch {
+    return { provider: "icloud", status: "needs_connection" };
+  }
 }
 
 function storedICloudTravelCalendarEvent(value: unknown): StoredICloudTravelCalendarEvent | null {
@@ -3228,49 +2962,6 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
       }
     }
   }
-  if (calendarPlan.provider === "google" && calendarStatus === "approval_required") {
-    try {
-      const event: GoogleCalendarCreateInput = {
-        title: `Apple Maps offline · ${preflight.city}`,
-        start: preflight.at,
-        end: preflight.at + 30 * 60_000,
-        allDay: false,
-        timeZone: preflight.timeZone,
-        location: preflight.city,
-        notes: `Before ${preflight.flightTitle}: open the Apple Maps handoff, download ${preflight.city} for offline use, then remove an old unused map in Maps > Offline Maps. Jarvis cannot download or delete Apple offline maps.`,
-        reminderMinutesBefore: 5,
-        sourceDedupeKey: preflight.sourceKey,
-      };
-      const appleMapsOfflinePreflight = {
-        tripId: trip.id,
-        storage: trip.storage,
-        updatedAt: trip.doc.offlineMapPreflight.updatedAt,
-        sourceKey: preflight.sourceKey,
-      };
-      // The source key gives this handoff one stable managed event ID. When a
-      // refreshed itinerary is prepared again, seal an update to the current
-      // provider revision rather than relying on idempotent create to return
-      // the earlier event at its old time.
-      const existing = await getManagedGooglePrimaryCalendarEventForSourceKey(preflight.sourceKey);
-      const approval = existing
-        ? issueGoogleCalendarApprovalProposal({
-          action: "update",
-          eventId: existing.event.id,
-          expectedEtag: existing.etag,
-          event,
-          appleMapsOfflinePreflight,
-        })
-        : issueGoogleCalendarApprovalProposal({
-          action: "create",
-          event,
-          appleMapsOfflinePreflight,
-        });
-      calendarApprovalMarker = googleCalendarApprovalMarker(approval);
-    } catch {
-      calendarStatus = "needs_connection";
-      trip.doc.offlineMapPreflight.calendarStatus = calendarStatus;
-    }
-  }
   await saveTrip(trip.id, trip.doc, true, tripContext);
   await convexMutation("chatQueue:postCard", {
     threadId: tripThreadId,
@@ -3284,13 +2975,11 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     : todoStatus === "existing"
       ? "The matching Hub to-do already exists."
       : "The Hub to-do needs a retry; the saved trip card keeps that state visible.";
-  const calendarName = calendarPlan.provider === "icloud" ? "iCloud Calendar" : "Google Calendar";
+  const calendarName = "iCloud Calendar";
   const calendarNote = calendarApprovalMarker
     ? `${calendarName} is ready for your protected one-click approval below; nothing has been written yet.`
-    : calendarPlan.provider === "google"
-      ? calendarStatus === "needs_reconnect"
-        ? "Google Calendar needs a reconnect with Calendar access; ask Jarvis to prepare this exact trip again after reconnecting."
-        : "Google Calendar is not connected yet; ask Jarvis to prepare this exact trip again after connecting it."
+    : workspace.storage === "draft"
+      ? "This is still a live draft, so Calendar stays untouched until you save the trip."
       : calendarStatus === "needs_reconnect"
         ? "iCloud Calendar needs a fresh calendar choice before Jarvis can update the existing reminder; prepare this exact trip again after choosing it."
         : calendarStatus === "needs_connection"
@@ -5883,14 +5572,6 @@ export async function executeTool(
       return await calendarView(args);
     case "icloud_calendar_create":
       return await iCloudCalendarCreate(args);
-    case "google_calendar_list":
-      return await googleCalendarList(args);
-    case "google_calendar_create":
-      return await googleCalendarCreate(args);
-    case "google_calendar_update":
-      return await googleCalendarUpdate(args);
-    case "google_calendar_delete":
-      return await googleCalendarDelete(args);
     case "bookings_lookup":
       return await bookingsLookup(args);
     case "bookings_check":

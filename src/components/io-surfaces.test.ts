@@ -42,7 +42,7 @@ describe("reactive IO surfaces", () => {
     const jarvis = source("src/components/JarvisUI.tsx");
     expect(jarvis.match(/<GuestSafeAttachment/g)).toHaveLength(2);
     expect(jarvis).toContain(
-      '.filter((m) => m.text || (!guest && (m.attachment || m.calendarApprovalToken || m.gmailSendApprovalToken)) || m.status === "streaming")',
+      '.filter((m) => m.text || (!guest && (m.attachment || m.iCloudCalendarApprovalToken || m.gmailSendApprovalToken)) || m.status === "streaming")',
     );
   });
 

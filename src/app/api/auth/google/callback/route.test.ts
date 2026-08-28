@@ -50,7 +50,7 @@ afterEach(() => {
 
 describe("Google OAuth callback scope persistence", () => {
   it.each([
-    "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/calendar.events.owned",
+    "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.modify",
   ])("persists exactly Google's returned scope rather than assuming requested grants", async (scope) => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => Response.json({

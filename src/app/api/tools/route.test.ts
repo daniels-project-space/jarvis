@@ -18,12 +18,12 @@ vi.mock("@/lib/tools", () => ({
   TOOL_DEFS: [
     { name: "show" },
     { name: "email_support" },
-    { name: "google_calendar_create" },
+    { name: "icloud_calendar_create" },
   ],
 }));
 vi.mock("@/lib/tool-belts", () => ({
-  TOOL_BELTS: { core: new Set(["show", "email_support", "google_calendar_create"]) },
-  isForegroundOwnerToolName: (name: unknown) => name === "email_support" || name === "google_calendar_create" || name === "browser_errand_run",
+  TOOL_BELTS: { core: new Set(["show", "email_support", "icloud_calendar_create"]) },
+  isForegroundOwnerToolName: (name: unknown) => name === "email_support" || name === "icloud_calendar_create" || name === "browser_errand_run",
   slimToolDefinition: (value: unknown) => value,
 }));
 
@@ -103,7 +103,7 @@ describe("owner direct-tool invocation context", () => {
     expect(mock.executeTool).not.toHaveBeenCalled();
   });
 
-  it.each(["email_support", "google_calendar_create"]) (
+  it.each(["email_support", "icloud_calendar_create"]) (
     "does not let an owner-session browser route invoke foreground-only %s without its verified turn",
     async (name) => {
       const response = await POST(request({ name, args: {} }));

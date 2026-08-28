@@ -5,7 +5,7 @@ import { GMAIL_SEND_APPROVAL_MARKER } from "./gmail-send-approval-marker";
 
 // Approval receipts for sending mail as Daniel.
 //
-// Same shape as the Google Calendar approval: a tool can PREPARE a send but
+// Same owner-approval shape as the Calendar writer: a tool can PREPARE a send but
 // cannot perform one. It creates a real Gmail draft, then issues a signed
 // receipt naming that draft id. Only a same-origin owner click can redeem it.
 //

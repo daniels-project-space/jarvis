@@ -8,14 +8,9 @@ export const GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail
 // compatibility capability only; new consent never requests it.
 export const GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
-// `calendar.events.owned` is enough for the authenticated account's primary
-// calendar and cannot alter events on calendars merely shared with it.
-export const GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE = "https://www.googleapis.com/auth/calendar.events.owned";
-
 export const GOOGLE_OAUTH_SCOPES = [
   GOOGLE_GMAIL_READONLY_SCOPE,
   GOOGLE_GMAIL_COMPOSE_SCOPE,
-  GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE,
 ].join(" ");
 
 function grantedScopes(scope: string): Set<string> {
@@ -32,6 +27,5 @@ export function googleCapabilities(scope: string) {
     gmail:
       hasGoogleScopes(scope, [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_COMPOSE_SCOPE]) ||
       hasGoogleScopes(scope, [GOOGLE_GMAIL_MODIFY_SCOPE]),
-    calendar: hasGoogleScopes(scope, [GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE]),
   };
 }

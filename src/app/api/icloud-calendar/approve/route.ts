@@ -197,7 +197,7 @@ export async function POST(req: NextRequest) {
   if (!isOwnerActor(actor)) {
     return Response.json({ ok: false, error: "owner enrollment required" }, { status: 403, headers: PRIVATE_HEADERS });
   }
-  if (!iCloudCalendarConfigured()) {
+  if (!await iCloudCalendarConfigured()) {
     return Response.json({
       ok: false,
       error: "iCloud Calendar is not configured in this Jarvis environment. Prepare a fresh approval after it is connected.",

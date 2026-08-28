@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE,
   GOOGLE_GMAIL_COMPOSE_SCOPE,
   GOOGLE_GMAIL_READONLY_SCOPE,
   GOOGLE_OAUTH_SCOPES,
@@ -8,22 +7,19 @@ import {
 } from "./google-scopes";
 
 describe("Google OAuth scope policy", () => {
-  it("requests the smallest set needed to read, draft/send, and manage owned calendar events", () => {
+  it("requests the smallest set needed for Gmail read and draft actions", () => {
     expect(GOOGLE_OAUTH_SCOPES.split(" ")).toEqual([
       GOOGLE_GMAIL_READONLY_SCOPE,
       GOOGLE_GMAIL_COMPOSE_SCOPE,
-      GOOGLE_CALENDAR_EVENTS_OWNED_SCOPE,
     ]);
   });
 
   it("accepts the least-privilege grant and keeps a historical broader grant working", () => {
     expect(googleCapabilities(`${GOOGLE_GMAIL_READONLY_SCOPE} ${GOOGLE_GMAIL_COMPOSE_SCOPE}`)).toEqual({
       gmail: true,
-      calendar: false,
     });
     expect(googleCapabilities(`https://www.googleapis.com/auth/gmail.modify ${GOOGLE_GMAIL_COMPOSE_SCOPE}`)).toEqual({
       gmail: true,
-      calendar: false,
     });
   });
 });

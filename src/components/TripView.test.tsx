@@ -220,7 +220,7 @@ describe("TripTimeline", () => {
     expect(markup).toContain('aria-label="Apple Maps offline preflight"');
     expect(markup).toContain('href="https://maps.apple.com/search?query=Seville"');
     expect(markup).toContain("Matching Hub to-do is already saved.");
-    expect(markup).toContain("Connect Google Calendar");
+    expect(markup).toContain("Connect iCloud Calendar");
     expect(markup).toContain("Gmail itinerary refresh is active for this exact saved trip.");
     expect(markup).toContain("Download and deletion remain in Maps");
   });

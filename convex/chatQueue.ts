@@ -363,7 +363,7 @@ async function admitMessage(
   });
   // This scope is minted only after conversationIdentity accepted the
   // authenticated owner and the submitted message starts with a direct,
-  // unquoted Gmail/Google Calendar/browser-errand command. A browser command
+  // unquoted Gmail/iCloud Calendar/browser-errand command. A browser command
   // additionally has to contain exactly one durable errand ID, persisted
   // below before the model can discover the run tool. No browser credential is
   // retained: later calls are separately bound to the active assistant claim
@@ -1090,7 +1090,7 @@ async function claimPending(
     )
     : [];
   const ownerToolAccess = ownerToolNames.length > 0;
-  const ownerCalendarAndHubTodo = (ownerToolNames.includes("icloud_calendar_create") || ownerToolNames.includes("google_calendar_create"))
+  const ownerCalendarAndHubTodo = ownerToolNames.includes("icloud_calendar_create")
     && ownerToolGrant?.calendarAndHubTodo === true;
 
   const all = await ctx.db
@@ -1424,7 +1424,7 @@ async function foregroundOwnerToolGrantForLiveClaim(
   );
   return {
     toolNames,
-    ...((toolNames.includes("icloud_calendar_create") || toolNames.includes("google_calendar_create")) && grant.calendarAndHubTodo === true
+    ...(toolNames.includes("icloud_calendar_create") && grant.calendarAndHubTodo === true
       ? { calendarAndHubTodo: true as const }
       : {}),
     ...(toolNames.includes("browser_errand_run") && browserErrandId ? { browserErrandId } : {}),

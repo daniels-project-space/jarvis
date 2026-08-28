@@ -8,6 +8,7 @@ const mock = vi.hoisted(() => ({
   getSecret: vi.fn(),
   lookupBookings: vi.fn(),
   createICloudEvent: vi.fn(),
+  iCloudCalendarConfigured: vi.fn(),
 }));
 
 vi.mock("./context", () => ({
@@ -27,14 +28,13 @@ vi.mock("./icloud-calendar", () => ({
   deleteICloudEvent: vi.fn(),
   findICloudEvents: vi.fn(),
   listICloudEvents: vi.fn(),
+  iCloudCalendarConfigured: mock.iCloudCalendarConfigured,
 }));
 
-import { extractGoogleCalendarApproval } from "./sanitize";
+import { extractICloudCalendarApproval } from "./sanitize";
 import { executeTool, TOOL_DEFS } from "./tools";
 
-afterEach(() => {
-  delete process.env.GOOGLE_TOKEN_ENCRYPTION_KEY;
-});
+afterEach(() => vi.unstubAllEnvs());
 
 function osmPlace(name: string, address: string, lat: number, lng: number) {
   return { name, display_name: address, lat: String(lat), lon: String(lng), type: "attraction" };
@@ -430,11 +430,13 @@ describe("travel_map tool", () => {
   });
 
   it("keeps Gmail read-only while a calendar sync only creates an owner approval", async () => {
-    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 8).toString("base64");
+    vi.stubEnv("ICLOUD_CALENDAR_APPLE_ID", "calendar-owner@example.test");
+    vi.stubEnv("ICLOUD_CALENDAR_APP_PASSWORD", "test-app-password");
+    mock.iCloudCalendarConfigured.mockResolvedValue(true);
     const result = await executeTool("bookings_check", { sync_calendar: true });
 
     expect(result).toContain("Ready for your approval");
-    expect(extractGoogleCalendarApproval(result)).toBeTruthy();
+    expect(extractICloudCalendarApproval(result)).toBeTruthy();
     expect(mock.createICloudEvent).not.toHaveBeenCalled();
     const panelCall = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
     const panel = JSON.parse(String(panelCall?.[1]?.value));

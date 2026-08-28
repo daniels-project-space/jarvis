@@ -5,7 +5,7 @@ describe("googleOAuthReturnNotice", () => {
   it("shows a clear completion message only for the callback success status", () => {
     expect(googleOAuthReturnNotice("?google_oauth=connected")).toEqual({
       tone: "success",
-      message: "Google account connected. Checking Gmail and Google Calendar access…",
+      message: "Google account connected. Checking Gmail access…",
     });
     expect(googleOAuthReturnNotice("?google_oauth=connected&google_oauth_detail=ignored")).not.toBeNull();
   });

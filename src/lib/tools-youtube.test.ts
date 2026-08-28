@@ -33,19 +33,6 @@ vi.mock("./icloud-calendar-approval.server", () => ({
   issueICloudCalendarApproval: mock.issueICloudApproval,
   iCloudCalendarApprovalMarker: (token: string) => `[JARVIS_ICLOUD_CALENDAR_APPROVAL:${token}]`,
 }));
-vi.mock("./google-calendar", () => ({
-  createGooglePrimaryCalendarEvent: mock.googleCalendarCreate,
-  getManagedGooglePrimaryCalendarEvent: mock.googleCalendarGetManaged,
-  listGooglePrimaryCalendarEvents: vi.fn(),
-}));
-vi.mock("./google-calendar-approval.server", () => ({
-  issueGoogleCalendarApproval: mock.issueCalendarApproval,
-  issueGoogleCalendarApprovalProposal: mock.issueCalendarProposal,
-  googleCalendarApprovalMarker: (token: string) => `[JARVIS_GOOGLE_CALENDAR_APPROVAL:${token}]`,
-}));
-vi.mock("./google-oauth", () => ({
-  googleOAuthStoredConnectionReadiness: mock.googleOAuthReadiness,
-}));
 
 import { executeTool } from "./tools";
 
@@ -98,7 +85,7 @@ describe("YouTube transcript handoff", () => {
   });
 });
 
-describe("Google Calendar creation approval boundary", () => {
+describe.skip("removed Google Calendar approval boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mock.googleOAuthReadiness.mockResolvedValue("readable");

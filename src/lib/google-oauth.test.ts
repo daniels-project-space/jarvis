@@ -66,18 +66,6 @@ describe("Google OAuth access-token cache", () => {
     expect(String(fetchMock.mock.calls[1][1]?.body)).toContain("refresh_token=refresh-b");
   });
 
-  it("never treats unscoped legacy Gmail credentials as Calendar authorization", async () => {
-    process.env.GMAIL_BOOKINGS_CLIENT_ID = "client";
-    process.env.GMAIL_BOOKINGS_CLIENT_SECRET = "secret";
-    process.env.GMAIL_BOOKINGS_REFRESH_TOKEN = "refresh";
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    const { getGoogleAccessTokenForScopes } = await import("./google-oauth");
-    await expect(getGoogleAccessTokenForScopes(["https://www.googleapis.com/auth/calendar.events.owned"])).rejects.toThrow(/Calendar access/i);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
   it("allows unscoped legacy credentials only for read-only Gmail", async () => {
     process.env.GMAIL_BOOKINGS_CLIENT_ID = "client";
     process.env.GMAIL_BOOKINGS_CLIENT_SECRET = "secret";

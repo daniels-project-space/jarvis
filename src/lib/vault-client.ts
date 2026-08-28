@@ -54,7 +54,11 @@ function vaultQueryUrl(): string {
 export async function vaultService(service: string): Promise<Record<string, string>> {
   const cached = cache.get(service);
   if (cached) return cached;
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(service)) throw new VaultRequestError("configuration");
+  // Project Hub has a small number of legacy, explicitly scoped service
+  // names that use underscores (including Apple Calendar). The service name
+  // is still a fixed caller constant and Vault enforces the caller's service
+  // allowlist; accept that legacy grammar without accepting arbitrary paths.
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(service)) throw new VaultRequestError("configuration");
   const vaultToken = process.env.VAULT_ACCESS_TOKEN?.trim();
   if (!vaultToken) throw new VaultRequestError("capability");
   const body = JSON.stringify({

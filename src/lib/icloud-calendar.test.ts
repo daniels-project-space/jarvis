@@ -99,6 +99,33 @@ afterEach(() => {
 });
 
 describe("iCloud saved-trip CalDAV writes", () => {
+  it("uses the Project Hub Apple credential pair in preference to copied environment values", async () => {
+    vi.stubEnv("VAULT_ACCESS_TOKEN", "jarvis-vault-capability");
+    const getServiceSecrets = vi.fn().mockResolvedValue({
+      APPLE_ID: "vault-owner@example.test",
+      APPLE_APP_PASSWORD: "vault-app-password",
+    });
+    vi.doMock("./vault", () => ({ getServiceSecrets }));
+    const { calls } = mockCalDav({ putStatus: 201, putEtag: '"etag-1"' });
+    const { resolveICloudTravelCalendar } = await import("./icloud-calendar");
+
+    await expect(resolveICloudTravelCalendar()).resolves.toMatchObject({ name: "Home", url: CALENDAR_URL });
+
+    expect(getServiceSecrets).toHaveBeenCalledWith("apple_calendar");
+    const firstRequest = calls[0];
+    expect(new Headers(firstRequest?.init.headers).get("authorization")).toBe(
+      `Basic ${Buffer.from("vault-owner@example.test:vault-app-password").toString("base64")}`,
+    );
+  });
+
+  it("fails closed when the Project Hub Apple credential lookup is unavailable", async () => {
+    vi.stubEnv("VAULT_ACCESS_TOKEN", "jarvis-vault-capability");
+    vi.doMock("./vault", () => ({ getServiceSecrets: vi.fn().mockRejectedValue(new Error("denied")) }));
+    const { iCloudCalendarConfigured } = await import("./icloud-calendar");
+
+    await expect(iCloudCalendarConfigured()).resolves.toBe(false);
+  });
+
   it("creates the deterministic resource with If-None-Match and sealed provenance", async () => {
     const { calls } = mockCalDav({ putStatus: 201, putEtag: '"etag-1"' });
     const { writeICloudTravelCalendarEvent } = await import("./icloud-calendar");

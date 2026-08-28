@@ -48,7 +48,6 @@ describe("Google OAuth start", () => {
     expect(location.searchParams.get("scope")).toBe([
       "https://www.googleapis.com/auth/gmail.readonly",
       "https://www.googleapis.com/auth/gmail.compose",
-      "https://www.googleapis.com/auth/calendar.events.owned",
     ].join(" "));
     expect(location.searchParams.has("include_granted_scopes")).toBe(false);
     expect(response.headers.get("set-cookie")).toContain("__Host-jarvis_google_oauth_state=");

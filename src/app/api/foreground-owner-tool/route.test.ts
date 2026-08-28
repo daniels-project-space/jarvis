@@ -19,7 +19,7 @@ vi.mock("@/lib/tools", () => ({
   TOOL_DEFS: [
     { name: "gmail_search", description: "Search Gmail." },
     { name: "gmail_draft_reply", description: "Create a Gmail draft." },
-    { name: "google_calendar_create", description: "Create an approval card." },
+    { name: "icloud_calendar_create", description: "Create an approval card." },
     { name: "browser_errand_run", description: "Run an approved browser errand." },
     { name: "work_control", description: "Must never be exposed here." },
   ],
@@ -62,7 +62,7 @@ function request(
   }) as unknown as NextRequest;
 }
 
-describe("foreground owner Gmail/Google tool endpoint", () => {
+describe("foreground owner Gmail/iCloud tool endpoint", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubEnv("JARVIS_DISPATCH_TOKEN", DISPATCH);
@@ -74,7 +74,7 @@ describe("foreground owner Gmail/Google tool endpoint", () => {
 
   afterEach(() => vi.unstubAllEnvs());
 
-  it("exposes only the server-authorized fixed Gmail/Google subset", async () => {
+  it("exposes only the server-authorized fixed Gmail/iCloud subset", async () => {
     const response = await GET(request("GET", "/api/foreground-owner-tool?belt=work", {
       receipt: receipt("discover", "work"),
     }));

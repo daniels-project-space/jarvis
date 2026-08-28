@@ -301,7 +301,7 @@ export class AgentToolBridge {
   private hasCalendarAndHubTodoScope(turn: ForegroundOwnerToolHostTurn | null): boolean {
     return Boolean(
       turn?.calendarAndHubTodo === true
-      && (turn.toolNames?.includes("icloud_calendar_create") || turn.toolNames?.includes("google_calendar_create")),
+      && turn.toolNames?.includes("icloud_calendar_create"),
     );
   }
 

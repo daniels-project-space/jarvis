@@ -87,7 +87,7 @@ export async function GET(req: NextRequest) {
       return redirectWithStatus(req, "error", "no_refresh_token");
     }
 
-    // Best-effort only: the requested Gmail and narrow Calendar event scopes
+    // Best-effort only: the requested Gmail scopes
     // do not include email/profile/openid, so Google's userinfo endpoint
     // will typically return nothing usable here. This is expected; `email`
     // is an optional display field and the flow must not fail without it.
@@ -109,7 +109,7 @@ export async function GET(req: NextRequest) {
 
     // Never mark a connection ready when Google omitted the returned grants.
     // We must not assume all requested scopes: consent can be partial, and a
-    // Calendar client without a recorded grant must fail closed.
+    // Gmail client without a recorded grant must fail closed.
     const scope = typeof payload.scope === "string" ? payload.scope.trim() : "";
     if (!scope) return redirectWithStatus(req, "error", "missing_scope");
     const encryptedRefreshToken = encryptGoogleRefreshToken(payload.refresh_token);

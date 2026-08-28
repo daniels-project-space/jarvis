@@ -25,7 +25,7 @@ export type CapabilityRoutingOptions = {
   /**
    * Enables the separate, turn-fenced owner foreground catalog. Normal
    * subscription workers never set this and therefore never discover Gmail or
-   * Google Calendar capabilities.
+   * iCloud Calendar capabilities.
    */
   ownerForeground?: boolean;
   /**
@@ -209,7 +209,7 @@ export function rankCapabilities(
     : [];
   const ownerCalendarAndHubTodo = options.ownerForeground
     && options.ownerCalendarAndHubTodo === true
-    && (ownerToolNames.includes("icloud_calendar_create") || ownerToolNames.includes("google_calendar_create"));
+    && ownerToolNames.includes("icloud_calendar_create");
   const allowedToolNames = new Set(SUBSCRIPTION_TOOL_NAMES);
   ownerToolNames.forEach((name) => allowedToolNames.add(name));
   // A foreground owner turn has an additional authority boundary. Prevent a
@@ -252,9 +252,7 @@ export function rankCapabilities(
           ? "owner_gmail"
           : tool === "browser_errand_run"
             ? "owner_browser_errand"
-            : tool === "icloud_calendar_create"
-              ? "owner_icloud_calendar"
-              : "owner_google_calendar",
+            : "owner_icloud_calendar",
       });
     });
     // The dual destination scope was fixed at owner-message admission and is

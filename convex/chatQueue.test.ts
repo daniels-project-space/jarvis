@@ -222,7 +222,7 @@ describe("durable foreground chat recovery", () => {
       finalText: [
         "Your draft is ready.",
         `[jarvis-gmail-send-approval:${gmailReceipt}]`,
-        `[JARVIS_GOOGLE_CALENDAR_APPROVAL:${calendarReceipt}]`,
+        `[JARVIS_ICLOUD_CALENDAR_APPROVAL:${calendarReceipt}]`,
       ].join("\n"),
       workerToken: WORKER,
     })).resolves.toBe(true);

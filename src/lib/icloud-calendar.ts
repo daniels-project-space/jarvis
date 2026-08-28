@@ -3,6 +3,7 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import { XMLParser } from "fast-xml-parser";
 import { parseIcsVevents } from "./ics";
+import { getServiceSecrets } from "./vault";
 
 const DAV = "DAV:";
 const CALDAV = "urn:ietf:params:xml:ns:caldav";
@@ -15,6 +16,7 @@ const XML = '<?xml version="1.0" encoding="utf-8"?>';
 // request anywhere else: every CalDAV request carries the app password.
 const ICLOUD_CALDAV_HOST = "caldav.icloud.com";
 const ICLOUD_CALDAV_SHARD = /^p\d+-caldav\.icloud\.com$/;
+const APPLE_CALENDAR_VAULT_SERVICE = "apple_calendar";
 
 export type ICloudCalendar = { name: string; url: string; color?: string };
 export type ICloudEvent = {
@@ -85,14 +87,34 @@ export class ICloudCalendarError extends Error {}
 /** A conditional CalDAV write found a different external revision. */
 export class ICloudCalendarConflictError extends ICloudCalendarError {}
 
-export function iCloudCalendarConfigured(): boolean {
-  return Boolean(
-    process.env.ICLOUD_CALENDAR_APPLE_ID?.trim()
-    && process.env.ICLOUD_CALENDAR_APP_PASSWORD?.trim(),
-  );
+export async function iCloudCalendarConfigured(): Promise<boolean> {
+  try {
+    await credentials();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function credentials(): { appleId: string; appPassword: string } {
+async function credentials(): Promise<{ appleId: string; appPassword: string }> {
+  // Production uses Project Hub as the credential authority. Do not silently
+  // fall back to a copied environment value when that capability is present:
+  // an allowlist/configuration failure must leave Calendar unavailable.
+  if (process.env.VAULT_ACCESS_TOKEN?.trim()) {
+    let secrets: Record<string, string>;
+    try {
+      secrets = await getServiceSecrets(APPLE_CALENDAR_VAULT_SERVICE);
+    } catch {
+      throw new ICloudCalendarError("iCloud Calendar credentials are unavailable from Project Hub Vault.");
+    }
+    const appleId = secrets.APPLE_ID?.trim();
+    const appPassword = secrets.APPLE_APP_PASSWORD?.trim();
+    if (!appleId || !appPassword) {
+      throw new ICloudCalendarError("Project Hub Vault is missing the iCloud Calendar credential pair.");
+    }
+    return { appleId, appPassword };
+  }
+
   const appleId = process.env.ICLOUD_CALENDAR_APPLE_ID?.trim();
   const appPassword = process.env.ICLOUD_CALENDAR_APP_PASSWORD?.trim();
   if (!appleId || !appPassword) {
@@ -131,8 +153,8 @@ function href(value: unknown): string {
   return text(asRecord(value).href);
 }
 
-function authHeader(): string {
-  const { appleId, appPassword } = credentials();
+async function authHeader(): Promise<string> {
+  const { appleId, appPassword } = await credentials();
   return `Basic ${Buffer.from(`${appleId}:${appPassword}`).toString("base64")}`;
 }
 
@@ -178,9 +200,10 @@ async function caldavRequest(
   if (expectedUrl && current !== expectedUrl) {
     throw new ICloudCalendarConflictError("iCloud changed the sealed Calendar event location before approval.");
   }
+  const authorization = await authHeader();
   for (let attempt = 0; attempt < 6; attempt += 1) {
     const headers = new Headers({
-      Authorization: authHeader(),
+      Authorization: authorization,
       Accept: "application/xml, text/calendar;q=0.9, */*;q=0.1",
       "User-Agent": "JARVIS-iCloud-Calendar/1.0",
       ...(options.body ? { "Content-Type": "application/xml; charset=utf-8" } : {}),

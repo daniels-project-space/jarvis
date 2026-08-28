@@ -55,7 +55,7 @@ function calendarPreflightChanged(previous: RegistryPreflight, next: RegistryPre
     || next.flightStart !== previous.flightStart
     || next.at !== previous.at
     || next.flightTitle !== previous.flightTitle
-    // Google Calendar stores the explicit IANA zone alongside the instant.
+    // Calendar scheduling stores the explicit IANA zone alongside the instant.
     // Madrid and Paris can share an offset, so an itinerary zone correction
     // does not always move `at`; it still needs a fresh owner-approved update.
     || next.timeZone !== previous.timeZone;

@@ -40,12 +40,12 @@ async function admitOwnerTurn(t: ReturnType<typeof convexTest>, text: string) {
   });
 }
 
-describe("foreground owner Google/Gmail turn fence", () => {
+describe("foreground owner iCloud/Gmail turn fence", () => {
   it("carries an explicit Calendar + Jarvis to-do request from admission into its active claim", async () => {
     const t = convexTest(schema, modules);
     const userId = await admitOwnerTurn(
       t,
-      "Add a reminder to my Google Calendar and Jarvis to-do list tomorrow morning.",
+      "Add a reminder to my iCloud Calendar and Jarvis to-do list tomorrow morning.",
     );
     await t.run(async (ctx) => {
       const grant = await ctx.db
@@ -53,7 +53,7 @@ describe("foreground owner Google/Gmail turn fence", () => {
         .withIndex("by_message", (q: any) => q.eq("messageId", userId))
         .unique();
       expect(grant).toMatchObject({
-        toolNames: ["google_calendar_list", "google_calendar_create"],
+        toolNames: ["icloud_calendar_create"],
         calendarAndHubTodo: true,
       });
     });
@@ -65,7 +65,7 @@ describe("foreground owner Google/Gmail turn fence", () => {
     });
     expect(claim).toMatchObject({
       ownerToolAccess: true,
-      ownerToolNames: ["google_calendar_list", "google_calendar_create"],
+      ownerToolNames: ["icloud_calendar_create"],
       ownerCalendarAndHubTodo: true,
     });
   });

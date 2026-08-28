@@ -307,7 +307,7 @@ export default defineSchema({
     // admission. Never reconstruct this from conversation/model text later.
     toolNames: v.array(v.string()),
     // Present only when the direct owner command explicitly requested both a
-    // Google Calendar create and a Jarvis Hub to-do. This capability is
+    // iCloud Calendar create and a Jarvis Hub to-do. This capability is
     // consumed by the foreground worker; it is never inferred from model text.
     calendarAndHubTodo: v.optional(v.boolean()),
     // Browser execution needs more than a generic tool name: the exact ID is
@@ -321,7 +321,7 @@ export default defineSchema({
     .index("by_thread", ["threadId"]),
 
   // A redeemed dynamic-call receipt is the irrevocable linearization point for
-  // its Gmail/Google Calendar request. A later cancellation may stop the
+  // its Gmail/iCloud Calendar request. A later cancellation may stop the
   // reply, but cannot claim an already-committed provider request vanished.
   // Bounded cleanup happens with the owning terminal chat turn.
   chatTurnOwnerToolUses: defineTable({

@@ -518,8 +518,7 @@ describe("foreground agent tool bridge", () => {
         requests.push({ url, init });
         if (url.pathname.endsWith("/foreground-owner-tool")) {
           return Response.json([
-            { name: "google_calendar_list", description: "List Calendar." },
-            { name: "google_calendar_create", description: "Prepare Calendar approval." },
+            { name: "icloud_calendar_create", description: "Prepare iCloud Calendar approval." },
           ]);
         }
         if (init?.method === "GET") {
@@ -533,7 +532,7 @@ describe("foreground agent tool bridge", () => {
         messageId: "message-1",
         assistantId: "assistant-1",
         claimToken: "claim-1",
-        toolNames: ["google_calendar_list", "google_calendar_create"],
+        toolNames: ["icloud_calendar_create"],
       },
     } as const;
     const calendarAndTodo = {
@@ -542,7 +541,7 @@ describe("foreground agent tool bridge", () => {
         calendarAndHubTodo: true,
       },
     } as const;
-    const modelSuppliedIntent = "Add a reminder to my Google Calendar and Jarvis to-do list tomorrow.";
+    const modelSuppliedIntent = "Add a reminder to my iCloud Calendar and Jarvis to-do list tomorrow.";
 
     const spoofed = await bridge.invoke(dynamicCall(
       "jarvis_get_tools",
@@ -556,8 +555,7 @@ describe("foreground agent tool bridge", () => {
       spoofed.contentItems[0].type === "inputText" ? spoofed.contentItems[0].text : "{}",
     );
     expect(spoofedPayload.tools.map((tool: { name: string }) => tool.name)).toEqual([
-      "google_calendar_list",
-      "google_calendar_create",
+      "icloud_calendar_create",
     ]);
 
     // An explicit belt is another model-controlled path and must not expose
@@ -594,8 +592,7 @@ describe("foreground agent tool bridge", () => {
       permitted.contentItems[0].type === "inputText" ? permitted.contentItems[0].text : "{}",
     );
     expect(permittedPayload.tools.map((tool: { name: string }) => tool.name)).toEqual([
-      "google_calendar_list",
-      "google_calendar_create",
+      "icloud_calendar_create",
       "todo_add",
     ]);
     const added = await bridge.invoke(dynamicCall(

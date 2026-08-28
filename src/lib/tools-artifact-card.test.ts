@@ -34,15 +34,6 @@ vi.mock("./booking-email", () => ({
 vi.mock("./icloud-calendar", () => ({
   createICloudEvent: vi.fn(), deleteICloudEvent: vi.fn(), findICloudEvents: vi.fn(), listICloudEvents: vi.fn(),
 }));
-vi.mock("./google-calendar", () => ({
-  createGooglePrimaryCalendarEvent: vi.fn(), getManagedGooglePrimaryCalendarEvent: vi.fn(), listGooglePrimaryCalendarEvents: vi.fn(),
-}));
-vi.mock("./google-calendar-approval.server", () => ({
-  issueGoogleCalendarApproval: vi.fn(),
-  issueGoogleCalendarApprovalProposal: vi.fn(),
-  googleCalendarApprovalMarker: (token: string) => `[JARVIS_GOOGLE_CALENDAR_APPROVAL:${token}]`,
-}));
-
 import { executeTool } from "./tools";
 
 const imageAsset = {

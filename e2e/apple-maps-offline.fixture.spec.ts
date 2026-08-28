@@ -30,7 +30,7 @@ test("renders the saved Apple Maps preflight as a truthful device handoff", asyn
   );
   await expect(card).toContainText("Jarvis reminder is scheduled.");
   await expect(card).toContainText("Matching Hub to-do is already saved.");
-  await expect(card).toContainText("Connect Google Calendar");
+  await expect(card).toContainText("Connect iCloud Calendar");
   await expect(card).toContainText("Download and deletion remain in Maps");
   await expect(card).not.toContainText(/downloaded|deleted/i);
   await page.screenshot({ path: testInfo.outputPath("apple-maps-offline.png"), fullPage: true });
