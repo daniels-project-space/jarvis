@@ -2,9 +2,10 @@
 
 This change is a cross-provider protocol release. A provider order by itself is
 not safe: an older Vercel or Trigger worker can still perform an unconditional
-R2 operation after Convex has started enforcing the new creation fence. The
-release owner must record the candidate Git SHA and the matching Vercel,
-Trigger, and Convex deployment IDs in the change record.
+R2 operation after Convex has started enforcing the new creation fence. This
+is therefore an intentional exception to the normal **Convex → Trigger →
+Vercel** rollout order. The release owner must record the candidate Git SHA and
+the matching Vercel, Trigger, and Convex deployment IDs in the change record.
 
 ## Compatibility bridge
 
@@ -44,10 +45,15 @@ runs start while it drains.
 
    Use Trigger's supported `queues.pause` management operation for each. A
    dashboard-wide environment pause, if offered, is stronger, but it is not a
-   substitute for recording these queue-level controls. Pausing prevents new
-   runs from starting; it does not stop already executing runs. Save the
-   current (old) Trigger deployment version and queue/run snapshots as the
-   pre-cutover evidence.
+   substitute for recording these queue-level controls. The existing
+   `TRIGGER_ACCESS_TOKEN` personal token can list runs but cannot pause queues
+   or cancel runs; perform these operations in the Trigger dashboard or an
+   approved release console with a project-scoped production `tr_prod_…`
+   secret injected from the vault. Do not export a credential to a shell or
+   disk. Trigger CLI 4.5.1 supplies deploy/promote, not queue/run management.
+   Pausing prevents new runs from starting; it does not stop already executing
+   runs. Save the current (old) Trigger deployment version and queue/run
+   snapshots as the pre-cutover evidence.
 4. Deploy the candidate Trigger task bundle with no promotion:
 
    ```bash
