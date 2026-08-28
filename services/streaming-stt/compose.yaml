@@ -1,0 +1,19 @@
+services:
+  streaming-stt:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      STREAMING_STT_TICKET_SECRET: ${STREAMING_STT_TICKET_SECRET:?set_STREAMING_STT_TICKET_SECRET}
+      STREAMING_STT_THREADS: 2
+      STREAMING_STT_MAX_CONNECTIONS: 2
+      SHERPA_MODEL_DIR: /models/zipformer-en
+    volumes:
+      - ./models:/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=5).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 3m

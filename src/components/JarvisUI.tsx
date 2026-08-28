@@ -151,6 +151,11 @@ import {
   transcribeRecordedAudio,
 } from "@/lib/stt-client";
 import {
+  selfHostedStreamingSpeechEnabled,
+  startSelfHostedStreamingSpeech,
+  type SelfHostedStreamingSpeech,
+} from "@/lib/streaming-stt-client";
+import {
   reconcileEmbeddedThreadReadiness,
   stableEmbeddedActorKey,
   type EmbeddedThreadContext,
@@ -203,6 +208,7 @@ type JarvisPrefs = { reduceMotion: boolean; liveDefault: boolean };
 type LiveMicrophoneResources = {
   stream: MediaStream;
   context: AudioContext;
+  source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
   aecEnabled: boolean;
 };
@@ -4103,9 +4109,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const analyser = context.createAnalyser();
       analyser.fftSize = 512;
       analyser.smoothingTimeConstant = 0.35;
-      context.createMediaStreamSource(stream).connect(analyser);
+      const source = context.createMediaStreamSource(stream);
+      source.connect(analyser);
       const aecEnabled = stream.getAudioTracks().some((track) => track.getSettings().echoCancellation === true);
-      const resources = { stream, context, analyser, aecEnabled };
+      const resources = { stream, context, source, analyser, aecEnabled };
       liveMicRef.current = resources;
       stream.getAudioTracks().forEach((track) => {
         track.addEventListener?.("ended", () => {
@@ -4691,6 +4698,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     let previousBrowserPreview: BrowserSpeechPreview | null = null;
     let previewRecognizer: BrowserSpeechRecognizer | null = null;
     let browserPreviewCaptureOpen = false;
+    const selfHostedStreaming = { current: null as SelfHostedStreamingSpeech | null };
+    let selfHostedPartial = "";
     const researchState: {
       controller: AbortController | null;
       promise: Promise<LiveResearchResponse | null> | null;
@@ -4705,7 +4714,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setLiveResearch({ phase: "idle", sourceCount: 0 });
     try {
       void ownVoice();
-      const { stream, context, analyser } = await ensurePersistentLiveMic();
+      const { stream, context, source, analyser } = await ensurePersistentLiveMic();
       if (!freeLoop.current || sessionEpoch !== liveSessionEpoch.current) return;
       if (context.state === "suspended") await context.resume().catch(() => undefined);
       import("../lib/tts").then((m) => m.warm());
@@ -4828,6 +4837,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           return result;
         }).catch(() => null);
       };
+      // Do not spend local CPU decoding silence. The stream opens only after
+      // this turn's VAD has accepted near-field speech, and has no authority
+      // over a command until it emits its explicit final result.
+      const startSelfHostedStream = () => {
+        if (!selfHostedStreamingSpeechEnabled) return;
+        if (selfHostedStreaming.current) return;
+        selfHostedStreaming.current = startSelfHostedStreamingSpeech({
+          context,
+          source,
+          onPartial: (text) => {
+            const previous = selfHostedPartial;
+            selfHostedPartial = text;
+            startLiveResearch(text, previous);
+          },
+        });
+      };
       recRef.current = rec;
       const t0 = Date.now();
       let vad = createLiveVadState(t0);
@@ -4944,6 +4969,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         });
         vad = result.state;
         if (result.acceptedSpeech) {
+          startSelfHostedStream();
           energyRef.current = Math.min(1, level / 90);
           if (!listeningCaptionShown) {
             listeningCaptionShown = true;
@@ -4997,11 +5023,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         return;
       }
       if (contaminatedByOutput || lastKeyboardActivityRef.current >= t0) {
+        selfHostedStreaming.current?.stop();
         outcome = contaminatedByOutput ? "echo" : "empty";
         return;
       }
       const blob = new Blob(chunks, { type: mime });
       if (!vad.spoke || blob.size < 2000) {
+        selfHostedStreaming.current?.stop();
         outcome = "silence";
         return;
       }
@@ -5009,6 +5037,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       voiceTrace.speechClosedAt = speechClosedAt;
       document.documentElement.dataset.jarvisSpeechClosedMs = String(Math.round(speechClosedAt));
       showCaption({ who: "you", text: "Processing…" });
+      const streamedText = await selfHostedStreaming.current?.finish() ?? "";
       const transcriptSource = chooseLiveTranscriptSource({
         preview: browserPreview,
         sessionId: voiceRequestId,
@@ -5016,7 +5045,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
       });
       let text: string;
-      if (transcriptSource.source === "browser-final") {
+      if (isMeaningfulSpeechTranscript(streamedText)) {
+        text = streamedText;
+        // Reuse the existing bounded "server" metric category rather than
+        // expanding durable telemetry before this optional host is deployed.
+        voiceTrace.transcriptSource = "server";
+        document.documentElement.dataset.jarvisAuthoritativeStt = "self-hosted-stream";
+      } else if (transcriptSource.source === "browser-final") {
         text = transcriptSource.text;
         voiceTrace.transcriptSource = "browser-final";
         document.documentElement.dataset.jarvisAuthoritativeStt = "browser-final";
@@ -5121,6 +5156,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       // Also fences a delayed embedded ownership grant after cancellation.
       browserPreviewCaptureOpen = false;
       try { (previewRecognizer as BrowserSpeechRecognizer | null)?.abort?.(); } catch { /* preview already stopped */ }
+      selfHostedStreaming.current?.stop();
       pendingSttController?.abort();
       researchState.controller?.abort();
       if (outcome !== "speech") voiceInterruptionPendingRef.current = false;
