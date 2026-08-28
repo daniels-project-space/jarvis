@@ -120,6 +120,16 @@ describe("wake command capture", () => {
     expect(state).toHaveBeenLastCalledWith(true);
   });
 
+  it("reports inactive when the browser revokes wake-listener permission", () => {
+    vi.stubGlobal("window", { webkitSpeechRecognition: FakeSpeechRecognition });
+    const state = vi.fn();
+
+    startWake(vi.fn(), state);
+    FakeSpeechRecognition.instance?.onerror?.({ error: "not-allowed" });
+
+    expect(state).toHaveBeenLastCalledWith(false);
+  });
+
   it("waits for the native recognizer start event before reporting standby ready", () => {
     class DelayedSpeechRecognition extends FakeSpeechRecognition {
       start = vi.fn();

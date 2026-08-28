@@ -2693,9 +2693,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           releaseStandbyListener();
           return;
         }
-        m.startWake(onWake, (listening) => setWake(listening), onWakeDetected);
+        m.startWake(onWake, (listening) => {
+          setWake(listening);
+          // `wakeword` reports false only after a terminal local recognizer
+          // failure. Do not keep renewing a remote lease for a listener that
+          // no longer exists; a stale callback cannot release a newer lease.
+          if (!listening && standbyLeaseOwnedRef.current && isCurrentStandbyLease(lease)) {
+            releaseStandbyListener();
+          }
+        }, onWakeDetected);
       }
-      maintainStandbyHeartbeat();
+      // A synchronous recognizer failure above may have released this lease.
+      // Do not leave a heartbeat timer behind to keep it alive accidentally.
+      if (standbyLeaseOwnedRef.current && isCurrentStandbyLease(lease)) {
+        maintainStandbyHeartbeat();
+      }
     })();
   };
   // An embedded frame learns its verified host origin after its first render.
