@@ -11,6 +11,7 @@ import {
   FleetCommandCenter,
   FleetDag,
   WorkerDetail,
+  compactWorkCardSelection,
   fetchWorkRealtimeTicket,
   fleetDagLayout,
   fleetNodeStateLabel,
@@ -157,7 +158,7 @@ describe("FleetCommandCenter", () => {
     expect(realtimeWorkSignalState("job-1", metadata, { finished: true })).toBe("durable");
   });
 
-  it("streams the attention task first while keeping every parallel task visible", () => {
+  it("streams the attention task first while preserving a meaningful secondary task", () => {
     const attention = node({ jobId: "job-attention", label: "Approval gate", needsDaniel: true, state: "needs_input", progress: "Choose the production cap", progressAt: 20 });
     const freshest = node({ id: "parallel", jobId: "job-parallel", label: "Parallel validation", progress: "Running mobile checks", progressAt: 90 });
     const snapshot: CompactWorkSnapshot = {
@@ -176,6 +177,76 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain("Your input is needed");
     expect(markup).toContain("Running mobile checks");
     expect(markup.match(/data-work-card=/g)).toHaveLength(2);
+  });
+
+  it("caps collapsed work to the current task plus one meaningful secondary and keeps the remainder on demand", () => {
+    const attention = node({
+      id: "attention",
+      jobId: "job-attention",
+      label: "Approval gate",
+      needsDaniel: true,
+      state: "needs_input",
+      progress: "Choose the production cap",
+      progressAt: 40,
+    });
+    const executing = node({
+      id: "executing",
+      jobId: "job-executing",
+      label: "Live validation",
+      state: "running",
+      progress: "Checking the visual surface",
+      progressAt: 30,
+    });
+    const queued = node({
+      id: "queued",
+      jobId: "job-queued",
+      label: "Queued background task",
+      state: "queued",
+      progress: "Waiting for a worker",
+      progressAt: 20,
+    });
+    const held = node({
+      id: "held",
+      jobId: "job-held",
+      label: "Held follow-up",
+      state: "dependency_held",
+      progress: "Waiting for earlier work",
+      progressAt: 10,
+    });
+    const nodes = [attention, executing, queued, held];
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      active: { ...work.active!, id: attention.jobId, needsDaniel: true },
+      fleet: { ...work.fleet!, attentionCount: 1, nodes },
+      hierarchy: [{ ...work.hierarchy[0], projects: [{ ...work.hierarchy[0].projects[0], jobs: nodes }] }],
+    };
+
+    const selection = compactWorkCardSelection(snapshot);
+    expect(selection.visibleCards.map((entry) => entry.jobId)).toEqual(["job-attention", "job-executing"]);
+    expect(selection.hiddenCount).toBe(2);
+
+    const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={snapshot} />);
+    expect(markup.match(/data-work-card=/g)).toHaveLength(2);
+    expect(markup).toContain('data-work-more="true"');
+    expect(markup).toContain("+2 more work");
+    expect(markup).toContain("Open all 4 active Jarvis tasks; 2 more available");
+    expect(markup).not.toContain("Queued background task");
+    expect(markup).not.toContain("Held follow-up");
+  });
+
+  it("keeps the collapsed view to one current task when remaining work is not actionable or executing", () => {
+    const current = node({ id: "current", jobId: "job-current", label: "Current task", progressAt: 20 });
+    const queued = node({ id: "queued", jobId: "job-queued", label: "Queued background task", state: "queued", progressAt: 10 });
+    const snapshot: CompactWorkSnapshot = {
+      ...work,
+      active: { ...work.active!, id: current.jobId },
+      fleet: { ...work.fleet!, nodes: [current, queued] },
+      hierarchy: [{ ...work.hierarchy[0], projects: [{ ...work.hierarchy[0].projects[0], jobs: [current, queued] }] }],
+    };
+
+    const selection = compactWorkCardSelection(snapshot);
+    expect(selection.visibleCards.map((entry) => entry.jobId)).toEqual(["job-current"]);
+    expect(selection.hiddenCount).toBe(1);
   });
 
   it("uses plain-English task, model, and recoverable system labels", () => {

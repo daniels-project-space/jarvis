@@ -22,7 +22,7 @@ export default defineConfig({
   reporter: "list",
   retries: 0,
   testDir: "./e2e",
-  testMatch: ["trip-timeline.fixture.spec.ts", "trip-location-follow.fixture.spec.ts", "trip-booked-stay-marker.fixture.spec.ts", "trip-city-itinerary-scope.fixture.spec.ts", "apple-maps-offline.fixture.spec.ts", "spoken-caption-layout.fixture.spec.ts", "artifact-card.fixture.spec.ts", "private-video-player.fixture.spec.ts", "private-pdf-viewer.fixture.spec.ts", "work-map-bubble.fixture.spec.ts", "orb-mood.fixture.spec.ts"],
+  testMatch: ["trip-timeline.fixture.spec.ts", "trip-location-follow.fixture.spec.ts", "trip-booked-stay-marker.fixture.spec.ts", "trip-city-itinerary-scope.fixture.spec.ts", "apple-maps-offline.fixture.spec.ts", "spoken-caption-layout.fixture.spec.ts", "artifact-card.fixture.spec.ts", "private-video-player.fixture.spec.ts", "private-pdf-viewer.fixture.spec.ts", "work-map-bubble.fixture.spec.ts", "compact-work.fixture.spec.ts", "orb-mood.fixture.spec.ts"],
   timeout: 30_000,
   use: {
     baseURL: `http://127.0.0.1:${port}`,

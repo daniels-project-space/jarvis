@@ -39,6 +39,9 @@ const EDGE_STYLE: Record<FleetEdge["readiness"], string> = {
   waiting: "#526274", ready: "#7dd3fc", delivered: "#34d399", blocked: "#fb7185",
 };
 
+const COMPACT_WORK_CARD_LIMIT = 2;
+const EXECUTING_WORK_STATES = new Set<FleetNode["state"]>(["dispatching", "running", "reviewing", "integrating"]);
+
 function agentName(id: string) {
   return ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry", jarvis: "JARVIS" } as Record<string, string>)[id]
     ?? id.charAt(0).toUpperCase() + id.slice(1);
@@ -642,8 +645,7 @@ export function liveWorkSignalNode(snapshot: CompactWorkSnapshot) {
         (right.progressAt ?? 0) - (left.progressAt ?? 0)
       )[0] ?? null
     : null;
-  const executingStates = new Set<FleetNode["state"]>(["dispatching", "running", "reviewing", "integrating"]);
-  const executing = candidates.filter((node) => executingStates.has(node.state));
+  const executing = candidates.filter((node) => EXECUTING_WORK_STATES.has(node.state));
   const freshestExecuting = [...executing].sort((left, right) =>
     Number(Boolean(right.workerRunId)) - Number(Boolean(left.workerRunId))
       || (right.progressAt ?? 0) - (left.progressAt ?? 0)
@@ -653,6 +655,36 @@ export function liveWorkSignalNode(snapshot: CompactWorkSnapshot) {
     (right.progressAt ?? 0) - (left.progressAt ?? 0)
   )[0] ?? null;
   return attentionNode ?? freshestExecuting ?? activeNode ?? freshestFallback;
+}
+
+function meaningfulCompactSecondary(node: FleetNode) {
+  return node.needsDaniel || Boolean(node.attentionKind) || EXECUTING_WORK_STATES.has(node.state);
+}
+
+export function compactWorkCardSelection(
+  snapshot: CompactWorkSnapshot,
+  signalNode: FleetNode | null = liveWorkSignalNode(snapshot),
+) {
+  const nodes = liveWorkNodes(snapshot);
+  const liveCards = nodes.filter(isLiveWorkCardNode);
+  const allCards = liveCards.length
+    ? liveCards
+    : nodes.filter((node) => node.state !== "done" && node.projectionKind === "supervisor_planning");
+  const primary = signalNode
+    ? allCards.find((node) => node.jobId === signalNode.jobId) ?? null
+    : null;
+  const first = primary ?? allCards[0] ?? null;
+  if (!first) return { allCards, visibleCards: [] as FleetNode[], hiddenCount: 0 };
+
+  // Keep one current task in view. A second card earns its place only when it
+  // needs attention or is actively moving; the full fleet remains one click away.
+  const secondary = allCards.find((node) => node.jobId !== first.jobId && meaningfulCompactSecondary(node)) ?? null;
+  const visibleCards = [first, ...(secondary ? [secondary] : [])].slice(0, COMPACT_WORK_CARD_LIMIT);
+  return {
+    allCards,
+    visibleCards,
+    hiddenCount: Math.max(0, allCards.length - visibleCards.length),
+  };
 }
 
 export function liveWorkFreshnessLabel(progressAt: number | null, now: number | null) {
@@ -913,14 +945,10 @@ function CompactLiveWorkBubbleView({
   onOpen: (jobId?: string) => void;
 }) {
   const active = snapshot.active!;
-  const nodes = liveWorkNodes(snapshot);
-  const liveCards = nodes.filter(isLiveWorkCardNode);
-  const cards = liveCards.length
-    ? liveCards
-    : nodes.filter((node) => node.state !== "done" && node.projectionKind === "supervisor_planning");
+  const { allCards, visibleCards, hiddenCount } = compactWorkCardSelection(snapshot, signalNode);
   const circumference = 100;
 
-  if (!cards.length) return null;
+  if (!visibleCards.length) return null;
 
   return (
     <aside
@@ -928,10 +956,10 @@ function CompactLiveWorkBubbleView({
       data-work-id={active.id}
       data-work-realtime={realtimeState}
       aria-live="off"
-      aria-label={`${cards.length || 1} active Jarvis task${cards.length === 1 ? "" : "s"}`}
+      aria-label={`${allCards.length} active Jarvis task${allCards.length === 1 ? "" : "s"}${hiddenCount ? `; ${visibleCards.length} shown` : ""}`}
       className="scrollbar-thin absolute left-2 top-2 z-30 max-h-[42vh] w-[min(360px,calc(100%-16px))] overflow-y-auto pr-0.5 sm:left-3 sm:top-3 sm:max-h-[calc(100vh-96px)]"
     >
-      <div className="space-y-1.5">{cards.map((durableNode) => {
+      <div className="space-y-1.5">{visibleCards.map((durableNode) => {
         const node = signalNode?.jobId === durableNode.jobId ? signalNode : durableNode;
         const percent = Math.max(0, Math.min(100, node.percent));
         const progress = node.progress.trim() || node.stage;
@@ -974,8 +1002,19 @@ function CompactLiveWorkBubbleView({
           </span>
           <span className="absolute inset-x-2 bottom-0 h-px overflow-hidden rounded-full bg-white/[0.06]" aria-hidden="true"><span data-work-progress-meter className={`work-progress-meter block h-full rounded-full ${meterClass}`} style={{ width: `${percent}%` }} /></span>
         </button>;
-      })}</div>
-      <span className="sr-only" aria-live="polite" aria-atomic="true">{cards.length} active tasks. Latest progress is shown on each card.</span>
+      })}
+        {hiddenCount > 0 && <button
+          type="button"
+          data-work-more
+          onClick={() => onOpen()}
+          aria-label={`Open all ${allCards.length} active Jarvis tasks; ${hiddenCount} more available`}
+          className="glass flex w-full items-center justify-between rounded-xl !border-cyan/20 bg-[#071019]/86 px-3 py-2 text-left transition hover:!border-cyan/50 hover:bg-cyan/[0.05] motion-reduce:transition-none"
+        >
+          <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-cyan">+{hiddenCount} more work</span>
+          <span className="font-mono text-[8px] text-slate">view all ›</span>
+        </button>}
+      </div>
+      <span className="sr-only" aria-live="polite" aria-atomic="true">{allCards.length} active tasks. {hiddenCount ? `${visibleCards.length} shown; ${hiddenCount} more available in the full work view.` : "Latest progress is shown on each card."}</span>
     </aside>
   );
 }

@@ -34,6 +34,9 @@ const contentTypes: Record<string, string> = {
   "/work-map": "text/html; charset=utf-8",
   "/work-map.js": "text/javascript; charset=utf-8",
   "/work-map.css": "text/css; charset=utf-8",
+  "/compact-work": "text/html; charset=utf-8",
+  "/compact-work.js": "text/javascript; charset=utf-8",
+  "/compact-work.css": "text/css; charset=utf-8",
   "/orb-mood": "text/html; charset=utf-8",
   "/orb-mood.js": "text/javascript; charset=utf-8",
   "/location": "text/html; charset=utf-8",
@@ -178,6 +181,22 @@ const workMapFixtureHtml = [
   "</html>",
 ].join("\n");
 
+const compactWorkFixtureHtml = [
+  "<!doctype html>",
+  "<html lang=\"en\">",
+  "  <head>",
+  "    <meta charset=\"utf-8\" />",
+  "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+  "    <title>Jarvis compact work fixture</title>",
+  "    <link rel=\"stylesheet\" href=\"/compact-work.css\" />",
+  "  </head>",
+  "  <body>",
+  "    <div id=\"root\"></div>",
+  "    <script src=\"/compact-work.js\" defer></script>",
+  "  </body>",
+  "</html>",
+].join("\n");
+
 const orbMoodFixtureHtml = `<!doctype html>
 <html lang="en">
   <head>
@@ -264,6 +283,10 @@ async function main() {
 
   await build({
   absWorkingDir: projectRoot,
+  // The compact-work browser fixture imports the real component but keeps its
+  // worker run unset. Keep this test bundle from traversing a Node-only
+  // realtime transport that the fixture never exercises.
+  alias: { "@trigger.dev/react-hooks": join(projectRoot, "e2e/fixtures/trigger-react-hooks.browser.ts") },
   bundle: true,
   define: { "process.env.NODE_ENV": JSON.stringify("test") },
   entryNames: "[name]",
@@ -279,6 +302,7 @@ async function main() {
     "offline-map": join(projectRoot, "e2e/fixtures/apple-maps-offline.browser.tsx"),
     "city-itinerary": join(projectRoot, "e2e/fixtures/trip-city-itinerary-scope.browser.tsx"),
     "work-map": join(projectRoot, "e2e/fixtures/work-map-bubble.browser.tsx"),
+    "compact-work": join(projectRoot, "e2e/fixtures/compact-work.browser.tsx"),
     "orb-mood": join(projectRoot, "e2e/fixtures/orb-mood.browser.tsx"),
   },
   format: "iife",
@@ -306,6 +330,7 @@ async function main() {
   const offlineMapJsPath = join(outputDir, "offline-map.js");
   const cityItineraryJsPath = join(outputDir, "city-itinerary.js");
   const workMapJsPath = join(outputDir, "work-map.js");
+  const compactWorkJsPath = join(outputDir, "compact-work.js");
   const orbMoodJsPath = join(outputDir, "orb-mood.js");
   await Promise.all([
     access(fixtureJsPath),
@@ -321,6 +346,7 @@ async function main() {
     access(offlineMapJsPath),
     access(cityItineraryJsPath),
     access(workMapJsPath),
+    access(compactWorkJsPath),
     access(orbMoodJsPath),
   ]);
 
@@ -453,12 +479,22 @@ async function main() {
     response.end(workMapFixtureHtml);
     return;
   }
+  if (pathname === "/compact-work") {
+    response.writeHead(200);
+    response.end(compactWorkFixtureHtml);
+    return;
+  }
   if (pathname === "/orb-mood") {
     response.writeHead(200);
     response.end(orbMoodFixtureHtml);
     return;
   }
   if (pathname === "/work-map.css") {
+    response.writeHead(200);
+    response.end(workMapCss);
+    return;
+  }
+  if (pathname === "/compact-work.css") {
     response.writeHead(200);
     response.end(workMapCss);
     return;
@@ -494,6 +530,7 @@ async function main() {
     "/caption.js": captionJsPath,
     "/caption.css": captionCssPath,
     "/work-map.js": workMapJsPath,
+    "/compact-work.js": compactWorkJsPath,
     "/orb-mood.js": orbMoodJsPath,
     "/location.js": locationJsPath,
     "/booking-marker.js": bookingMarkerJsPath,
