@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { task } from "@trigger.dev/sdk/v3";
+import { task, tasks } from "@trigger.dev/sdk/v3";
 import { FileExtractionError, extractPrivateFile, type FileExtractionResult } from "../lib/file-extraction";
 import { trustedReadyDuplicate, type ReadyDuplicateRecord } from "../lib/file-dedupe";
-import { privateFileObjectKey, privateR2Delete, privateR2Get, privateR2Put } from "../lib/private-r2";
+import { privateFileObjectKey, privateR2Get, privateR2Put } from "../lib/private-r2";
 import { applyPrivateMediaAnalysis, MediaTranscriptionError, transcribePrivateMedia } from "./media-transcription";
 import { extractVideoPreview, MediaFrameExtractionError } from "./media-frame-extraction";
 
@@ -18,6 +18,49 @@ type ClaimedFile = {
   r2Key: string;
   ingestVersion: number;
 };
+type IngestCommitReceipt = {
+  committed?: boolean;
+  status?: "ready" | "stored_only";
+};
+type IngestCleanupEnqueue = IngestCommitReceipt & {
+  outboxId?: string;
+  waiting?: boolean;
+  enqueued?: boolean;
+  conflict?: boolean;
+};
+
+class StaleIngestCompletionError extends Error {
+  constructor(readonly reason?: string) {
+    super("completeIngest lost its claim");
+  }
+}
+
+const INGEST_RECEIPT_RECONCILIATION_ATTEMPTS = 3;
+
+function isIngestCommitReceipt(value: unknown): value is IngestCommitReceipt {
+  return Boolean(value && typeof value === "object" && typeof (value as IngestCommitReceipt).committed === "boolean");
+}
+
+async function reconcileIngestCommit(args: {
+  fileId: string;
+  ingestVersion: number;
+  extractedTextR2Key?: string;
+  previewR2Key?: string;
+}): Promise<IngestCommitReceipt | null> {
+  for (let attempt = 0; attempt < INGEST_RECEIPT_RECONCILIATION_ATTEMPTS; attempt += 1) {
+    try {
+      const receipt = await convexCall("query", "files:ingestCommitReceipt", args);
+      if (isIngestCommitReceipt(receipt)) return receipt;
+    } catch {
+      // A response-loss recovery is allowed a short bounded reconciliation
+      // window before it transfers cleanup ownership to the durable outbox.
+    }
+    if (attempt + 1 < INGEST_RECEIPT_RECONCILIATION_ATTEMPTS) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+    }
+  }
+  return null;
+}
 
 async function convexCall(kind: "query" | "mutation", path: string, args: Record<string, unknown>) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -101,6 +144,7 @@ export async function runFileIngest(payload: IngestPayload) {
       .finally(() => { heartbeatBusy = false; });
   }, 30_000);
   let derivedKeys: { extractedTextR2Key?: string; previewR2Key?: string } = {};
+  let completionAttempted = false;
   try {
     const original = await responseBytes(await privateR2Get(claim.r2Key), claim.sizeBytes);
     if (original.byteLength !== claim.sizeBytes) throw new FileExtractionError("stored_size_mismatch", true);
@@ -130,6 +174,7 @@ export async function runFileIngest(payload: IngestPayload) {
       });
     }
     derivedKeys = await writeDerived(fileId, ingestVersion, result);
+    completionAttempted = true;
     const completion = await convexCall("mutation", "files:completeIngest", {
       fileId,
       ingestVersion,
@@ -145,13 +190,68 @@ export async function runFileIngest(payload: IngestPayload) {
       sheetNames: result.sheetNames,
       chunks: result.chunks,
     }) as { ok?: boolean; reason?: string };
-    if (!completion?.ok) {
-      for (const key of Object.values(derivedKeys)) if (key) await privateR2Delete(key).catch(() => undefined);
-      return { fileId, stale: true, reason: completion?.reason };
-    }
+    if (completion?.ok === false) throw new StaleIngestCompletionError(completion.reason);
+    if (completion?.ok !== true) throw new Error("completeIngest returned no durable outcome");
     return { fileId, status: result.status, chunks: result.chunks.length, extractedChars: result.text.length, reused: Boolean(reused) };
   } catch (error) {
-    for (const key of Object.values(derivedKeys)) if (key) await privateR2Delete(key).catch(() => undefined);
+    // completeIngest is terminal and clears its claim token. If its response is
+    // lost after Convex commits, replaying it is stale and the old catch path
+    // would delete the exact objects the durable row now references. Reconcile
+    // the precise worker output first. Every derived-output failure path is
+    // handed to a durable, exact cleanup outbox rather than deleting inline.
+    const hasDerivedKeys = Boolean(derivedKeys.extractedTextR2Key || derivedKeys.previewR2Key);
+    if (completionAttempted) {
+      const receipt = await reconcileIngestCommit({
+        fileId,
+        ingestVersion,
+        extractedTextR2Key: derivedKeys.extractedTextR2Key,
+        previewR2Key: derivedKeys.previewR2Key,
+      });
+      if (receipt?.committed && (receipt.status === "ready" || receipt.status === "stored_only")) {
+        return { fileId, status: receipt.status, recovered: true };
+      }
+      const cleanup = await convexCall("mutation", "files:enqueueIngestDerivedCleanup", {
+        fileId,
+        ingestVersion,
+        claimToken,
+        extractedTextR2Key: derivedKeys.extractedTextR2Key,
+        previewR2Key: derivedKeys.previewR2Key,
+      }).catch(() => null) as IngestCleanupEnqueue | null;
+      if (cleanup?.committed && (cleanup.status === "ready" || cleanup.status === "stored_only")) {
+        return { fileId, status: cleanup.status, recovered: true };
+      }
+      if (cleanup?.outboxId) {
+        await tasks.trigger(
+          "jarvis-file-ingest-derived-cleanup",
+          { outboxId: cleanup.outboxId },
+          { idempotencyKey: `jarvis-file-ingest-derived-cleanup-${cleanup.outboxId}` },
+        ).catch(() => undefined);
+      }
+      if (error instanceof StaleIngestCompletionError && cleanup && !cleanup.conflict) {
+        return { fileId, stale: true, reason: error.reason, cleanupQueued: Boolean(cleanup.outboxId) };
+      }
+      throw error;
+    }
+    if (hasDerivedKeys) {
+      const cleanup = await convexCall("mutation", "files:enqueueIngestDerivedCleanup", {
+        fileId,
+        ingestVersion,
+        claimToken,
+        extractedTextR2Key: derivedKeys.extractedTextR2Key,
+        previewR2Key: derivedKeys.previewR2Key,
+      }).catch(() => null) as IngestCleanupEnqueue | null;
+      if (cleanup?.committed && (cleanup.status === "ready" || cleanup.status === "stored_only")) {
+        return { fileId, status: cleanup.status, recovered: true };
+      }
+      if (cleanup?.outboxId) {
+        await tasks.trigger(
+          "jarvis-file-ingest-derived-cleanup",
+          { outboxId: cleanup.outboxId },
+          { idempotencyKey: `jarvis-file-ingest-derived-cleanup-${cleanup.outboxId}` },
+        ).catch(() => undefined);
+      }
+      throw error;
+    }
     const extractionError = error instanceof FileExtractionError ? error : null;
     await convexCall("mutation", "files:failIngest", {
       fileId,

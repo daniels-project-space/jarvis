@@ -50,10 +50,11 @@ export const insightEngine = schedules.task({
       m("jobs:reapStale").catch(() => ({ requeued: [], abandoned: [] })),
       m("chatQueue:reapStuck").catch(() => ({ requeued: 0 })),
     ]);
-    const [state, pendingFiles, expiredUploads] = await Promise.all([
+    const [state, pendingFiles, expiredUploads, pendingDerivedCleanup] = await Promise.all([
       m("proactive:reconcile", { now: Date.now() }),
       q("files:pendingIngest", { limit: 4 }).catch(() => []),
       m("files:cleanupExpiredReservations", { limit: 2 }).catch(() => []),
+      q("files:pendingIngestDerivedCleanup", { limit: 4 }).catch(() => []),
     ]);
     const recoveryWindow = Math.floor(Date.now() / (2 * 60 * 60_000));
     const ingestRecoveries = [];
@@ -80,6 +81,16 @@ export const insightEngine = schedules.task({
         { idempotencyKey: `jarvis-file-cleanup-reconcile-${fileId}-${recoveryWindow}` },
       ).catch(() => null));
     }
+    const derivedCleanupRecoveries = [];
+    for (const item of Array.isArray(pendingDerivedCleanup) ? pendingDerivedCleanup.slice(0, 4) : []) {
+      const outboxId = String(item?.outboxId ?? "");
+      if (!outboxId) continue;
+      derivedCleanupRecoveries.push(await tasks.trigger(
+        "jarvis-file-ingest-derived-cleanup",
+        { outboxId },
+        { idempotencyKey: `jarvis-file-ingest-derived-cleanup-reconcile-${outboxId}-${recoveryWindow}` },
+      ).catch(() => null));
+    }
     const shouldWake =
       Number(state?.eligiblePending ?? 0) > 0 ||
       (Array.isArray(reaped?.requeued) && reaped.requeued.length > 0) ||
@@ -102,6 +113,7 @@ export const insightEngine = schedules.task({
       stalled: reaped?.stalled?.length ?? 0,
       fileIngestRecoveries: ingestRecoveries.filter(Boolean).length,
       fileCleanupRecoveries: cleanupRecoveries.filter(Boolean).length,
+      fileDerivedCleanupRecoveries: derivedCleanupRecoveries.filter(Boolean).length,
     };
   },
 });

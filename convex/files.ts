@@ -1,7 +1,8 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
 import { paginationOptsValidator } from "convex/server";
-import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
+import { actorAuthArgs, requireActor, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import {
   CHAT_FILE_LIMITS,
   FILE_READY_STATUSES,
@@ -136,6 +137,25 @@ function cleanupKeysForFile(file: any): string[] {
     file.extractedTextR2Key ? String(file.extractedTextR2Key) : `${prefix}/extracted.txt`,
     file.previewR2Key ? String(file.previewR2Key) : `${prefix}/preview.webp`,
   ])];
+}
+
+function derivedIngestKeys(record: { extractedTextR2Key?: string; previewR2Key?: string }): string[] {
+  return [record.extractedTextR2Key, record.previewR2Key].filter((key): key is string => Boolean(key));
+}
+
+type IngestCommitFile = Pick<Doc<"files">, "ingestVersion" | "status" | "extractedTextR2Key" | "previewR2Key">;
+
+function matchesIngestCommit(
+  file: IngestCommitFile | null,
+  expected: { ingestVersion: number; extractedTextR2Key?: string; previewR2Key?: string },
+): boolean {
+  return Boolean(
+    file
+    && file.ingestVersion === expected.ingestVersion
+    && (file.status === "ready" || file.status === "stored_only")
+    && (file.extractedTextR2Key ?? undefined) === expected.extractedTextR2Key
+    && (file.previewR2Key ?? undefined) === expected.previewR2Key,
+  );
 }
 
 /**
@@ -766,6 +786,14 @@ export const claimIngest = mutation({
     await requireActor(ctx, args);
     const file = await ctx.db.get(args.fileId);
     if (!file || file.ingestVersion !== args.ingestVersion) return null;
+    // The same deterministic versioned R2 keys must not be reused while a
+    // response-loss cleanup receipt is still pending. The cleanup worker owns
+    // that exact output set; a fresh claim would otherwise race its DELETE.
+    const pendingDerivedCleanup = await ctx.db
+      .query("fileIngestCleanupOutbox")
+      .withIndex("by_file_version", (q) => q.eq("fileId", file._id).eq("ingestVersion", args.ingestVersion))
+      .first();
+    if (pendingDerivedCleanup) return null;
     const now = Date.now();
     if (file.status === "processing" && Number(file.lastProgressAt ?? 0) > now - INGEST_CLAIM_STALE_MS) return null;
     if (!["uploaded", "error", "processing"].includes(file.status) || file.ingestAttempt >= 3) return null;
@@ -903,6 +931,147 @@ export const completeIngest = mutation({
       updatedAt: now,
     });
     return { ok: true, status: args.status };
+  },
+});
+
+/**
+ * Reconcile an ambiguous completeIngest response without ever replaying the
+ * terminal mutation. The receipt is intentionally exact: a later retry may
+ * reuse the file id but must not make an older worker believe its derived
+ * objects are still authoritative.
+ */
+export const ingestCommitReceipt = query({
+  args: {
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    extractedTextR2Key: v.optional(v.string()),
+    previewR2Key: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const file = await ctx.db.get(args.fileId);
+    if (
+      !file
+      || file.ingestVersion !== args.ingestVersion
+      || (file.status !== "ready" && file.status !== "stored_only")
+      || (file.extractedTextR2Key ?? undefined) !== args.extractedTextR2Key
+      || (file.previewR2Key ?? undefined) !== args.previewR2Key
+    ) {
+      return { committed: false as const };
+    }
+    return { committed: true as const, status: file.status };
+  },
+});
+
+/**
+ * Atomically turn an ambiguous completeIngest outcome into either a confirmed
+ * commit or an exact durable cleanup item. A same-version active claim is
+ * fenced before it can race the cleanup worker's R2 DELETE.
+ */
+export const enqueueIngestDerivedCleanup = mutation({
+  args: {
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    claimToken: v.string(),
+    extractedTextR2Key: v.optional(v.string()),
+    previewR2Key: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const file = await ctx.db.get(args.fileId);
+    const existing = await ctx.db
+      .query("fileIngestCleanupOutbox")
+      .withIndex("by_file_version", (q) => q.eq("fileId", args.fileId).eq("ingestVersion", args.ingestVersion))
+      .first();
+    if (file && matchesIngestCommit(file, args)) {
+      if (existing) await ctx.db.delete(existing._id);
+      return { committed: true as const, status: file.status as "ready" | "stored_only" };
+    }
+    const exactActiveClaim = Boolean(
+      file
+      && file.ingestVersion === args.ingestVersion
+      && file.status === "processing"
+      && file.ingestClaimToken === args.claimToken,
+    );
+    if (file?.ingestVersion === args.ingestVersion && file.status === "processing" && !exactActiveClaim) {
+      // A newer worker owns these deterministic keys. Wait for its durable
+      // terminal state rather than scheduling a cleanup that could delete it.
+      return { committed: false as const, waiting: true as const };
+    }
+    if (file && exactActiveClaim) {
+      const now = Date.now();
+      await ctx.db.patch(file._id, {
+        status: "error",
+        errorCode: "ingest_completion_outcome_unknown",
+        ingestClaimToken: undefined,
+        lastProgressAt: now,
+        updatedAt: now,
+      });
+    }
+    const r2Keys = derivedIngestKeys(args);
+    if (!r2Keys.length) return { committed: false as const, enqueued: false as const };
+    if (existing) {
+      if (
+        (existing.extractedTextR2Key ?? undefined) !== args.extractedTextR2Key
+        || (existing.previewR2Key ?? undefined) !== args.previewR2Key
+      ) {
+        return { committed: false as const, conflict: true as const };
+      }
+      return { committed: false as const, outboxId: existing._id };
+    }
+    const now = Date.now();
+    const outboxId = await ctx.db.insert("fileIngestCleanupOutbox", {
+      fileId: args.fileId,
+      ingestVersion: args.ingestVersion,
+      extractedTextR2Key: args.extractedTextR2Key,
+      previewR2Key: args.previewR2Key,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { committed: false as const, outboxId };
+  },
+});
+
+/** Worker-only fallback sweep for cleanup items whose immediate Trigger call was lost. */
+export const pendingIngestDerivedCleanup = query({
+  args: { limit: v.optional(v.number()), workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const limit = Math.min(12, Math.max(1, Math.floor(args.limit ?? 8)));
+    const rows = await ctx.db.query("fileIngestCleanupOutbox").withIndex("by_createdAt").take(limit);
+    return rows.map((row) => ({ outboxId: row._id, fileId: String(row.fileId), ingestVersion: row.ingestVersion }));
+  },
+});
+
+/** Recheck the durable receipt immediately before an external R2 DELETE. */
+export const claimIngestDerivedCleanup = mutation({
+  args: { outboxId: v.id("fileIngestCleanupOutbox"), workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const outbox = await ctx.db.get(args.outboxId);
+    if (!outbox) return null;
+    const file = await ctx.db.get(outbox.fileId);
+    if (matchesIngestCommit(file, outbox)) {
+      await ctx.db.delete(outbox._id);
+      return { ready: false as const, committed: true as const };
+    }
+    if (file && file.ingestVersion === outbox.ingestVersion && file.status === "processing") {
+      return { ready: false as const, retryAfterMs: 15_000 };
+    }
+    return { ready: true as const, r2Keys: derivedIngestKeys(outbox) };
+  },
+});
+
+export const finishIngestDerivedCleanup = mutation({
+  args: { outboxId: v.id("fileIngestCleanupOutbox"), workerToken: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const outbox = await ctx.db.get(args.outboxId);
+    if (!outbox) return true;
+    await ctx.db.delete(outbox._id);
+    return true;
   },
 });
 

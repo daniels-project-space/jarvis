@@ -31,10 +31,14 @@ const mocks = vi.hoisted(() => {
     privateR2Delete: vi.fn(),
     privateR2Get: vi.fn(),
     privateR2Put: vi.fn(),
+    triggerTask: vi.fn(),
   };
 });
 
-vi.mock("@trigger.dev/sdk/v3", () => ({ task: (definition: unknown) => definition }));
+vi.mock("@trigger.dev/sdk/v3", () => ({
+  task: (definition: unknown) => definition,
+  tasks: { trigger: mocks.triggerTask },
+}));
 vi.mock("../lib/file-extraction", () => ({
   FileExtractionError: mocks.FileExtractionError,
   extractPrivateFile: mocks.extractPrivateFile,
@@ -123,17 +127,56 @@ function analyzedMedia(source: ReturnType<typeof storedVideo>, analysis: {
 function configureConvex(options: {
   complete?: { ok: boolean; reason?: string };
   duplicate?: unknown;
+  throwAfterCommittedCompletion?: boolean;
+  throwAfterUncommittedCompletion?: boolean;
+  receiptFailuresBeforeResponse?: number;
 } = {}) {
   const calls: Array<{ path: string; args: Record<string, unknown> }> = [];
+  let committedCompletion: Record<string, unknown> | null = null;
+  let receiptRequests = 0;
   const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body)) as { path: string; args: Record<string, unknown> };
     calls.push({ path: body.path, args: body.args });
+    if (body.path === "files:completeIngest" && options.throwAfterCommittedCompletion) {
+      // The server mutation has committed, but the caller loses its response.
+      committedCompletion = body.args;
+      throw new Error("simulated response loss after committed completeIngest mutation");
+    }
+    if (body.path === "files:completeIngest" && options.throwAfterUncommittedCompletion) {
+      throw new Error("simulated response loss before completeIngest mutation commits");
+    }
+    if (body.path === "files:ingestCommitReceipt") {
+      receiptRequests += 1;
+      if (receiptRequests <= Number(options.receiptFailuresBeforeResponse ?? 0)) {
+        throw new Error("simulated receipt transport outage");
+      }
+    }
     const value = body.path === "files:claimIngest"
       ? CLAIM
       : body.path === "files:readyDuplicateByHash"
         ? (options.duplicate ?? null)
         : body.path === "files:completeIngest"
           ? (options.complete ?? { ok: true })
+          : body.path === "files:ingestCommitReceipt"
+            ? (
+              committedCompletion
+              && body.args.fileId === committedCompletion.fileId
+              && body.args.ingestVersion === committedCompletion.ingestVersion
+              && body.args.extractedTextR2Key === committedCompletion.extractedTextR2Key
+              && body.args.previewR2Key === committedCompletion.previewR2Key
+                ? { committed: true, status: "ready" }
+                : { committed: false }
+            )
+          : body.path === "files:enqueueIngestDerivedCleanup"
+            ? (
+              committedCompletion
+              && body.args.fileId === committedCompletion.fileId
+              && body.args.ingestVersion === committedCompletion.ingestVersion
+              && body.args.extractedTextR2Key === committedCompletion.extractedTextR2Key
+              && body.args.previewR2Key === committedCompletion.previewR2Key
+                ? { committed: true, status: "ready" }
+                : { committed: false, outboxId: "cleanup-outbox-1" }
+            )
           : null;
     return new Response(JSON.stringify({ value }), { status: 200, headers: { "content-type": "application/json" } });
   });
@@ -152,6 +195,7 @@ describe("private media file ingest", () => {
     });
     mocks.privateR2Put.mockResolvedValue(undefined);
     mocks.privateR2Delete.mockResolvedValue(undefined);
+    mocks.triggerTask.mockResolvedValue({ id: "cleanup-run-1" });
     mocks.extractPrivateFile.mockResolvedValue(storedVideo());
     mocks.extractVideoPreview.mockResolvedValue({
       bytes: new Uint8Array([9, 8, 7]),
@@ -212,14 +256,73 @@ describe("private media file ingest", () => {
     expect(mocks.transcribePrivateMedia).not.toHaveBeenCalled();
   });
 
-  it("removes every derived media object when completion loses its claim", async () => {
-    configureConvex({ complete: { ok: false, reason: "stale_claim" } });
+  it("hands stale completion output to durable cleanup instead of deleting inline", async () => {
+    const { calls } = configureConvex({ complete: { ok: false, reason: "stale_claim" } });
 
-    await expect(runFileIngest({ fileId: "file-1", ingestVersion: 1 })).resolves.toMatchObject({ stale: true });
+    await expect(runFileIngest({ fileId: "file-1", ingestVersion: 1 }))
+      .resolves.toMatchObject({ stale: true, reason: "stale_claim", cleanupQueued: true });
 
-    expect(mocks.privateR2Delete).toHaveBeenCalledWith("owners/daniel/files/file-1/v1/extracted.txt");
-    expect(mocks.privateR2Delete).toHaveBeenCalledWith("owners/daniel/files/file-1/v1/preview.webp");
-    expect(mocks.privateR2Delete).toHaveBeenCalledTimes(2);
+    expect(calls.some((call) => call.path === "files:ingestCommitReceipt")).toBe(true);
+    expect(calls.find((call) => call.path === "files:enqueueIngestDerivedCleanup")?.args).toMatchObject({
+      extractedTextR2Key: "owners/daniel/files/file-1/v1/extracted.txt",
+      previewR2Key: "owners/daniel/files/file-1/v1/preview.webp",
+    });
+    expect(mocks.privateR2Delete).not.toHaveBeenCalled();
+    expect(mocks.triggerTask).toHaveBeenCalledWith(
+      "jarvis-file-ingest-derived-cleanup",
+      { outboxId: "cleanup-outbox-1" },
+      { idempotencyKey: "jarvis-file-ingest-derived-cleanup-cleanup-outbox-1" },
+    );
+  });
+
+  it("keeps committed derived media when the complete response is lost", async () => {
+    const { calls } = configureConvex({ throwAfterCommittedCompletion: true });
+
+    await expect(runFileIngest({ fileId: "file-1", ingestVersion: 1 }))
+      .resolves.toMatchObject({ status: "ready", recovered: true });
+
+    const receipt = calls.find((call) => call.path === "files:ingestCommitReceipt");
+    expect(receipt?.args).toMatchObject({
+      fileId: "file-1",
+      ingestVersion: 1,
+      extractedTextR2Key: "owners/daniel/files/file-1/v1/extracted.txt",
+      previewR2Key: "owners/daniel/files/file-1/v1/preview.webp",
+      workerToken: "worker-token",
+    });
+    expect(calls.map((call) => call.path)).toEqual([
+      "files:claimIngest",
+      "files:readyDuplicateByHash",
+      "files:completeIngest",
+      "files:ingestCommitReceipt",
+    ]);
+    expect(mocks.privateR2Delete).not.toHaveBeenCalled();
+    expect(calls.some((call) => call.path === "files:failIngest")).toBe(false);
+  });
+
+  it("hands an unavailable receipt and non-commit to durable derived cleanup", async () => {
+    const { calls } = configureConvex({
+      throwAfterUncommittedCompletion: true,
+      receiptFailuresBeforeResponse: 1,
+    });
+
+    await expect(runFileIngest({ fileId: "file-1", ingestVersion: 1 }))
+      .rejects.toThrow("simulated response loss before completeIngest mutation commits");
+
+    expect(calls.filter((call) => call.path === "files:ingestCommitReceipt")).toHaveLength(2);
+    const enqueue = calls.find((call) => call.path === "files:enqueueIngestDerivedCleanup");
+    expect(enqueue?.args).toMatchObject({
+      fileId: "file-1",
+      ingestVersion: 1,
+      extractedTextR2Key: "owners/daniel/files/file-1/v1/extracted.txt",
+      previewR2Key: "owners/daniel/files/file-1/v1/preview.webp",
+      workerToken: "worker-token",
+    });
+    expect(mocks.privateR2Delete).not.toHaveBeenCalled();
+    expect(mocks.triggerTask).toHaveBeenCalledWith(
+      "jarvis-file-ingest-derived-cleanup",
+      { outboxId: "cleanup-outbox-1" },
+      { idempotencyKey: "jarvis-file-ingest-derived-cleanup-cleanup-outbox-1" },
+    );
   });
 
   it("keeps an undecodable video honestly stored-only without orphaning a preview", async () => {

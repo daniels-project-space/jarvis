@@ -489,6 +489,22 @@ export default defineSchema({
     .index("by_file_ordinal", ["fileId", "ordinal"])
     .searchIndex("search_text", { searchField: "text", filterFields: ["fileKey"] }),
 
+  // Exact private R2 derivatives that may only be deleted after a lost
+  // completeIngest response has been reconciled against Convex. Keeping this
+  // separate from file metadata makes cleanup survive another worker response
+  // loss without ever treating a retry as proof that the terminal mutation
+  // did not commit.
+  fileIngestCleanupOutbox: defineTable({
+    fileId: v.id("files"),
+    ingestVersion: v.number(),
+    extractedTextR2Key: v.optional(v.string()),
+    previewR2Key: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_file_version", ["fileId", "ingestVersion"])
+    .index("by_createdAt", ["createdAt"]),
+
   // Stable citations let maps/charts/boards show where a value came from and
   // prevent permanent deletion while a saved creation still depends on it.
   creationFileRefs: defineTable({

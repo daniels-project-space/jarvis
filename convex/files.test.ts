@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { CHAT_FILE_LIMITS, privateFileSourceKey } from "../src/lib/chat-files";
 import { TURN_FILE_LEASE_MS } from "./files";
@@ -107,6 +108,45 @@ async function makeReady(
     workerToken: WORKER,
   });
   return { batch, fileId };
+}
+
+async function makeProcessing(
+  t: ReturnType<typeof convexTest>,
+  threadId: string,
+  name: string,
+  sha256: string,
+  mimeType = "text/plain",
+) {
+  const batch = await reserve(t, threadId, name, sha256, 1, mimeType);
+  const fileId = batch.files[0].fileId;
+  const typedFileId = fileId as Id<"files">;
+  const typedBatchId = batch.batchId as Id<"uploadBatches">;
+  const uploadClaimToken = `upload-claim-${sha256.slice(0, 20)}`;
+  await t.mutation(api.files.claimUpload, {
+    batchId: typedBatchId,
+    fileId: typedFileId,
+    claimToken: uploadClaimToken,
+    contentType: mimeType,
+    sha256,
+    workerToken: WORKER,
+  });
+  await t.mutation(api.files.markUploaded, {
+    batchId: typedBatchId,
+    fileId: typedFileId,
+    sizeBytes: 24,
+    contentType: mimeType,
+    sha256,
+    claimToken: uploadClaimToken,
+    workerToken: WORKER,
+  });
+  const claimToken = `ingest-claim-${name}`;
+  await t.mutation(api.files.claimIngest, {
+    fileId: typedFileId,
+    ingestVersion: 1,
+    claimToken,
+    workerToken: WORKER,
+  });
+  return { batch, fileId, claimToken };
 }
 
 describe("durable private chat files", () => {
@@ -739,6 +779,76 @@ describe("durable private chat files", () => {
     });
     expect(match?.file._id).toBe(source.fileId);
     expect(match?.chunks).toEqual([{ ordinal: 0, text: "deduplicated deterministic text", page: undefined, sheet: undefined, cellRange: undefined }]);
+  });
+
+  it("returns an exact worker-only receipt for a committed ingest", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "2".repeat(64);
+    const { fileId } = await makeReady(t, "main", "receipt.txt", sha256, "durable ingest receipt");
+    const receiptArgs = {
+      fileId: fileId as any,
+      ingestVersion: 1,
+      extractedTextR2Key: `files/${fileId}/v1/extracted.txt`,
+      workerToken: WORKER,
+    };
+
+    await expect(t.query(api.files.ingestCommitReceipt, receiptArgs))
+      .resolves.toEqual({ committed: true, status: "ready" });
+    await expect(t.query(api.files.ingestCommitReceipt, {
+      ...receiptArgs,
+      extractedTextR2Key: `files/${fileId}/v1/other.txt`,
+    })).resolves.toEqual({ committed: false });
+    await expect(t.query(api.files.ingestCommitReceipt, {
+      ...receiptArgs,
+      workerToken: undefined,
+    })).rejects.toThrow(/Unauthorized worker capability/);
+  });
+
+  it("durably fences an ambiguous ingest before derived cleanup can run", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "3".repeat(64);
+    const { fileId, claimToken } = await makeProcessing(t, "main", "response-loss.txt", sha256);
+    const typedFileId = fileId as Id<"files">;
+    const cleanup = await t.mutation(api.files.enqueueIngestDerivedCleanup, {
+      fileId: typedFileId,
+      ingestVersion: 1,
+      claimToken,
+      extractedTextR2Key: `owners/daniel/files/${fileId}/v1/extracted.txt`,
+      previewR2Key: `owners/daniel/files/${fileId}/v1/preview.webp`,
+      workerToken: WORKER,
+    });
+    expect(cleanup).toMatchObject({ committed: false, outboxId: expect.anything() });
+    if (!cleanup.outboxId) throw new Error("missing durable cleanup outbox id");
+    const outboxId = cleanup.outboxId;
+    expect(await t.mutation(api.files.claimIngest, {
+      fileId: typedFileId,
+      ingestVersion: 1,
+      claimToken: "must-not-race-cleanup",
+      workerToken: WORKER,
+    })).toBeNull();
+
+    const pending = await t.query(api.files.pendingIngestDerivedCleanup, { workerToken: WORKER });
+    expect(pending).toEqual([expect.objectContaining({ outboxId, fileId: String(fileId), ingestVersion: 1 })]);
+    expect(await t.mutation(api.files.claimIngestDerivedCleanup, {
+      outboxId,
+      workerToken: WORKER,
+    })).toEqual({
+      ready: true,
+      r2Keys: [
+        `owners/daniel/files/${fileId}/v1/extracted.txt`,
+        `owners/daniel/files/${fileId}/v1/preview.webp`,
+      ],
+    });
+    expect(await t.mutation(api.files.finishIngestDerivedCleanup, {
+      outboxId,
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.mutation(api.files.claimIngest, {
+      fileId: typedFileId,
+      ingestVersion: 1,
+      claimToken: "claim-after-cleanup",
+      workerToken: WORKER,
+    })).toMatchObject({ status: "processing" });
   });
 
   it("fences concurrent PUT claims and accepts only the winning claim token", async () => {
