@@ -6,6 +6,7 @@ import {
   LIVE_COMPLETE_QUESTION_END_SILENCE_MS,
   LIVE_END_SILENCE_MS,
   LIVE_SPEAKER_TAIL_MS,
+  LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS,
   LIVE_UNFINISHED_END_SILENCE_MS,
   advanceLiveVad,
   createLiveVadState,
@@ -146,6 +147,40 @@ describe("live full-duplex voice gate", () => {
     const statement = "I want to understand how its voice agent works";
     expect(liveEndpointSilenceMs(statement)).toBe(LIVE_END_SILENCE_MS);
     expect(shouldCloseLiveUtterance(state, 2_000 + LIVE_COMPLETE_QUESTION_END_SILENCE_MS + 1, statement)).toBe(false);
+  });
+
+  it("uses the faster boundary only for an exact trusted browser-final question", () => {
+    const state = { ...createLiveVadState(1_000), spoke: true, lastVoice: 2_000 };
+    const question = "How does Sesame train its voice agent?";
+    expect(shouldCloseLiveUtterance(
+      state,
+      state.lastVoice + LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS,
+      question,
+      true,
+    )).toBe(false);
+    expect(shouldCloseLiveUtterance(
+      state,
+      state.lastVoice + LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS + 1,
+      question,
+      true,
+    )).toBe(true);
+    expect(shouldCloseLiveUtterance(
+      state,
+      state.lastVoice + LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS + 1,
+      question,
+    )).toBe(false);
+    expect(shouldCloseLiveUtterance(
+      state,
+      state.lastVoice + LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS + 1,
+      "I need you to help me with this",
+      true,
+    )).toBe(false);
+    expect(shouldCloseLiveUtterance(
+      state,
+      state.lastVoice + LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS + 1,
+      "How can I explain this to you —",
+      true,
+    )).toBe(false);
   });
 
   it("extends endpointing for an unfinished connective and a self-correction", () => {

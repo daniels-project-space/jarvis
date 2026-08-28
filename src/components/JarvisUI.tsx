@@ -4953,8 +4953,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           void import("../lib/tts").then((m) => m.stopSpeaking());
           setSpeaking(false);
         }
+        const trustedBrowserFinal = chooseLiveTranscriptSource({
+          preview: browserPreview,
+          sessionId: voiceRequestId,
+          currentVoiceAt: vad.lastVoice,
+          sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+        }).source === "browser-final";
         if (
-          shouldCloseLiveUtterance(vad, now, browserPreview?.text)
+          shouldCloseLiveUtterance(vad, now, browserPreview?.text, trustedBrowserFinal)
           || (!vad.spoke && now - t0 > 8000)
           || now - t0 > 25_000
         ) {

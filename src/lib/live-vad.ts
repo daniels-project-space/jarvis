@@ -29,6 +29,10 @@ export type LiveVadFrame = {
 // inform this boundary, but authoritative server STT never runs before it.
 export const LIVE_END_SILENCE_MS = 1_150;
 export const LIVE_COMPLETE_QUESTION_END_SILENCE_MS = 720;
+// A strongly-confident browser final is useful only after the same exact VAD
+// fence that permits it to replace server STT. This trims the remaining turn
+// boundary for a clear question without shortening statements or corrections.
+export const LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS = 420;
 export const LIVE_UNFINISHED_END_SILENCE_MS = 1_550;
 // Do not merely ask VAD to ignore Jarvis's loudspeaker. Do not open an
 // utterance recording at all until the room has lost its acoustic tail.
@@ -101,21 +105,26 @@ function isUnfinishedPartial(transcript: string): boolean {
     || TRAILING_SELF_CORRECTION.test(withoutClosingPunctuation);
 }
 
+function isClearCompleteQuestion(transcript: string): boolean {
+  const words = transcript.replace(/[^\p{L}\p{N}' ]/gu, " ").trim().split(/\s+/).filter(Boolean);
+  const punctuatedQuestion = transcript.endsWith("?") && words.length >= 3;
+  const syntacticQuestion = words.length >= 4 && CLEAR_QUESTION.test(transcript);
+  return punctuatedQuestion || syntacticQuestion;
+}
+
 /**
  * A deterministic endpoint policy for an optional authoritative partial.
  * Only an unmistakably complete question gets the shorter pause. Statements
  * keep the proven default, while dangling clauses and corrections get room to
- * finish. Provisional browser-only text should not be passed here.
+ * finish. Provisional browser text may use this normal policy, but only an
+ * exact VAD-fenced final may opt into the faster trusted-final boundary.
  */
 export function liveEndpointSilenceMs(authoritativePartialTranscript?: string): number {
   const transcript = normalizedTranscript(authoritativePartialTranscript);
   if (!transcript) return LIVE_END_SILENCE_MS;
   if (isUnfinishedPartial(transcript)) return LIVE_UNFINISHED_END_SILENCE_MS;
 
-  const words = transcript.replace(/[^\p{L}\p{N}' ]/gu, " ").trim().split(/\s+/).filter(Boolean);
-  const punctuatedQuestion = transcript.endsWith("?") && words.length >= 3;
-  const syntacticQuestion = words.length >= 4 && CLEAR_QUESTION.test(transcript);
-  return punctuatedQuestion || syntacticQuestion
+  return isClearCompleteQuestion(transcript)
     ? LIVE_COMPLETE_QUESTION_END_SILENCE_MS
     : LIVE_END_SILENCE_MS;
 }
@@ -124,9 +133,17 @@ export function shouldCloseLiveUtterance(
   state: LiveVadState,
   now: number,
   authoritativePartialTranscript?: string,
+  trustedBrowserFinal = false,
 ): boolean {
+  const transcript = normalizedTranscript(authoritativePartialTranscript);
+  const trustedQuestionFinal = trustedBrowserFinal
+    && !isUnfinishedPartial(transcript)
+    && isClearCompleteQuestion(transcript);
+  const silenceMs = trustedQuestionFinal
+    ? LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS
+    : liveEndpointSilenceMs(transcript);
   return state.spoke
-    && now - state.lastVoice > liveEndpointSilenceMs(authoritativePartialTranscript);
+    && now - state.lastVoice > silenceMs;
 }
 
 const READ_ONLY_RESEARCH_INTENT = /\b(?:research|look up|find out|investigate|compare|explain|tell me about|what|why|how|who|where|when|which)\b/i;
