@@ -16,6 +16,8 @@ const CONVEX =
 const REPO = "daniels-project-space/jarvis-memory";
 
 type MemoryRow = { kind?: unknown; title?: unknown; body?: unknown; tags?: unknown[] };
+type MemoryReconciliation = { cycle?: unknown; cutoffAt?: unknown; cursor?: unknown };
+type MemoryReconciliationPage = { items?: unknown; isDone?: unknown; continueCursor?: unknown };
 type AttentionRow = { title?: unknown; detail?: unknown; status?: unknown };
 type BusinessRow = { domain?: unknown; headline?: unknown; detail?: unknown };
 type ProjectRow = { slug?: unknown; status?: unknown; summary?: unknown; data?: { recent?: unknown } };
@@ -36,22 +38,28 @@ export function obsidianMemoryFolderForKind(kind: unknown): string | null {
   return OBSIDIAN_MEMORY_FOLDERS[String(kind || "fact")] ?? null;
 }
 
-async function q(path: string, args: unknown) {
+async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   try {
-    return (
-      await (
-        await fetch(`${CONVEX}/api/query`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
-        })
-      ).json()
-    ).value;
+    const response = await fetch(`${CONVEX}/api/${kind}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, args: { ...((args ?? {}) as Record<string, unknown>), workerToken }, format: "json" }),
+    });
+    const payload = await response.json().catch(() => null) as { value?: unknown; status?: string } | null;
+    return response.ok && payload?.status !== "error" ? payload?.value ?? null : null;
   } catch {
     return null;
   }
+}
+
+async function q(path: string, args: unknown) {
+  return await convexCall("query", path, args);
+}
+
+async function m(path: string, args: unknown) {
+  return await convexCall("mutation", path, args);
 }
 function sh(cmd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string }> {
   return new Promise((res) => {
@@ -99,7 +107,30 @@ export const memoryVault = schedules.task({
     await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], env);
     await sh("git", ["-C", dir, "config", "user.name", "JARVIS"], env);
 
-    const mem = ((await q("memory:recent", { limit: 60 })) as MemoryRow[] | null) ?? [];
+    const reconciliation = await m("memory:beginObsidianReconciliation", {}) as MemoryReconciliation | null;
+    const cycle = Number(reconciliation?.cycle);
+    const cutoffAt = Number(reconciliation?.cutoffAt);
+    const cursor = typeof reconciliation?.cursor === "string" ? reconciliation.cursor : undefined;
+    if (!Number.isSafeInteger(cycle) || cycle < 1 || !Number.isFinite(cutoffAt)) {
+      return { error: "memory reconciliation unavailable" };
+    }
+    const reconciliationPage = await q("memory:obsidianReconciliationPage", {
+      cycle,
+      cutoffAt,
+      ...(cursor ? { cursor } : {}),
+    }) as MemoryReconciliationPage | null;
+    const isDone = reconciliationPage?.isDone === true;
+    const continueCursor = typeof reconciliationPage?.continueCursor === "string"
+      ? reconciliationPage.continueCursor
+      : undefined;
+    if (!reconciliationPage || !Array.isArray(reconciliationPage.items) || (!isDone && !continueCursor)) {
+      return { error: "memory reconciliation page unavailable" };
+    }
+    const mem = reconciliationPage.items as MemoryRow[];
+    // The daily log stays a compact current summary. The resumable page above
+    // is deliberately oldest-first, so it must not drive this owner-facing
+    // recency view.
+    const recentMem = ((await q("memory:recent", { limit: 15 })) as MemoryRow[] | null) ?? [];
     const attention = ((await q("attention:list", { status: "open", limit: 10 })) as AttentionRow[] | null) ?? [];
     const biz = ((await q("business:list", {})) as BusinessRow[] | null) ?? [];
     const stack = ((await q("projectState:list", {})) as ProjectRow[] | null) ?? [];
@@ -116,7 +147,7 @@ export const memoryVault = schedules.task({
       ...(attention.length ? attention.map((item) => `- **${clean(item.title)}** — ${clean(item.detail)}`) : ["- (none)"]),
       "",
       "## Remembered",
-      ...mem
+      ...recentMem
         .slice(0, 15)
         .map((m) => safeMemoryNote(m.title, m.body))
         .filter((note): note is { title: string; body: string } => Boolean(note))
@@ -187,13 +218,43 @@ export const memoryVault = schedules.task({
       notes++;
     }
 
-    await sh("git", ["-C", dir, "add", "-A"], env);
-    const commit = await sh("git", ["-C", dir, "commit", "-m", `memory: consolidate ${date}`], env);
+    const add = await sh("git", ["-C", dir, "add", "-A"], env);
+    if (add.code !== 0) {
+      return { date, notes, attention: attention.length, pushed: false, error: "Obsidian mirror staging did not complete" };
+    }
+    // `git diff --cached --quiet` exits 0 only when staging is verified clean,
+    // 1 when there is a commit-worthy page, and >1 on a Git failure. This is
+    // stronger than parsing `git commit` text after a failed `git add`.
+    const staged = await sh("git", ["-C", dir, "diff", "--cached", "--quiet"], env);
+    if (staged.code !== 0 && staged.code !== 1) {
+      return { date, notes, attention: attention.length, pushed: false, error: "Obsidian mirror staging could not be verified" };
+    }
     let pushed = false;
-    if (!/nothing to commit/i.test(commit.out)) {
+    if (staged.code === 1) {
+      const commit = await sh("git", ["-C", dir, "commit", "-m", `memory: consolidate ${date}`], env);
+      if (commit.code !== 0) {
+        return { date, notes, attention: attention.length, pushed, error: "Obsidian mirror commit did not complete" };
+      }
       const push = await sh("git", ["-C", dir, "push", url, "HEAD"], gitEnv);
       pushed = push.code === 0;
     }
-    return { date, notes, attention: attention.length, pushed };
+    if (staged.code === 1 && !pushed) {
+      // Do not advance: a retry may rewrite this page, but cannot leave a
+      // canonical memory absent from the durable mirror.
+      return { date, notes, attention: attention.length, pushed, error: "Obsidian mirror push did not complete" };
+    }
+    const checkpoint = await m("memory:advanceObsidianReconciliation", {
+      cycle,
+      cutoffAt,
+      ...(cursor ? { fromCursor: cursor } : {}),
+      complete: isDone,
+      ...(!isDone && continueCursor ? { continueCursor } : {}),
+    }) as { ok?: unknown } | null;
+    if (checkpoint?.ok !== true) {
+      // The mirror is safe; retain the page cursor so a later run can replay
+      // it rather than risking a skipped write after a transient API failure.
+      return { date, notes, attention: attention.length, pushed, error: "Obsidian mirror checkpoint did not complete" };
+    }
+    return { date, notes, attention: attention.length, pushed, reconciliationComplete: isDone };
   },
 });
