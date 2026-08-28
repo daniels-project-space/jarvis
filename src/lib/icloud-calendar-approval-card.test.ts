@@ -18,6 +18,7 @@ describe("iCloud Calendar approval card state", () => {
 
   it("does not offer a dead retry for an expired or invalid receipt", () => {
     expect(iCloudCalendarApprovalFailureState(400)).toBe("expired");
+    expect(iCloudCalendarApprovalFailureState(409)).toBe("expired");
     expect(iCloudCalendarApprovalButtonLabel("expired")).toBe("Approval expired");
   });
 });

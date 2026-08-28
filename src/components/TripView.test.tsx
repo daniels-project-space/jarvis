@@ -225,6 +225,24 @@ describe("TripTimeline", () => {
     expect(markup).toContain("Download and deletion remain in Maps");
   });
 
+  it("shows a committed iCloud Calendar reminder as scheduled", () => {
+    const markup = renderToStaticMarkup(
+      <TripOfflineMapPreflight preflight={{
+        city: "Seville",
+        at: Date.parse("2026-09-02T09:15:00+02:00"),
+        timeZone: "Europe/Madrid",
+        mapUrl: "https://maps.apple.com/search?query=Seville",
+        todoStatus: "existing",
+        reminderStatus: "scheduled",
+        calendarProvider: "icloud",
+        calendarStatus: "scheduled",
+      }} />,
+    );
+
+    expect(markup).toContain("The iCloud Calendar reminder is scheduled.");
+    expect(markup).not.toContain("Connect iCloud Calendar");
+  });
+
   it("shows a recorded late reminder refresh without claiming the reminder stayed unchanged", () => {
     const markup = renderToStaticMarkup(
       <TripOfflineMapPreflight preflight={{

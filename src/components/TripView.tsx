@@ -362,6 +362,7 @@ type OfflineMapPreflightValue = {
   mapUrl?: unknown;
   todoStatus?: unknown;
   reminderStatus?: unknown;
+  calendarProvider?: unknown;
   calendarStatus?: unknown;
   refreshState?: unknown;
   refreshError?: unknown;
@@ -390,13 +391,16 @@ export function TripOfflineMapPreflight({ preflight }: { preflight: OfflineMapPr
     // A corrupted historic time zone must never prevent the saved travel plan
     // from reopening; the server uses a validated zone when creating it.
   }
+  const calendarName = preflight?.calendarProvider === "icloud" ? "iCloud Calendar" : "Google Calendar";
   const calendar = preflight?.calendarRefreshRequired === true
     ? "The itinerary changed, so prepare a fresh protected Calendar approval before adding or changing it."
     : preflight?.calendarStatus === "approval_required"
-    ? "Prepare a fresh protected Calendar approval in Jarvis chat when you are ready to add it."
+    ? `Prepare a fresh protected ${calendarName} approval in Jarvis chat when you are ready to add it.`
+    : preflight?.calendarStatus === "scheduled"
+      ? `The ${calendarName} reminder is scheduled.`
     : preflight?.calendarStatus === "needs_reconnect"
-      ? "Reconnect Google with Calendar access to prepare the calendar reminder."
-      : "Connect Google Calendar to prepare the calendar reminder.";
+      ? `Reconnect ${calendarName} with Calendar access to prepare the calendar reminder.`
+      : `Connect ${calendarName} to prepare the calendar reminder.`;
   const todo = preflight?.todoStatus === "needs_retry"
     ? "Hub to-do needs a retry."
     : preflight?.todoStatus === "existing"

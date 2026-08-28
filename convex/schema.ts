@@ -670,6 +670,17 @@ export default defineSchema({
       distanceKm: v.number(),
       verifiedAt: v.number(),
     }),
+    // Additive migration: historical rows simply have no iCloud binding and
+    // receive their first one only through a fresh owner-approved preflight.
+    // Never infer a managed event from generic CalDAV history.
+    iCloudCalendarEvent: v.optional(v.object({
+      calendarUrl: v.string(),
+      eventUrl: v.string(),
+      etag: v.string(),
+      revision: v.number(),
+      nonce: v.string(),
+      committedAt: v.number(),
+    })),
     refreshState: v.union(
       v.literal("scheduled"),
       v.literal("pending_refresh"),
