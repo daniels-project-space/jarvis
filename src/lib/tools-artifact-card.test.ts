@@ -11,6 +11,7 @@ const mock = vi.hoisted(() => ({
   storePrivateCreationAssetFromUrl: vi.fn(),
   creationMediaUrl: vi.fn(),
   markdownToPdf: vi.fn(),
+  writePrivateCreationAssetWithRecord: vi.fn(),
 }));
 
 vi.mock("./context", () => ({
@@ -26,6 +27,9 @@ vi.mock("./creation-assets", () => ({
   putPrivateCreationAsset: mock.putPrivateCreationAsset,
   storePrivateCreationAssetFromUrl: mock.storePrivateCreationAssetFromUrl,
   creationMediaUrl: mock.creationMediaUrl,
+}));
+vi.mock("./private-creation-asset-write", () => ({
+  writePrivateCreationAssetWithRecord: mock.writePrivateCreationAssetWithRecord,
 }));
 vi.mock("./pdf", () => ({ markdownToPdf: mock.markdownToPdf }));
 vi.mock("./booking-email", () => ({
@@ -46,14 +50,20 @@ vi.mock("./google-calendar-approval.server", () => ({
 import { executeTool } from "./tools";
 
 const imageAsset = {
+  assetStore: "private-r2-v1" as const,
+  assetLocator: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
   key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
   contentType: "image/webp",
 };
 const pdfAsset = {
+  assetStore: "private-r2-v1" as const,
+  assetLocator: "owners/daniel/creations/570df4a2-8870-4fe1-a4cf-6d32ccf758e1/asset",
   key: "owners/daniel/creations/570df4a2-8870-4fe1-a4cf-6d32ccf758e1/asset",
   contentType: "application/pdf",
 };
 const mindMapAsset = {
+  assetStore: "private-r2-v1" as const,
+  assetLocator: "owners/daniel/creations/e01d4985-5aa4-4caa-b460-842871de3f84/asset",
   key: "owners/daniel/creations/e01d4985-5aa4-4caa-b460-842871de3f84/asset",
   contentType: "image/svg+xml",
 };
@@ -84,6 +94,17 @@ describe("created artifact download cards", () => {
     mock.deletePrivateCreationAsset.mockResolvedValue(undefined);
     mock.creationMediaUrl.mockImplementation((id: string) => `/api/creation-media?id=${encodeURIComponent(id)}&variant=asset`);
     mock.markdownToPdf.mockResolvedValue(new Uint8Array([37, 80, 68, 70]));
+    mock.writePrivateCreationAssetWithRecord.mockImplementation(async ({ writeAsset, persistCreation }: any) => {
+      let asset: any;
+      try {
+        asset = await writeAsset("f47ac10b-58cc-4372-a567-0e02b2c3d479", async () => new AbortController().signal);
+        const creationId = await persistCreation(asset, "817fcdd9-43d8-46f7-bc89-5205af27d284");
+        if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
+        return { ok: true, asset, creationId, recovered: false };
+      } catch (error) {
+        return { ok: false, stage: asset ? "creation_unverified" : "asset_write", error };
+      }
+    });
     mock.convexMutation.mockImplementation(async (name: string) => {
       if (name === "creations:create") return "creation-default";
       return undefined;
@@ -106,7 +127,11 @@ describe("created artifact download cards", () => {
 
     expect(mock.convexMutation).toHaveBeenCalledWith("creations:create", expect.objectContaining({
       kind: "image", title: "Mood board", assetR2Key: imageAsset.key, assetContentType: imageAsset.contentType,
+      assetWriteEpoch: "817fcdd9-43d8-46f7-bc89-5205af27d284",
     }));
+    expect(mock.storePrivateCreationAssetFromUrl).toHaveBeenCalledWith(
+      "https://provider.example/generated.png", "asset", expect.any(String), { beforeR2Write: expect.any(Function) },
+    );
     const creationCall = mock.convexMutation.mock.calls.find(([path]) => path === "creations:create")?.[1];
     expect(creationCall).not.toHaveProperty("url");
     expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", {
@@ -118,15 +143,16 @@ describe("created artifact download cards", () => {
     });
   });
 
-  it("cleans up a generated image and withholds its card when creation persistence fails", async () => {
+  it("fences a generated image and withholds its card when creation persistence is ambiguous", async () => {
     mock.convexMutation.mockImplementation(async (name: string) => {
       if (name === "creations:create") throw new Error("Convex unavailable");
       return undefined;
     });
 
-    await expect(createGeneratedImage()).resolves.toContain("could not be saved");
+    await expect(createGeneratedImage()).resolves.toContain("could not be verified");
 
-    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith(imageAsset);
+    expect(mock.writePrivateCreationAssetWithRecord).toHaveBeenCalledTimes(1);
+    expect(mock.deletePrivateCreationAsset).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalledWith("ui:setPanel", expect.anything());
     expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
   });
@@ -142,7 +168,11 @@ describe("created artifact download cards", () => {
 
     expect(mock.convexMutation).toHaveBeenCalledWith("creations:create", expect.objectContaining({
       kind: "image", title: "Reference image", assetR2Key: imageAsset.key, assetContentType: imageAsset.contentType,
+      assetWriteEpoch: "817fcdd9-43d8-46f7-bc89-5205af27d284",
     }));
+    expect(mock.storePrivateCreationAssetFromUrl).toHaveBeenCalledWith(
+      "https://source.example/reference.webp", "asset", expect.any(String), { beforeR2Write: expect.any(Function) },
+    );
     expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", {
       threadId: "main",
       type: "image",
@@ -152,16 +182,16 @@ describe("created artifact download cards", () => {
     });
   });
 
-  it("cleans up a stored image and withholds its card when creation persistence fails", async () => {
+  it("fences a stored image and withholds its card when creation persistence is ambiguous", async () => {
     mock.convexMutation.mockImplementation(async (name: string) => {
       if (name === "creations:create") throw new Error("Convex unavailable");
       return undefined;
     });
 
     await expect(executeTool("store_image", { title: "Reference image", url: "https://source.example/reference.webp" }))
-      .resolves.toContain("could not be saved");
+      .resolves.toContain("could not be verified");
 
-    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith(imageAsset);
+    expect(mock.deletePrivateCreationAsset).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
   });
 
@@ -169,9 +199,9 @@ describe("created artifact download cards", () => {
     mock.convexMutation.mockResolvedValue(undefined);
 
     await expect(executeTool("store_image", { title: "Reference image", url: "https://source.example/reference.webp" }))
-      .resolves.toContain("could not be saved");
+      .resolves.toContain("could not be verified");
 
-    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith(imageAsset);
+    expect(mock.deletePrivateCreationAsset).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
   });
 
@@ -186,7 +216,11 @@ describe("created artifact download cards", () => {
 
     expect(mock.convexMutation).toHaveBeenCalledWith("creations:create", expect.objectContaining({
       kind: "pdf", title: "Travel plan", assetR2Key: pdfAsset.key, assetContentType: pdfAsset.contentType,
+      assetWriteEpoch: "817fcdd9-43d8-46f7-bc89-5205af27d284",
     }));
+    expect(mock.putPrivateCreationAsset).toHaveBeenCalledWith(
+      expect.any(Uint8Array), "application/pdf", "asset", expect.any(String), { beforeR2Write: expect.any(Function) },
+    );
     expect(mock.convexMutation).toHaveBeenCalledWith("chatQueue:postCard", {
       threadId: "main",
       type: "pdf",
@@ -212,7 +246,10 @@ describe("created artifact download cards", () => {
       edges: [{ from: "base", to: "food" }],
     })).resolves.toContain("secure download card");
 
-    expect(mock.putPrivateCreationAsset).toHaveBeenCalledWith(expect.stringContaining("<svg"), "image/svg+xml");
+    expect(mock.putPrivateCreationAsset).toHaveBeenCalledWith(
+      expect.stringContaining("<svg"), "image/svg+xml", "asset", expect.any(String),
+      { beforeR2Write: expect.any(Function) },
+    );
     const creationCalls = mock.convexMutation.mock.calls.filter(([path]) => path === "creations:create");
     expect(creationCalls[0]?.[1]).toMatchObject({ kind: "canvas", title: "Seville days" });
     expect(creationCalls[1]?.[1]).toMatchObject({
@@ -220,6 +257,7 @@ describe("created artifact download cards", () => {
       title: "Seville days · mind map",
       assetR2Key: mindMapAsset.key,
       assetContentType: "image/svg+xml",
+      assetWriteEpoch: "817fcdd9-43d8-46f7-bc89-5205af27d284",
       data: JSON.stringify({ sourceCreationId: "mind-map/canvas 1", format: "svg", type: "mind_map_snapshot" }),
     });
     expect(creationCalls[1]?.[1]).not.toHaveProperty("url");
@@ -232,7 +270,7 @@ describe("created artifact download cards", () => {
     });
   });
 
-  it("cleans up a mind-map snapshot and withholds its card when artifact persistence fails", async () => {
+  it("fences a mind-map snapshot and withholds its card when artifact persistence is ambiguous", async () => {
     let creationCount = 0;
     mock.putPrivateCreationAsset.mockResolvedValue(mindMapAsset);
     mock.convexMutation.mockImplementation(async (name: string) => {
@@ -246,9 +284,9 @@ describe("created artifact download cards", () => {
       action: "create",
       title: "Seville days",
       nodes: [{ id: "base", label: "Booked stay" }],
-    })).resolves.toContain("fresh private image was cleaned up");
+    })).resolves.toContain("image snapshot could not be verified");
 
-    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith(mindMapAsset);
+    expect(mock.deletePrivateCreationAsset).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
   });
 
@@ -274,16 +312,16 @@ describe("created artifact download cards", () => {
     }));
   });
 
-  it("cleans up a rendered PDF and withholds its card when creation persistence fails", async () => {
+  it("fences a rendered PDF and withholds its card when creation persistence is ambiguous", async () => {
     mock.convexMutation.mockImplementation(async (name: string) => {
       if (name === "creations:create") throw new Error("Convex unavailable");
       return undefined;
     });
 
     await expect(executeTool("create_pdf", { title: "Travel plan", markdown: "# Seville" }))
-      .resolves.toContain("could not be saved");
+      .resolves.toContain("could not be verified");
 
-    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith(pdfAsset);
+    expect(mock.deletePrivateCreationAsset).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalledWith("ui:setPanel", expect.anything());
     expect(mock.convexMutation).not.toHaveBeenCalledWith("chatQueue:postCard", expect.anything());
   });

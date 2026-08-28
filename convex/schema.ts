@@ -2506,6 +2506,11 @@ export default defineSchema({
     url: v.optional(v.string()), // legacy public URL or first-party media route
     thumb: v.optional(v.string()), // legacy preview URL or first-party media route
     assetR2Key: v.optional(v.string()), // private `owners/daniel/creations/.../asset`
+    // `assetStore` + `assetLocator` are the authoritative binary identity.
+    // Historical V1 rows intentionally omit both and derive V1 from
+    // assetR2Key during the additive migration.
+    assetStore: v.optional(v.string()),
+    assetLocator: v.optional(v.string()),
     assetContentType: v.optional(v.string()), // media type verified again at read time
     category: v.optional(v.string()), // emails, notes, boards, mind maps, etc.
     folder: v.optional(v.string()), // human-readable hierarchy: Projects / X, Visuals / Boards…
@@ -2523,7 +2528,148 @@ export default defineSchema({
     .index("by_thread", ["threadId", "updatedAt"])
     .index("by_url", ["url", "updatedAt"])
     .index("by_thumb", ["thumb", "updatedAt"])
+    .index("by_assetR2Key", ["assetR2Key"])
+    .index("by_assetStoreLocator", ["assetStore", "assetLocator"])
     .index("by_updatedAt", ["updatedAt"]),
+
+  // A private creation asset first receives a bounded writer lease before its
+  // R2 PUT. This is the transaction fence between object storage and creation
+  // metadata: a worker may only clean an expired lease, while an unreferenced
+  // record remains nonterminal for later R2 sweeps until a creation commits.
+  creationAssetCleanupIntents: defineTable({
+    assetR2Key: v.string(),
+    // New intents bind deletion to the explicit store/locator identity. Old
+    // V1 intents retain only assetR2Key and remain readable/reapable.
+    assetStore: v.optional(v.string()),
+    assetLocator: v.optional(v.string()),
+    // `writerEpoch` fences one exact producer attempt. The durable intent is
+    // deliberately retained after cleanup because an accepted R2 PUT can
+    // emerge after the producer has stopped observing its request.
+    writerEpoch: v.optional(v.string()),
+    // Retained only for a rolling deployment with the earlier producer. They
+    // are advisory; cleanup never terminalizes based on either timestamp.
+    writerDeadlineAt: v.optional(v.number()),
+    writeRecoveryEndsAt: v.optional(v.number()),
+    recoveryKind: v.optional(v.string()), // write | deletion
+    state: v.string(), // writing | cleanup_ready | cleanup_claimed | cleanup_sweep; cleaned is legacy-reaped
+    nextActionAt: v.number(),
+    // New cleanup workers receive this opaque server-issued deletion ticket
+    // only after Convex has bound it to this exact intent/store/locator.
+    // cleanupClaimToken remains solely for a short mixed-trigger rollout.
+    cleanupDeletionTicketId: v.optional(v.id("creationAssetCleanupTickets")),
+    cleanupClaimToken: v.optional(v.string()),
+    cleanupClaimExpiresAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_assetR2Key", ["assetR2Key"])
+    .index("by_assetStoreLocator", ["assetStore", "assetLocator"])
+    .index("by_state_action", ["state", "nextActionAt"]),
+
+  // A short-lived server-issued capability for one exact cleanup intent. The
+  // ticket is created by claim and deleted when finish/reclaim consumes it;
+  // it does not accumulate across the nonterminal reaper's periodic sweeps.
+  creationAssetCleanupTickets: defineTable({
+    intentId: v.id("creationAssetCleanupIntents"),
+    assetStore: v.string(),
+    assetLocator: v.string(),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+  }).index("by_intent", ["intentId"]),
+
+  // A durable, owner-controlled snapshot of every V1 creation asset. The
+  // state freezes private-asset mutations before pagination starts, then only
+  // permits a CAS cutover after every exact snapshot entry has verified a
+  // full-byte V2 readback.
+  creationAssetStoreMigrations: defineTable({
+    key: v.string(),
+    state: v.string(), // snapshotting | frozen | cutover_ready | cutting_over | cutover | activated | aborted | failed
+    // A pre-cutover abort retains its previous manifest as audit evidence.
+    // A later restart increments this attempt and snapshots into a new lane.
+    attempt: v.optional(v.number()),
+    snapshotCursor: v.optional(v.string()),
+    snapshotComplete: v.boolean(),
+    expectedCount: v.number(),
+    verifiedCount: v.number(),
+    cutoverCount: v.number(),
+    freezeAt: v.number(),
+    cutoverAt: v.optional(v.number()),
+    activatedAt: v.optional(v.number()),
+    abortedAt: v.optional(v.number()),
+    abortReason: v.optional(v.string()),
+    failure: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  // One immutable V1 source per snapshot creation. Every V2 copy claim gets
+  // a fresh, immutable generation; source locators remain audit evidence and
+  // are never delete targets.
+  creationAssetStoreMigrationItems: defineTable({
+    migrationKey: v.string(),
+    attempt: v.optional(v.number()),
+    creationId: v.id("creations"),
+    sourceStore: v.string(),
+    sourceLocator: v.string(),
+    destinationStore: v.string(),
+    destinationLocator: v.optional(v.string()), // current claim target only
+    destinationGeneration: v.optional(v.number()),
+    verifiedDestinationLocator: v.optional(v.string()),
+    verifiedDestinationGeneration: v.optional(v.number()),
+    sourceContentType: v.optional(v.string()),
+    state: v.string(), // pending | copying | verified | cutover | failed
+    activeTicketId: v.optional(v.id("creationAssetStoreMigrationTickets")),
+    claimExpiresAt: v.optional(v.number()),
+    sha256: v.optional(v.string()),
+    sizeBytes: v.optional(v.number()),
+    verifiedAt: v.optional(v.number()),
+    failure: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_migration_creation", ["migrationKey", "creationId"])
+    .index("by_migration_state", ["migrationKey", "state", "updatedAt"])
+    .index("by_migration_attempt_creation", ["migrationKey", "attempt", "creationId"])
+    .index("by_migration_attempt_state", ["migrationKey", "attempt", "state", "updatedAt"])
+    .index("by_creation", ["creationId"]),
+
+  // Tickets are inserted by Convex, never supplied by a task. Each ticket is
+  // bound to one immutable V2 generation, so a delayed old PUT cannot target
+  // a newer retry. The same binding is required for V2 destination cleanup.
+  creationAssetStoreMigrationTickets: defineTable({
+    migrationKey: v.string(),
+    attempt: v.optional(v.number()),
+    itemId: v.id("creationAssetStoreMigrationItems"),
+    creationId: v.id("creations"),
+    purpose: v.string(), // copy | destination_delete
+    destinationStore: v.optional(v.string()),
+    destinationLocator: v.optional(v.string()),
+    destinationGeneration: v.optional(v.number()),
+    state: v.string(), // active | consumed | revoked
+    expiresAt: v.number(),
+    createdAt: v.number(),
+    consumedAt: v.optional(v.number()),
+  })
+    .index("by_item_purpose", ["itemId", "purpose", "state"])
+    .index("by_creation", ["creationId"])
+    .index("by_expiry", ["expiresAt"]),
+
+  // V1 is not frozen until both runtimes have independently completed this
+  // short-lived, isolated-V2 write/readback/delete proof. The task receives
+  // only its opaque proof id; the server derives the V2 probe locator.
+  creationAssetStoreCapabilityProofs: defineTable({
+    migrationKey: v.string(),
+    runtime: v.string(), // vercel | trigger
+    attempt: v.number(),
+    state: v.string(), // pending | verified | failed | consumed
+    expiresAt: v.number(),
+    verifiedAt: v.optional(v.number()),
+    sha256: v.optional(v.string()),
+    sizeBytes: v.optional(v.number()),
+    failure: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_migration_runtime", ["migrationKey", "runtime"]),
 
   // Conversational travel remains deliberately separate from Daniel's saved
   // creations until he explicitly locks a reviewed plan. `data` is a bounded

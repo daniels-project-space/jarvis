@@ -1,7 +1,9 @@
 import type { NextRequest } from "next/server";
 import { controlMutation, controlQuery, isSameOriginRequest } from "@/lib/control-session";
-import { privateR2Delete } from "@/lib/private-r2";
+import { schedulePrivateCreationAssetCleanup } from "@/lib/private-creation-asset-write";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
+
+const CREATION_ASSET_CLEANUP_PROTOCOL = "nonterminal-reaper-v1";
 
 const ALLOWED = new Set([
   "creations:boardSave",
@@ -46,14 +48,32 @@ async function removeCreationWithPrivateAsset(
   // unreachable R2 orphan. The narrow server-side query binds the opaque key
   // to this exact authenticated creation; clients never supply a storage key.
   const media = await controlQuery("creations:getForMedia", { id, ...credentials }) as {
-    assetR2Key?: unknown;
+    assetStore?: unknown;
+    assetLocator?: unknown;
   } | null;
-  if (typeof media?.assetR2Key === "string") {
-    // R2 DELETE accepts an already-removed key, so if the later Convex
-    // mutation is interrupted the same owner retry safely finishes removal.
-    await privateR2Delete(media.assetR2Key);
+  if (typeof media?.assetStore === "string" && typeof media?.assetLocator === "string") {
+    // The production app ships before the matching Convex contract. Until
+    // `protocol` exists, reject this deletion before metadata changes: old
+    // Convex cannot durably enqueue its R2 cleanup, and old Vercel must be
+    // drained before the new contract is enabled.
+    const capability = await controlQuery("creationAssetCleanup:protocol", credentials) as {
+      cleanupProtocol?: unknown;
+    } | null;
+    if (capability?.cleanupProtocol !== CREATION_ASSET_CLEANUP_PROTOCOL) {
+      throw new Error("private creation cleanup contract is unavailable");
+    }
   }
-  return await controlMutation("creations:remove", { ...args, ...credentials });
+  const removed = await controlMutation("creations:remove", { ...args, ...credentials });
+  if (typeof media?.assetStore === "string" && typeof media?.assetLocator === "string") {
+    // Convex atomically records the deletion intent with metadata removal.
+    // Triggering is only an accelerator: a lost acknowledgement leaves the
+    // durable intent for scheduled reconciliation, never a broken creation.
+    await schedulePrivateCreationAssetCleanup({
+      assetStore: media.assetStore as "private-r2-v1" | "private-r2-v2",
+      assetLocator: media.assetLocator,
+    }).catch(() => undefined);
+  }
+  return removed;
 }
 
 export async function POST(req: NextRequest) {

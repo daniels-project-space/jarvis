@@ -10,6 +10,7 @@ const mock = vi.hoisted(() => ({
   putPrivateCreationAsset: vi.fn(),
   deletePrivateCreationAsset: vi.fn(),
   creationMediaUrl: vi.fn(),
+  writePrivateCreationAssetWithRecord: vi.fn(),
 }));
 
 vi.mock("@/lib/control-session", () => ({
@@ -23,6 +24,9 @@ vi.mock("@/lib/creation-assets", () => ({
   putPrivateCreationAsset: mock.putPrivateCreationAsset,
   deletePrivateCreationAsset: mock.deletePrivateCreationAsset,
   creationMediaUrl: mock.creationMediaUrl,
+}));
+vi.mock("@/lib/private-creation-asset-write", () => ({
+  writePrivateCreationAssetWithRecord: mock.writePrivateCreationAssetWithRecord,
 }));
 
 import { POST } from "./route";
@@ -54,11 +58,24 @@ describe("creation export persistence", () => {
     mock.validateAdminSession.mockResolvedValue(true);
     mock.controlQuery.mockResolvedValue(board);
     mock.putPrivateCreationAsset.mockImplementation(async (_bytes: unknown, contentType: string) => ({
+      assetStore: "private-r2-v1",
+      assetLocator: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
       key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
       contentType,
     }));
     mock.deletePrivateCreationAsset.mockResolvedValue(undefined);
     mock.creationMediaUrl.mockImplementation((id: string) => `/api/creation-media?id=${encodeURIComponent(id)}&variant=asset`);
+    mock.writePrivateCreationAssetWithRecord.mockImplementation(async ({ writeAsset, persistCreation }: any) => {
+      let asset: any;
+      try {
+        asset = await writeAsset("f47ac10b-58cc-4372-a567-0e02b2c3d479", async () => new AbortController().signal);
+        const creationId = await persistCreation(asset, "817fcdd9-43d8-46f7-bc89-5205af27d284");
+        if (typeof creationId !== "string" || !creationId) throw new Error("creation persistence returned no id");
+        return { ok: true, asset, creationId, recovered: false };
+      } catch (error) {
+        return { ok: false, stage: asset ? "creation_unverified" : "asset_write", error };
+      }
+    });
     mock.controlMutation.mockImplementation(async (path: string) => {
       if (path === "creations:create") return "export-1";
       return undefined;
@@ -75,11 +92,17 @@ describe("creation export persistence", () => {
       downloadUrl: "/api/creation-download?id=export-1",
       chatPosted: true,
     });
-    expect(mock.putPrivateCreationAsset).toHaveBeenCalledWith(expect.any(Buffer), "image/svg+xml");
+    expect(mock.putPrivateCreationAsset).toHaveBeenCalledWith(
+      expect.any(Buffer), "image/svg+xml", "asset", expect.any(String),
+      { beforeR2Write: expect.any(Function) },
+    );
     expect(mock.controlMutation).toHaveBeenCalledWith("creations:create", expect.objectContaining({
       kind: "export",
       assetR2Key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
+      assetStore: "private-r2-v1",
+      assetLocator: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
       assetContentType: "image/svg+xml",
+      assetWriteEpoch: "817fcdd9-43d8-46f7-bc89-5205af27d284",
       data: expect.stringContaining('"sourceCreationId":"board-1"'),
     }));
     const creationCall = mock.controlMutation.mock.calls.find(([path]) => path === "creations:create")?.[1];
@@ -112,15 +135,16 @@ describe("creation export persistence", () => {
     expect(mock.controlMutation).not.toHaveBeenCalled();
   });
 
-  it("cleans up a fresh object if its library record cannot be persisted", async () => {
+  it("fences a fresh object if its library record cannot be verified", async () => {
     mock.controlMutation.mockRejectedValueOnce(new Error("Convex unavailable"));
 
     const response = await POST(request());
 
     expect(response.status).toBe(502);
-    expect(mock.deletePrivateCreationAsset).toHaveBeenCalledWith({
-      key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
-      contentType: "image/png",
+    await expect(response.json()).resolves.toEqual({
+      error: "export persistence could not be verified; private storage is queued for safe recovery",
     });
+    expect(mock.writePrivateCreationAssetWithRecord).toHaveBeenCalledTimes(1);
+    expect(mock.deletePrivateCreationAsset).not.toHaveBeenCalled();
   });
 });

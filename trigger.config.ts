@@ -47,6 +47,18 @@ export default defineConfig({
             // This is never made available to browser code or Codex children.
             "JARVIS_HUB_ACTIONS_TOKEN",
             "JARVIS_PRIVATE_R2_BUCKET",
+            // V2 is opt-in until the owner-controlled migration route proves
+            // its isolated bucket/vault capability and full readback manifest.
+            "JARVIS_PRIVATE_CREATION_ASSET_STORE",
+            "JARVIS_PRIVATE_R2_V2_BUCKET",
+            "JARVIS_PRIVATE_R2_V2_ENDPOINT",
+            // This is distinct from VAULT_ACCESS_TOKEN and reaches only the
+            // fixed V2-credential backend. syncEnvVars is global to a Trigger
+            // build, not a task-scope boundary: use this only in the dedicated
+            // V2 migration Trigger environment/project (or provider-supported
+            // task-scoped secret) required by the runbook, after proving every
+            // legacy deployment/environment lacks the token.
+            "JARVIS_PRIVATE_CREATION_ASSET_V2_VAULT_TOKEN",
             "JARVIS_CODEX_SESSION_SOURCE",
             "JARVIS_MISSION_PROTOCOL_ROLLOUT",
             "JARVIS_MISSION_SUPERVISOR_ROLLOUT",

@@ -3,17 +3,40 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 
 import { normalizeUploadMime } from "./chat-files";
-import { privateCreationObjectKey, privateR2Delete, privateR2Put, type PrivateCreationObjectPurpose } from "./private-r2";
+import type { PrivateCreationObjectPurpose } from "./private-r2";
+import {
+  activePrivateCreationAssetStore,
+  privateCreationAssetDelete,
+  privateCreationAssetLocatorForWrite,
+  privateCreationAssetPut,
+  type PrivateCreationAssetLocator,
+} from "./private-creation-asset-store";
 export { creationMediaUrl, type CreationMediaVariant } from "./creation-media-url";
 
-const MAX_CREATION_ASSET_BYTES = 30 * 1024 * 1024;
+export const MAX_CREATION_ASSET_BYTES = 30 * 1024 * 1024;
 
-export type PrivateCreationAsset = Readonly<{
+export type PrivateCreationAsset = Readonly<PrivateCreationAssetLocator & {
+  // `key` is retained only for staged producer compatibility. New database
+  // writes use assetStore + assetLocator as the authoritative identity.
   key: string;
   contentType: string;
 }>;
 
-type CreationAssetBody = Uint8Array | ArrayBuffer | string;
+type LegacyPrivateCreationAssetReference = Readonly<{
+  key: string;
+  contentType?: string;
+  assetStore?: PrivateCreationAssetLocator["assetStore"];
+  assetLocator?: string;
+}>;
+
+export type CreationAssetBody = Uint8Array | ArrayBuffer | string;
+
+// The shared creation-record fence supplies this immediately before the R2
+// PUT—not before any provider download or rendering work—so Convex can fence
+// creation metadata if the writer loses its bounded lease.
+export type PrivateCreationAssetWriteFence = Readonly<{
+  beforeR2Write?: () => Promise<void>;
+}>;
 
 function bodySizeBytes(body: CreationAssetBody): number {
   if (typeof body === "string") return Buffer.byteLength(body, "utf8");
@@ -80,12 +103,15 @@ export async function putPrivateCreationAsset(
   body: CreationAssetBody,
   contentType: string,
   purpose: PrivateCreationObjectPurpose = "asset",
+  assetId: string = randomUUID(),
+  fence?: PrivateCreationAssetWriteFence,
 ): Promise<PrivateCreationAsset> {
   assertAssetSize(body);
-  const key = privateCreationObjectKey(randomUUID(), purpose);
+  const locator = privateCreationAssetLocatorForWrite(activePrivateCreationAssetStore(), assetId, purpose);
   const normalizedContentType = normalizeUploadMime(contentType);
-  await privateR2Put(key, body, normalizedContentType);
-  return { key, contentType: normalizedContentType };
+  await fence?.beforeR2Write?.();
+  await privateCreationAssetPut(locator, body, normalizedContentType);
+  return { ...locator, key: locator.assetLocator, contentType: normalizedContentType };
 }
 
 // Re-home short-lived provider results before their URL can expire. The caller
@@ -94,6 +120,8 @@ export async function putPrivateCreationAsset(
 export async function storePrivateCreationAssetFromUrl(
   sourceUrl: string,
   purpose: PrivateCreationObjectPurpose = "asset",
+  assetId: string = randomUUID(),
+  fence?: PrivateCreationAssetWriteFence,
 ): Promise<PrivateCreationAsset> {
   const source = externalHttpUrl(sourceUrl);
   // Do not follow a provider-controlled redirect into an unexpected network
@@ -106,10 +134,25 @@ export async function storePrivateCreationAssetFromUrl(
     throw new Error("creation asset too large (30MB cap)");
   }
   const bytes = await readResponseBodyWithinAssetLimit(response);
-  return await putPrivateCreationAsset(bytes, response.headers.get("content-type") ?? "application/octet-stream", purpose);
+  return await putPrivateCreationAsset(
+    bytes,
+    response.headers.get("content-type") ?? "application/octet-stream",
+    purpose,
+    assetId,
+    fence,
+  );
 }
 
-export async function deletePrivateCreationAsset(asset: PrivateCreationAsset | string): Promise<void> {
-  const key = typeof asset === "string" ? asset : asset.key;
-  await privateR2Delete(key);
+export async function deletePrivateCreationAsset(
+  asset: PrivateCreationAsset | LegacyPrivateCreationAssetReference | string,
+): Promise<void> {
+  // A string is a legacy V1 key. New callers must carry the explicit store so
+  // a V2 locator never silently falls back to V1 deletion.
+  const locator = typeof asset === "string"
+    ? { assetStore: "private-r2-v1" as const, assetLocator: asset }
+    : {
+      assetStore: asset.assetStore ?? "private-r2-v1",
+      assetLocator: asset.assetLocator ?? asset.key,
+    };
+  await privateCreationAssetDelete(locator);
 }

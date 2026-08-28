@@ -1,10 +1,18 @@
 import { mutation, query } from "./_generated/server";
 import { type Id } from "./_generated/dataModel";
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
 import { inferCreationFiling } from "./creationFiling";
 import { linkExplicitFilesToCreation, linkMessageFilesToCreation } from "./fileHelpers";
 import { MAX_TRIP_CANVAS_BYTES, tripCanvas, type TripCanvasRecord } from "./tripCanvas";
+import {
+  CREATION_ASSET_STORE_V1,
+  CREATION_ASSET_STORE_V2,
+  creationAssetLocatorFromInput,
+  creationAssetLocatorFromWriteInput,
+  creationAssetLocatorFromRow,
+  isPrivateCreationAssetKey,
+} from "./creationAssetLocator";
 import { redactLegacyCreationUrls, trustedLegacyCreationUrl } from "../src/lib/legacy-creation-url";
 
 // JARVIS's atelier — everything he makes (mind maps, charts, images, PDFs,
@@ -21,18 +29,26 @@ function creationMediaUrl(id: Id<"creations">): string {
   return `/api/creation-media?id=${encodeURIComponent(String(id))}&variant=asset`;
 }
 
-function isPrivateCreationAssetKey(value: string | undefined): value is string {
-  return Boolean(value && /^owners\/daniel\/creations\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/asset$/i.test(value));
+export { isPrivateCreationAssetKey } from "./creationAssetLocator";
+
+function isCreationAssetWriterEpoch(value: string | undefined): value is string {
+  return Boolean(value && /^[a-zA-Z0-9_-]{16,120}$/.test(value));
 }
 
 export function viewerCreation(row: any) {
-  const { assetR2Key: _assetR2Key, assetContentType: _assetContentType, ...publicRow } = row;
+  const {
+    assetR2Key: _assetR2Key,
+    assetStore: _assetStore,
+    assetLocator: _assetLocator,
+    assetContentType: _assetContentType,
+    ...publicRow
+  } = row;
   for (const field of ["title", "data", "category", "folder", "project", "inquiry"] as const) {
     if (typeof publicRow[field] === "string") publicRow[field] = redactLegacyCreationUrls(publicRow[field]);
   }
   const filing = inferCreationFiling(row);
   const mediaUrl = creationMediaUrl(row._id);
-  if (isPrivateCreationAssetKey(row.assetR2Key)) {
+  if (creationAssetLocatorFromRow(row)) {
     return {
       ...publicRow,
       ...filing,
@@ -236,9 +252,11 @@ export const getForMedia = query({
     await requireActor(ctx, a);
     const row = await ctx.db.get(a.id);
     if (!row) return null;
-    if (isPrivateCreationAssetKey(row.assetR2Key)) {
+    const asset = creationAssetLocatorFromRow(row);
+    if (asset) {
       return {
-        assetR2Key: row.assetR2Key,
+        assetStore: asset.assetStore,
+        assetLocator: asset.assetLocator,
         assetContentType: typeof row.assetContentType === "string" ? row.assetContentType.slice(0, 160) : undefined,
         title: row.title,
         kind: row.kind,
@@ -247,6 +265,44 @@ export const getForMedia = query({
     const legacyUrl = trustedLegacyCreationUrl(row.url) || trustedLegacyCreationUrl(row.thumb);
     if (!legacyUrl) return null;
     return { legacyUrl, title: row.title, kind: row.kind };
+  },
+});
+
+// This lookup is intentionally narrower than `getForMedia`: recovery needs
+// only a durable creation receipt, never the private object coordinate or the
+// rest of the library row. It is owner/worker-only so an opaque asset key is
+// never an unauthenticated existence oracle.
+export const getByAssetR2Key = query({
+  args: { assetR2Key: v.string(), ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    if (!isPrivateCreationAssetKey(a.assetR2Key)) {
+      throw new ConvexError({ code: "INVALID_CREATION_ASSET_KEY", message: "Private creation asset identity is invalid" });
+    }
+    const row = await ctx.db
+      .query("creations")
+      .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", a.assetR2Key))
+      .first();
+    return row ? String(row._id) : null;
+  },
+});
+
+// The locator form is authoritative for V2. The legacy key query remains for
+// already deployed producers during the additive rollout, but no V2 reader
+// may downgrade to it as a storage selection mechanism.
+export const getByAssetLocator = query({
+  args: { assetStore: v.string(), assetLocator: v.string(), ...actorAuthArgs },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const asset = creationAssetLocatorFromInput({ assetStore: a.assetStore, assetLocator: a.assetLocator });
+    if (!asset) {
+      throw new ConvexError({ code: "INVALID_CREATION_ASSET_LOCATOR", message: "Private creation asset locator is invalid" });
+    }
+    const row = await ctx.db
+      .query("creations")
+      .withIndex("by_assetStoreLocator", (q: any) => q.eq("assetStore", asset.assetStore).eq("assetLocator", asset.assetLocator))
+      .first();
+    return row ? String(row._id) : null;
   },
 });
 
@@ -275,7 +331,10 @@ export const create = mutation({
     url: v.optional(v.string()),
     thumb: v.optional(v.string()),
     assetR2Key: v.optional(v.string()),
+    assetStore: v.optional(v.string()),
+    assetLocator: v.optional(v.string()),
     assetContentType: v.optional(v.string()),
+    assetWriteEpoch: v.optional(v.string()),
     category: v.optional(v.string()),
     folder: v.optional(v.string()),
     project: v.optional(v.string()),
@@ -287,11 +346,124 @@ export const create = mutation({
   },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);
-    if (a.assetR2Key !== undefined && !isPrivateCreationAssetKey(a.assetR2Key)) {
+    const hasAssetIdentity = a.assetR2Key !== undefined || a.assetStore !== undefined || a.assetLocator !== undefined;
+    const asset = creationAssetLocatorFromWriteInput(a);
+    if (hasAssetIdentity && !asset) {
       throw new Error("invalid private creation asset key");
     }
-    if (a.assetContentType !== undefined && !a.assetR2Key) {
+    if (a.assetContentType !== undefined && !asset) {
       throw new Error("private creation asset content type requires an asset key");
+    }
+    if (a.assetWriteEpoch !== undefined && (!asset || !isCreationAssetWriterEpoch(a.assetWriteEpoch))) {
+      throw new Error("private creation asset writer epoch is invalid");
+    }
+
+    // The migration's first durable transition freezes private creation
+    // writes before its paginated snapshot. After cutover, only an explicit
+    // V2 locator is legal, so an old Vercel/Trigger process cannot silently
+    // create a new V1 row outside the verified manifest.
+    if (asset) {
+      const migration = await ctx.db
+        .query("creationAssetStoreMigrations")
+        .withIndex("by_key", (q: any) => q.eq("key", "private-creation-r2-v2"))
+        .first();
+      if (asset.assetStore === CREATION_ASSET_STORE_V2 && migration?.state !== "activated") {
+        throw new ConvexError({
+          code: "CREATION_ASSET_V2_NOT_ACTIVATED",
+          message: "Private creation V2 assets are unavailable until the durable migration activation completes",
+        });
+      }
+      if (
+        asset.assetStore === CREATION_ASSET_STORE_V1
+        && migration
+        && migration.state !== "aborted"
+        && migration.state !== "activated"
+      ) {
+        throw new ConvexError({
+          code: "CREATION_ASSET_MIGRATION_FROZEN",
+          message: "Private creation assets are frozen for their controlled storage migration",
+        });
+      }
+      if (migration?.state === "activated" && asset.assetStore !== CREATION_ASSET_STORE_V2) {
+        throw new ConvexError({
+          code: "CREATION_ASSET_V2_REQUIRED",
+          message: "Private creation assets must use the activated V2 store",
+        });
+      }
+    }
+
+    // A lost response is indistinguishable from a rejected request to a
+    // caller. For a private asset, the exact authenticated owner + opaque key
+    // is therefore the durable idempotency identity—not title, route, or any
+    // caller-controlled request body that could accidentally merge work.
+    if (asset) {
+      let existing = await ctx.db
+        .query("creations")
+        .withIndex("by_assetStoreLocator", (q: any) => q.eq("assetStore", asset.assetStore).eq("assetLocator", asset.assetLocator))
+        .first();
+      // Historical V1 rows predate explicit locator fields. This bridge is
+      // deliberately V1-only: a V2 locator may never fall back to the old
+      // key index or old bucket semantics.
+      if (!existing && asset.assetStore === CREATION_ASSET_STORE_V1) {
+        existing = await ctx.db
+          .query("creations")
+          .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", asset.assetLocator))
+          .first();
+      }
+      if (existing) {
+        let staleIntent = await ctx.db
+          .query("creationAssetCleanupIntents")
+          .withIndex("by_assetStoreLocator", (q: any) => q.eq("assetStore", asset.assetStore).eq("assetLocator", asset.assetLocator))
+          .first();
+        if (!staleIntent && asset.assetStore === CREATION_ASSET_STORE_V1) {
+          staleIntent = await ctx.db
+            .query("creationAssetCleanupIntents")
+            .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", asset.assetLocator))
+            .first();
+        }
+        if (staleIntent) {
+          if (staleIntent.cleanupDeletionTicketId) await ctx.db.delete(staleIntent.cleanupDeletionTicketId);
+          await ctx.db.delete(staleIntent._id);
+        }
+        return existing._id;
+      }
+    }
+    const now = Date.now();
+    let assetIntent = asset
+      ? await ctx.db
+        .query("creationAssetCleanupIntents")
+        .withIndex("by_assetStoreLocator", (q: any) => q.eq("assetStore", asset.assetStore).eq("assetLocator", asset.assetLocator))
+        .first()
+      : null;
+    if (!assetIntent && asset?.assetStore === CREATION_ASSET_STORE_V1) {
+      assetIntent = await ctx.db
+        .query("creationAssetCleanupIntents")
+        .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", asset.assetLocator))
+        .first();
+    }
+    if (assetIntent) {
+      // Cleanup owns every state except a live writer lease. Refusing a late
+      // commit is what prevents a delayed request from creating a row after
+      // recovery has deleted its private object.
+      if (
+        assetIntent.state !== "writing"
+        || assetIntent.recoveryKind === "deletion"
+        || assetIntent.writerEpoch !== a.assetWriteEpoch
+        || Number(assetIntent.nextActionAt) <= now
+      ) {
+        throw new ConvexError({
+          code: "CREATION_ASSET_RECOVERY_OWNED",
+          message: "Private creation asset is no longer writable",
+        });
+      }
+    } else if (asset && a.assetWriteEpoch) {
+      // New producers never write without a reservation. Legacy producers
+      // omit the epoch during a staged Convex rollout and retain their old
+      // behavior; an epoch-bearing request fails closed if its fence vanished.
+      throw new ConvexError({
+        code: "CREATION_ASSET_RESERVATION_MISSING",
+        message: "Private creation asset reservation is unavailable",
+      });
     }
     const filing = inferCreationFiling(a);
     const creationId = await ctx.db.insert("creations", {
@@ -300,16 +472,24 @@ export const create = mutation({
       data: a.data,
       url: a.url,
       thumb: a.thumb,
-      assetR2Key: a.assetR2Key,
+      // assetR2Key remains a compatibility mirror for rolled-out readers and
+      // indexes. It never selects a store once explicit fields are present.
+      assetR2Key: asset?.assetLocator,
+      assetStore: asset?.assetStore,
+      assetLocator: asset?.assetLocator,
       assetContentType: a.assetContentType?.slice(0, 160),
       ...filing,
       threadId: a.threadId?.slice(0, 120),
       sourceFiles: a.sourceFiles,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
     });
     await linkExplicitFilesToCreation(ctx, creationId, a.sourceFiles);
     await linkMessageFilesToCreation(ctx, creationId, a.sourceMessageId);
+    // The asset write intent and creation insert are one Convex transaction.
+    // A cleanup claim that races this mutation retries and observes either the
+    // committed creation or its own cleanup ownership, never a half-state.
+    if (assetIntent) await ctx.db.delete(assetIntent._id);
     return creationId;
   },
 });
@@ -788,6 +968,57 @@ export const remove = mutation({
     if (!creation) return true;
     const refs = await ctx.db.query("creationFileRefs").withIndex("by_creation", (q) => q.eq("creationId", a.id)).collect();
     for (const ref of refs) await ctx.db.delete(ref._id);
+    const asset = creationAssetLocatorFromRow(creation);
+    if (asset) {
+      const migration = await ctx.db
+        .query("creationAssetStoreMigrations")
+        .withIndex("by_key", (q: any) => q.eq("key", "private-creation-r2-v2"))
+        .first();
+      if (migration && migration.state !== "activated" && migration.state !== "aborted") {
+        throw new ConvexError({
+          code: "CREATION_ASSET_MIGRATION_FROZEN",
+          message: "Private creation assets are frozen for their controlled storage migration",
+        });
+      }
+      // Deleting R2 before this metadata mutation can leave a committed row
+      // pointing to a missing asset when its response is lost. Put a durable
+      // cleanup intent in the same transaction as removal instead: from this
+      // point forward the worker may delete only after rechecking that no
+      // canonical creation still references the opaque key.
+      const now = Date.now();
+      let existingIntent = await ctx.db
+        .query("creationAssetCleanupIntents")
+        .withIndex("by_assetStoreLocator", (q: any) => q.eq("assetStore", asset.assetStore).eq("assetLocator", asset.assetLocator))
+        .first();
+      if (!existingIntent && asset.assetStore === CREATION_ASSET_STORE_V1) {
+        existingIntent = await ctx.db
+          .query("creationAssetCleanupIntents")
+          .withIndex("by_assetR2Key", (q: any) => q.eq("assetR2Key", asset.assetLocator))
+          .first();
+      }
+      if (existingIntent) {
+        if (existingIntent.cleanupDeletionTicketId) await ctx.db.delete(existingIntent.cleanupDeletionTicketId);
+        await ctx.db.patch(existingIntent._id, {
+          state: "cleanup_ready",
+          nextActionAt: now,
+          cleanupDeletionTicketId: undefined,
+          cleanupClaimToken: undefined,
+          cleanupClaimExpiresAt: undefined,
+          updatedAt: now,
+        });
+      } else {
+        await ctx.db.insert("creationAssetCleanupIntents", {
+          assetR2Key: asset.assetLocator,
+          assetStore: asset.assetStore,
+          assetLocator: asset.assetLocator,
+          recoveryKind: "deletion",
+          state: "cleanup_ready",
+          nextActionAt: now,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
     await ctx.db.delete(a.id);
     return true;
   },

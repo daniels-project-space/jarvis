@@ -5,7 +5,7 @@ const mock = vi.hoisted(() => ({
   adminSessionHash: vi.fn(),
   validateAdminSession: vi.fn(),
   controlQuery: vi.fn(),
-  privateR2Get: vi.fn(),
+  privateCreationAssetGet: vi.fn(),
   markdownToPdf: vi.fn(),
 }));
 
@@ -14,7 +14,7 @@ vi.mock("@/lib/control-session", () => ({
   validateAdminSession: mock.validateAdminSession,
   controlQuery: mock.controlQuery,
 }));
-vi.mock("@/lib/private-r2", () => ({ privateR2Get: mock.privateR2Get }));
+vi.mock("@/lib/private-creation-asset-store", () => ({ privateCreationAssetGet: mock.privateCreationAssetGet }));
 vi.mock("@/lib/pdf", () => ({ markdownToPdf: mock.markdownToPdf }));
 
 import { GET } from "./route";
@@ -27,7 +27,8 @@ const privateRow = {
   hasPrivateAsset: true,
 };
 const privateMedia = {
-  assetR2Key: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
+  assetStore: "private-r2-v1" as const,
+  assetLocator: "owners/daniel/creations/f47ac10b-58cc-4372-a567-0e02b2c3d479/asset",
   assetContentType: "image/png",
   title: "Private image",
   kind: "image",
@@ -47,7 +48,7 @@ describe("creation downloads", () => {
       if (path === "creations:getForMedia") return privateMedia;
       return null;
     });
-    mock.privateR2Get.mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), {
+    mock.privateCreationAssetGet.mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), {
       status: 200,
       headers: { "content-type": "image/png" },
     }));
@@ -66,7 +67,7 @@ describe("creation downloads", () => {
     expect(response.status).toBe(200);
     expect(mock.controlQuery).toHaveBeenNthCalledWith(1, "creations:get", { id: "creation-1", authTokenHash: OWNER });
     expect(mock.controlQuery).toHaveBeenNthCalledWith(2, "creations:getForMedia", { id: "creation-1", authTokenHash: OWNER });
-    expect(mock.privateR2Get).toHaveBeenCalledWith(privateMedia.assetR2Key);
+    expect(mock.privateCreationAssetGet).toHaveBeenCalledWith({ assetStore: privateMedia.assetStore, assetLocator: privateMedia.assetLocator });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(response.headers.get("content-disposition")).toContain("attachment");
     expect(response.headers.get("content-type")).toBe("image/png");
@@ -128,6 +129,6 @@ describe("creation downloads", () => {
 
     expect(response.status).toBe(401);
     expect(mock.controlQuery).not.toHaveBeenCalled();
-    expect(mock.privateR2Get).not.toHaveBeenCalled();
+    expect(mock.privateCreationAssetGet).not.toHaveBeenCalled();
   });
 });
