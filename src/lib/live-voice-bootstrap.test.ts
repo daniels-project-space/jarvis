@@ -188,6 +188,8 @@ describe("live voice bootstrap policy", () => {
     // Both asynchronous handoffs re-check this policy: a live session can
     // start while the remote lease or the wakeword module is still loading.
     expect(rearmWake.match(/live: liveCaptureIsActiveOrStarting\(\)/g)).toHaveLength(3);
+    expect(rearmWake).toContain("if (!listening && standbyLeaseOwnedRef.current && isCurrentStandbyLease(lease))");
+    expect(rearmWake).toContain("if (standbyLeaseOwnedRef.current && isCurrentStandbyLease(lease)) {");
     expect(source).toContain("const liveStartPendingRef = useRef(false);");
   });
 
