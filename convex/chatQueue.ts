@@ -48,6 +48,12 @@ export const CHAT_TURN_STALE_MS = 45_000;
 export const MAX_CHAT_TURN_ATTEMPTS = 3;
 export const MAX_CHAT_RECOVERY_WAKES = 3;
 export const CHAT_PENDING_EXPIRY_MS = 15 * 60_000;
+// A warm Codex process retains its native thread. This snapshot is only for
+// the occasional cold process, so cap it before it becomes an unbounded model
+// prompt and slows down the very first reply after a handoff or restart.
+export const FOREGROUND_HISTORY_MESSAGE_LIMIT = 12;
+export const FOREGROUND_HISTORY_TEXT_LIMIT = 24_000;
+export const FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT = 4_000;
 const RESEARCH_PREFETCH_BASIS_MAX_CHARS = 720;
 const RESEARCH_PREFETCH_CONTEXT_MAX_CHARS = 3_600;
 const RESEARCH_PREFETCH_MAX_LIFETIME_MS = 60_000;
@@ -63,6 +69,39 @@ const GUEST_CHAT_BUCKET_CAPACITY = 3;
 const GUEST_CHAT_REFILL_MS = 2 * 60_000;
 const GUEST_CHAT_DAILY_LIMIT = 24;
 const GUEST_CHAT_MAX_IN_FLIGHT = 2;
+
+export const FOREGROUND_HISTORY_OMISSION_MARKER = "\n… [earlier history omitted] …\n";
+
+function boundedForegroundHistoryText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  if (limit <= FOREGROUND_HISTORY_OMISSION_MARKER.length) return text.slice(-limit);
+  const retained = limit - FOREGROUND_HISTORY_OMISSION_MARKER.length;
+  const prefixLength = Math.ceil(retained * 0.7);
+  const suffixLength = retained - prefixLength;
+  return [
+    text.slice(0, prefixLength),
+    FOREGROUND_HISTORY_OMISSION_MARKER,
+    suffixLength > 0 ? text.slice(-suffixLength) : "",
+  ].join("");
+}
+
+export function boundedForegroundHistory(rows: Array<{ role: string; text: string }>) {
+  let remaining = FOREGROUND_HISTORY_TEXT_LIMIT;
+  const history: Array<{ role: string; text: string }> = [];
+  // Preserve the newest anchors first, then restore chronological ordering for
+  // the model. A long old answer therefore cannot crowd out the turn Daniel
+  // is most likely following up on.
+  for (let index = rows.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const row = rows[index];
+    const text = boundedForegroundHistoryText(
+      row.text,
+      Math.min(FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT, remaining),
+    );
+    history.unshift({ role: row.role, text });
+    remaining -= text.length;
+  }
+  return history;
+}
 
 // Cloud chat transport for the subscription brain. UI calls sendMessage +
 // subscribes to listMessages; the Trigger dispatcher calls claimNext /
@@ -1059,7 +1098,7 @@ async function claimPending(
     .withIndex("by_thread", (q: any) => q.eq("threadId", pending.threadId))
     .order("desc")
     .take(40);
-  const history = all
+  const historyRows = all
     .filter(
       (m: any) =>
         m._id !== assistantId &&
@@ -1069,7 +1108,7 @@ async function claimPending(
         m.createdAt < pending.createdAt,
     )
     .sort((a: any, b: any) => a.createdAt - b.createdAt)
-    .slice(-12)
+    .slice(-FOREGROUND_HISTORY_MESSAGE_LIMIT)
     .map((m: any) => ({
       role: m.role,
       // Approval markers are bearer receipts. Keep the source row intact so
@@ -1077,6 +1116,7 @@ async function claimPending(
       // receipt into another model turn's context.
       text: m.role === "user" ? visibleTurnText(m.text) : stripAssistantApprovals(m.text),
     }));
+  const history = boundedForegroundHistory(historyRows);
   const prefetchRow =
     pending.hasResearchPrefetch === false
       ? null
