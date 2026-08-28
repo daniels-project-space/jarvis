@@ -3,6 +3,7 @@ import {
   canSubmitICloudCalendarApproval,
   iCloudCalendarApprovalFailureState,
   iCloudCalendarApprovalButtonLabel,
+  iCloudCalendarApprovalSuccessDetail,
 } from "./icloud-calendar-approval-card";
 
 describe("iCloud Calendar approval card state", () => {
@@ -20,5 +21,11 @@ describe("iCloud Calendar approval card state", () => {
     expect(iCloudCalendarApprovalFailureState(400)).toBe("expired");
     expect(iCloudCalendarApprovalFailureState(409)).toBe("expired");
     expect(iCloudCalendarApprovalButtonLabel("expired")).toBe("Approval expired");
+  });
+
+  it("labels a successful sealed update as an update, even when CalDAV reports an existing resource", () => {
+    expect(iCloudCalendarApprovalSuccessDetail("update", false)).toBe("Updated iCloud Calendar.");
+    expect(iCloudCalendarApprovalSuccessDetail("create", false)).toBe("Already present in iCloud Calendar.");
+    expect(iCloudCalendarApprovalSuccessDetail("create", true)).toBe("Added to iCloud Calendar.");
   });
 });

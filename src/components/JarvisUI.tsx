@@ -26,6 +26,7 @@ import {
   canSubmitICloudCalendarApproval,
   iCloudCalendarApprovalFailureState,
   iCloudCalendarApprovalButtonLabel,
+  iCloudCalendarApprovalSuccessDetail,
   type ICloudCalendarApprovalCardState,
 } from "@/lib/icloud-calendar-approval-card";
 import { createOrbMotionFrame, deriveOrbVisual, type OrbMotionFrame } from "@/lib/orb-motion";
@@ -409,7 +410,7 @@ function ICloudCalendarApprovalCard({ token }: { token: string }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ token }),
       });
-      const payload = await response.json().catch(() => ({})) as { ok?: unknown; created?: unknown; error?: unknown };
+      const payload = await response.json().catch(() => ({})) as { ok?: unknown; action?: unknown; created?: unknown; error?: unknown };
       if (!response.ok || payload.ok !== true) {
         const failureState = iCloudCalendarApprovalFailureState(response.status);
         if (failureState === "expired") {
@@ -420,7 +421,7 @@ function ICloudCalendarApprovalCard({ token }: { token: string }) {
         throw new Error(String(payload.error ?? "iCloud Calendar approval was rejected."));
       }
       setState("completed");
-      setDetail(payload.created === false ? "Already present in iCloud Calendar." : "Added to iCloud Calendar.");
+      setDetail(iCloudCalendarApprovalSuccessDetail(payload.action, payload.created));
     } catch (error) {
       setState("error");
       setDetail(String(error instanceof Error ? error.message : "iCloud Calendar approval was rejected."));

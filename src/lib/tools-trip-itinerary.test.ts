@@ -31,6 +31,7 @@ const mock = vi.hoisted(() => ({
   listGooglePrimaryCalendarEvents: vi.fn(),
   iCloudCalendarConfigured: vi.fn(),
   resolveICloudTravelCalendar: vi.fn(),
+  inspectICloudTravelCalendarAttempt: vi.fn(),
 }));
 
 vi.mock("./context", () => ({ convexMutation: mock.convexMutation, convexQuery: mock.convexQuery }));
@@ -50,6 +51,7 @@ vi.mock("./icloud-calendar", () => ({
   findICloudEvents: vi.fn(),
   listICloudEvents: vi.fn(),
   iCloudCalendarConfigured: mock.iCloudCalendarConfigured,
+  inspectICloudTravelCalendarAttempt: mock.inspectICloudTravelCalendarAttempt,
   resolveICloudTravelCalendar: mock.resolveICloudTravelCalendar,
 }));
 vi.mock("./openstreetmap", () => ({ searchOpenStreetMapPlaces: mock.searchOpenStreetMapPlaces }));
@@ -614,11 +616,12 @@ describe("trip itinerary tool actions", () => {
     mock.convexQuery.mockImplementation(async (path: string) => path === "ui:getActiveThread" ? "thread-icloud" : null);
     let registryWrites = 0;
     mock.convexMutation.mockImplementation(async (path: string) => {
+      if (path === "appleMapsOfflinePreflights:reconcileICloudCalendarAttempt") return { ok: true };
       if (path !== "appleMapsOfflinePreflights:upsert") return undefined;
       registryWrites += 1;
       return registryWrites === 1
         ? { ok: true }
-        : {
+        : registryWrites === 2 ? {
           ok: true,
           iCloudCalendarEvent: {
             calendarUrl,
@@ -628,7 +631,24 @@ describe("trip itinerary tool actions", () => {
             nonce: "priorReceiptNonce_123456",
             committedAt: 1_780_000_000_000,
           },
+        } : {
+          ok: true,
+          iCloudCalendarAttempt: {
+            sourceKey,
+            calendarUrl,
+            eventUrl,
+            revision: 1_780_000_000_111,
+            nonce: "orphanedReceiptNonce_123456",
+            action: "create",
+            startedAt: 1_780_000_000_111,
+          },
         };
+    });
+    mock.inspectICloudTravelCalendarAttempt.mockResolvedValue({
+      state: "present",
+      revision: 1_780_000_000_111,
+      nonce: "orphanedReceiptNonce_123456",
+      etag: '"orphan-etag-1"',
     });
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
       const url = new URL(String(input));
@@ -679,6 +699,24 @@ describe("trip itinerary tool actions", () => {
         calendarStatus: "approval_required",
       }),
     }), true, expect.objectContaining({ storage: "creation" }));
+
+    const recovered = await executeTool("travel_offline_maps_prepare", { creation_id: "creation-icloud" });
+    const recoveredUpdate = verifyICloudCalendarTravelApproval(extractICloudCalendarApproval(recovered)!);
+    expect(recoveredUpdate.proposal).toMatchObject({
+      action: "update",
+      eventUrl,
+      expectedEtag: '"orphan-etag-1"',
+    });
+    expect(mock.inspectICloudTravelCalendarAttempt).toHaveBeenCalledWith(expect.objectContaining({
+      calendarUrl,
+      eventUrl,
+      sourceKey,
+      markers: [{ revision: 1_780_000_000_111, nonce: "orphanedReceiptNonce_123456" }],
+    }));
+    expect(mock.convexMutation).toHaveBeenCalledWith("appleMapsOfflinePreflights:reconcileICloudCalendarAttempt", expect.objectContaining({
+      state: "present",
+      etag: '"orphan-etag-1"',
+    }));
   });
 
   it("keeps a durable retry state when Google Calendar is not connected", async () => {
