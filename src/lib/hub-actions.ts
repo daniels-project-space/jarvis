@@ -4,6 +4,12 @@ import "server-only";
 // The Hub façade accepts only this dedicated capability and only the four
 // explicitly named operations below.
 export const HUB_ACTIONS_URL = "https://fantastic-roadrunner-485.convex.cloud";
+// Read-only Hub context/status calls must not consume a foreground turn or a
+// durable refresh until their much larger outer worker deadlines. This is an
+// overall deadline (including a stalled response body), not just a connection
+// timeout. Mutations deliberately do not use it: once a write left Jarvis, a
+// timeout cannot truthfully say whether Hub committed it.
+export const HUB_ACTIONS_TIMEOUT_MS = 5_000;
 
 export type HubActionsEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -47,12 +53,26 @@ export type HubActionsRequestOptions = Readonly<{
   environment?: HubActionsEnvironment;
   fetchImpl?: typeof fetch;
   hubUrl?: string;
+  // Applies only to read-only query calls. Mutation calls intentionally retain
+  // their existing transport semantics so a response loss cannot be mistaken
+  // for a failed write.
+  //
+  // Internal callers and tests may request a shorter deadline, never a longer
+  // one. The shared default remains the hard ceiling for query calls.
+  timeoutMs?: number;
 }>;
 
 export class HubActionsUnavailableError extends Error {
   constructor() {
     super("Project Hub actions are not configured");
     this.name = "HubActionsUnavailableError";
+  }
+}
+
+export class HubActionsTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Project Hub action timed out after ${timeoutMs}ms`);
+    this.name = "HubActionsTimeoutError";
   }
 }
 
@@ -77,8 +97,47 @@ type HubActionPath =
   | "jarvisActions:createTodo"
   | "jarvisActions:updateTodo";
 
+type HubActionKind = "query" | "mutation";
+
+type HubActionPayload<T> = Readonly<{
+  value?: T;
+  status?: string;
+  errorMessage?: string;
+}>;
+
+function isReadOnlyHubAction(kind: HubActionKind): kind is "query" {
+  // The only read-only façade calls use Convex queries (`listTodos` and
+  // `listWidgets`). Keeping this classification at the transport boundary
+  // prevents a future caller from accidentally putting a write on a deadline.
+  return kind === "query";
+}
+
+function isHubActionPayload(value: unknown): value is HubActionPayload<unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSuccessfulReadHubActionPayload(
+  value: unknown,
+): value is HubActionPayload<unknown> & Readonly<{ value: unknown }> {
+  return isHubActionPayload(value) && Object.prototype.hasOwnProperty.call(value, "value");
+}
+
+function boundedHubActionsTimeout(value: unknown): number {
+  const requested = Number(value);
+  if (!Number.isFinite(requested)) return HUB_ACTIONS_TIMEOUT_MS;
+  // A tiny lower bound avoids a caller accidentally converting a safe fail
+  // closed result into a synchronous failure, while still allowing focused
+  // tests and intentionally fast callers to use a shorter budget.
+  return Math.min(HUB_ACTIONS_TIMEOUT_MS, Math.max(25, Math.floor(requested)));
+}
+
+function requireHubActionList<T>(value: unknown, path: HubActionPath): T[] {
+  if (!Array.isArray(value)) throw new Error(`Project Hub ${path} failed`);
+  return value as T[];
+}
+
 async function requestHubAction<T>(
-  kind: "query" | "mutation",
+  kind: HubActionKind,
   path: HubActionPath,
   args: Record<string, unknown>,
   options: HubActionsRequestOptions = {},
@@ -86,30 +145,79 @@ async function requestHubAction<T>(
   const vaultArgs = hubActionsRequestArgs(options.environment);
   if (!vaultArgs) throw new HubActionsUnavailableError();
 
-  const response = await (options.fetchImpl ?? fetch)(`${options.hubUrl ?? HUB_ACTIONS_URL}/api/${kind}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    // The capability travels only in this server-to-server JSON body. It is
-    // never put in a URL, browser payload, request header, or child process.
-    body: JSON.stringify({ path, args: { ...args, ...vaultArgs }, format: "json" }),
-  });
-  const payload = await response.json().catch(() => null) as {
-    value?: T;
-    status?: string;
-    errorMessage?: string;
-  } | null;
-  if (!response.ok || payload?.status === "error") {
-    throw new Error(`Project Hub ${path} failed`);
+  const request = async (signal?: AbortSignal): Promise<T> => {
+    const response = await (options.fetchImpl ?? fetch)(`${options.hubUrl ?? HUB_ACTIONS_URL}/api/${kind}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      ...(signal ? { signal } : {}),
+      // The capability travels only in this server-to-server JSON body. It is
+      // never put in a URL, browser payload, request header, or child process.
+      body: JSON.stringify({ path, args: { ...args, ...vaultArgs }, format: "json" }),
+    });
+    const payload = await response.json().catch((error) => {
+      // Do not turn an abort while reading the response body into a seemingly
+      // successful `undefined` action result.
+      if (signal?.aborted) throw error;
+      // Read-only context/status calls can safely fail closed on a malformed
+      // body without exposing a transport/parser detail to their callers.
+      if (isReadOnlyHubAction(kind)) throw new Error(`Project Hub ${path} failed`);
+      return null;
+    }) as unknown;
+    const isReadOnly = isReadOnlyHubAction(kind);
+    if (
+      !response.ok ||
+      (isHubActionPayload(payload) && payload.status === "error") ||
+      (isReadOnly && !isSuccessfulReadHubActionPayload(payload))
+    ) {
+      throw new Error(`Project Hub ${path} failed`);
+    }
+    return (payload as HubActionPayload<T> | null)?.value as T;
+  };
+
+  if (!isReadOnlyHubAction(kind)) {
+    // Preserve the prior write transport exactly: no deadline, cancellation,
+    // or replay. A late create/update result is more honest than falsely
+    // claiming that nothing changed after Hub accepted the mutation.
+    return await request();
   }
-  return payload?.value as T;
+
+  const timeoutMs = boundedHubActionsTimeout(options.timeoutMs);
+  const controller = new AbortController();
+  const timeoutError = new HubActionsTimeoutError(timeoutMs);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      // Abort transports that honor a signal, and race the full request so a
+      // test/custom transport that ignores it cannot strand the caller.
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([request(controller.signal), deadline]);
+  } catch (error) {
+    // Some fetch implementations reject from their abort listener before the
+    // deadline promise is observed. Preserve one stable fail-closed error for
+    // callers either way.
+    if (controller.signal.aborted && controller.signal.reason === timeoutError) throw timeoutError;
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 export async function listHubTodos(options?: HubActionsRequestOptions): Promise<HubTodo[]> {
-  return await requestHubAction<HubTodo[]>("query", "jarvisActions:listTodos", {}, options);
+  return requireHubActionList<HubTodo>(
+    await requestHubAction<unknown>("query", "jarvisActions:listTodos", {}, options),
+    "jarvisActions:listTodos",
+  );
 }
 
 export async function listHubWidgets(options?: HubActionsRequestOptions): Promise<HubWidget[]> {
-  return await requestHubAction<HubWidget[]>("query", "jarvisActions:listWidgets", {}, options);
+  return requireHubActionList<HubWidget>(
+    await requestHubAction<unknown>("query", "jarvisActions:listWidgets", {}, options),
+    "jarvisActions:listWidgets",
+  );
 }
 
 export async function createHubTodo(

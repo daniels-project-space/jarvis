@@ -2137,10 +2137,16 @@ async function todoAdd(args: any): Promise<string> {
       dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(args.due_date ?? "")) ? londonMs(String(args.due_date), "12:00") : undefined,
       tags: Array.isArray(args.tags) ? args.tags.map(String).slice(0, 4) : ["jarvis"],
     });
-    const open = (await listHubTodos()).filter((todo) => !todo.done).length;
-    return `Done — "${text}" is now on the hub to-do list (${open} open). Confirm it casually in one line.`;
   } catch (error) {
     return hubActionsFailureMessage(error);
+  }
+  try {
+    const open = (await listHubTodos()).filter((todo) => !todo.done).length;
+    return `Done — "${text}" is now on the hub to-do list (${open} open). Confirm it casually in one line.`;
+  } catch {
+    // The creation receipt already crossed the exact Hub boundary. A later
+    // read only affects the optional count, never whether the to-do exists.
+    return `Done — "${text}" is now on the hub to-do list. I could not refresh the open count.`;
   }
 }
 

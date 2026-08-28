@@ -34,6 +34,15 @@ describe("subscription model policy", () => {
     expect(pickConversationTier("Hey Jarvis, fix the loading spinner")).toBe("terra");
   });
 
+  it("does not route short consequential instructions to the cheap reflex tier", () => {
+    expect(pickConversationTier("Send the client a confirmation email")).toBe("terra");
+    expect(pickConversationTier("Delete this upcoming calendar event")).toBe("terra");
+    expect(pickConversationTier("Deploy this to production")).toBe("terra");
+    // Analytical and explicitly negated wording remains cheap when it does
+    // not request an external effect.
+    expect(pickConversationTier("Do not send the client an email; just show a draft")).toBe("luna");
+  });
+
   it("reserves the stripped Luna thread for exact social reflexes", () => {
     expect(shouldUseLunaFastLane("hello Jarvis", "luna")).toBe(true);
     expect(shouldUseLunaFastLane("Thanks, Jarvis!", "luna")).toBe(true);

@@ -1,6 +1,7 @@
 import { normalizeWorkModelTier, type WorkModelTier } from "../lib/work-models";
 import { visibleTurnText } from "../lib/host-context";
 import { isConversationalReflex } from "../lib/conversation-intent";
+import { requestsConsequentialAction } from "../lib/work-safety";
 
 export const CODEX_MODEL_POLICY = {
   luna: { model: "gpt-5.6-luna", effort: "low" },
@@ -116,6 +117,11 @@ export function pickConversationTier(text: string): WorkModelTier {
     value.length > 700 ||
     /\b(root cause|multi[- ]?(repo|project|file)|architecture migration|security incident|production outage|think (really |very )?hard|from first principles|deep dive)\b/.test(value)
   ) return "sol";
+  // The shared consequence classifier already protects execution at the tool
+  // and Convex boundaries. Do not nevertheless ask the cheapest model to
+  // interpret a short request that may create an external effect; Terra keeps
+  // it responsive while giving approvals/drafts enough reasoning headroom.
+  if (requestsConsequentialAction(value)) return "terra";
   if (value.length <= 80 && isConversationalReflex(value)) return "luna";
   if (
     value.length <= 80 &&

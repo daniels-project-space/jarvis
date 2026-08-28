@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("server-only", () => ({}));
 
 import {
+  HubActionsTimeoutError,
   HubActionsUnavailableError,
   createHubTodo,
   hubActionsReadiness,
@@ -55,6 +56,86 @@ describe("Project Hub Jarvis actions capability", () => {
       args: { vaultToken: "dedicated-jarvis-actions-token" },
       format: "json",
     });
+    expect(fetchImpl.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("fails closed on a bounded overall deadline even when an injected transport ignores abort", async () => {
+    let signal: AbortSignal | undefined;
+    const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      signal = init?.signal ?? undefined;
+      return new Promise<Response>(() => {});
+    });
+
+    await expect(listHubTodos({ environment: ENV, fetchImpl: fetchImpl as typeof fetch, timeoutMs: 25 }))
+      .rejects.toBeInstanceOf(HubActionsTimeoutError);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("includes a stalled response body in the same Hub deadline", async () => {
+    let signal: AbortSignal | undefined;
+    const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      signal = init?.signal ?? undefined;
+      return Promise.resolve({
+        ok: true,
+        json: () => new Promise<unknown>(() => {}),
+      } as Response);
+    });
+
+    await expect(listHubTodos({ environment: ENV, fetchImpl: fetchImpl as typeof fetch, timeoutMs: 25 }))
+      .rejects.toBeInstanceOf(HubActionsTimeoutError);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("fails closed on a malformed read body without exposing parser details", async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      json: () => Promise.reject(new SyntaxError("unexpected Hub body")),
+    } as Response));
+
+    await expect(listHubTodos({ environment: ENV, fetchImpl }))
+      .rejects.toThrow("Project Hub jarvisActions:listTodos failed");
+  });
+
+  it.each([
+    ["array", []],
+    ["empty object", {}],
+    ["string", "not a Hub action payload"],
+  ])("fails closed when a read body is a %s without a value field", async (_description, body) => {
+    const fetchImpl = vi.fn(async () => Response.json(body));
+
+    await expect(listHubTodos({ environment: ENV, fetchImpl }))
+      .rejects.toThrow("Project Hub jarvisActions:listTodos failed");
+  });
+
+  it("fails closed when either list query returns a non-list value", async () => {
+    const readActions = [
+      ["jarvisActions:listTodos", listHubTodos],
+      ["jarvisActions:listWidgets", listHubWidgets],
+    ] as const;
+
+    for (const [path, read] of readActions) {
+      for (const value of [{}, "not a Hub list"]) {
+        const fetchImpl = vi.fn(async () => Response.json({ value }));
+        await expect(read({ environment: ENV, fetchImpl }))
+          .rejects.toThrow(`Project Hub ${path} failed`);
+      }
+    }
+  });
+
+  it("keeps mutation transport unchanged even when a query deadline is requested", async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      // A mutation that takes longer than a query's requested test deadline
+      // must still resolve rather than returning a false failed-write result.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(init).not.toHaveProperty("signal");
+      return response({ id: "todo-1" });
+    });
+
+    await expect(createHubTodo(
+      { text: "Keep the write outcome truthful" },
+      { environment: ENV, fetchImpl, timeoutMs: 25 },
+    )).resolves.toEqual({ id: "todo-1" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("uses only the façade's bounded create and update fields", async () => {
