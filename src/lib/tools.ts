@@ -1883,11 +1883,11 @@ async function rankFocus(args: any): Promise<string> {
 }
 
 // Show a widget AND drop a recallable card in the stream (tap = re-show later).
-async function showWidget(widget: Record<string, unknown>, title: string) {
+async function showWidget(widget: Record<string, unknown>, title: string, threadId?: string) {
   const json = JSON.stringify(widget);
   await convexMutation("ui:setPanel", { type: "widget", value: json, title });
   if (json.length < 3900)
-    await convexMutation("chatQueue:postCard", { threadId: await activeThread(), type: "widget", value: json, title }).catch(
+    await convexMutation("chatQueue:postCard", { threadId: threadId || await activeThread(), type: "widget", value: json, title }).catch(
       () => {},
     );
 }
@@ -2613,6 +2613,7 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
   const bookings = await scanGmailBookingConfirmations({ days });
   const syncCalendar = args.sync_calendar === true;
   let tripNote = "";
+  let cardThreadId = invocationContext?.threadId;
   const workspace = workspaceResult.workspace;
   if (workspace) {
     const {
@@ -2629,6 +2630,10 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
       : { storage: "creation" as const };
     const trip = await getTrip(workspace.id, tripContext);
     if (!trip) return `I found ${bookings.length} confirmed booking${bookings.length === 1 ? "" : "s"}, but ${workspace.field} ${workspace.id} was not found.`;
+    // An exact saved workspace already has an owner conversation. A later
+    // refresh request must not move its booking card into whichever chat
+    // happens to invoke the tool after the UI switched.
+    cardThreadId = String(trip.doc.threadId ?? "").trim() || cardThreadId;
     const matching = bookingsForTripWindow(bookings, trip.doc.departDate, trip.doc.returnDate);
     const total = replaceConfirmedBookings(trip.doc, matching);
     const checkedAt = Date.now();
@@ -2649,7 +2654,7 @@ async function bookingsCheck(args: any, invocationContext?: ToolInvocationContex
     calendarAdded: 0,
     readOnly: !workspace,
     items: bookings.map(bookingBoardItem),
-  }, "confirmed bookings");
+  }, "confirmed bookings", cardThreadId);
   let calendarNote = " Calendar left untouched.";
   let calendarApprovalMarker = "";
   if (syncCalendar) {
@@ -2815,6 +2820,10 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
     : { storage: "creation" as const };
   const trip = await getTrip(workspace.id, tripContext);
   if (!trip) return `${workspace.field} ${workspace.id} was not found.`;
+  // A saved trip is permanently bound to its conversation. If the owner
+  // switches chats while this worker turn runs, keep reminders and the Apple
+  // Maps handoff with the trip rather than the newly active UI thread.
+  const tripThreadId = String(trip.doc.threadId ?? "").trim() || invocationContext?.threadId || await activeThread();
 
   const days = Math.max(7, Math.min(730, Math.round(Number(args.days) || 365)));
   let bookings: ConfirmedBooking[];
@@ -2880,7 +2889,7 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
       text: preflight.reminderText,
       at: preflight.at,
       sourceKey: preflight.sourceKey,
-      originThreadId: await activeThread(),
+      originThreadId: tripThreadId,
     });
   } catch {
     return "Apple Maps preflight could not persist Jarvis's timed reminder. No Calendar proposal was created; retry this exact trip.";
@@ -2997,7 +3006,7 @@ async function travelOfflineMapsPrepare(args: any, invocationContext?: ToolInvoc
   }
   await saveTrip(trip.id, trip.doc, true, tripContext);
   await convexMutation("chatQueue:postCard", {
-    threadId: await activeThread(),
+    threadId: tripThreadId,
     type: "url",
     value: preflight.mapUrl,
     title: `Apple Maps · ${preflight.city} ↗`,
@@ -4464,6 +4473,7 @@ async function tripPlanTool(args: any, invocationContext?: ToolInvocationContext
     reuseId: workspace.workspace?.id,
     reuseStorage: workspace.workspace?.storage,
     sourceMessageId: invocationContext?.userMessageId,
+    threadId: invocationContext?.threadId,
   });
   const { id, doc } = result;
   const idField = result.storage === "draft" ? "draft_id" : "creation_id";
@@ -5653,6 +5663,7 @@ export async function executeTool(
         destination,
         destIata: args.dest_iata ? String(args.dest_iata) : undefined,
         sourceMessageId: invocationContext?.userMessageId,
+        threadId: invocationContext?.threadId,
       });
       return `Trip draft ${id} is up on the globe, centred on ${destination}${doc.airport ? ` (${doc.airport.name} marked)` : ""}. It fills in live as you plan; use this exact draft_id for trip_plan and every later edit until you explicitly lock it.`;
     }
