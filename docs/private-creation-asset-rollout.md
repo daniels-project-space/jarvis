@@ -27,11 +27,20 @@ runs start while it drains.
 1. Record the candidate SHA. Deploy that exact Vercel build to the production
    alias and verify the alias's source SHA in Vercel. Do not treat a Git push
    as proof that the alias changed.
-2. After the alias is confirmed, wait **150 seconds** before changing Convex:
-   this covers the longest old HTTP creation producer (`/api/tools`,
-   `/api/agent-tool`, and `/api/foreground-owner-tool`: 120 seconds) plus a
-   30-second drain margin. `/api/creation-export` is limited to 30 seconds.
-   The new Vercel build is fail-closed throughout this bridge.
+2. Before shifting the alias, inspect the **old production Vercel deployment**
+   and record the effective function maximum for `/api/client-mutation`. That
+   old direct-R2-delete route has no source-level `maxDuration`, so its bound
+   comes from Vercel project/function settings and must not be inferred from
+   this repository or plan defaults. After the alias is confirmed, keep the
+   bridge active for `max(120 seconds, T_clientMutation) + 30 seconds`, where
+   `T_clientMutation` is that recorded old-deployment bound. The 120-second
+   floor covers `/api/tools`, `/api/agent-tool`, and
+   `/api/foreground-owner-tool`; `/api/creation-export` is limited to
+   30 seconds. At the end of that interval, capture Vercel function/log
+   evidence that no old-alias invocation remains active. If the effective bound
+   or completion evidence cannot be obtained from Vercel, this is a **NO-GO**;
+   do not substitute a fixed 150-second wait. The new Vercel build is
+   fail-closed throughout this bridge.
 3. In Trigger production, pause these queues before the old-version drain:
 
    - `{ type: "custom", name: "jarvis-background-agents" }` — owns
