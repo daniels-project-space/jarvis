@@ -1,3 +1,6 @@
+import { visibleTurnText } from "./host-context";
+import { redactSensitiveText } from "./secret-redaction";
+
 // Fast, local mood inference for the orb. It deliberately runs in the client:
 // colour should react the instant Daniel speaks, not after a model round-trip
 // or a Convex mutation. The model can still use orb_mood for a nuanced shift.
@@ -45,6 +48,15 @@ export const MOOD_COLORS: Record<OrbMood, string> = {
 
 export function isOrbMood(value: unknown): value is OrbMood {
   return typeof value === "string" && (ORB_MOODS as readonly string[]).includes(value);
+}
+
+/**
+ * Mood is a local presentation signal, so it should see the same clean user
+ * wording the interface exposes—not hidden host context or credential-shaped
+ * text embedded beside a fast dispatch request.
+ */
+export function sanitizedVisibleUserMoodText(input: string): string {
+  return redactSensitiveText(visibleTurnText(input));
 }
 
 /**

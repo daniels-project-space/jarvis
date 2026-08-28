@@ -64,6 +64,12 @@ describe("particle orb source contracts", () => {
     expect(moodHookSource).toContain("freshAutomaticOrbMood(moodRow, thread)");
     expect(moodHookSource).toContain("message.status === \"done\"");
     expect(moodHookSource).toContain("automaticMoodForThread || freshAutoMood");
+    const fastDispatchPath = jarvisSource.slice(
+      jarvisSource.indexOf("if (fastDispatch) {"),
+      jarvisSource.indexOf("return;", jarvisSource.indexOf("if (fastDispatch) {")),
+    );
+    expect(fastDispatchPath).toContain("updateConversationMood(sanitizedVisibleUserMoodText(visibleText));");
+    expect(fastDispatchPath.indexOf("updateConversationMood(")).toBeLessThan(fastDispatchPath.indexOf("openFastAgentDispatch"));
     expect(personaSource).toContain("let it subtly change your register too");
   });
 
