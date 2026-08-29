@@ -1,20 +1,19 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
+import { JARVIS_TRIGGER_ENV_KEYS } from "./trigger-env";
+
 describe("Trigger mission rollout environment", () => {
   it("forwards the V2 mission protocol rollout consumed by Trigger workers", () => {
     const config = readFileSync(new URL("../../trigger.config.ts", import.meta.url), "utf8");
     const syncStart = config.indexOf("syncEnvVars(() =>");
-    const syncEnd = config.indexOf("return Object.keys(values)", syncStart);
     expect(syncStart).toBeGreaterThan(-1);
-    expect(syncEnd).toBeGreaterThan(syncStart);
-
-    const syncedEnvironment = config.slice(syncStart, syncEnd);
-    expect(syncedEnvironment).toContain('"JARVIS_MISSION_PROTOCOL_ROLLOUT"');
-    expect(syncedEnvironment).toContain('"JARVIS_MISSION_SUPERVISOR_ROLLOUT"');
-    expect(syncedEnvironment).toContain('"JARVIS_HUB_CONTEXT_TOKEN"');
-    expect(syncedEnvironment).toContain('"JARVIS_HUB_ACTIONS_TOKEN"');
-    expect(syncedEnvironment).toContain('"JARVIS_CLOUD_PROVIDER_PROBE"');
+    expect(config.slice(syncStart)).toContain("syncedJarvisTriggerEnvironment(process.env)");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_MISSION_PROTOCOL_ROLLOUT");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_MISSION_SUPERVISOR_ROLLOUT");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_HUB_CONTEXT_TOKEN");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_HUB_ACTIONS_TOKEN");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_CLOUD_PROVIDER_PROBE");
 
     const runner = readFileSync(new URL("./agent-runner.ts", import.meta.url), "utf8");
     const foregroundTools = readFileSync(new URL("../lib/tools.ts", import.meta.url), "utf8");

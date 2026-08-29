@@ -47,14 +47,11 @@ export const JARVIS_TRIGGER_ENV_KEYS = [
 export function syncedJarvisTriggerEnvironment(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): Record<string, string> {
-  return Object.fromEntries(
-    JARVIS_TRIGGER_ENV_KEYS
-      .map((key) => [
-        key,
-        key === CODEX_SESSION_SOURCE_ENV
-          ? (environment[key]?.trim() || CODEX_SESSION_SOURCE)
-          : environment[key],
-      ] as const)
-      .filter((entry): entry is readonly [string, string] => Boolean(entry[1])),
-  );
+  return JARVIS_TRIGGER_ENV_KEYS.reduce<Record<string, string>>((values, key) => {
+    const value = key === CODEX_SESSION_SOURCE_ENV
+      ? (environment[key]?.trim() || CODEX_SESSION_SOURCE)
+      : environment[key];
+    if (value) values[key] = value;
+    return values;
+  }, {});
 }
