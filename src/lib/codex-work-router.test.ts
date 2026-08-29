@@ -216,6 +216,17 @@ describe("adaptive Codex work policy", () => {
     })).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
   });
 
+  it("keeps emphatic quality language on Terra ultra unless Sol/max is explicit", () => {
+    expect(selectCodexWorkPolicy({
+      task: "Think really hard and produce the highest quality architecture recommendation",
+      role: "goal-planner",
+    })).toMatchObject({ model: "terra", reasoningEffort: "ultra" });
+    expect(selectCodexWorkPolicy({
+      task: "Use Sol/max for the exceptional safety review",
+      role: "sentry",
+    })).toMatchObject({ model: "sol", reasoningEffort: "max" });
+  });
+
   it.each([
     {
       task: "Apply the routine deterministic rename with high reasoning effort",

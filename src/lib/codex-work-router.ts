@@ -78,7 +78,11 @@ const SHORT = /\b(quick|brief|bounded|one[- ]file|single[- ]file|small|routine|d
 const SECURITY = /\b(security|privacy|authentication|authorization|permissions?|credentials?|secrets?|tenant isolation|customer data|personal data|pii|payment)\b/i;
 const PRODUCTION = /\b(production|live|deploy|release|customer-facing|user data|data loss|outage|incident)\b/i;
 const BROAD_TOOLS = /\b(browser|playwright|provider|production logs?|web search|multiple repositories|cross[- ]project|multi[- ]repo)\b/i;
-const EXPLICIT_MAX_QUALITY = /\b(max(?:imum)? quality|highest quality|best available (?:model|reasoning)|use sol(?:\/max)?|sol\/max|deepest reasoning|think (?:very |really )?hard|do not economi[sz]e)\b/i;
+// A direct Sol/max request is exceptional. General requests for the best
+// answer stay on Terra/ultra so they retain quality without treating common
+// emphatic language as permission to spend the frontier route.
+const EXPLICIT_SOL_MAX = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?sol\s*\/\s*max\b|\bsol\s*\/\s*max\b/i;
+const EXPLICIT_PREFERRED_ULTRA = /\b(max(?:imum)? quality|highest quality|best available (?:model|reasoning)|deepest reasoning|think (?:very |really )?hard|do not economi[sz]e)\b/i;
 const EXPLICIT_HIGH_QUALITY = /\b(?:at|with|use|using|choose|select)?\s*high[- ]quality\b/i;
 const EXPLICIT_HIGH_EFFORT = /\bhigh reasoning effort\b|\breasoning effort(?:\s+(?:of|is|at)|\s*[:=])?\s*high\b/i;
 const EXPLICIT_TERRA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?terra(?:\/(?:low|medium|high|xhigh|max|ultra))?\b|\bterra\/(?:low|medium|high|xhigh|max|ultra)\b/i;
@@ -114,15 +118,15 @@ function maxEffort(left: CodexReasoningEffort, right: CodexReasoningEffort): Cod
 }
 
 function explicitTextModel(task: string): WorkModelTier | null {
-  if (EXPLICIT_MAX_QUALITY.test(task) || EXPLICIT_SOL.test(task)) return "sol";
+  if (EXPLICIT_SOL_MAX.test(task) || EXPLICIT_SOL.test(task)) return "sol";
   if (EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_TERRA.test(task)) return "terra";
   if (EXPLICIT_LUNA.test(task)) return "luna";
   return null;
 }
 
 function explicitTextEffort(task: string): CodexReasoningEffort | null {
-  if (EXPLICIT_ULTRA_EFFORT.test(task)) return "ultra";
-  if (EXPLICIT_MAX_QUALITY.test(task) || /\b(?:luna|terra|sol)\/max\b|\bmax(?:imum)? reasoning effort\b/i.test(task)) return "max";
+  if (EXPLICIT_ULTRA_EFFORT.test(task) || EXPLICIT_PREFERRED_ULTRA.test(task)) return "ultra";
+  if (EXPLICIT_SOL_MAX.test(task) || /\b(?:luna|terra|sol)\/max\b|\bmax(?:imum)? reasoning effort\b/i.test(task)) return "max";
   if (EXPLICIT_XHIGH_EFFORT.test(task)) return "xhigh";
   if (EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_HIGH_EFFORT.test(task) || /\b(?:luna|terra|sol)\/high\b/i.test(task)) return "high";
   if (/\b(?:luna|terra|sol)\/medium\b|\bmedium reasoning effort\b/i.test(task)) return "medium";
@@ -231,8 +235,9 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
   const toolBreadth = input.toolBreadth ?? inferToolBreadth(task, tools, crossProject);
   const proseModelFloor = explicitTextModel(task);
   const proseEffortFloor = explicitTextEffort(task);
-  const explicitMaximum = EXPLICIT_MAX_QUALITY.test(task);
-  const explicitQuality = explicitMaximum || EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_HIGH_EFFORT.test(task)
+  const explicitSolMax = EXPLICIT_SOL_MAX.test(task);
+  const explicitQuality = explicitSolMax || EXPLICIT_PREFERRED_ULTRA.test(task)
+    || EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_HIGH_EFFORT.test(task)
     || proseModelFloor === "sol" || proseModelFloor === "terra";
   const difficultRootCause = DIFFICULT_ROOT_CAUSE.test(task);
 
@@ -255,7 +260,7 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
     // tier for a bounded, reversible change in one owned repository.
     model = "terra";
   }
-  if (explicitMaximum) model = "sol";
+  if (explicitSolMax) model = "sol";
 
   const structuredModelFloor = parseWorkModelTier(input.requestedModel);
   const requestedModel = structuredModelFloor && proseModelFloor
@@ -277,7 +282,7 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
       ? "ultra"
       : "xhigh";
   } else {
-    reasoningEffort = explicitMaximum || requiresSolMax ? "max" : "xhigh";
+    reasoningEffort = explicitSolMax || requiresSolMax ? "max" : "xhigh";
   }
   const structuredEffortFloor = parseCodexReasoningEffort(input.requestedReasoningEffort);
   const requestedEffort = structuredEffortFloor && proseEffortFloor
