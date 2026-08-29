@@ -140,8 +140,8 @@ describe("Goal Mode exact source lineage", () => {
     });
     expect(rootCause).toMatchObject({
       ...expectedSource,
-      model: "sol",
-      reasoningEffort: "max",
+      model: "terra",
+      reasoningEffort: "xhigh",
       maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.building,
     });
   });

@@ -75,7 +75,7 @@ describe("controller Codex review transport", () => {
         "--model",
         "gpt-5.6-terra",
         "--config",
-        'model_reasoning_effort="medium"',
+        'model_reasoning_effort="xhigh"',
         "--sandbox",
         "read-only",
         "--ephemeral",

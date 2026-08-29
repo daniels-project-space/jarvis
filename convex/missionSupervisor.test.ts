@@ -5116,19 +5116,19 @@ describe("dormant mission supervisor authority", () => {
     }));
     expect(escalatedRoute.job).toMatchObject({
       model: "terra",
-      reasoningEffort: "high",
+      reasoningEffort: "xhigh",
       modelReason: expect.stringContaining(
         "after 2 evidenced quality failures",
       ),
     });
     expect(escalatedRoute.runtime).toMatchObject({
       model: "terra",
-      reasoningEffort: "high",
+      reasoningEffort: "xhigh",
       modelReason: escalatedRoute.job?.modelReason,
     });
     expect(escalatedRoute.order).toMatchObject({
       minimumModel: "terra",
-      minimumReasoningEffort: "high",
+      minimumReasoningEffort: "xhigh",
     });
   });
 

@@ -51,7 +51,7 @@ describe("managed mission workflow", () => {
       approvalRequired: true,
       readonly: true,
       risk: "consequential",
-      model: "sol",
+      model: "terra",
     });
   });
 });
