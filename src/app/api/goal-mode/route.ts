@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
         code: "cloud_provider_not_ready",
         reason: readiness.code,
         retryable: true,
-        error: "Goal Mode is temporarily unavailable because secure workspace readiness evidence is missing, expired, or does not match the deployed worker. No mission or Trigger worker was started.",
+        error: "Goal Mode is temporarily unavailable because secure workspace readiness evidence is missing, expired, or does not match the deployed worker. No mission or Trigger worker was started. Open Options, choose Cloud worker release, select Verify release, wait for attested, then run Background readiness and retry.",
       }, {
         status: 503,
         headers: { "cache-control": "no-store", "retry-after": "60" },

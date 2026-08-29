@@ -169,6 +169,7 @@ describe("goal_mode exact source admission", () => {
 
     expect(result).toContain("temporarily unavailable");
     expect(result).toContain("No mission or Trigger worker was started");
+    expect(result).toContain("Cloud worker release, select Verify release");
     expect(mock.resolveProjectSourceAdmission).not.toHaveBeenCalled();
     expect(mock.convexQuery).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalled();

@@ -190,6 +190,7 @@ describe("Goal Mode admission UI ownership", () => {
       code: "cloud_provider_not_ready",
       reason: "missing_receipt",
       retryable: true,
+      error: expect.stringContaining("Cloud worker release, select Verify release"),
     });
     expect(mock.resolveProjectSourceAdmission).not.toHaveBeenCalled();
     expect(mock.controlQuery).not.toHaveBeenCalled();

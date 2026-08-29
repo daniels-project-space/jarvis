@@ -5190,7 +5190,7 @@ export async function executeTool(
       if (protocolV2) {
         const readiness = await cloudProviderAdmissionReadinessAtRuntime();
         if (!readiness.ready) {
-          return `Agent dispatch is temporarily unavailable because secure workspace readiness evidence is ${readiness.code.replaceAll("_", " ")}. No mission, job, or Trigger worker was started; retry after the provider rollout is repaired.`;
+          return `Agent dispatch is temporarily unavailable because secure workspace readiness evidence is ${readiness.code.replaceAll("_", " ")}. No mission, job, or Trigger worker was started. Open Options, choose Cloud worker release, select Verify release, wait for attested, then run Background readiness and retry.`;
         }
       }
       const [projectAdmission] = protocolV2 ? await resolveMissionProjectAdmissions([repo]) : [undefined];
@@ -5279,7 +5279,7 @@ export async function executeTool(
       if (protocolV2) {
         const readiness = await cloudProviderAdmissionReadinessAtRuntime();
         if (!readiness.ready) {
-          return `Goal Mode is temporarily unavailable because secure workspace readiness evidence is ${readiness.code.replaceAll("_", " ")}. No mission or Trigger worker was started; retry after the provider rollout is repaired.`;
+          return `Goal Mode is temporarily unavailable because secure workspace readiness evidence is ${readiness.code.replaceAll("_", " ")}. No mission or Trigger worker was started. Open Options, choose Cloud worker release, select Verify release, wait for attested, then run Background readiness and retry.`;
         }
       }
       let projectAdmission: ProjectSourceAdmission | undefined;

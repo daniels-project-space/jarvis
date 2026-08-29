@@ -78,7 +78,7 @@ describe("dispatch_agent adaptive work policy", () => {
     await expect(executeTool("dispatch_agent", {
       task: "Research the current provider choices and summarize the tradeoffs.",
       agent_id: "atlas",
-    })).resolves.toContain("No mission, job, or Trigger worker was started");
+    })).resolves.toContain("Cloud worker release, select Verify release");
 
     expect(mock.resolveProjectSourceAdmission).not.toHaveBeenCalled();
     expect(mock.convexMutation).not.toHaveBeenCalled();
