@@ -58,6 +58,9 @@ export default defineConfig({
             "JARVIS_NOVITA_QWEN_ATTESTATION",
             "JARVIS_CLOUD_WORKSPACE_PROVIDER", "JARVIS_CLOUD_WORKSPACE_TEMPLATE", "JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST", "JARVIS_VERCEL_PRO_SPEND_APPROVED",
             "JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID", "JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", "JARVIS_CLOUD_PROVIDER_PROBE_KEYRING",
+            // Explicitly forwarded but dormant unless exactly `live`; this
+            // gates the owner-only attestation task before any provider call.
+            "JARVIS_CLOUD_PROVIDER_PROBE",
             "E2B_API_KEY", "SANDBOX0_TOKEN", "SANDBOX0_BASE_URL", "VERCEL_TOKEN", "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID",
           ]
             .map((key) => [key, process.env[key]])

@@ -1,10 +1,13 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { runWithDeadline } from "../src/lib/bounded-json";
 import {
   cloudProviderTemplateDigest,
   configuredCloudProviderProbeBinding,
   configuredCloudProviderProbeKeyring,
   installedCloudProviderSdkVersion,
+  type CloudProviderProbeEnvelope,
   type CloudProviderProbeReceipt,
 } from "../src/trigger/cloud-provider-probe-attestation";
 import { cloudProviderProbeMaxAgeMs } from "../src/lib/cloud-provider-probe-policy";
@@ -35,12 +38,18 @@ import {
 
 const LIVE_OPT_IN = "JARVIS_CLOUD_PROVIDER_PROBE=live";
 
-function blocked(reason: string): never {
-  console.log(`BLOCKED: ${reason}; no provider probe receipt was emitted`);
-  process.exit(2);
+export class CloudProviderProbeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CloudProviderProbeError";
+  }
 }
 
-function configuredCredentialAvailable(env: NodeJS.ProcessEnv): boolean {
+function blocked(reason: string): never {
+  throw new CloudProviderProbeError(reason);
+}
+
+function configuredCredentialAvailable(env: Readonly<Record<string, string | undefined>>): boolean {
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "sandbox0") return Boolean(env.SANDBOX0_TOKEN);
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "e2b") return Boolean(env.E2B_API_KEY);
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "vercel") return Boolean(env.VERCEL_TOKEN && env.VERCEL_TEAM_ID && env.VERCEL_PROJECT_ID);
@@ -75,7 +84,11 @@ function parseBounds(stdout: string): { cpu: number; memoryMb: number } {
   return { cpu: cpuCount, memoryMb };
 }
 
-async function probeVercelNativeCancellation(workspace: CloudWorkspace, runId: string) {
+async function probeVercelNativeCancellation(
+  workspace: CloudWorkspace,
+  runId: string,
+  env: Readonly<Record<string, string | undefined>>,
+) {
   const { Sandbox } = await import("@vercel/sandbox");
   const markerDelayMs = 15_000;
   const id = randomBytes(12).toString("hex");
@@ -90,7 +103,7 @@ async function probeVercelNativeCancellation(workspace: CloudWorkspace, runId: s
     "setTimeout(()=>fs.writeFileSync(markerPath,'unexpected',{flag:'wx'}),Number(delay));",
   ].join("");
   const sandbox = await Sandbox.get({
-    token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID!,
+    token: env.VERCEL_TOKEN!, teamId: env.VERCEL_TEAM_ID!, projectId: env.VERCEL_PROJECT_ID!,
     name: workspace.providerWorkspaceId, resume: false,
   });
   const session = sandbox.currentSession();
@@ -124,7 +137,7 @@ async function probeVercelNativeCancellation(workspace: CloudWorkspace, runId: s
   const marker = await session.readFileToBuffer({ path: markerPath, cwd: workspace.root });
   if (marker) throw new Error("Vercel native cancellation marker appeared after SIGKILL");
   const refreshed = await Sandbox.get({
-    token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID!,
+    token: env.VERCEL_TOKEN!, teamId: env.VERCEL_TEAM_ID!, projectId: env.VERCEL_PROJECT_ID!,
     name: workspace.providerWorkspaceId, resume: false,
   });
   const refreshedSession = refreshed.currentSession() as { sessionId?: string };
@@ -134,9 +147,14 @@ async function probeVercelNativeCancellation(workspace: CloudWorkspace, runId: s
   return { adapterCancelled: true, pidGone: true, processGone: true, markerAbsent: true };
 }
 
-async function inspectSandbox0Configuration(workspace: CloudWorkspace, templateIdentity: string, expectedTemplateDigest: string) {
+async function inspectSandbox0Configuration(
+  workspace: CloudWorkspace,
+  templateIdentity: string,
+  expectedTemplateDigest: string,
+  env: Readonly<Record<string, string | undefined>>,
+) {
   const { Client: Sandbox0Client } = await import("sandbox0");
-  const client = new Sandbox0Client({ token: process.env.SANDBOX0_TOKEN!, baseUrl: process.env.SANDBOX0_BASE_URL });
+  const client = new Sandbox0Client({ token: env.SANDBOX0_TOKEN!, baseUrl: env.SANDBOX0_BASE_URL });
   const template = await client.templates.get(templateIdentity);
   const actualTemplateDigest = cloudProviderTemplateDigest({ templateId: template.templateId, spec: template.spec });
   if (actualTemplateDigest !== expectedTemplateDigest) throw new Error("configured template digest does not match live provider provenance");
@@ -157,9 +175,12 @@ async function inspectSandbox0Configuration(workspace: CloudWorkspace, templateI
   return { ttlMs, observedMemory };
 }
 
-async function inspectVercelConfiguration(workspace: CloudWorkspace): Promise<{ ttlMs: number; observedMemory: number }> {
+async function inspectVercelConfiguration(
+  workspace: CloudWorkspace,
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<{ ttlMs: number; observedMemory: number }> {
   const { Sandbox } = await import("@vercel/sandbox");
-  const credentials = { token: process.env.VERCEL_TOKEN!, teamId: process.env.VERCEL_TEAM_ID!, projectId: process.env.VERCEL_PROJECT_ID! };
+  const credentials = { token: env.VERCEL_TOKEN!, teamId: env.VERCEL_TEAM_ID!, projectId: env.VERCEL_PROJECT_ID! };
   // This is deliberately a fresh, no-resume observation rather than cached
   // adapter metadata. A stopped or substituted session is not proof.
   const detail = await runWithDeadline(30_000, async (signal) =>
@@ -214,15 +235,18 @@ async function inspectVercelConfiguration(workspace: CloudWorkspace): Promise<{ 
   return { ttlMs: detail.expiresAt.getTime() - detail.createdAt.getTime(), observedMemory: detail.memory };
 }
 
-async function main() {
-  if (process.env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") blocked(`real live opt-in is required (${LIVE_OPT_IN})`);
-  if (!configuredCredentialAvailable(process.env)) blocked("a safe scoped credential for the selected provider is unavailable");
+/** Executes the full lifecycle proof without logging or persisting its receipt. */
+export async function issueLiveCloudProviderProbe(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): Promise<CloudProviderProbeEnvelope> {
+  if (env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") blocked(`real live opt-in is required (${LIVE_OPT_IN})`);
+  if (!configuredCredentialAvailable(env)) blocked("a safe scoped credential for the selected provider is unavailable");
 
   let binding;
   let authority;
   try {
-    binding = configuredCloudProviderProbeBinding(process.env);
-    authority = configuredCloudProviderProbeKeyring(process.env);
+    binding = configuredCloudProviderProbeBinding(env);
+    authority = configuredCloudProviderProbeKeyring(env);
   } catch {
     blocked("the exact deployment/template provenance configuration is incomplete");
   }
@@ -234,7 +258,7 @@ async function main() {
     blocked("the Vercel template digest does not match the exact bounded runtime policy");
   }
 
-  const provider = configuredCloudWorkspaceProviderForLiveProbe(process.env);
+  const provider = configuredCloudWorkspaceProviderForLiveProbe(env);
   const runId = `provider-probe-${randomUUID()}`;
   const attemptKey = runId;
   let first: CloudWorkspace | null = null;
@@ -252,8 +276,8 @@ async function main() {
     });
     probeStage = "provider configuration observation";
     let providerObservation = binding.provider === "sandbox0"
-      ? await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest)
-      : await inspectVercelConfiguration(first);
+      ? await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest, env)
+      : await inspectVercelConfiguration(first, env);
 
     const bytes = probeArchive();
     probeStage = "credentialless archive upload";
@@ -264,7 +288,7 @@ async function main() {
       await provider.hydrateDependencies(first);
       // Re-fetch after the allow-only install phase. This is an authoritative
       // provider observation of the relock, not a copy of controller intent.
-      providerObservation = await inspectVercelConfiguration(first);
+      providerObservation = await inspectVercelConfiguration(first, env);
     }
     // This reads the uploaded provider file through the fenced data plane;
     // it proves the exact sandbox's file lifecycle rather than inferring it
@@ -282,7 +306,7 @@ async function main() {
     });
     if (envResult.exitCode !== 0) throw new Error("environment probe failed");
     const sandboxEnv = JSON.parse(envResult.stdout) as Record<string, string>;
-    const controllerCanary = String(process.env.JARVIS_CLOUD_PROVIDER_PROBE_SECRET_CANARY ?? "controller-secret-canary-not-configured");
+    const controllerCanary = String(env.JARVIS_CLOUD_PROVIDER_PROBE_SECRET_CANARY ?? "controller-secret-canary-not-configured");
     if (Object.keys(sandboxEnv).some((key) => /(?:TOKEN|SECRET|PASSWORD|API_KEY|CODEX|GITHUB|CONVEX|TRIGGER|VAULT)/i.test(key))) {
       throw new Error("sandbox environment contains an authority-shaped name");
     }
@@ -333,7 +357,7 @@ async function main() {
 
     probeStage = "exact cancellation observation";
     const cancellationEvidence = binding.provider === "vercel"
-      ? await probeVercelNativeCancellation(first, runId)
+      ? await probeVercelNativeCancellation(first, runId, env)
       : await probeExactRemoteCancellation(cloudWorkspaceCancellationProbeRemote(provider, first), runId);
     if (!cancellationEvidence.adapterCancelled || !cancellationEvidence.pidGone
       || !cancellationEvidence.processGone || !cancellationEvidence.markerAbsent) {
@@ -387,9 +411,9 @@ async function main() {
     if (binding.provider === "vercel") {
       probeStage = "final plan authorization observation";
       await runWithDeadline(30_000, (signal) => assertVercelPlanAuthorized(
-        process.env.VERCEL_TOKEN!,
-        process.env.VERCEL_TEAM_ID!,
-        isVercelProSpendApproved(process.env.JARVIS_VERCEL_PRO_SPEND_APPROVED),
+        env.VERCEL_TOKEN!,
+        env.VERCEL_TEAM_ID!,
+        isVercelProSpendApproved(env.JARVIS_VERCEL_PRO_SPEND_APPROVED),
         signal,
       ));
     }
@@ -419,7 +443,7 @@ async function main() {
       nonce: randomBytes(24).toString("base64url"),
     };
     const envelope = issueAfterExactRemoteCancellation(cancellationEvidence, () => authority.issue(receipt));
-    console.log(JSON.stringify({ status: "PASS", envelope }));
+    return envelope;
   } catch (error) {
     if (!safeFailureDetail && error instanceof CloudWorkspaceError) {
       safeFailureDetail = ` (${error.code}/${error.disposition}: ${error.message})`;
@@ -438,4 +462,15 @@ async function main() {
   }
 }
 
-void main().catch(() => blocked("the live provider probe could not complete"));
+async function main() {
+  const envelope = await issueLiveCloudProviderProbe();
+  console.log(JSON.stringify({ status: "PASS", envelope }));
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  void main().catch((error) => {
+    const reason = error instanceof CloudProviderProbeError ? error.message : "the live provider probe could not complete";
+    console.log(`BLOCKED: ${reason}; no provider probe receipt was emitted`);
+    process.exitCode = 2;
+  });
+}
