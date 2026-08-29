@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mock = vi.hoisted(() => {
   class AudioStream {
@@ -34,8 +34,9 @@ vi.mock("msedge-tts", () => ({
 }));
 vi.mock("@/lib/control-session", () => ({ isSameOriginRequest: vi.fn(() => true) }));
 vi.mock("@/lib/request-auth", () => ({ controlActor: vi.fn(async () => ({ id: "viewer" })) }));
+vi.mock("@/lib/vault", () => ({ getSecret: vi.fn(async () => { throw new Error("not configured"); }) }));
 
-import { JARVIS_TTS_ENGINE, JARVIS_TTS_VOICE } from "@/lib/tts-config";
+import { EDGE_TTS_ENGINE, EDGE_TTS_VOICE, SELF_HOSTED_TTS_ENGINE, SELF_HOSTED_TTS_VOICE } from "@/lib/tts-config";
 import { GET, POST } from "./route";
 
 const request = (text = "A <safe> phrase") => new Request("https://jarvis.test/api/tts", {
@@ -45,11 +46,31 @@ const request = (text = "A <safe> phrase") => new Request("https://jarvis.test/a
 });
 
 describe("Ryan Neural route", () => {
+  const selfHostedTts = process.env.JARVIS_SELF_HOSTED_TTS;
+  const selfHostedUrl = process.env.SELF_HOSTED_TTS_URL;
+  const selfHostedKey = process.env.SELF_HOSTED_TTS_API_KEY;
+
+  beforeEach(() => {
+    delete process.env.JARVIS_SELF_HOSTED_TTS;
+    delete process.env.SELF_HOSTED_TTS_URL;
+    delete process.env.SELF_HOSTED_TTS_API_KEY;
+    vi.unstubAllGlobals();
+  });
+
+  afterAll(() => {
+    if (selfHostedTts === undefined) delete process.env.JARVIS_SELF_HOSTED_TTS;
+    else process.env.JARVIS_SELF_HOSTED_TTS = selfHostedTts;
+    if (selfHostedUrl === undefined) delete process.env.SELF_HOSTED_TTS_URL;
+    else process.env.SELF_HOSTED_TTS_URL = selfHostedUrl;
+    if (selfHostedKey === undefined) delete process.env.SELF_HOSTED_TTS_API_KEY;
+    else process.env.SELF_HOSTED_TTS_API_KEY = selfHostedKey;
+  });
+
   it("advertises one fixed engine and voice", async () => {
     const response = await GET(new Request("https://jarvis.test/api/tts") as any);
     expect(response.status).toBe(204);
-    expect(response.headers.get("x-jarvis-tts-engine")).toBe(JARVIS_TTS_ENGINE);
-    expect(response.headers.get("x-jarvis-tts-voice")).toBe("en-GB-RyanNeural");
+    expect(response.headers.get("x-jarvis-tts-engine")).toBe(EDGE_TTS_ENGINE);
+    expect(response.headers.get("x-jarvis-tts-voice")).toBe(EDGE_TTS_VOICE);
   });
 
   it("constructs one Ryan upstream stream for one request", async () => {
@@ -57,12 +78,12 @@ describe("Ryan Neural route", () => {
     const response = await POST(request() as any);
     const tts = mock.instances.at(-1);
     expect(mock.instances).toHaveLength(before + 1);
-    expect(tts.setMetadata).toHaveBeenCalledWith(JARVIS_TTS_VOICE, "mp3");
+    expect(tts.setMetadata).toHaveBeenCalledWith(EDGE_TTS_VOICE, "mp3");
     expect(tts.toStream).toHaveBeenCalledWith("A &lt;safe&gt; phrase", {
       rate: "+10%", pitch: "+4Hz", volume: 100,
     });
-    expect(response.headers.get("x-jarvis-tts-engine")).toBe(JARVIS_TTS_ENGINE);
-    expect(response.headers.get("x-jarvis-tts-voice")).toBe(JARVIS_TTS_VOICE);
+    expect(response.headers.get("x-jarvis-tts-engine")).toBe(EDGE_TTS_ENGINE);
+    expect(response.headers.get("x-jarvis-tts-voice")).toBe(EDGE_TTS_VOICE);
     mock.streams.at(-1)!.emit("data", Buffer.from([1, 2, 3]));
     mock.streams.at(-1)!.emit("end");
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
@@ -78,5 +99,60 @@ describe("Ryan Neural route", () => {
     expect(mock.instances).toHaveLength(before + 1);
     expect(stream.destroy).toHaveBeenCalledTimes(1);
     expect(tts.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses only the authenticated self-hosted Kokoro stream when opted in", async () => {
+    process.env.JARVIS_SELF_HOSTED_TTS = "1";
+    process.env.SELF_HOSTED_TTS_URL = "https://speech.example";
+    process.env.SELF_HOSTED_TTS_API_KEY = "self-hosted-test-key";
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(new Uint8Array([7, 8, 9]), {
+      headers: { "content-type": "audio/mpeg" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const before = mock.instances.length;
+
+    const response = await POST(request("Hello locally") as any);
+
+    expect(response.status).toBe(200);
+    expect(mock.instances).toHaveLength(before);
+    expect(response.headers.get("x-jarvis-tts-engine")).toBe(SELF_HOSTED_TTS_ENGINE);
+    expect(response.headers.get("x-jarvis-tts-voice")).toBe(SELF_HOSTED_TTS_VOICE);
+    expect(fetchMock).toHaveBeenCalledWith("https://speech.example/v1/audio/speech", expect.objectContaining({
+      method: "POST",
+      headers: expect.objectContaining({ authorization: "Bearer self-hosted-test-key" }),
+    }));
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init).toBeDefined();
+    if (!init) throw new Error("expected the self-hosted request options");
+    expect(JSON.parse(String(init.body))).toEqual({
+      model: "kokoro",
+      input: "Hello locally",
+      voice: SELF_HOSTED_TTS_VOICE,
+      response_format: "mp3",
+      speed: 1.1,
+      stream_format: "audio",
+    });
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([7, 8, 9]));
+  });
+
+  it("fails closed instead of falling back to Edge when self-hosted mode is incomplete", async () => {
+    process.env.JARVIS_SELF_HOSTED_TTS = "1";
+    const before = mock.instances.length;
+    const response = await POST(request("Do not send this to Edge") as any);
+    expect(response.status).toBe(503);
+    expect(mock.instances).toHaveLength(before);
+  });
+
+  it("rejects a bad self-hosted response without trying the cloud engine", async () => {
+    process.env.JARVIS_SELF_HOSTED_TTS = "1";
+    process.env.SELF_HOSTED_TTS_URL = "https://speech.example";
+    process.env.SELF_HOSTED_TTS_API_KEY = "self-hosted-test-key";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "bad upstream" }, { status: 502 })));
+    const before = mock.instances.length;
+
+    const response = await POST(request("Do not replay this") as any);
+
+    expect(response.status).toBe(502);
+    expect(mock.instances).toHaveLength(before);
   });
 });

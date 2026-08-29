@@ -2,10 +2,25 @@ import type { NextRequest } from "next/server";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { controlActor } from "@/lib/request-auth";
-import { JARVIS_TTS_ENGINE, JARVIS_TTS_VOICE } from "@/lib/tts-config";
+import {
+  EDGE_TTS_ENGINE,
+  EDGE_TTS_VOICE,
+  SELF_HOSTED_TTS_ENGINE,
+  SELF_HOSTED_TTS_VOICE,
+} from "@/lib/tts-config";
+import { getSecret } from "@/lib/vault";
 
 export const runtime = "nodejs";
 export const maxDuration = 15;
+
+const CONFIG_CACHE_MS = 5 * 60_000;
+const SELF_HOSTED_CONNECT_TIMEOUT_MS = 5_000;
+
+type TtsConfig =
+  | { kind: "edge"; engine: typeof EDGE_TTS_ENGINE; voice: typeof EDGE_TTS_VOICE }
+  | { kind: "self-hosted"; engine: typeof SELF_HOSTED_TTS_ENGINE; voice: typeof SELF_HOSTED_TTS_VOICE; url: string; apiKey: string };
+
+let cachedSelfHostedConfig: { value: Extract<TtsConfig, { kind: "self-hosted" }> | null; expiresAt: number } | null = null;
 
 function escapeSpeechXml(value: string): string {
   return value
@@ -22,6 +37,10 @@ function speechRate(value: unknown): string {
   return `${percent >= 0 ? "+" : ""}${percent}%`;
 }
 
+function selfHostedSpeed(value: unknown): number {
+  return Math.min(1.12, Math.max(0.96, Number(value) || 1.06));
+}
+
 function speechPitch(value: unknown): string {
   const pitch = Math.min(5, Math.max(1, Number(value) || 3));
   return `+${Math.round(pitch)}Hz`;
@@ -31,14 +50,100 @@ async function authorized(req: NextRequest): Promise<boolean> {
   return isSameOriginRequest(req) && Boolean(await controlActor(req));
 }
 
+function selfHostedSpeechEndpoint(raw: string): string | null {
+  try {
+    const url = new URL(raw.trim());
+    const local = url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1");
+    if (url.protocol !== "https:" && !local) return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+    const path = url.pathname.replace(/\/$/, "");
+    url.pathname = path.endsWith("/v1/audio/speech")
+      ? path
+      : `${path}/v1/audio/speech`.replace(/^([^/])/, "/$1");
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function selfHostedConfig(): Promise<Extract<TtsConfig, { kind: "self-hosted" }> | null> {
+  if (cachedSelfHostedConfig && cachedSelfHostedConfig.expiresAt > Date.now()) return cachedSelfHostedConfig.value;
+  const [configuredUrl, apiKey] = await Promise.all([
+    process.env.SELF_HOSTED_TTS_URL?.trim()
+      ? Promise.resolve(process.env.SELF_HOSTED_TTS_URL.trim())
+      : getSecret("streaming-tts", "SELF_HOSTED_TTS_URL").catch(() => ""),
+    process.env.SELF_HOSTED_TTS_API_KEY?.trim()
+      ? Promise.resolve(process.env.SELF_HOSTED_TTS_API_KEY.trim())
+      : getSecret("streaming-tts", "SELF_HOSTED_TTS_API_KEY").catch(() => ""),
+  ]);
+  const url = selfHostedSpeechEndpoint(configuredUrl);
+  const value = url && apiKey
+    ? { kind: "self-hosted" as const, engine: SELF_HOSTED_TTS_ENGINE, voice: SELF_HOSTED_TTS_VOICE, url, apiKey }
+    : null;
+  if (process.env.NODE_ENV !== "test") cachedSelfHostedConfig = { value, expiresAt: Date.now() + CONFIG_CACHE_MS };
+  return value;
+}
+
+async function ttsConfig(): Promise<TtsConfig | null> {
+  if (process.env.JARVIS_SELF_HOSTED_TTS === "1") return await selfHostedConfig();
+  return { kind: "edge", engine: EDGE_TTS_ENGINE, voice: EDGE_TTS_VOICE };
+}
+
+function speechHeaders(config: TtsConfig): HeadersInit {
+  return {
+    "content-type": "audio/mpeg",
+    "cache-control": "private, no-store",
+    "x-content-type-options": "nosniff",
+    "x-jarvis-tts-engine": config.engine,
+    "x-jarvis-tts-voice": config.voice,
+  };
+}
+
+async function selfHostedSpeech(config: Extract<TtsConfig, { kind: "self-hosted" }>, text: string, speed: unknown, clientSignal: AbortSignal): Promise<Response> {
+  const upstream = new AbortController();
+  const abortUpstream = () => upstream.abort();
+  const timeout = setTimeout(abortUpstream, SELF_HOSTED_CONNECT_TIMEOUT_MS);
+  clientSignal.addEventListener("abort", abortUpstream, { once: true });
+  let response: Response;
+  try {
+    // This bound protects connection / first-byte latency only. Once the
+    // upstream has returned an audio stream it is allowed to finish normally.
+    response = await fetch(config.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
+      body: JSON.stringify({
+        model: "kokoro",
+        input: text,
+        voice: config.voice,
+        response_format: "mp3",
+        speed: selfHostedSpeed(speed),
+        stream_format: "audio",
+      }),
+      signal: upstream.signal,
+      cache: "no-store",
+    });
+  } finally {
+    clearTimeout(timeout);
+    clientSignal.removeEventListener("abort", abortUpstream);
+  }
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!response.ok || !response.body || !(contentType.startsWith("audio/mpeg") || contentType.startsWith("audio/mp3"))) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error("self-hosted speech unavailable");
+  }
+  return new Response(response.body, { headers: speechHeaders(config) });
+}
+
 export async function GET(req: NextRequest) {
   if (!(await authorized(req))) return Response.json({ error: "unauthorized" }, { status: 401 });
+  const config = await ttsConfig();
+  if (!config) return Response.json({ error: "self-hosted speech is unavailable" }, { status: 503 });
   return new Response(null, {
     status: 204,
     headers: {
       "cache-control": "private, no-store",
-      "x-jarvis-tts-engine": JARVIS_TTS_ENGINE,
-      "x-jarvis-tts-voice": JARVIS_TTS_VOICE,
+      "x-jarvis-tts-engine": config.engine,
+      "x-jarvis-tts-voice": config.voice,
     },
   });
 }
@@ -52,12 +157,22 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: "Speech text must contain 1–800 characters" }, { status: 400 });
   }
 
-  // There is intentionally one production voice identity and one free,
-  // streamed cloud engine. A failed request surfaces as a 502; it never waits
-  // for a second engine or replays the phrase through a fallback chain.
+  const config = await ttsConfig();
+  if (!config) return Response.json({ error: "self-hosted speech is unavailable" }, { status: 503 });
+
+  // One selected engine, no cross-provider retry. Explicit self-hosted mode
+  // fails closed rather than quietly sending speech to Edge.
+  if (config.kind === "self-hosted") {
+    try {
+      return await selfHostedSpeech(config, text, payload?.speed, req.signal);
+    } catch {
+      return Response.json({ error: "self-hosted speech is unavailable" }, { status: 502, headers: { "cache-control": "private, no-store" } });
+    }
+  }
+
   const tts = new MsEdgeTTS();
   try {
-    await tts.setMetadata(JARVIS_TTS_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    await tts.setMetadata(config.voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
     const { audioStream } = tts.toStream(escapeSpeechXml(text), {
       rate: speechRate(payload?.speed),
       pitch: speechPitch(payload?.pitchHz),
@@ -92,15 +207,7 @@ export async function POST(req: NextRequest) {
         tts.close();
       },
     });
-    return new Response(stream, {
-      headers: {
-        "content-type": "audio/mpeg",
-        "cache-control": "private, no-store",
-        "x-content-type-options": "nosniff",
-        "x-jarvis-tts-engine": JARVIS_TTS_ENGINE,
-        "x-jarvis-tts-voice": JARVIS_TTS_VOICE,
-      },
-    });
+    return new Response(stream, { headers: speechHeaders(config) });
   } catch (error) {
     tts.close();
     return Response.json(

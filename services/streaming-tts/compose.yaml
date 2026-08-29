@@ -1,0 +1,25 @@
+services:
+  streaming-tts:
+    # Supply a reviewed immutable digest, e.g.
+    # hwdsl2/kokoro-server@sha256:<reviewed-digest>
+    image: ${KOKORO_SERVER_IMAGE:?set a reviewed immutable Kokoro image digest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8082:8880"
+    environment:
+      KOKORO_API_KEY: ${SELF_HOSTED_TTS_API_KEY:?set a long random API key}
+      KOKORO_VOICE: bm_george
+      KOKORO_LANG_CODE: b
+      KOKORO_DISABLE_USAGE_COUNTS: "1"
+    volumes:
+      - kokoro-data:/var/lib/kokoro
+    healthcheck:
+      # FastAPI only serves this after Kokoro's startup model load has finished.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8880/docs', timeout=5).read()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 3m
+
+volumes:
+  kokoro-data:
