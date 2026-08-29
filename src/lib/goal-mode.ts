@@ -493,7 +493,7 @@ export function goalBranch(goal: string, missionId: string): string {
 
 export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: string[], maxBuildSessions: number): string {
   return [
-    "GOAL MODE — SOL/MAX PLANNING SESSION. Plan only; do not edit, deploy, publish, or start implementation.",
+    "GOAL MODE — DEEP PLANNING SESSION. Plan only; do not edit, deploy, publish, or start implementation.",
     `Outcome: ${goal}`,
     `Deterministic route: ${route.kind}${route.primaryRepo ? ` · ${route.primaryRepo}` : ""}`,
     `Why: ${route.reason}`,
@@ -524,7 +524,7 @@ export function validatorTask(args: {
     .join("\n")
     .slice(0, maxChars);
   const prompt = [
-    "GOAL MODE — SOL/MAX FINAL VALIDATION SESSION. Be the skeptical owner of the outcome, not a summary writer.",
+    "GOAL MODE — DEEP FINAL VALIDATION SESSION. Be the skeptical owner of the outcome, not a summary writer.",
     `Outcome: ${args.goal.slice(0, 1_000)}`,
     `Revision wave: ${args.revisionWave}`,
     `Plan summary: ${args.plan.summary.slice(0, 1_500)}`,

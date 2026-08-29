@@ -1356,7 +1356,7 @@ export function GoalModeLauncherView() {
         <div className="w-full rounded-2xl border border-cyan/20 bg-[radial-gradient(circle_at_50%_0%,rgba(0,255,136,.09),rgba(7,13,23,.88)_58%)] p-5 shadow-2xl backdrop-blur-xl">
           <div className="hud-label text-cyan">durable goal mode</div>
           <div className="mt-2 text-xl font-semibold text-ice">Give Jarvis the outcome, not a task list.</div>
-          <p className="mt-2 max-w-xl text-xs leading-relaxed text-slate">One Sol/max session designs the path, bounded Terra/high sessions build it with checkpoints, and Sol/max validates the complete result.</p>
+          <p className="mt-2 max-w-xl text-xs leading-relaxed text-slate">Terra/xhigh designs and builds the path; unusually deep work uses Terra/ultra. Sol/max is held back for exceptional critical-risk validation.</p>
           <div className="mt-3 rounded-xl border border-cyan/15 bg-cyan/[0.04] px-3 py-2 text-[10px] leading-relaxed text-slate">Once started, the top-left live-work tile is the single command centre for the exact DAG, workers, handoffs, controls and realtime detail.</div>
           <textarea value={goalDraft} onChange={(event) => setGoalDraft(event.target.value)} rows={4} maxLength={500} placeholder="Example: Make the Rental Manager return workflow fully accurate, fast and proven in production…" className="mt-4 w-full resize-none rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-sm leading-relaxed text-ice outline-none transition placeholder:text-slate/45 focus:border-cyan/35" />
           <div className="mt-3 flex flex-wrap items-end gap-3">

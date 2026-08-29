@@ -811,7 +811,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     }
 
     const [validatorRun] = await dispatch(f.t, 8, "dag-validator");
-    expect(validatorRun.claim).toMatchObject({ goalStage: "validating", reasoningEffort: "max", readonly: true, repo: null });
+    expect(validatorRun.claim).toMatchObject({ goalStage: "validating", model: "terra", reasoningEffort: "ultra", readonly: true, repo: null });
     const validationResult = `GOAL_VALIDATION_JSON:${JSON.stringify({ verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs"], gaps: [], refinements: [] })}`;
     const validatorJob: any = await f.t.run(async (ctx) => ctx.db.get(validatorRun.reservation.jobId as any));
     await finalizeReadonly(f.t, validatorJob, validationResult, "Parent Sol validator checked original plan, handoffs, child heads, and live checks.");

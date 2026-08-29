@@ -66,6 +66,7 @@ import {
   SHALLOW_PROVENANCE_RULE,
 } from "../lib/git-delivery";
 import { repairPrompt } from "../lib/repair-prompt";
+import { selectCodexWorkPolicy } from "../lib/codex-work-router";
 import { SAFE_SANDBOX_EXECUTION_RULES } from "../lib/work-safety";
 import {
   continueRepositoryDelivery,
@@ -1050,12 +1051,22 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
           priority: 90,
           risk: "high",
         });
+        const task = repairPrompt(inc, repo);
+        const repairPolicy = selectCodexWorkPolicy({
+          task,
+          role: "paul",
+          repo: projectAdmission?.repository ?? repo,
+          readonly: false,
+          risk: "high",
+          tools: ["playwright", "context7"],
+        });
         const repairJobId = await convexMutation(admissionMutationName("job"), {
-          task: repairPrompt(inc, repo),
+          task,
           repo: projectAdmission?.repository ?? repo,
           missionId: String(missionId),
-          model: "sol",
-          modelReason: "Paul uses the highest tier for production root-cause repair",
+          model: repairPolicy.model,
+          reasoningEffort: repairPolicy.reasoningEffort,
+          modelReason: `Paul's autonomous repair uses adaptive quality routing; ${repairPolicy.modelReason}`.slice(0, 300),
           agentId: "paul",
           risk: "high",
           priority: 90,

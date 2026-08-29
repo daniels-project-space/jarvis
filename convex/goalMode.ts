@@ -50,6 +50,7 @@ import {
   sealProjectSourceAdmission,
   type ProjectSourceAdmission,
 } from "../src/lib/source-admission";
+import { selectCodexWorkPolicy, type CodexWorkSelection } from "../src/lib/codex-work-router";
 import type { WorkModelTier } from "../src/lib/work-models";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
@@ -62,6 +63,57 @@ type AdvanceLeaseFence = {
   advanceLeaseToken?: string;
   advanceLeaseVersion?: number;
 };
+
+/**
+ * Goal planning is substantial architecture work, so Terra/ultra is the
+ * normal quality default. The shared router may use Sol/max only for an
+ * explicitly requested maximum or a genuinely critical security/privacy
+ * production outcome.
+ */
+function selectGoalPlannerPolicy(goal: string, route: GoalRoute, risk: unknown): CodexWorkSelection {
+  return selectCodexWorkPolicy({
+    task: goal,
+    role: "goal-planner",
+    repo: route.primaryRepo,
+    readonly: true,
+    risk: String(risk ?? "high"),
+    workType: "architecture",
+    complexity: "intense",
+    uncertainty: "high",
+    expectedDuration: "long",
+    toolBreadth: "broad",
+    productionRisk: String(risk ?? "").toLowerCase() === "critical" ? "critical" : undefined,
+  });
+}
+
+/** Apply the same intentional Sol/max boundary to Goal Mode's final audit. */
+function selectGoalValidationPolicy(
+  mission: any,
+  policyTask: string,
+  repository: string | undefined,
+  mcp: readonly string[],
+  crossProject: boolean,
+): CodexWorkSelection {
+  return selectCodexWorkPolicy({
+    // The validator prompt contains fixed safety instructions mentioning
+    // credentials and protected state. Route on the actual requested outcome
+    // instead, so boilerplate cannot accidentally spend Sol/max on every
+    // ordinary final audit.
+    task: policyTask,
+    role: "goal-validator",
+    repo: repository,
+    readonly: true,
+    risk: String(mission.risk ?? "high"),
+    tools: mcp,
+    workType: "verification",
+    complexity: "intense",
+    uncertainty: "high",
+    expectedDuration: "long",
+    toolBreadth: "broad",
+    crossProject,
+    productionRisk: String(mission.risk ?? "").toLowerCase() === "critical" ? "critical" : undefined,
+  });
+}
 
 // Older rows had only an expiry timestamp. Keep those rows recoverable, but
 // once a modern owner has claimed an advance every write must carry its exact
@@ -516,6 +568,7 @@ export const createV2 = mutation({
       reason: args.routeReason.slice(0, 1000),
       infrastructureContext: args.infrastructureContext.slice(0, 4000),
     };
+    const plannerPolicy = selectGoalPlannerPolicy(goal, route, args.risk ?? "high");
     if (!await validProjectAdmissions([args.projectAdmission], { requireFresh: true })
       || args.projectAdmission.repository !== primaryRepo) {
       throw new Error("Goal Mode requires one fresh canonical project source admission");
@@ -558,8 +611,8 @@ export const createV2 = mutation({
       label: "JARVIS · goal architecture",
       repo: route.primaryRepo,
       readonly: true,
-      model: "sol",
-      reasoningEffort: "max",
+      model: plannerPolicy.model,
+      reasoningEffort: plannerPolicy.reasoningEffort,
       mcp: ["context7"],
       originThreadId: args.originThreadId,
       agentId: "jarvis",
@@ -570,7 +623,7 @@ export const createV2 = mutation({
         `Return a valid 2-${maxBuildSessions} session GOAL_PLAN_JSON contract`,
         "Keep consequential actions explicitly gated",
       ],
-      modelReason: "Goal Mode uses exactly one Sol/max architecture session before implementation",
+      modelReason: `Goal Mode's architecture pass is adaptively quality-routed; ${plannerPolicy.modelReason}`.slice(0, 300),
       maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.planning,
       goalStage: "planning",
       goalWorkstreamId: "goal-plan",
@@ -582,11 +635,13 @@ export const createV2 = mutation({
       integrationBranch: route.primaryRepo ? goalBranch(goal, String(missionId)) : undefined,
       integrationGeneration: 0,
     });
-    await recordMissionEvent(ctx, String(missionId), "goal_started", "Goal Mode started with a Sol/max planning session", "planning", 3, {
+    await recordMissionEvent(ctx, String(missionId), "goal_started", `Goal Mode started with ${plannerPolicy.model}/${plannerPolicy.reasoningEffort} planning`, "planning", 3, {
       route: route.kind,
       primaryRepo: route.primaryRepo,
       maxBuildSessions,
       maxRevisionWaves,
+      model: plannerPolicy.model,
+      reasoningEffort: plannerPolicy.reasoningEffort,
     });
     return { missionId, plannerJobId, route: route.kind };
   },
@@ -765,7 +820,7 @@ async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Pro
 
 async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
   const plan = mission.plan as GoalPlan;
-  // App Factory owns its own repository/build lifecycle. Its final Sol session
+  // App Factory owns its own repository/build lifecycle. Its final deep session
   // validates the external run and must not be pointed at a made-up Jarvis branch.
   const splitParent = Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length > 0;
   const branch = mission.externalRunId || splitParent
@@ -773,15 +828,26 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     : mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
   const task = await validatorTaskForMission(ctx, mission, jobs);
   const repository = splitParent ? undefined : mission.primaryRepo ?? plan.primaryRepo;
+  const mcp = mission.externalRunId || plan.validation.liveChecks.length ? ["playwright", "context7"] : ["context7"];
+  const validationPolicy = selectGoalValidationPolicy(
+    mission,
+    [mission.goal, plan.summary, ...(mission.acceptanceCriteria ?? []), ...(plan.validation.criteria ?? [])]
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean)
+      .join("\n"),
+    repository,
+    mcp,
+    splitParent,
+  );
   const validatorJobId = await insertGoalJob(ctx, {
     task,
     missionId: String(mission._id),
     label: `JARVIS · deep validation ${Number(mission.revisionWave ?? 0) + 1}`,
     repo: repository,
     readonly: true,
-    model: "sol",
-    reasoningEffort: "max",
-    mcp: mission.externalRunId || plan.validation.liveChecks.length ? ["playwright", "context7"] : ["context7"],
+    model: validationPolicy.model,
+    reasoningEffort: validationPolicy.reasoningEffort,
+    mcp,
     originThreadId: mission.originThreadId,
     agentId: "jarvis",
     risk: "low",
@@ -791,7 +857,7 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
       "Validate the end-to-end outcome and relevant live/provider surfaces",
       "Return a valid GOAL_VALIDATION_JSON verdict",
     ],
-    modelReason: "Goal Mode reserves Sol/max for skeptical end-to-end validation and refinement planning",
+    modelReason: `Goal Mode's final audit is adaptively quality-routed; ${validationPolicy.modelReason}`.slice(0, 300),
     integrationBranch: branch,
     maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.validating,
     goalStage: "validating",
@@ -814,8 +880,10 @@ async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
     advanceLeaseUntil: undefined,
     updatedAt: now,
   });
-  await recordMissionEvent(ctx, String(mission._id), "goal_validation_queued", "Sol/max deep validation queued", "validating", 82, {
+  await recordMissionEvent(ctx, String(mission._id), "goal_validation_queued", `${validationPolicy.model}/${validationPolicy.reasoningEffort} deep validation queued`, "validating", 82, {
     revisionWave: Number(mission.revisionWave ?? 0),
+    model: validationPolicy.model,
+    reasoningEffort: validationPolicy.reasoningEffort,
   });
   return validatorJobId;
 }
@@ -1304,7 +1372,7 @@ export const materializePlanBatch = mutation({
       ].join("\n\n") : [
         stream.task, `Goal Mode outcome: ${mission.goal}`,
         `Reuse/ownership boundary: ${mission.infrastructureContext ?? "Inspect the current project boundary before editing."}`,
-        `This is Terra/high implementation session ${cursor + jobByNode.size + 1} of ${ordered.length}. Preserve completed branch work, stay inside this workstream, and leave a compact evidence-rich checkpoint for the final Sol validator.`,
+        `This is adaptive implementation session ${cursor + jobByNode.size + 1} of ${ordered.length}. Preserve completed branch work, stay inside this workstream, and leave a compact evidence-rich checkpoint for the final deep validator.`,
       ].join("\n\n");
       const selectedPolicy = selectGoalWorkstreamPolicy({ ...stream, repo: repository });
       const id = await insertGoalJob(ctx, {

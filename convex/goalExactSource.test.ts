@@ -72,8 +72,8 @@ describe("Goal Mode exact source lineage", () => {
     });
     expect(persisted.plannerJob).toMatchObject(expectedSource);
     expect(persisted.plannerJob).toMatchObject({
-      model: "sol",
-      reasoningEffort: "max",
+      model: "terra",
+      reasoningEffort: "ultra",
       maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.planning,
     });
     expect(persisted.schedulingAdmission).toMatchObject(expectedSource);
@@ -144,5 +144,33 @@ describe("Goal Mode exact source lineage", () => {
       reasoningEffort: "xhigh",
       maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.building,
     });
+  });
+
+  it("reserves Sol/max goal planning for an explicitly critical production-security outcome", async () => {
+    const canonicalProjectId = canonicalProjectIdForRepository(REPOSITORY);
+    if (!canonicalProjectId) throw new Error("YouTube Studio test repository is not registered");
+    const projectAdmission = await sealProjectSourceAdmission({
+      protocolVersion: SOURCE_ADMISSION_PROTOCOL_VERSION,
+      canonicalProjectId,
+      repository: REPOSITORY,
+      sourceProvider: "github",
+      sourceBranch: SOURCE_BRANCH,
+      sourceRef: `refs/heads/${SOURCE_BRANCH}`,
+      sourceHeadSha: SOURCE_HEAD_SHA,
+      sourceObservedAt: Date.now(),
+    });
+    const t = convexTest(schema, modules);
+    const created = await t.mutation(api.goalMode.createV2, {
+      goal: "Repair the live production authentication and privacy isolation breach",
+      route: "youtube_studio",
+      routeReason: "The existing YouTube Studio product owns this outcome.",
+      primaryRepo: REPOSITORY,
+      infrastructureContext: "Reuse the existing production pipeline.",
+      risk: "critical",
+      projectAdmission,
+      workerToken: TOKEN,
+    });
+    const planner = await t.run(async (ctx) => ctx.db.get(created.plannerJobId));
+    expect(planner).toMatchObject({ model: "sol", reasoningEffort: "max" });
   });
 });

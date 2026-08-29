@@ -5312,7 +5312,7 @@ export async function executeTool(
       if (!created?.held) await wakeAgentFleet(`goal:${id}`).catch(() => false);
       return created?.held
         ? `Goal Mode ${id} is durably held while the mission protocol rollout is dormant; no planner or repository workspace was started.`
-        : `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} One Sol/max planner is working now; it will route bounded work to the least expensive model that preserves its quality floor, save a durable checkpoint before every continuation, and only finish after a Sol/max deep validation passes.`;
+        : `Goal Mode ${id} is live. Route: ${route.kind}${route.primaryRepo ? ` in ${route.primaryRepo}` : ""} — ${route.reason} Its planner and final validation use Terra/xhigh or Terra/ultra by default, reserving Sol/max for exceptional critical-risk work. Every worker saves a durable checkpoint before continuation.`;
     }
     case "orchestrate": {
       const mission = String(args.mission ?? "").trim();
@@ -5881,17 +5881,27 @@ export async function executeTool(
         priority: 95,
         risk: "high",
       });
+      const repairTask =
+        `SELF-REPAIR: trace the ROOT CAUSE and fix it — never paper over symptoms. Daniel reports: ${problem}\n` +
+        `Method: 1) REPRODUCE (hit live endpoints, read the failing path). 2) Trace to the underlying cause. ` +
+        `3) Minimal correct fix. 4) VALIDATE: 'npm install' + 'npx tsc --noEmit' must pass; 'npm run build' must pass for app code. ` +
+        `5) Commit only working code ("self-repair: ..."). ${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
+        `If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`;
+      const repairPolicy = selectCodexWorkPolicy({
+        task: repairTask,
+        role: "paul",
+        repo: projectAdmission?.repository ?? app ?? "jarvis",
+        readonly: false,
+        risk: "high",
+        tools: ["playwright", "context7"],
+      });
       await convexMutation(admissionMutationName("job"), {
         authTokenHash,
-        task:
-          `SELF-REPAIR: trace the ROOT CAUSE and fix it — never paper over symptoms. Daniel reports: ${problem}\n` +
-          `Method: 1) REPRODUCE (hit live endpoints, read the failing path). 2) Trace to the underlying cause. ` +
-          `3) Minimal correct fix. 4) VALIDATE: 'npm install' + 'npx tsc --noEmit' must pass; 'npm run build' must pass for app code. ` +
-          `5) Commit only working code ("self-repair: ..."). ${SHALLOW_PROVENANCE_RULE} Never replace or reparent a persisted shared branch based on a truncated revision walk. ` +
-          `If it needs convex/ or src/trigger/ redeploy, commit and say so plainly.`,
+        task: repairTask,
         repo: projectAdmission?.repository ?? app ?? "jarvis",
         missionId: String(missionId),
-        model: "sol",
+        model: repairPolicy.model,
+        reasoningEffort: repairPolicy.reasoningEffort,
         incidentId: String(incidentId),
         originThreadId,
         visibility: "conversation",
@@ -5904,7 +5914,7 @@ export async function executeTool(
           "Run relevant typecheck/tests/build",
           "Verify the actual user-visible or provider surface",
         ],
-        modelReason: "Paul + Sol: production repair requires deep Codex engineering and verification",
+        modelReason: `Paul self-repair uses adaptive quality routing; ${repairPolicy.modelReason}`.slice(0, 300),
         label: `Paul · repair ${problem.slice(0, 48)}`,
       });
       await wakeAgentFleet(`repair:${String(incidentId)}`).catch(() => false);
@@ -5926,19 +5936,32 @@ export async function executeTool(
         priority: 80,
         risk: "high",
       });
+      const upgradeTask = `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`;
+      const upgradePolicy = selectCodexWorkPolicy({
+        // SELF_IMPROVE_RULES contains fixed security language. Route only on
+        // Daniel's requested outcome so policy boilerplate cannot promote all
+        // upgrades to Sol/max.
+        task: request,
+        role: "paul",
+        repo: projectAdmission?.repository ?? "jarvis",
+        readonly: false,
+        risk: "high",
+        tools: ["context7"],
+      });
       await convexMutation(admissionMutationName("job"), {
         authTokenHash,
-        task: `${SELF_IMPROVE_RULES}\n\nThe upgrade Daniel wants: ${request}`,
+        task: upgradeTask,
         repo: projectAdmission?.repository ?? "jarvis",
         missionId: String(missionId),
-        model: "sol",
+        model: upgradePolicy.model,
+        reasoningEffort: upgradePolicy.reasoningEffort,
         originThreadId,
         visibility: "conversation",
         agentId: "paul",
         risk: "high",
         priority: 80,
         acceptanceCriteria: ["Connected implementation, not placeholder UI", "Typecheck/tests/build pass", "Verified repository delivery completes without a manual approval"],
-        modelReason: "Paul + Sol: JARVIS self-modification is complex Codex engineering",
+        modelReason: `Paul self-improvement uses adaptive quality routing; ${upgradePolicy.modelReason}`.slice(0, 300),
         label: `Paul · upgrade ${request.slice(0, 46)}`,
       });
       await wakeAgentFleet("self-improve").catch(() => false);

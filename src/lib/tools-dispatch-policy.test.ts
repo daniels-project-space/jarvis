@@ -133,4 +133,47 @@ describe("dispatch_agent adaptive work policy", () => {
       reasoningEffort: "xhigh",
     }));
   });
+
+  it("uses Terra/xhigh for ordinary self-repair and self-improvement work", async () => {
+    await executeTool("self_repair", {
+      problem: "Fix the recurring compact work-card layout regression and verify it in the browser.",
+      app: "jarvis",
+    });
+    expect(mock.convexMutation).toHaveBeenCalledWith("jobs:enqueueV2", expect.objectContaining({
+      agentId: "paul",
+      model: "terra",
+      reasoningEffort: "xhigh",
+      modelReason: expect.stringMatching(/adaptive quality routing/),
+    }));
+
+    vi.clearAllMocks();
+    mock.convexQuery.mockResolvedValue("voice-thread");
+    mock.convexMutation.mockImplementation(async (path: string) =>
+      path === "missions:createV2" ? "mission-voice" : "job-voice",
+    );
+    mock.resolveProjectSourceAdmission.mockResolvedValue(jarvisAdmission);
+    mock.wakeAgentFleet.mockResolvedValue(true);
+    await executeTool("self_improve", {
+      request: "Make the compact work summary easier to scan without changing its detailed view.",
+    });
+    expect(mock.convexMutation).toHaveBeenCalledWith("jobs:enqueueV2", expect.objectContaining({
+      agentId: "paul",
+      model: "terra",
+      reasoningEffort: "xhigh",
+      modelReason: expect.stringMatching(/adaptive quality routing/),
+    }));
+  });
+
+  it("keeps Sol/max available for a critical production privacy repair", async () => {
+    await executeTool("self_repair", {
+      problem: "Repair the live production authentication and privacy isolation breach before customer data is exposed.",
+      app: "jarvis",
+    });
+    expect(mock.convexMutation).toHaveBeenCalledWith("jobs:enqueueV2", expect.objectContaining({
+      agentId: "paul",
+      model: "sol",
+      reasoningEffort: "max",
+      modelReason: expect.stringMatching(/Exceptional security\/privacy safety floor/),
+    }));
+  });
 });
