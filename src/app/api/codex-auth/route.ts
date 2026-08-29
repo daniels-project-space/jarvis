@@ -16,6 +16,14 @@ const TICKET_COOKIE = "jarvis_codex_auth_enrollment";
 const TICKET_TTL_SECONDS = 20 * 60;
 const MAX_BODY_BYTES = 256;
 const DEVICE_CODE = /^[A-Z0-9]{4}-[A-Z0-9]{5}$/;
+const ACTIVE_ENROLLMENT_STATUSES = [
+  "PENDING_VERSION",
+  "QUEUED",
+  "DEQUEUED",
+  "EXECUTING",
+  "WAITING",
+  "DELAYED",
+] as const;
 
 type Ticket = Readonly<{ expiresAt: number; runId: string }>;
 type PublicState =
@@ -173,6 +181,20 @@ async function owner(req: NextRequest) {
   return actor && isOwnerActor(actor) ? actor : null;
 }
 
+async function cancelActiveEnrollments(): Promise<void> {
+  let inspected = 0;
+  for await (const run of runs.list({
+    taskIdentifier: "jarvis-codex-auth-enrollment",
+    status: [...ACTIVE_ENROLLMENT_STATUSES],
+    from: Date.now() - TICKET_TTL_SECONDS * 1_000,
+    limit: 10,
+  })) {
+    await runs.cancel(run.id);
+    inspected += 1;
+    if (inspected >= 10) break;
+  }
+}
+
 export async function GET(req: NextRequest): Promise<NextResponse> {
   const actor = await owner(req);
   if (!actor) return response({ ok: false, state: "unavailable" }, 403);
@@ -202,6 +224,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     return response({ ok: false, state: "unavailable" }, 400);
   }
   try {
+    // There is intentionally one enrollment slot. Retrying must replace an
+    // abandoned run instead of silently queuing behind it for sixteen minutes.
+    await cancelActiveEnrollments();
     const handle = await tasks.trigger<typeof codexAuthEnrollment>(
       "jarvis-codex-auth-enrollment",
       undefined,
@@ -211,6 +236,17 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       { runId: handle.id, expiresAt: Date.now() + TICKET_TTL_SECONDS * 1_000 },
       actor.authTokenHash,
     );
+  } catch {
+    return response({ ok: false, state: "unavailable" }, 503);
+  }
+}
+
+export async function DELETE(req: NextRequest): Promise<NextResponse> {
+  const actor = await owner(req);
+  if (!actor) return response({ ok: false, state: "unavailable" }, 403);
+  try {
+    await cancelActiveEnrollments();
+    return clearTicket(response({ ok: true, state: "idle" }));
   } catch {
     return response({ ok: false, state: "unavailable" }, 503);
   }

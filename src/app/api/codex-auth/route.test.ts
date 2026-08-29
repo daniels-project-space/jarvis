@@ -3,13 +3,15 @@ import { NextRequest } from "next/server";
 
 const mock = vi.hoisted(() => ({
   controlActor: vi.fn(),
+  cancel: vi.fn(),
+  list: vi.fn(),
   retrieve: vi.fn(),
   sameOrigin: vi.fn(),
   trigger: vi.fn(),
 }));
 
 vi.mock("@trigger.dev/sdk/v3", () => ({
-  runs: { retrieve: mock.retrieve },
+  runs: { cancel: mock.cancel, list: mock.list, retrieve: mock.retrieve },
   tasks: { trigger: mock.trigger },
 }));
 vi.mock("@/lib/control-session", () => ({
@@ -21,12 +23,12 @@ vi.mock("@/lib/request-auth", () => ({
 }));
 
 import { CODEX_AUTH_ENROLLMENT_CONFIRMATION } from "@/lib/codex-auth-control";
-import { GET, POST } from "./route";
+import { DELETE, GET, POST } from "./route";
 
 const owner = { kind: "owner", authTokenHash: "owner-scope" };
 
 function request(
-  method: "GET" | "POST",
+  method: "DELETE" | "GET" | "POST",
   options: { body?: unknown; cookie?: string } = {},
 ) {
   const headers = new Headers({ origin: "https://jarvis.test" });
@@ -55,6 +57,10 @@ describe("owner ChatGPT reconnect control", () => {
     vi.clearAllMocks();
     mock.sameOrigin.mockReturnValue(true);
     mock.controlActor.mockResolvedValue(owner);
+    mock.list.mockReturnValue({
+      async *[Symbol.asyncIterator]() {},
+    });
+    mock.cancel.mockResolvedValue({ id: "cancelled" });
   });
 
   it("starts only the fixed no-payload enrollment task behind an HttpOnly ticket", async () => {
@@ -65,9 +71,37 @@ describe("owner ChatGPT reconnect control", () => {
       undefined,
     );
     expect(await response.json()).toEqual({ ok: true, state: "queued" });
+    expect(mock.list).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskIdentifier: "jarvis-codex-auth-enrollment",
+        limit: 10,
+      }),
+    );
     const cookie = response.headers.get("set-cookie") ?? "";
     expect(cookie).toContain("HttpOnly");
     expect(cookie).not.toContain("private-enrollment-run");
+  });
+
+  it("cancels an abandoned enrollment before retry and through the owner cancel route", async () => {
+    mock.list
+      .mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { id: "stale-enrollment" };
+        },
+      })
+      .mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {
+          yield { id: "current-enrollment" };
+        },
+      });
+
+    await start();
+    expect(mock.cancel).toHaveBeenCalledWith("stale-enrollment");
+
+    const cancelled = await DELETE(request("DELETE"));
+    expect(cancelled.status).toBe(200);
+    expect(await cancelled.json()).toEqual({ ok: true, state: "idle" });
+    expect(mock.cancel).toHaveBeenCalledWith("current-enrollment");
   });
 
   it("requires the owner session, same origin, and exact confirmation", async () => {
