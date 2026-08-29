@@ -123,6 +123,20 @@ describe("cloud provider probe owner control", () => {
     expect(JSON.stringify(body)).not.toContain("must-not-leak");
   });
 
+  it("treats a paid-provider approval hold as release setup, not a provider outage", async () => {
+    const { cookie } = await startTicket();
+    mock.retrieve.mockResolvedValueOnce({
+      status: "FAILED",
+      error: { message: "Vercel Pro sandbox usage requires JARVIS_VERCEL_PRO_SPEND_APPROVED=true" },
+    });
+
+    expect(await (await GET(request("GET", { cookie }))).json()).toEqual({
+      ok: true,
+      status: "attention",
+      detail: "configuration",
+    });
+  });
+
   it("redacts Trigger retrieval and trigger failures", async () => {
     const { cookie } = await startTicket();
     mock.retrieve.mockRejectedValueOnce(new Error("TRIGGER_SECRET_KEY=must-not-leak"));
