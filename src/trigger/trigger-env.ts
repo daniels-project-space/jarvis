@@ -6,6 +6,10 @@
  */
 export const CODEX_SESSION_SOURCE_ENV = "JARVIS_CODEX_SESSION_SOURCE";
 export const CODEX_SESSION_SOURCE = "vault-broker";
+// Trigger receives a deliberately narrow Vault capability. It must never reuse
+// the web application's broader runtime capability just because both run the
+// same source tree.
+export const TRIGGER_VAULT_ACCESS_TOKEN_SOURCE_ENV = "JARVIS_TRIGGER_VAULT_ACCESS_TOKEN";
 
 export const JARVIS_TRIGGER_ENV_KEYS = [
   // Managed ChatGPT state is fetched by the controller from the codex-session
@@ -50,7 +54,9 @@ export function syncedJarvisTriggerEnvironment(
   return JARVIS_TRIGGER_ENV_KEYS.reduce<Record<string, string>>((values, key) => {
     const value = key === CODEX_SESSION_SOURCE_ENV
       ? (environment[key]?.trim() || CODEX_SESSION_SOURCE)
-      : environment[key];
+      : key === "VAULT_ACCESS_TOKEN"
+        ? (environment[TRIGGER_VAULT_ACCESS_TOKEN_SOURCE_ENV]?.trim() || environment[key])
+        : environment[key];
     if (value) values[key] = value;
     return values;
   }, {});

@@ -4,6 +4,7 @@ import {
   CODEX_SESSION_SOURCE,
   CODEX_SESSION_SOURCE_ENV,
   syncedJarvisTriggerEnvironment,
+  TRIGGER_VAULT_ACCESS_TOKEN_SOURCE_ENV,
 } from "./trigger-env";
 
 describe("Trigger environment allowlist", () => {
@@ -24,6 +25,16 @@ describe("Trigger environment allowlist", () => {
     })).toEqual({
       VAULT_ACCESS_TOKEN: "vault-token",
       [CODEX_SESSION_SOURCE_ENV]: "explicit-source",
+    });
+  });
+
+  it("uses the dedicated Trigger Vault capability without exposing its source name", () => {
+    expect(syncedJarvisTriggerEnvironment({
+      VAULT_ACCESS_TOKEN: "web-runtime-token",
+      [TRIGGER_VAULT_ACCESS_TOKEN_SOURCE_ENV]: "trigger-runtime-token",
+    })).toEqual({
+      VAULT_ACCESS_TOKEN: "trigger-runtime-token",
+      [CODEX_SESSION_SOURCE_ENV]: CODEX_SESSION_SOURCE,
     });
   });
 });
