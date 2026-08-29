@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { wakeAgentFleet } from "@/lib/agent-fleet-dispatch";
-import { cloudProviderAdmissionReadiness } from "@/lib/cloud-provider-admission";
+import { cloudProviderAdmissionReadinessAtRuntime } from "@/lib/cloud-provider-admission-runtime";
 import { controlMutation, controlQuery } from "@/lib/control-session";
 import { routeGoal } from "@/lib/goal-mode";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
@@ -39,7 +39,7 @@ export async function POST(req: NextRequest) {
     }, { status: 400 });
   }
   if (protocolV2) {
-    const readiness = cloudProviderAdmissionReadiness(process.env);
+    const readiness = await cloudProviderAdmissionReadinessAtRuntime();
     if (!readiness.ready) {
       return Response.json({
         ok: false,

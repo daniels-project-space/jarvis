@@ -6,6 +6,7 @@ const mock = vi.hoisted(() => ({
   convexMutation: vi.fn(),
   convexQuery: vi.fn(),
   resolveProjectSourceAdmission: vi.fn(),
+  cloudProviderAdmissionReadinessAtRuntime: vi.fn(),
   v2AdmissionEnabled: vi.fn(),
   wakeAgentFleet: vi.fn(),
 }));
@@ -20,6 +21,9 @@ vi.mock("./control-context", () => ({
 vi.mock("./agent-fleet-dispatch", () => ({ wakeAgentFleet: mock.wakeAgentFleet }));
 vi.mock("./source-admission-server", () => ({
   resolveProjectSourceAdmission: mock.resolveProjectSourceAdmission,
+}));
+vi.mock("./cloud-provider-admission-runtime", () => ({
+  cloudProviderAdmissionReadinessAtRuntime: mock.cloudProviderAdmissionReadinessAtRuntime,
 }));
 vi.mock("./mission-protocol-rollout", () => ({
   admissionMutationName: () => "goalMode:createV2",
@@ -54,6 +58,7 @@ describe("goal_mode exact source admission", () => {
     mock.convexQuery.mockResolvedValue("main");
     mock.convexMutation.mockResolvedValue({ missionId: "mission-1", held: false });
     mock.resolveProjectSourceAdmission.mockResolvedValue(projectAdmission);
+    mock.cloudProviderAdmissionReadinessAtRuntime.mockResolvedValue({ ready: true });
     mock.v2AdmissionEnabled.mockReturnValue(true);
     mock.wakeAgentFleet.mockResolvedValue(true);
     const now = Date.now();
@@ -153,7 +158,7 @@ describe("goal_mode exact source admission", () => {
   });
 
   it("refuses v2 admission before source observation or dispatch when provider evidence is absent", async () => {
-    vi.stubEnv("JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", "");
+    mock.cloudProviderAdmissionReadinessAtRuntime.mockResolvedValueOnce({ ready: false, code: "missing_receipt" });
 
     const result = await executeTool("goal_mode", {
       action: "start",

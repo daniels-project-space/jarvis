@@ -22,7 +22,7 @@ import { transcribableMediaKind } from "./media-types";
 import type { ManagedMission } from "../mastra/supervisor";
 import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
-import { cloudProviderAdmissionReadiness } from "./cloud-provider-admission";
+import { cloudProviderAdmissionReadinessAtRuntime } from "./cloud-provider-admission-runtime";
 import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
 import { selectCodexWorkPolicy } from "./codex-work-router";
 import { parseWorkModelTier, workModelLabel, workModelPriority } from "./work-models";
@@ -5268,7 +5268,7 @@ export async function executeTool(
         return "Explicit source branch requires a routed repository; no mission was created.";
       }
       if (protocolV2) {
-        const readiness = cloudProviderAdmissionReadiness(process.env);
+        const readiness = await cloudProviderAdmissionReadinessAtRuntime();
         if (!readiness.ready) {
           return `Goal Mode is temporarily unavailable because secure workspace readiness evidence is ${readiness.code.replaceAll("_", " ")}. No mission or Trigger worker was started; retry after the provider rollout is repaired.`;
         }

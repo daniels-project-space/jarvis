@@ -6,6 +6,7 @@ const mock = vi.hoisted(() => ({
   controlMutation: vi.fn(),
   controlQuery: vi.fn(),
   resolveProjectSourceAdmission: vi.fn(),
+  cloudProviderAdmissionReadinessAtRuntime: vi.fn(),
   v2AdmissionEnabled: vi.fn(),
   wakeAgentFleet: vi.fn(),
 }));
@@ -35,6 +36,9 @@ vi.mock("@/lib/mission-protocol-rollout", () => ({
 vi.mock("@/lib/source-admission-server", () => ({
   resolveProjectSourceAdmission: mock.resolveProjectSourceAdmission,
 }));
+vi.mock("@/lib/cloud-provider-admission-runtime", () => ({
+  cloudProviderAdmissionReadinessAtRuntime: mock.cloudProviderAdmissionReadinessAtRuntime,
+}));
 
 import { POST } from "./route";
 
@@ -63,6 +67,7 @@ describe("Goal Mode admission UI ownership", () => {
       sourceObservedAt: 1_800_000_000_000,
       sourceAdmissionDigest: "b".repeat(64),
     });
+    mock.cloudProviderAdmissionReadinessAtRuntime.mockResolvedValue({ ready: true });
     mock.v2AdmissionEnabled.mockReturnValue(true);
     mock.wakeAgentFleet.mockResolvedValue(true);
     const now = Date.now();
@@ -171,7 +176,7 @@ describe("Goal Mode admission UI ownership", () => {
   });
 
   it("returns a recoverable 503 before source observation, mission creation, or Trigger wake when provider evidence is absent", async () => {
-    vi.stubEnv("JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", "");
+    mock.cloudProviderAdmissionReadinessAtRuntime.mockResolvedValueOnce({ ready: false, code: "missing_receipt" });
 
     const response = await POST(request({
       goal: "Overhaul YouTube Studio from the exact ready branch",
