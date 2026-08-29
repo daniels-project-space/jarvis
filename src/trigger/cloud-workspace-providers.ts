@@ -3,6 +3,7 @@ import { posix as pathPosix } from "node:path";
 import type { Sandbox as E2BSandbox } from "e2b";
 import type { Client as Sandbox0Client, Sandbox as Sandbox0Sandbox } from "sandbox0";
 import type { Command as VercelCommand, Sandbox as VercelSandbox, Session as VercelSession } from "@vercel/sandbox";
+import { envvars } from "@trigger.dev/sdk/v3";
 import { runWithDeadline } from "../lib/bounded-json";
 import { configuredCloudWorkspaceProviderName } from "../lib/cloud-provider-selection";
 import {
@@ -1489,6 +1490,66 @@ export function configuredCloudWorkspaceProvider(
   const provider = configuredProviderAdapter(env);
   assertRequiredCapabilities(provider);
   return provider;
+}
+
+const RUNTIME_PROOF_VARIABLES = [
+  "JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID",
+  "JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT",
+] as const;
+
+type RuntimeProofEnvironment = Readonly<Record<(typeof RUNTIME_PROOF_VARIABLES)[number], string | undefined>>;
+type RuntimeProofLoader = () => Promise<RuntimeProofEnvironment>;
+
+function runtimeProofUnavailable(
+  env: Readonly<Record<string, string | undefined>>,
+): never {
+  throw new CloudWorkspaceError(
+    configuredCloudWorkspaceProviderName(env) ?? "cloudflare",
+    "provider_probe_attestation_failed",
+    "current Trigger cloud provider proof is unavailable or secret-redacted",
+    "blocked",
+  );
+}
+
+/**
+ * The receipt is generated only after Trigger assigns ctx.deployment.version.
+ * Read the two mutable proof fields from Trigger's control plane at task start
+ * so a proof for the executing version does not require another deployment.
+ */
+async function currentTriggerRuntimeProof(): Promise<RuntimeProofEnvironment> {
+  try {
+    const variables = await Promise.all(RUNTIME_PROOF_VARIABLES.map(async (name) => {
+      const value = await envvars.retrieve(name);
+      if (value.name !== name || value.isSecret || typeof value.value !== "string") throw new Error("unavailable");
+      return [name, value.value] as const;
+    }));
+    return Object.fromEntries(variables) as RuntimeProofEnvironment;
+  } catch {
+    // The caller maps all management-plane failures to one safe, typed hold.
+    return {
+      JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: undefined,
+      JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT: undefined,
+    };
+  }
+}
+
+export async function configuredCloudWorkspaceProviderForCurrentTriggerDeployment(
+  env: Readonly<Record<string, string | undefined>>,
+  runtimeAttestation: CloudProviderRuntimeAttestation,
+  loadRuntimeProof: RuntimeProofLoader = currentTriggerRuntimeProof,
+): Promise<CloudWorkspaceProvider> {
+  let runtimeProof: RuntimeProofEnvironment;
+  try {
+    runtimeProof = await loadRuntimeProof();
+  } catch {
+    return runtimeProofUnavailable(env);
+  }
+  if (!runtimeProof.JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID || !runtimeProof.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT) {
+    return runtimeProofUnavailable(env);
+  }
+  // Never fall back to a build-time copy.  It necessarily names the previous
+  // Trigger deployment after a new version has been created.
+  return configuredCloudWorkspaceProvider({ ...env, ...runtimeProof }, runtimeAttestation);
 }
 
 /** Orphan cleanup never receives execution authority or exposes execution methods. */

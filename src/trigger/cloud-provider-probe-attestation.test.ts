@@ -17,6 +17,7 @@ import { DEFAULT_WORKSPACE_LIMITS, REQUIRED_CLOUD_WORKSPACE_CAPABILITIES } from 
 import {
   configuredCloudWorkspaceCleanupProvider,
   configuredCloudWorkspaceProvider,
+  configuredCloudWorkspaceProviderForCurrentTriggerDeployment,
 } from "./cloud-workspace-providers";
 import { prepareCloudWorkspaceExecution } from "./cloud-workspace-controller";
 
@@ -109,7 +110,7 @@ describe("deployment-bound cloud provider probe authority", () => {
     expect(runner).toContain("runtimeAttestation: { triggerDeploymentVersion: ctx.deployment?.version }");
     expect(runner).not.toContain("configuredCloudWorkspaceProviderForLiveProbe");
     expect(runner.match(/options\.runtimeAttestation/g)).toHaveLength(1);
-    expect(runner.lastIndexOf("cloudProvider = configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
+    expect(runner.lastIndexOf("cloudProvider = await configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation)")).toBeLessThan(runner.indexOf("await processJob(job, cloudProvider)"));
   });
 
   it("keeps VERCEL_TOKEN alone blocked before adapter construction, hydration, or model execution", async () => {
@@ -185,6 +186,35 @@ describe("deployment-bound cloud provider probe authority", () => {
       code: "provider_probe_attestation_failed", disposition: "blocked",
       message: expect.stringMatching(/actual Trigger worker deployment/),
     }));
+  });
+
+  it("consumes only the current Trigger control-plane proof for the executing deployment", async () => {
+    const nextDeploymentVersion = "trigger-deploy-2026-07-21-b";
+    const staleBuildEnvironment = signedEnvironment();
+    const currentProofEnvironment = baseEnvironment();
+    currentProofEnvironment.JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID = nextDeploymentVersion;
+    const signedCurrentProof = signedEnvironment(currentProofEnvironment);
+
+    await expect(configuredCloudWorkspaceProviderForCurrentTriggerDeployment(
+      staleBuildEnvironment,
+      { triggerDeploymentVersion: nextDeploymentVersion },
+      async () => ({
+        JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: nextDeploymentVersion,
+        JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT: signedCurrentProof.JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT,
+      }),
+    )).resolves.toMatchObject({ name: "sandbox0" });
+
+    await expect(configuredCloudWorkspaceProviderForCurrentTriggerDeployment(
+      staleBuildEnvironment,
+      { triggerDeploymentVersion: nextDeploymentVersion },
+      async () => ({
+        JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID: nextDeploymentVersion,
+        JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT: undefined,
+      }),
+    )).rejects.toMatchObject({
+      code: "provider_probe_attestation_failed",
+      disposition: "blocked",
+    });
   });
 
   it("does not let matching environment or configuration claims override mismatched runtime context", () => {

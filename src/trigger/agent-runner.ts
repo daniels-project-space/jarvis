@@ -127,7 +127,7 @@ import type {
 import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
 import {
   configuredCloudWorkspaceCleanupProvider,
-  configuredCloudWorkspaceProvider,
+  configuredCloudWorkspaceProviderForCurrentTriggerDeployment,
 } from "./cloud-workspace-providers";
 import {
   CLOUD_WORKSPACE_RUNTIME_IDENTITY,
@@ -872,6 +872,11 @@ type ExecutionLeaseControl = Readonly<{
   close: () => void;
 }>;
 
+type CloudWorkspaceProviderFactory = (
+  env: Readonly<Record<string, string | undefined>>,
+  runtimeAttestation: CloudProviderRuntimeAttestation,
+) => CloudWorkspaceProvider | Promise<CloudWorkspaceProvider>;
+
 export type AgentRunnerDependencies = Readonly<{
   onAuthorityBoundary: (
     effect: AgentRunnerEffectBoundary,
@@ -882,7 +887,7 @@ export type AgentRunnerDependencies = Readonly<{
   cleanupSubscriptionHome: typeof cleanupSubscriptionHome;
   verifyCodexSubscriptionPreflight: typeof verifyCodexSubscriptionPreflight;
   missingSubscriptionTools: typeof missingSubscriptionTools;
-  configuredCloudWorkspaceProvider: typeof configuredCloudWorkspaceProvider;
+  configuredCloudWorkspaceProvider: CloudWorkspaceProviderFactory;
   runCommand: typeof sh;
   readGitObject: typeof readGitObject;
   createCredentiallessGitArchive: typeof createCredentiallessGitArchive;
@@ -928,7 +933,7 @@ export function createProductionAgentRunnerDependencies(): AgentRunnerDependenci
     cleanupSubscriptionHome,
     verifyCodexSubscriptionPreflight,
     missingSubscriptionTools,
-    configuredCloudWorkspaceProvider,
+    configuredCloudWorkspaceProvider: configuredCloudWorkspaceProviderForCurrentTriggerDeployment,
     runCommand: sh,
     readGitObject,
     createCredentiallessGitArchive,
@@ -994,7 +999,7 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
       // Construction validates the exact deployment-bound probe receipt but
       // does not create a paid workspace. Only after that proof is fresh may
       // system-held jobs return to the dispatch queue.
-      configuredCloudWorkspaceProvider(process.env, runtimeAttestation);
+      await configuredCloudWorkspaceProviderForCurrentTriggerDeployment(process.env, runtimeAttestation);
       const resumed = await convexMutation("jobs:resumeCloudWorkspaceBlocks", { limit: 8 });
       cloudWorkspaceResumed = Number(resumed?.resumed?.length ?? 0);
     } catch {
@@ -3441,7 +3446,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
 
     let cloudProvider: CloudWorkspaceProvider;
     try {
-      cloudProvider = configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation);
+      cloudProvider = await configuredCloudWorkspaceProvider(process.env, options.runtimeAttestation);
     } catch (error) {
       const failure = error instanceof CloudWorkspaceError
         ? error

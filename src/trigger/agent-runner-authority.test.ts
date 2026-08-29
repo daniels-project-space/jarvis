@@ -72,6 +72,7 @@ vi.mock("./subscription-runtime", async (importOriginal) => ({
 vi.mock("./cloud-workspace-providers", async (importOriginal) => ({
   ...await importOriginal<typeof import("./cloud-workspace-providers")>(),
   configuredCloudWorkspaceProvider: boundaries.configuredCloudWorkspaceProvider,
+  configuredCloudWorkspaceProviderForCurrentTriggerDeployment: boundaries.configuredCloudWorkspaceProvider,
   configuredCloudWorkspaceCleanupProvider: boundaries.configuredCloudWorkspaceCleanupProvider,
 }));
 
