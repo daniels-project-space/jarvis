@@ -6,7 +6,8 @@ import {
   readFileSync,
   rmSync,
 } from "node:fs";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { metadata, task } from "@trigger.dev/sdk/v3";
 import { CODEX_DEVICE_AUTH_URI } from "../lib/codex-auth-control";
 import { parseChatgptSubscriptionAuthText } from "./subscription-auth";
@@ -29,6 +30,17 @@ type SpawnLogin = (
   args: readonly string[],
   options: Parameters<typeof spawn>[2],
 ) => ChildProcessWithoutNullStreams;
+
+const require = createRequire(import.meta.url);
+
+/** Resolve the exact package installed by Trigger's pinned build extension. */
+export function packagedCodexBinary(): string {
+  return join(
+    dirname(require.resolve("@openai/codex/package.json")),
+    "bin",
+    "codex.js",
+  );
+}
 
 type EnrollmentFailureReason =
   | "spawn_failed"
@@ -117,7 +129,15 @@ export async function enrollCodexDeviceSession(
   } = {},
 ): Promise<{ status: "connected"; tokenExpiresAt: number }> {
   const environment = options.environment ?? process.env;
-  const bin = options.bin ?? environment.CODEX_BIN ?? "codex";
+  const configuredBin = options.bin ?? environment.CODEX_BIN?.trim();
+  const bin = configuredBin || packagedCodexBinary();
+  // Trigger tasks do not guarantee that node_modules/.bin survives the
+  // deliberately restricted child PATH. Execute the pinned package entrypoint
+  // with the current Node binary instead of relying on a global `codex` shim.
+  const loginCommand = configuredBin ? bin : process.execPath;
+  const loginArgs = configuredBin
+    ? ["login", "--device-auth"]
+    : [bin, "login", "--device-auth"];
   const root = options.root ?? "/tmp/jarvis-codex-enrollment";
   const now = options.now ?? Date.now;
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -138,7 +158,7 @@ export async function enrollCodexDeviceSession(
       ) as ChildProcessWithoutNullStreams);
 
   try {
-    const child = spawnLogin(bin, ["login", "--device-auth"], {
+    const child = spawnLogin(loginCommand, loginArgs, {
       cwd: home,
       env: enrollmentEnvironment(home, environment),
       stdio: ["ignore", "pipe", "pipe"],
@@ -170,7 +190,7 @@ export async function enrollCodexDeviceSession(
         resolve(null);
       }, LOGIN_TIMEOUT_MS);
       timer.unref?.();
-      child.once("error", (error) => {
+      child.once("error", () => {
         clearTimeout(timer);
         reject(new CodexEnrollmentError("spawn_failed"));
       });

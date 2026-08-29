@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   CODEX_DEVICE_AUTH_URI,
+  packagedCodexBinary,
   parseCodexDevicePrompt,
 } from "./codex-auth-enrollment";
 
 describe("Codex device enrollment", () => {
+  it("resolves the pinned installed Codex package without relying on PATH", () => {
+    expect(packagedCodexBinary()).toMatch(
+      /@openai[/\\]codex[/\\]bin[/\\]codex\.js$/,
+    );
+  });
+
   it("extracts only the fixed OpenAI verification URI and bounded one-time code", () => {
     expect(
       parseCodexDevicePrompt(
