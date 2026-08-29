@@ -1290,6 +1290,7 @@ const FILE_TURN_READ_ONLY_TOOLS = new Set([
 const FILE_TURN_VISUAL_TOOLS = new Set([
   "show", "show_ranking", "visual_scene", "board", "mind_map", "chart", "memory_map", "draft", "show_uploaded_image",
 ]);
+const GOOGLE_CALENDAR_REQUEST = /\b(?:google\s*calendar|gcal)\b/i;
 
 /**
  * File excerpts are untrusted data. This authorization derives solely from the
@@ -1310,6 +1311,12 @@ export const authorizeFileTool = query({
     if (!linked || FILE_TURN_READ_ONLY_TOOLS.has(toolName)) return { allowed: true };
 
     const userText = visibleTurnText(String(message.text)).toLowerCase().slice(0, 4_000);
+    // A file attachment must not create a second, broader calendar admission
+    // path than the foreground owner belt. Jarvis is intentionally iCloud-only:
+    // a request that names Google Calendar must never become an Apple approval.
+    if (toolName === "icloud_calendar_create" && GOOGLE_CALENDAR_REQUEST.test(userText)) {
+      return { allowed: false, reason: "file_turn_google_calendar_not_supported" };
+    }
     if (FILE_TURN_VISUAL_TOOLS.has(toolName)) {
       const requested = /\b(?:show|display|visual(?:ize|ise)?|chart|graph|plot|map|board|diagram|dashboard|draft)\b/.test(userText);
       return requested ? { allowed: true } : { allowed: false, reason: "file_turn_visual_not_requested" };

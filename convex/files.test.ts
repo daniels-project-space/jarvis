@@ -1107,6 +1107,36 @@ describe("durable private chat files", () => {
     }
   });
 
+  it("never turns a file-attached Google Calendar request into an iCloud approval", async () => {
+    const t = convexTest(schema, modules);
+    const ready = await makeReady(t, "main", "agenda.txt", "6".repeat(64), "calendar notes");
+    const google = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Add the attached meeting details to my Google Calendar tomorrow.",
+      requestId: "file-google-calendar-denied",
+      fileIds: [ready.fileId as any],
+      workerToken: WORKER,
+    });
+    await expect(t.query(api.files.authorizeFileTool, {
+      messageId: google,
+      toolName: "icloud_calendar_create",
+      workerToken: WORKER,
+    })).resolves.toEqual({ allowed: false, reason: "file_turn_google_calendar_not_supported" });
+
+    const apple = await t.mutation(api.chatQueue.sendMessage, {
+      threadId: "main",
+      text: "Add the attached meeting details to my iCloud Calendar tomorrow.",
+      requestId: "file-icloud-calendar-allowed",
+      fileIds: [ready.fileId as any],
+      workerToken: WORKER,
+    });
+    await expect(t.query(api.files.authorizeFileTool, {
+      messageId: apple,
+      toolName: "icloud_calendar_create",
+      workerToken: WORKER,
+    })).resolves.toEqual({ allowed: true });
+  });
+
   it("resolves one explicitly named catalog file without attaching every file", async () => {
     const t = convexTest(schema, modules);
     const budget = await makeReady(t, "main", "budget.csv", "2".repeat(64), "month,revenue\nAugust,2645");
