@@ -15,8 +15,9 @@ const TICKET_TTL_SECONDS = 20 * 60;
 
 type Ticket = Readonly<{ expiresAt: number; runId: string }>;
 type PublicStatus = "idle" | "queued" | "running" | "attested" | "attention" | "unavailable";
+type PublicDetail = "configuration" | "provider" | "publication" | "unknown";
 
-function response(body: { ok: boolean; status: PublicStatus }, status = 200): NextResponse {
+function response(body: { ok: boolean; status: PublicStatus; detail?: PublicDetail }, status = 200): NextResponse {
   return NextResponse.json(body, { status, headers: PRIVATE_HEADERS });
 }
 
@@ -99,6 +100,22 @@ function runStatus(run: unknown): PublicStatus {
   }
 }
 
+/**
+ * The provider may include credential-shaped text in a failed task error.
+ * Return only one stable owner-facing category, never the original message.
+ */
+function runFailureDetail(run: unknown): PublicDetail | undefined {
+  if (!run || typeof run !== "object" || Array.isArray(run)) return undefined;
+  const record = run as Record<string, unknown>;
+  if (record.status === "COMPLETED" || !record.error || typeof record.error !== "object" || Array.isArray(record.error)) {
+    return undefined;
+  }
+  const message = String((record.error as Record<string, unknown>).message ?? "").toLowerCase();
+  if (/opt-in|capability|credential|provenance|template|keyring|configuration|environment/.test(message)) return "configuration";
+  if (/publish|proof|receipt|deployment identity|attestation/.test(message)) return "publication";
+  return message ? "provider" : "unknown";
+}
+
 export async function GET(req: NextRequest): Promise<NextResponse> {
   if (!isSameOriginRequest(req)) return response({ ok: false, status: "unavailable" }, 403);
   const actor = await controlActor(req);
@@ -109,7 +126,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   if (!ticket) return clearTicket(response({ ok: true, status: "idle" }));
   try {
     const run = await runs.retrieve<typeof cloudProviderProbeBootstrap>(ticket.runId);
-    return response({ ok: true, status: runStatus(run) });
+    const status = runStatus(run);
+    const detail = status === "attention" ? runFailureDetail(run) : undefined;
+    return response({ ok: true, status, ...(detail ? { detail } : {}) });
   } catch {
     // Provider/task errors can include sensitive details. The UI receives only
     // a finite status and can safely offer a fresh owner confirmation.

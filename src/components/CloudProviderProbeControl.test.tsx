@@ -9,6 +9,7 @@ describe("CloudProviderProbeControl", () => {
     expect(markup).toContain("verify release");
     expect(markup).toContain("not attested for this release");
     expect(markup).toContain('aria-live="polite"');
+    expect(markup).not.toContain("provider-specific detail");
     expect(markup).not.toContain("user task");
   });
 });

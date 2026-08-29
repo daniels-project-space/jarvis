@@ -105,10 +105,22 @@ describe("cloud provider probe owner control", () => {
 
   it("maps a non-successful run to a finite attention state", async () => {
     const { cookie } = await startTicket();
-    mock.retrieve.mockResolvedValueOnce({ status: "FAILED", output: { error: "provider-specific detail" } });
+    mock.retrieve.mockResolvedValueOnce({ status: "FAILED", error: { message: "a safe scoped credential for the selected provider is unavailable" } });
 
     const res = await GET(request("GET", { cookie }));
-    expect(await res.json()).toEqual({ ok: true, status: "attention" });
+    expect(await res.json()).toEqual({ ok: true, status: "attention", detail: "configuration" });
+  });
+
+  it("classifies a failed task without returning its raw error", async () => {
+    const { cookie } = await startTicket();
+    mock.retrieve.mockResolvedValueOnce({
+      status: "FAILED",
+      error: { message: "provider said token=must-not-leak while publishing the proof" },
+    });
+
+    const body = await (await GET(request("GET", { cookie }))).json();
+    expect(body).toEqual({ ok: true, status: "attention", detail: "publication" });
+    expect(JSON.stringify(body)).not.toContain("must-not-leak");
   });
 
   it("redacts Trigger retrieval and trigger failures", async () => {

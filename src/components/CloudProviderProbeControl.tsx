@@ -8,6 +8,7 @@ const MAX_STATUS_POLLS = 45;
 const STATUS_POLL_MS = 2_000;
 
 type ProbeStatus = "idle" | "starting" | "queued" | "running" | "attested" | "attention" | "unavailable";
+type ProbeDetail = "configuration" | "provider" | "publication" | "unknown";
 
 const LABELS: Record<ProbeStatus, string> = {
   idle: "not attested for this release",
@@ -19,8 +20,19 @@ const LABELS: Record<ProbeStatus, string> = {
   unavailable: "unavailable · no worker started",
 };
 
+const DETAIL_LABELS: Record<ProbeDetail, string> = {
+  configuration: "needs release setup · no worker started",
+  provider: "provider check failed · no worker started",
+  publication: "proof storage needs attention · no worker started",
+  unknown: "needs attention · no worker started",
+};
+
 function isProbeStatus(value: unknown): value is Exclude<ProbeStatus, "starting"> {
   return value === "idle" || value === "queued" || value === "running" || value === "attested" || value === "attention" || value === "unavailable";
+}
+
+function isProbeDetail(value: unknown): value is ProbeDetail {
+  return value === "configuration" || value === "provider" || value === "publication" || value === "unknown";
 }
 
 /**
@@ -30,20 +42,24 @@ function isProbeStatus(value: unknown): value is Exclude<ProbeStatus, "starting"
  */
 export function CloudProviderProbeControl() {
   const [status, setStatus] = useState<ProbeStatus>("idle");
+  const [detail, setDetail] = useState<ProbeDetail | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const pollCount = useRef(0);
 
   const refresh = useCallback(async () => {
     try {
       const res = await viewerFetchWithTimeout("/api/cloud-provider-probe", { cache: "no-store" }, 10_000);
-      const payload = await res.json().catch(() => null) as { ok?: unknown; status?: unknown } | null;
+      const payload = await res.json().catch(() => null) as { ok?: unknown; status?: unknown; detail?: unknown } | null;
       if (!res.ok || payload?.ok !== true || !isProbeStatus(payload.status)) {
         setStatus("unavailable");
+        setDetail(null);
         return;
       }
       setStatus(payload.status);
+      setDetail(payload.status === "attention" && isProbeDetail(payload.detail) ? payload.detail : null);
     } catch {
       setStatus("unavailable");
+      setDetail(null);
     }
   }, []);
 
@@ -68,6 +84,7 @@ export function CloudProviderProbeControl() {
     if (!window.confirm("Verify this cloud worker release? Jarvis will run one bounded, short-lived provider check. It will not create a user task or run a model.")) return;
     setSubmitting(true);
     setStatus("starting");
+    setDetail(null);
     pollCount.current = 0;
     try {
       const res = await viewerFetchWithTimeout("/api/cloud-provider-probe", {
@@ -78,12 +95,14 @@ export function CloudProviderProbeControl() {
       const payload = await res.json().catch(() => null) as { ok?: unknown; status?: unknown } | null;
       if (!res.ok || payload?.ok !== true || payload.status !== "queued") {
         setStatus("unavailable");
+        setDetail(null);
         return;
       }
       setStatus("queued");
       await refresh();
     } catch {
       setStatus("unavailable");
+      setDetail(null);
     } finally {
       setSubmitting(false);
     }
@@ -95,6 +114,7 @@ export function CloudProviderProbeControl() {
     : status === "attention" || status === "unavailable"
       ? "border-amber-300/30 bg-amber-300/10 text-amber-100"
       : "border-white/10 bg-black/20 text-slate";
+  const label = status === "attention" && detail ? DETAIL_LABELS[detail] : LABELS[status];
 
   return (
     <div className="flex max-w-[168px] flex-col items-end gap-1.5">
@@ -107,7 +127,7 @@ export function CloudProviderProbeControl() {
         {busy ? "verifying…" : "verify release"}
       </button>
       <span aria-live="polite" className={`rounded-lg border px-2 py-1 text-right text-[9px] ${tone}`}>
-        {LABELS[status]}
+        {label}
       </span>
     </div>
   );
