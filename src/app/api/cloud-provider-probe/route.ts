@@ -17,7 +17,7 @@ const TICKET_TTL_SECONDS = 20 * 60;
 type Ticket = Readonly<{ expiresAt: number; runId: string }>;
 type PublicStatus = "idle" | "queued" | "running" | "attested" | "attention" | "unavailable";
 type PublicDetail = "configuration" | "provider" | "publication" | "unknown";
-type PublicProvider = "vercel" | "sandbox0" | "e2b" | "cloudflare" | "unconfigured";
+type PublicProvider = "vercel" | "sandbox0" | "e2b" | "selfhost" | "cloudflare" | "unconfigured";
 
 function response(body: { ok: boolean; status: PublicStatus; detail?: PublicDetail; provider?: PublicProvider }, status = 200): NextResponse {
   return NextResponse.json(body, { status, headers: PRIVATE_HEADERS });

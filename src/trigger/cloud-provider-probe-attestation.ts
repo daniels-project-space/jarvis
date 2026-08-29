@@ -20,6 +20,9 @@ export const CLOUD_PROVIDER_SDKS = Object.freeze({
   e2b: { package: "e2b", version: "2.35.0" },
   sandbox0: { package: "sandbox0", version: "0.9.3" },
   vercel: { package: "@vercel/sandbox", version: "3.0.0" },
+  // The self-hosted adapter is vendored in this deployment, rather than an
+  // unpinned third-party SDK. Its version is the runner API contract.
+  selfhost: { package: "jarvis-self-hosted-runner-api", version: "1.0.0" },
   cloudflare: { package: "cloudflare-sandbox-compatible", version: "unconfigured" },
 } as const satisfies Record<CloudWorkspaceProviderName, { package: string; version: string }>);
 
@@ -301,6 +304,7 @@ function blocked(provider: CloudWorkspaceProviderName, detail: string): never {
 }
 
 export function installedCloudProviderSdkVersion(provider: CloudWorkspaceProviderName): string | null {
+  if (provider === "selfhost") return "1.0.0";
   try {
     const packageName = provider === "e2b" ? "e2b" : provider === "sandbox0" ? "sandbox0" : provider === "vercel" ? "@vercel/sandbox" : null;
     if (!packageName) return null;

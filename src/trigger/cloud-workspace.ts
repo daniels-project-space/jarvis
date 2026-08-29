@@ -9,7 +9,7 @@ import {
 
 export type { WorkspaceCheckpoint } from "../lib/workspace-checkpoint";
 
-export type CloudWorkspaceProviderName = "e2b" | "sandbox0" | "vercel" | "cloudflare";
+export type CloudWorkspaceProviderName = "e2b" | "sandbox0" | "vercel" | "selfhost" | "cloudflare";
 // Persisted attempts and checkpoint manifests can still name the retired
 // provider. Historical identity is data, not execution authority.
 export type HistoricalCloudWorkspaceProviderName = CloudWorkspaceProviderName | "daytona";

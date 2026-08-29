@@ -36,6 +36,10 @@ export const JARVIS_TRIGGER_ENV_KEYS = [
   "JARVIS_NOVITA_QWEN_ATTESTATION",
   "JARVIS_CLOUD_WORKSPACE_PROVIDER", "JARVIS_CLOUD_WORKSPACE_TEMPLATE", "JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST", "JARVIS_VERCEL_PRO_SPEND_APPROVED",
   "JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID", "JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT", "JARVIS_CLOUD_PROVIDER_PROBE_KEYRING",
+  // A Daniel-controlled runner reached through an HTTPS tunnel. Both values
+  // are required; the runner never receives controller or subscription
+  // credentials, only a credentialless source archive.
+  "JARVIS_SELF_HOST_RUNNER_URL", "JARVIS_SELF_HOST_RUNNER_TOKEN",
   // Explicitly forwarded but dormant unless exactly `live`; this gates the
   // owner-only attestation task before any provider call.
   "JARVIS_CLOUD_PROVIDER_PROBE",

@@ -29,6 +29,7 @@ import {
   VERCEL_HISTORY_PAGE_LIMIT,
   VERCEL_HISTORY_TOTAL_CEILING,
   VERCEL_NAME_PREFIX,
+  SelfHostedRunnerCloudWorkspaceProvider,
 } from "../src/trigger/cloud-workspace-providers";
 import {
   cloudWorkspaceCancellationProbeRemote,
@@ -53,6 +54,7 @@ function configuredCredentialAvailable(env: Readonly<Record<string, string | und
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "sandbox0") return Boolean(env.SANDBOX0_TOKEN);
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "e2b") return Boolean(env.E2B_API_KEY);
   if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "vercel") return Boolean(env.VERCEL_TOKEN && env.VERCEL_TEAM_ID && env.VERCEL_PROJECT_ID);
+  if (env.JARVIS_CLOUD_WORKSPACE_PROVIDER === "selfhost") return Boolean(env.JARVIS_SELF_HOST_RUNNER_URL && env.JARVIS_SELF_HOST_RUNNER_TOKEN);
   return false;
 }
 
@@ -251,7 +253,9 @@ export async function issueLiveCloudProviderProbe(
     blocked("the exact deployment/template provenance configuration is incomplete");
   }
   if (!authority) blocked("the rotating controller-only receipt signer is unavailable");
-  if (binding.provider !== "sandbox0" && binding.provider !== "vercel") blocked("the selected pinned adapter cannot exercise every required live capability");
+  if (binding.provider !== "sandbox0" && binding.provider !== "vercel" && binding.provider !== "selfhost") {
+    blocked("the selected pinned adapter cannot exercise every required live capability");
+  }
   if (installedCloudProviderSdkVersion(binding.provider) !== binding.sdk.version) blocked("the installed provider SDK does not match the pinned tuple");
   if (binding.provider === "vercel"
     && binding.template.digest !== cloudProviderTemplateDigest(VERCEL_CLOUD_WORKSPACE_TEMPLATE_PROVENANCE)) {
@@ -275,9 +279,19 @@ export async function issueLiveCloudProviderProbe(
       onStage: async (stage) => { probeStage = `workspace creation:${stage}`; },
     });
     probeStage = "provider configuration observation";
-    let providerObservation = binding.provider === "sandbox0"
-      ? await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest, env)
-      : await inspectVercelConfiguration(first, env);
+    let providerObservation: { ttlMs: number; observedMemory: number };
+    if (binding.provider === "sandbox0") {
+      providerObservation = await inspectSandbox0Configuration(first, binding.template.identity, binding.template.digest, env);
+    } else if (binding.provider === "vercel") {
+      providerObservation = await inspectVercelConfiguration(first, env);
+    } else if (binding.provider === "selfhost" && provider instanceof SelfHostedRunnerCloudWorkspaceProvider) {
+      // This is one layer of the proof only. The remaining source, empty-env,
+      // resource, network, cancellation, checkpoint, and recreation checks
+      // below execute against the exact same runner workspace.
+      providerObservation = await provider.observeWorkspace(first);
+    } else {
+      throw new Error("self-hosted runner adapter identity was not preserved");
+    }
 
     const bytes = probeArchive();
     probeStage = "credentialless archive upload";

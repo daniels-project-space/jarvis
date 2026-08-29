@@ -1,9 +1,10 @@
-export type ConfiguredCloudWorkspaceProvider = "e2b" | "sandbox0" | "vercel" | "cloudflare";
+export type ConfiguredCloudWorkspaceProvider = "e2b" | "sandbox0" | "vercel" | "selfhost" | "cloudflare";
 
 const PROVIDERS = new Set<ConfiguredCloudWorkspaceProvider>([
   "e2b",
   "sandbox0",
   "vercel",
+  "selfhost",
   "cloudflare",
 ]);
 
@@ -40,5 +41,8 @@ export function configuredCloudWorkspaceProviderName(
   if (env.VERCEL_TOKEN && env.VERCEL_TEAM_ID && env.VERCEL_PROJECT_ID) return "vercel";
   if (env.SANDBOX0_TOKEN) return "sandbox0";
   if (env.E2B_API_KEY) return "e2b";
+  // A remote runner is never inferred from its URL alone. Its shared bearer
+  // is an explicit execution authority and must be provisioned as a pair.
+  if (env.JARVIS_SELF_HOST_RUNNER_URL && env.JARVIS_SELF_HOST_RUNNER_TOKEN) return "selfhost";
   return null;
 }

@@ -59,6 +59,15 @@ const CAPABILITIES: Record<CloudWorkspaceProviderName, CloudWorkspaceCapabilitie
     exactCommandCancellation: true, sameWorkspaceResume: false, portableCheckpointReplay: true,
     providerSnapshots: false, persistentVolumes: false, opaqueSecretProjection: false,
   },
+  selfhost: {
+    // This describes the pinned runner protocol, not an optimistic local
+    // fallback. Construction and the live lifecycle probe both fail closed
+    // until an operator supplies an HTTPS endpoint and shared bearer.
+    credentiallessArchive: true, privateIngress: true, networkDenyByDefault: true,
+    emptyEnvironment: true, boundedResources: true, boundedTtl: true,
+    exactCommandCancellation: true, sameWorkspaceResume: true, portableCheckpointReplay: true,
+    providerSnapshots: false, persistentVolumes: false, opaqueSecretProjection: false,
+  },
   cloudflare: {
     // This is deliberately only a compatibility seam until a concrete client
     // is injected and probed; an absent seam must not advertise capabilities.
@@ -1439,6 +1448,331 @@ export class CloudflareSandboxCompatibleProvider implements CloudWorkspaceProvid
   terminate: CloudWorkspaceProvider["terminate"] = (workspace, reason) => this.require().terminate(workspace, reason);
 }
 
+/**
+ * Versioned, vendored protocol for a Daniel-controlled runner. It deliberately
+ * has no discovery path: the caller must name an HTTPS endpoint and present a
+ * high-entropy bearer before this adapter can make a single network request.
+ * The server contract lives in docs/self-hosted-runner.md.
+ */
+export const SELF_HOSTED_RUNNER_PROTOCOL_VERSION = "1.0.0";
+const SELF_HOSTED_RUNNER_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
+const SELF_HOSTED_RUNNER_ID = /^[A-Za-z0-9._:-]{1,240}$/;
+const SELF_HOSTED_RUNNER_CONTROL_TIMEOUT_MS = 20_000;
+const SELF_HOSTED_RUNNER_MAX_JSON_BYTES = 2 * 1024 * 1024;
+
+type SelfHostedRunnerFetch = typeof fetch;
+
+function selfHostedRunnerRecord(value: unknown, message: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CloudWorkspaceError("selfhost", "invalid_configuration", message, "blocked");
+  }
+  return value as Record<string, unknown>;
+}
+
+function selfHostedRunnerId(value: unknown, label: string): string {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!SELF_HOSTED_RUNNER_ID.test(normalized)) {
+    throw new CloudWorkspaceError("selfhost", "invalid_configuration", `self-hosted runner ${label} is malformed`, "blocked");
+  }
+  return normalized;
+}
+
+function selfHostedRunnerNumber(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new CloudWorkspaceError("selfhost", "invalid_configuration", `self-hosted runner ${label} is malformed`, "blocked");
+  }
+  return Number(value);
+}
+
+function selfHostedRunnerEndpoint(raw: string): URL {
+  let endpoint: URL;
+  try { endpoint = new URL(raw); }
+  catch { throw new CloudWorkspaceError("selfhost", "missing_configuration", "JARVIS_SELF_HOST_RUNNER_URL must be an HTTPS URL", "blocked"); }
+  if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    throw new CloudWorkspaceError("selfhost", "missing_configuration", "JARVIS_SELF_HOST_RUNNER_URL must be a credential-free HTTPS URL", "blocked");
+  }
+  endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/`;
+  return endpoint;
+}
+
+/** A concrete REST transport, not a local fallback or a simulated sandbox. */
+export class SelfHostedRunnerCloudWorkspaceProvider extends ProviderBase {
+  readonly name = "selfhost" as const;
+  readonly capabilities = CAPABILITIES.selfhost;
+  // Self-hosted dependency hydration is intentionally not supported. The
+  // runner starts deny-by-default and executes only its credentialless archive.
+  declare readonly hydrateDependencies?: CloudWorkspaceProvider["hydrateDependencies"];
+  private readonly endpoint: URL;
+
+  constructor(
+    rawEndpoint: string,
+    private readonly token: string,
+    private readonly request: SelfHostedRunnerFetch = fetch,
+  ) {
+    super();
+    this.endpoint = selfHostedRunnerEndpoint(rawEndpoint.trim());
+    if (!SELF_HOSTED_RUNNER_TOKEN.test(token)) {
+      throw new CloudWorkspaceError(this.name, "missing_configuration", "JARVIS_SELF_HOST_RUNNER_TOKEN must be a 32+ character base64url bearer", "blocked");
+    }
+  }
+
+  private api(path: string, query: Record<string, string | number> = {}): URL {
+    const url = new URL(path.replace(/^\/+/, ""), this.endpoint);
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, String(value));
+    return url;
+  }
+
+  private workspacePath(workspace: CloudWorkspace, suffix: string): string {
+    this.assertWorkspace(workspace);
+    return `v1/workspaces/${encodeURIComponent(workspace.providerWorkspaceId)}${suffix}`;
+  }
+
+  private filePath(workspace: CloudWorkspace, path: string, max: number): string {
+    const route = this.workspacePath(workspace, "/files");
+    return `${route}?path=${encodeURIComponent(path)}&max=${encodeURIComponent(String(max))}`;
+  }
+
+  private assertWorkspace(workspace: CloudWorkspace): void {
+    if (workspace.provider !== this.name) {
+      throw new CloudWorkspaceError(this.name, "invalid_configuration", "self-hosted runner received a foreign workspace identity", "blocked");
+    }
+    assertWorkspaceIdentity(workspace);
+  }
+
+  private async response(
+    method: string,
+    path: string,
+    options: { body?: BodyInit; headers?: HeadersInit; signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<Response> {
+    const deadline = AbortSignal.timeout(Math.min(60_000, Math.max(1_000, options.timeoutMs ?? SELF_HOSTED_RUNNER_CONTROL_TIMEOUT_MS)));
+    const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+    try {
+      const response = await this.request(this.api(path), {
+        method,
+        headers: {
+          authorization: `Bearer ${this.token}`,
+          "x-jarvis-self-hosted-runner-protocol": SELF_HOSTED_RUNNER_PROTOCOL_VERSION,
+          ...options.headers,
+        },
+        body: options.body,
+        signal,
+        // A redirect could forward the bearer to a different origin.
+        redirect: "error",
+      });
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          throw new CloudWorkspaceError(this.name, "missing_configuration", "self-hosted runner authentication was rejected", "blocked");
+        }
+        throw new CloudWorkspaceError(this.name, "provider_unavailable", "self-hosted runner request was rejected", "deferred");
+      }
+      return response;
+    } catch (error) {
+      if (error instanceof CloudWorkspaceError) throw error;
+      if (options.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "self-hosted runner command cancelled", "deferred");
+      if (deadline.aborted) throw new CloudWorkspaceError(this.name, "timeout", "self-hosted runner request timed out", "deferred");
+      throw new CloudWorkspaceError(this.name, "provider_unavailable", "self-hosted runner is unavailable", "deferred");
+    }
+  }
+
+  private async json(
+    method: string,
+    path: string,
+    options: { value?: unknown; headers?: HeadersInit; signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<Record<string, unknown>> {
+    const response = await this.response(method, path, {
+      ...(options.value === undefined ? {} : {
+        body: JSON.stringify(options.value),
+        headers: { ...options.headers, "content-type": "application/json" },
+      }),
+      ...(options.value === undefined && options.headers ? { headers: options.headers } : {}),
+      signal: options.signal,
+      timeoutMs: options.timeoutMs,
+    });
+    const size = Number(response.headers.get("content-length") ?? "0");
+    if (Number.isFinite(size) && size > SELF_HOSTED_RUNNER_MAX_JSON_BYTES) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "self-hosted runner control response exceeds its limit", "rejected");
+    }
+    const text = await response.text();
+    if (Buffer.byteLength(text) > SELF_HOSTED_RUNNER_MAX_JSON_BYTES) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "self-hosted runner control response exceeds its limit", "rejected");
+    }
+    try { return selfHostedRunnerRecord(JSON.parse(text), "control response is malformed"); }
+    catch (error) {
+      if (error instanceof CloudWorkspaceError) throw error;
+      throw new CloudWorkspaceError(this.name, "invalid_configuration", "self-hosted runner control response is malformed", "blocked");
+    }
+  }
+
+  private async bytes(
+    method: string,
+    path: string,
+    maxBytes: number,
+    options: { body?: BodyInit; headers?: HeadersInit; signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<Uint8Array> {
+    const response = await this.response(method, path, options);
+    const declared = Number(response.headers.get("content-length") ?? "0");
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "self-hosted runner file exceeds its limit", "rejected");
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "self-hosted runner file exceeds its limit", "rejected");
+    }
+    return bytes;
+  }
+
+  async createWorkspace(input: Parameters<CloudWorkspaceProvider["createWorkspace"]>[0]): Promise<CloudWorkspace> {
+    const created = await this.json("POST", "v1/workspaces", {
+      value: {
+        attemptKey: input.attemptKey,
+        template: input.template,
+        runtime: input.runtime,
+        lockfileDigest: input.lockfileDigest,
+        limits: input.limits,
+      },
+    });
+    const providerWorkspaceId = selfHostedRunnerId(created.workspaceId, "workspace identity");
+    const providerSessionId = selfHostedRunnerId(created.sessionId, "session identity");
+    if (providerWorkspaceId === providerSessionId || created.root !== this.workspaceRoot) {
+      throw new CloudWorkspaceError(this.name, "invalid_configuration", "self-hosted runner returned an invalid workspace boundary", "blocked");
+    }
+    const workspace = {
+      provider: this.name,
+      providerWorkspaceId,
+      providerSessionId,
+      root: this.workspaceRoot,
+      createdAt: selfHostedRunnerNumber(created.createdAt, "creation time"),
+    } satisfies CloudWorkspace;
+    assertWorkspaceIdentity(workspace);
+    return workspace;
+  }
+
+  async exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult> {
+    this.assertWorkspace(workspace);
+    if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "self-hosted runner command cancelled", "deferred");
+    const cwd = request.cwd ?? workspace.root;
+    if (cwd !== workspace.root) {
+      throw new CloudWorkspaceError(this.name, "invalid_configuration", "self-hosted runner command cwd escaped the workspace root", "blocked");
+    }
+    const result = await this.json("POST", this.workspacePath(workspace, "/exec"), {
+      value: {
+        sessionId: workspace.providerSessionId,
+        command: request.command,
+        cwd,
+        timeoutMs: request.timeoutMs,
+        maxOutputBytes: request.maxOutputBytes,
+      },
+      signal: request.signal,
+      timeoutMs: request.timeoutMs + 1_000,
+    });
+    const stdout = typeof result.stdout === "string" ? result.stdout : "";
+    const stderr = typeof result.stderr === "string" ? result.stderr : "";
+    if (!Number.isSafeInteger(result.exitCode)
+      || Buffer.byteLength(stdout) > request.maxOutputBytes
+      || Buffer.byteLength(stderr) > request.maxOutputBytes
+      || selfHostedRunnerId(result.sessionId, "command session") !== workspace.providerSessionId) {
+      throw new CloudWorkspaceError(this.name, "invalid_configuration", "self-hosted runner command response is invalid", "blocked");
+    }
+    return {
+      exitCode: Number(result.exitCode),
+      stdout,
+      stderr,
+      providerSessionId: workspace.providerSessionId,
+      durationMs: selfHostedRunnerNumber(result.durationMs, "command duration"),
+    };
+  }
+
+  async readFile(workspace: CloudWorkspace, path: string, maxBytes: number): Promise<Uint8Array> {
+    return await this.readAbsolute(workspace, safeWorkspacePath(workspace, path), maxBytes);
+  }
+
+  protected async readAbsolute(workspace: CloudWorkspace, path: string, maxBytes: number): Promise<Uint8Array> {
+    return await this.bytes("GET", this.filePath(workspace, path, maxBytes), maxBytes, {
+      headers: {
+        accept: "application/octet-stream",
+        "x-jarvis-workspace-session": workspace.providerSessionId,
+      },
+      timeoutMs: SELF_HOSTED_RUNNER_CONTROL_TIMEOUT_MS,
+    });
+  }
+
+  async writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void> {
+    await this.writeAbsolute(workspace, safeWorkspacePath(workspace, path), data, maxBytes);
+  }
+
+  protected async writeAbsolute(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void> {
+    if (data.byteLength > maxBytes) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "self-hosted runner write exceeds its limit", "rejected");
+    }
+    await this.response("PUT", this.workspacePath(workspace, "/files"), {
+      body: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
+      headers: {
+        "content-type": "application/octet-stream",
+        "x-jarvis-workspace-session": workspace.providerSessionId,
+        "x-jarvis-workspace-path": path,
+        "x-jarvis-max-bytes": String(maxBytes),
+      },
+      timeoutMs: SELF_HOSTED_RUNNER_CONTROL_TIMEOUT_MS,
+    });
+  }
+
+  async listFiles(workspace: CloudWorkspace, path: string, maxEntries: number): Promise<string[]> {
+    const result = await this.json("GET", this.filePath(workspace, safeWorkspacePath(workspace, path), maxEntries), {
+      // The path is read-only but still must be bound to the exact session.
+      // Otherwise a recycled workspace id could disclose another attempt.
+      headers: {
+        accept: "application/json",
+        "x-jarvis-workspace-session": workspace.providerSessionId,
+      },
+      timeoutMs: SELF_HOSTED_RUNNER_CONTROL_TIMEOUT_MS,
+    });
+    if (!Array.isArray(result.entries) || result.entries.length > maxEntries) {
+      throw new CloudWorkspaceError(this.name, "resource_limit", "self-hosted runner file listing exceeds its limit", "rejected");
+    }
+    return result.entries.map((entry) => {
+      if (typeof entry !== "string" || !entry || entry.length > 2_048) {
+        throw new CloudWorkspaceError(this.name, "invalid_configuration", "self-hosted runner file listing is malformed", "blocked");
+      }
+      return validateRelativePath(entry, this.name);
+    });
+  }
+
+  /** Re-observed by the live probe before receipt issuance; never trusted alone. */
+  async observeWorkspace(workspace: CloudWorkspace): Promise<{ ttlMs: number; observedMemory: number }> {
+    const result = await this.json("GET", this.workspacePath(workspace, "/attestation"), {
+      headers: { "x-jarvis-workspace-session": workspace.providerSessionId },
+      timeoutMs: SELF_HOSTED_RUNNER_CONTROL_TIMEOUT_MS,
+    });
+    const limits = selfHostedRunnerRecord(result.limits, "workspace limits are malformed");
+    const security = selfHostedRunnerRecord(result.security, "workspace security proof is malformed");
+    const quota = selfHostedRunnerRecord(result.quota, "workspace quota proof is malformed");
+    if (result.protocolVersion !== SELF_HOSTED_RUNNER_PROTOCOL_VERSION
+      || selfHostedRunnerId(result.workspaceId, "attestation workspace identity") !== workspace.providerWorkspaceId
+      || selfHostedRunnerId(result.sessionId, "attestation session identity") !== workspace.providerSessionId
+      || result.state !== "running"
+      || selfHostedRunnerNumber(limits.cpu, "CPU limit") < 1
+      || selfHostedRunnerNumber(limits.cpu, "CPU limit") > DEFAULT_WORKSPACE_LIMITS.cpu
+      || selfHostedRunnerNumber(limits.memoryMb, "memory limit") < 1
+      || selfHostedRunnerNumber(limits.memoryMb, "memory limit") > DEFAULT_WORKSPACE_LIMITS.memoryMb
+      || selfHostedRunnerNumber(limits.ttlMs, "TTL limit") < 1
+      || selfHostedRunnerNumber(limits.ttlMs, "TTL limit") > DEFAULT_WORKSPACE_LIMITS.ttlMs
+      || selfHostedRunnerNumber(quota.maxActiveWorkspaces, "active workspace quota") < 1
+      || selfHostedRunnerNumber(quota.activeWorkspaces, "active workspace count") > selfHostedRunnerNumber(quota.maxActiveWorkspaces, "active workspace quota")
+      || ["credentiallessArchive", "privateIngress", "networkDenyByDefault", "emptyEnvironment", "boundedResources", "boundedTtl", "exactCommandCancellation", "portableCheckpointReplay"].some((key) => security[key] !== true)) {
+      throw new CloudWorkspaceError(this.name, "provider_probe_attestation_failed", "self-hosted runner workspace policy proof was rejected", "blocked");
+    }
+    return { ttlMs: Number(limits.ttlMs), observedMemory: Number(limits.memoryMb) };
+  }
+
+  async terminate(workspace: CloudWorkspace, reason: "terminal" | "orphan" | "cancelled"): Promise<void> {
+    await this.response("DELETE", this.workspacePath(workspace, ""), {
+      body: JSON.stringify({ sessionId: workspace.providerSessionId, reason }),
+      headers: { "content-type": "application/json" },
+      timeoutMs: SELF_HOSTED_RUNNER_CONTROL_TIMEOUT_MS,
+    });
+  }
+}
+
 export type CloudWorkspaceCleanupProvider = Readonly<{
   name: CloudWorkspaceProviderName;
   terminate: CloudWorkspaceProvider["terminate"];
@@ -1466,6 +1800,12 @@ function configuredProviderAdapterForName(
       env.VERCEL_PROJECT_ID,
       undefined,
       isVercelProSpendApproved(env.JARVIS_VERCEL_PRO_SPEND_APPROVED),
+    );
+  }
+  if (name === "selfhost") {
+    return new SelfHostedRunnerCloudWorkspaceProvider(
+      String(env.JARVIS_SELF_HOST_RUNNER_URL ?? ""),
+      String(env.JARVIS_SELF_HOST_RUNNER_TOKEN ?? ""),
     );
   }
   if (name === "cloudflare") {
@@ -1580,7 +1920,7 @@ export function configuredCloudWorkspaceProviderForLiveProbe(
 ): CloudWorkspaceProvider {
   const name = String(env.JARVIS_CLOUD_WORKSPACE_PROVIDER ?? "").trim().toLowerCase();
   if (env.JARVIS_CLOUD_PROVIDER_PROBE !== "live") {
-    const provider = name === "e2b" || name === "sandbox0" || name === "vercel" || name === "cloudflare" ? name : "cloudflare";
+    const provider = name === "e2b" || name === "sandbox0" || name === "vercel" || name === "selfhost" || name === "cloudflare" ? name : "cloudflare";
     throw new CloudWorkspaceError(provider, "provider_probe_attestation_failed", "live provider probe authority was not explicitly enabled", "blocked");
   }
   return configuredProviderAdapter(env);

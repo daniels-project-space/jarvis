@@ -140,6 +140,30 @@ describe("deployment-bound cloud provider probe authority", () => {
     }
   });
 
+  it("keeps an unprovisioned self-host runner blocked before source hydration or Codex work", async () => {
+    const env: NodeJS.ProcessEnv = {
+      ...baseEnvironment(),
+      JARVIS_CLOUD_WORKSPACE_PROVIDER: "selfhost",
+      SANDBOX0_TOKEN: undefined,
+    };
+    const signed = signedEnvironment(env);
+    const hydrate = vi.fn();
+    await expect(prepareCloudWorkspaceExecution({
+      providerFactory: () => configuredCloudWorkspaceProvider(signed, RUNTIME_ATTESTATION),
+      hydrateArchive: hydrate,
+      attemptKey: "blocked-selfhost:1", template: signed.JARVIS_CLOUD_WORKSPACE_TEMPLATE!,
+      runtime: "node-22:codex-0.144.5", lockfileDigest: "0".repeat(64),
+    })).rejects.toMatchObject({ code: "missing_configuration", provider: "selfhost", disposition: "blocked" });
+    expect(hydrate).not.toHaveBeenCalled();
+
+    const configured = {
+      ...signed,
+      JARVIS_SELF_HOST_RUNNER_URL: "https://runner.example/relay",
+      JARVIS_SELF_HOST_RUNNER_TOKEN: "self_host_runner_test_bearer_token_0123456789",
+    };
+    expect(configuredCloudWorkspaceProvider(configured, RUNTIME_ATTESTATION).name).toBe("selfhost");
+  });
+
   it("opens execution for the exact ctx.deployment.version and a fresh signed provider tuple", () => {
     const env = signedEnvironment();
     expect(configuredCloudWorkspaceProvider(env, RUNTIME_ATTESTATION).name).toBe("sandbox0");

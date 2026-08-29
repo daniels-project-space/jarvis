@@ -14,6 +14,8 @@ describe("Trigger mission rollout environment", () => {
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_HUB_CONTEXT_TOKEN");
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_HUB_ACTIONS_TOKEN");
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_CLOUD_PROVIDER_PROBE");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_SELF_HOST_RUNNER_URL");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_SELF_HOST_RUNNER_TOKEN");
 
     const runner = readFileSync(new URL("./agent-runner.ts", import.meta.url), "utf8");
     const foregroundTools = readFileSync(new URL("../lib/tools.ts", import.meta.url), "utf8");

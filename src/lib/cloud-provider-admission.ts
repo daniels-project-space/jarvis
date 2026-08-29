@@ -1,7 +1,7 @@
 import { configuredCloudWorkspaceProviderName } from "./cloud-provider-selection";
 import { cloudProviderProbeMaxAgeMs } from "./cloud-provider-probe-policy";
 
-const PROVIDERS = new Set(["e2b", "sandbox0", "vercel", "cloudflare"]);
+const PROVIDERS = new Set(["e2b", "sandbox0", "vercel", "selfhost", "cloudflare"]);
 const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_ID = /^[a-zA-Z0-9._:/-]{1,200}$/;
 const KEY_ID = /^[a-zA-Z0-9._-]{1,64}$/;
