@@ -84,6 +84,8 @@ const EXPLICIT_HIGH_EFFORT = /\bhigh reasoning effort\b|\breasoning effort(?:\s+
 const EXPLICIT_TERRA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?terra(?:\/(?:low|medium|high|xhigh|max|ultra))?\b|\bterra\/(?:low|medium|high|xhigh|max|ultra)\b/i;
 const EXPLICIT_SOL = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?sol(?:\/(?:low|medium|high|xhigh|max|ultra))?\b|\bsol\/(?:low|medium|high|xhigh|max|ultra)\b/i;
 const EXPLICIT_LUNA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?luna(?:\/(?:low|medium|high|xhigh|max|ultra))?\b|\bluna\/(?:low|medium|high|xhigh|max|ultra)\b/i;
+const EXPLICIT_ULTRA_EFFORT = /\b(?:luna|terra|sol)(?:\/|\s+)ultra\b|\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+ultra\b|\bultra\s+(?:reasoning(?:\s+effort)?|effort)\b/i;
+const EXPLICIT_XHIGH_EFFORT = /\b(?:luna|terra|sol)(?:\/|\s+)x[- ]?high\b|\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+x[- ]?high\b|\bx[- ]?high\s+(?:reasoning(?:\s+effort)?|effort)\b/i;
 const DIFFICULT_ROOT_CAUSE = /\b(?:deep|difficult|recurring|intermittent|unknown|production) root cause\b|\broot cause\b.*\b(?:production|security|privacy|cross[- ]project|multi[- ]repo)\b/i;
 
 function boundedText(value: unknown, max = 120): string {
@@ -119,9 +121,9 @@ function explicitTextModel(task: string): WorkModelTier | null {
 }
 
 function explicitTextEffort(task: string): CodexReasoningEffort | null {
-  if (/\b(?:luna|terra|sol)\/ultra\b|\bultra(?:\s+reasoning(?:\s+effort)?)?\b/i.test(task)) return "ultra";
+  if (EXPLICIT_ULTRA_EFFORT.test(task)) return "ultra";
   if (EXPLICIT_MAX_QUALITY.test(task) || /\b(?:luna|terra|sol)\/max\b|\bmax(?:imum)? reasoning effort\b/i.test(task)) return "max";
-  if (/\b(?:luna|terra|sol)\/xhigh\b|\bx[- ]?high(?:\s+reasoning(?:\s+effort)?)?\b/i.test(task)) return "xhigh";
+  if (EXPLICIT_XHIGH_EFFORT.test(task)) return "xhigh";
   if (EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_HIGH_EFFORT.test(task) || /\b(?:luna|terra|sol)\/high\b/i.test(task)) return "high";
   if (/\b(?:luna|terra|sol)\/medium\b|\bmedium reasoning effort\b/i.test(task)) return "medium";
   if (/\b(?:luna|terra|sol)\/low\b|\blow reasoning effort\b/i.test(task)) return "low";

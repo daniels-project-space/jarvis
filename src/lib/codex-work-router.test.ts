@@ -199,6 +199,21 @@ describe("adaptive Codex work policy", () => {
       task: "Complete the multi-repository architecture migration using Terra/ultra",
       role: "paul",
     })).toMatchObject({ model: "terra", reasoningEffort: "ultra" });
+    expect(selectCodexWorkPolicy({
+      task: "Complete the multi-repository architecture migration using Terra ultra",
+      role: "paul",
+    })).toMatchObject({ model: "terra", reasoningEffort: "ultra" });
+    expect(selectCodexWorkPolicy({
+      task: "Apply the routine deterministic rename using Terra x high",
+      role: "paul",
+    })).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
+  });
+
+  it("does not mistake a non-model use of ultra for an expensive reasoning request", () => {
+    expect(selectCodexWorkPolicy({
+      task: "Make the microphone startup feel ultra fast without changing behavior",
+      role: "paul",
+    })).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
   });
 
   it.each([
