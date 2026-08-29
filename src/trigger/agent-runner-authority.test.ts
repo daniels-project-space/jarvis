@@ -1152,10 +1152,10 @@ describe("production Trigger worker authority harness", () => {
         .withIndex("by_job_revision", (q) => q.eq("jobId", jobId).eq("revision", 1))
         .unique(),
     }));
-    expect(sealedBeforeRun.job).toMatchObject({ model: "terra", reasoningEffort: "medium" });
+    expect(sealedBeforeRun.job).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
     expect(sealedBeforeRun.order).toMatchObject({
       minimumModel: "terra",
-      minimumReasoningEffort: "medium",
+      minimumReasoningEffort: "xhigh",
       backgroundExecutionProfile: {
         provider: "codex-subscription",
         modelTier: "terra",
@@ -1189,7 +1189,7 @@ describe("production Trigger worker authority harness", () => {
       dependencies,
     )).toEqual({ processed: 1 });
     expect(dependencies.runCloudWorkspaceAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "terra", reasoningEffort: "medium" }),
+      expect.objectContaining({ model: "terra", reasoningEffort: "xhigh" }),
     );
     const executionBoundaries = trace.filter((item) => [
       "source_checkout",

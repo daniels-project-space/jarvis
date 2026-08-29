@@ -30,7 +30,7 @@ export const GOAL_ROUTE_KINDS = [
 ] as const;
 
 export type GoalRouteKind = (typeof GOAL_ROUTE_KINDS)[number];
-export type GoalReasoningEffort = "low" | "medium" | "high" | "max";
+export type GoalReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type GoalAgentId = "jarvis" | "paul" | "atlas" | "iris" | "maya" | "sentry";
 
 export type GoalRoute = {

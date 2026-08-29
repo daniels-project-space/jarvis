@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { routeWork, suggestedAcceptanceCriteria } from "./routing";
 import { selectCodexWorkPolicy } from "../lib/codex-work-router";
+import { parseWorkModelTier } from "../lib/work-models";
 import {
   TEAM_BY_SLUG,
   type AgentSlug,
@@ -15,7 +16,7 @@ export const workstreamSchema = z.object({
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
   repo: z.string().nullable(),
   model: z.enum(["luna", "terra", "sol"]),
-  reasoningEffort: z.enum(["low", "medium", "high", "max"]),
+  reasoningEffort: z.enum(["low", "medium", "high", "xhigh", "ultra", "max"]),
   modelReason: z.string().min(1).max(300),
   readonly: z.boolean(),
   approvalRequired: z.boolean(),
@@ -64,13 +65,20 @@ export function normalizeWorkstream(input: {
     : input.risk && ["low", "medium", "high"].includes(input.risk)
       ? input.risk
       : route.risk) as WorkRisk;
+  const requestedModel = parseWorkModelTier(input.model);
+  const routeFloor = route.modelFloor;
+  const effectiveModelFloor = requestedModel === "sol" || routeFloor === "sol"
+    ? "sol"
+    : requestedModel === "terra" || routeFloor === "terra"
+      ? "terra"
+      : requestedModel;
   const modelPolicy = selectCodexWorkPolicy({
     task: input.task,
     role: agentId,
     repo: input.repo,
     readonly: input.readonly === true || approvalRequired,
     risk,
-    requestedModel: input.model,
+    requestedModel: effectiveModelFloor,
     requestedReasoningEffort: input.reasoningEffort,
   });
   return {

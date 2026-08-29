@@ -6,7 +6,7 @@ describe("routeWork", () => {
   it("routes complex engineering to Paul at the deep tier", () => {
     const route = routeWork("Trace the root cause and redesign this multi-repo Convex architecture", { repo: "jarvis" });
     expect(route.agentId).toBe("paul");
-    expect(route.model).toBe("sol");
+    expect(route.model).toBe("terra");
     expect(route.approvalRequired).toBe(false);
     expect(suggestedAcceptanceCriteria("deploy it", route)).toContain(
       "Do not call it live until the production alias is verified",
@@ -18,7 +18,7 @@ describe("routeWork", () => {
     expect(route.approvalRequired).toBe(true);
     expect(route.risk).toBe("consequential");
     expect(route.readonly).toBe(true);
-    expect(route.model).toBe("sol");
+    expect(route.model).toBe("terra");
   });
 
   it("does not turn owned-repository merge and deploy work into a human decision", () => {
@@ -66,11 +66,11 @@ describe("routeWork", () => {
       task: "Redesign the compact task cards and improve their visual hierarchy",
       repo: "daniels-project-space/jarvis",
       agentId: "paul",
-    })).toMatchObject({ agentId: "iris", model: "terra", reasoningEffort: "high" });
+    })).toMatchObject({ agentId: "iris", model: "terra", reasoningEffort: "xhigh" });
   });
 
   it("does not honour a cheap override for hard work", () => {
-    expect(routeWork("Production security architecture migration", { requestedModel: "luna" }).model).toBe("sol");
+    expect(routeWork("Production security architecture migration", { requestedModel: "luna" }).model).toBe("terra");
   });
 
   it("keeps a named tiny owned code fix low risk while retaining Terra review", () => {

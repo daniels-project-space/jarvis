@@ -75,9 +75,9 @@ describe("dispatch_agent adaptive work policy", () => {
       missionId: "mission-voice",
       originThreadId: "voice-thread",
       agentId: "atlas",
-      model: "luna",
-      reasoningEffort: "high",
-      modelReason: expect.stringMatching(/Bounded research specialist/),
+      model: "terra",
+      reasoningEffort: "xhigh",
+      modelReason: expect.stringMatching(/Research workload/),
     }));
     expect(mock.wakeAgentFleet).toHaveBeenCalledWith("job:job-voice");
   });
@@ -95,7 +95,7 @@ describe("dispatch_agent adaptive work policy", () => {
       agentId: "paul",
       model: "sol",
       reasoningEffort: "max",
-      modelReason: expect.stringMatching(/Security\/privacy safety floor/),
+      modelReason: expect.stringMatching(/Exceptional security\/privacy safety floor/),
     }));
   });
 
@@ -109,7 +109,7 @@ describe("dispatch_agent adaptive work policy", () => {
     expect(mock.convexMutation).toHaveBeenCalledWith("jobs:enqueueV2", expect.objectContaining({
       agentId: "paul",
       model: "terra",
-      reasoningEffort: "medium",
+      reasoningEffort: "xhigh",
     }));
   });
 });

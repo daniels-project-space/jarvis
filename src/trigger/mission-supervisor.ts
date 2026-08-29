@@ -104,7 +104,7 @@ type ModelMetadata = {
   modelProvider: "codex-subscription";
   modelTier: ModelTier;
   modelId: string;
-  reasoningEffort: "low" | "medium" | "high" | "max";
+  reasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   tierReason: string;
   supervisorPromptVersion: string;
 };
@@ -134,7 +134,7 @@ type SupervisorDecision =
         label: string;
         repo?: string;
         model: ModelTier;
-        reasoningEffort: "low" | "medium" | "high" | "max";
+        reasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
         modelReason: string;
         agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
         readonly: boolean;
@@ -316,7 +316,7 @@ const requestedWorkstreamSchema = z.object({
   label: boundedString(80).optional(),
   repo: boundedString(120).optional(),
   model: z.enum(["luna", "terra", "sol"]).optional(),
-  reasoningEffort: z.enum(["low", "medium", "high", "max"]).optional(),
+  reasoningEffort: z.enum(["low", "medium", "high", "xhigh", "ultra", "max"]).optional(),
   modelReason: boundedString(300).optional(),
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]).optional(),
   readonly: z.boolean().optional(),
@@ -670,7 +670,7 @@ const planningWorkstreamSchema = z.object({
   label: boundedString(80).min(3),
   repo: boundedString(120).nullable(),
   model: z.enum(["luna", "terra", "sol"]),
-  reasoningEffort: z.enum(["low", "medium", "high", "max"]),
+  reasoningEffort: z.enum(["low", "medium", "high", "xhigh", "ultra", "max"]),
   modelReason: boundedString(300).min(1),
   agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
   readonly: z.boolean(),
@@ -1426,7 +1426,7 @@ function assertPlanningAuthority(
   request: RequestPayload,
 ): void {
   const modelRank = { luna: 0, terra: 1, sol: 2 } as const;
-  const effortRank = { low: 0, medium: 1, high: 2, max: 3 } as const;
+  const effortRank = { low: 0, medium: 1, high: 2, xhigh: 3, ultra: 4, max: 5 } as const;
   const riskRank = {
     low: 0,
     medium: 1,

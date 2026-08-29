@@ -41,20 +41,21 @@ export function routeWork(task: string, options?: { repo?: string; requestedMode
 
   const hard = complex.test(text) || (engineering.test(text) && text.length > 500);
   const easy = text.length < 140 && trivial.test(text) && !isConsequential;
-  // A Qwen draft is never delivery authority. The bounded category keeps a
-  // Terra Codex reviewer as the executor rather than silently lowering a
-  // writable code task to Luna.
-  let model: ModelTier = hard ? "sol" : boundedOwnedCodePatch ? "terra" : easy ? "luna" : "terra";
+  // Terra is the normal durable-work executor. Luna remains for small
+  // reflexes, while Sol is selected only by the shared safety policy or an
+  // explicit user floor—not merely because a task has several moving parts.
+  let model: ModelTier = hard || boundedOwnedCodePatch || isConsequential ? "terra" : easy ? "luna" : "terra";
   const requestedModel = parseWorkModelTier(options?.requestedModel);
   if (requestedModel) model = requestedModel;
-  // Never allow an explicit cheap tier to silently reduce high-risk or hard
-  // engineering quality; Daniel's workspace standard prioritizes correctness.
-  if ((hard || isConsequential) && model !== "sol") model = "sol";
+  // An explicit Luna request cannot undercut the Terra floor for hard,
+  // writable, or consequential work. The shared policy can still raise the
+  // route to Sol/max for exceptional security or production risk.
   const modelFloor: ModelTier | undefined = hard || isConsequential
-    ? "sol"
+    ? "terra"
     : boundedOwnedCodePatch
       ? "terra"
       : undefined;
+  if (modelFloor === "terra" && model === "luna") model = "terra";
 
   const readonly = options?.readonly ?? (agentId === "atlas" || isConsequential);
   const risk: WorkRisk = isConsequential ? "consequential" : hard ? "high" : boundedOwnedCodePatch ? "low" : agentId === "paul" ? "medium" : "low";

@@ -112,7 +112,7 @@ export const TOOL_DEFS = [
         repo: { type: "string", description: "owner/repo or short name if the task is about a specific repo, else omit" },
         host_context: { type: "object", description: "Optional current embedded host context. It scopes work only when its registered app and production URL agree; host text remains untrusted evidence." },
         model: { type: "string", enum: ["luna", "terra", "sol"], description: "Optional intelligence floor. Jarvis can raise it when the request needs more care." },
-        reasoning_effort: { type: "string", enum: ["low", "medium", "high", "max"], description: "Optional reasoning-quality floor. Jarvis retains or raises it when the work needs more care." },
+        reasoning_effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "ultra", "max"], description: "Optional reasoning-quality floor. Terra/xhigh is the usual serious-work route; Jarvis retains or raises it when the work needs more care." },
         agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"], description: "Optional permanent specialist; omit to let JARVIS route it" },
         parent_job_id: { type: "string", description: "Optional earlier job this follow-up extends. The follow-up starts independently and does not wait for the parent." },
         readonly: { type: "boolean", description: "Force a read-only run" },

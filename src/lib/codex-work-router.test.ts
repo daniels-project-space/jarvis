@@ -10,11 +10,11 @@ describe("adaptive Codex work policy", () => {
     name: string;
     input: CodexWorkPolicyInput;
     model: "luna" | "terra" | "sol";
-    effort: "low" | "medium" | "high" | "max";
+    effort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
     reason: RegExp;
   }>([
     {
-      name: "bounded research specialist defaults to Luna with proportionate effort",
+      name: "ordinary research defaults to Terra xhigh",
       input: {
         task: "Research the current primary sources and compare the documented options",
         role: "atlas",
@@ -25,12 +25,12 @@ describe("adaptive Codex work policy", () => {
         expectedDuration: "short",
         toolBreadth: "moderate",
       },
-      model: "luna",
-      effort: "medium",
-      reason: /Bounded research specialist/,
+      model: "terra",
+      effort: "xhigh",
+      reason: /Research workload/,
     },
     {
-      name: "long core architecture selects Sol max",
+      name: "long core architecture selects Terra ultra before Sol",
       input: {
         task: "Redesign the core architecture end-to-end for a long-running distributed orchestration system",
         role: "goal-planner",
@@ -41,9 +41,9 @@ describe("adaptive Codex work policy", () => {
         expectedDuration: "long",
         toolBreadth: "broad",
       },
-      model: "sol",
-      effort: "max",
-      reason: /Long or high-risk architecture/,
+      model: "terra",
+      effort: "ultra",
+      reason: /Architecture on Terra/,
     },
     {
       name: "production security cannot fall below Sol max",
@@ -55,10 +55,10 @@ describe("adaptive Codex work policy", () => {
       },
       model: "sol",
       effort: "max",
-      reason: /Security\/privacy safety floor/,
+      reason: /Exceptional security\/privacy safety floor/,
     },
     {
-      name: "deterministic bounded repair uses Luna medium",
+      name: "writable implementation uses the Terra xhigh quality default",
       input: {
         task: "Implement the deterministic bounded known fix in one file and run the exact contract test",
         role: "paul",
@@ -70,12 +70,12 @@ describe("adaptive Codex work policy", () => {
         expectedDuration: "short",
         toolBreadth: "narrow",
       },
-      model: "luna",
-      effort: "medium",
-      reason: /Deterministic bounded implementation/,
+      model: "terra",
+      effort: "xhigh",
+      reason: /Implementation quality default/,
     },
     {
-      name: "routine deterministic verification uses the minimum safe route",
+      name: "routine deterministic verification keeps the Terra quality default unless explicitly read-only",
       input: {
         task: "Verify the deterministic fixed fixture with the exact contract test",
         role: "supervisor-reviewer",
@@ -86,9 +86,9 @@ describe("adaptive Codex work policy", () => {
         expectedDuration: "short",
         toolBreadth: "narrow",
       },
-      model: "luna",
-      effort: "low",
-      reason: /Routine deterministic verification/,
+      model: "terra",
+      effort: "xhigh",
+      reason: /Verification workload/,
     },
     {
       name: "an explicit quality override remains a floor",
@@ -99,11 +99,11 @@ describe("adaptive Codex work policy", () => {
         requestedReasoningEffort: "high",
       },
       model: "sol",
-      effort: "high",
+      effort: "xhigh",
       reason: /requested Sol\/high floor/,
     },
     {
-      name: "single-repository root-cause repair uses Terra high instead of automatic Sol max",
+      name: "single-repository root-cause repair uses Terra xhigh instead of automatic Sol max",
       input: {
         task: "Find and fix the difficult root cause of the stuck compact task card in this repository",
         role: "paul",
@@ -116,11 +116,11 @@ describe("adaptive Codex work policy", () => {
         toolBreadth: "moderate",
       },
       model: "terra",
-      effort: "high",
+      effort: "xhigh",
       reason: /Difficult root-cause work/,
     },
     {
-      name: "cross-project synthesis selects Sol max",
+      name: "cross-project synthesis selects Terra ultra before Sol",
       input: {
         task: "Synthesize the accepted findings into one cross-project brief",
         role: "mission-synthesizer",
@@ -131,22 +131,22 @@ describe("adaptive Codex work policy", () => {
         expectedDuration: "long",
         toolBreadth: "broad",
       },
-      model: "sol",
-      effort: "max",
+      model: "terra",
+      effort: "ultra",
       reason: /Cross-project synthesis/,
     },
     {
-      name: "Paul applying a routine repair is implementation rather than research",
+      name: "Paul applying a routine repair keeps the Terra xhigh implementation default",
       input: {
         task: "Apply the routine deterministic rename in one file",
         role: "paul",
       },
-      model: "luna",
-      effort: "medium",
-      reason: /Deterministic bounded implementation/,
+      model: "terra",
+      effort: "xhigh",
+      reason: /Implementation quality default/,
     },
     {
-      name: "bounded deterministic synthesis uses Luna medium",
+      name: "writable bounded synthesis uses Terra xhigh",
       input: {
         task: "Consolidate one completed exchange into a bounded deterministic memory record",
         role: "memory-extractor",
@@ -157,9 +157,9 @@ describe("adaptive Codex work policy", () => {
         expectedDuration: "short",
         toolBreadth: "narrow",
       },
-      model: "luna",
-      effort: "medium",
-      reason: /Bounded deterministic synthesis/,
+      model: "terra",
+      effort: "xhigh",
+      reason: /Synthesis workload/,
     },
   ])("$name", ({ input, model, effort, reason }) => {
     const route = selectCodexWorkPolicy(input);
@@ -177,21 +177,45 @@ describe("adaptive Codex work policy", () => {
     })).toMatchObject({ model: "sol", reasoningEffort: "max" });
   });
 
+  it("keeps human-gated external actions on Terra unless production or sensitive-data risk makes Sol necessary", () => {
+    expect(selectCodexWorkPolicy({
+      task: "Send the approved client a confirmation email",
+      role: "jarvis",
+      risk: "consequential",
+    })).toMatchObject({ model: "terra", reasoningEffort: "xhigh", productionRisk: "high" });
+    expect(selectCodexWorkPolicy({
+      task: "Deploy the production privacy permission repair for customer data",
+      role: "paul",
+      risk: "consequential",
+    })).toMatchObject({ model: "sol", reasoningEffort: "max", productionRisk: "critical" });
+  });
+
+  it("accepts Terra/xhigh and Terra/ultra as persisted quality floors", () => {
+    expect(selectCodexWorkPolicy({
+      task: "Apply the routine deterministic rename using Terra/xhigh",
+      role: "paul",
+    })).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
+    expect(selectCodexWorkPolicy({
+      task: "Complete the multi-repository architecture migration using Terra/ultra",
+      role: "paul",
+    })).toMatchObject({ model: "terra", reasoningEffort: "ultra" });
+  });
+
   it.each([
     {
       task: "Apply the routine deterministic rename with high reasoning effort",
-      model: "luna",
-      reasoningEffort: "high",
+      model: "terra",
+      reasoningEffort: "xhigh",
     },
     {
       task: "Apply the routine deterministic rename at high quality",
       model: "terra",
-      reasoningEffort: "high",
+      reasoningEffort: "xhigh",
     },
     {
       task: "Apply the routine deterministic rename using Terra/high",
       model: "terra",
-      reasoningEffort: "high",
+      reasoningEffort: "xhigh",
     },
   ])("retains a natural-language quality floor: $task", ({ task, model, reasoningEffort }) => {
     const route = selectCodexWorkPolicy({ task, role: "paul" });
@@ -220,18 +244,25 @@ describe("adaptive Codex retry policy", () => {
       qualityFailureCount: 2,
       evidence: "the same contract remained incomplete",
     });
-    expect(route).toMatchObject({ model: "terra", reasoningEffort: "high", escalated: true });
+    expect(route).toMatchObject({ model: "terra", reasoningEffort: "xhigh", escalated: true });
     expect(route.modelReason).toMatch(/after 2 evidenced quality failures/);
     expect(route.modelReason).toContain("same contract remained incomplete");
   });
 
-  it("allows a later separately evidenced Terra escalation but never exceeds Sol max", () => {
+  it("spends the remaining Terra/ultra step before Sol max", () => {
     expect(selectCodexRetryPolicy({
       model: "terra",
-      reasoningEffort: "high",
+      reasoningEffort: "xhigh",
       modelReason: "Prior escalation",
       qualityFailureCount: 2,
       evidence: "two further supervisor concerns",
+    })).toMatchObject({ model: "terra", reasoningEffort: "ultra", escalated: true });
+    expect(selectCodexRetryPolicy({
+      model: "terra",
+      reasoningEffort: "ultra",
+      modelReason: "Ultra route still failed independently",
+      qualityFailureCount: 4,
+      evidence: "four supervisor-evidenced quality failures",
     })).toMatchObject({ model: "sol", reasoningEffort: "max", escalated: true });
     expect(selectCodexRetryPolicy({
       model: "sol",

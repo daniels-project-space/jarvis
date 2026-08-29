@@ -5,7 +5,10 @@ import {
   type WorkModelTier,
 } from "./work-models";
 
-export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "max"] as const;
+// These names are passed straight to the subscribed Codex runtime. Keep the
+// normal durable-work route on Terra/xhigh; `ultra` is an intentional opt-in
+// for unusually difficult work, and Sol/max is the exceptional safety route.
+export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "ultra", "max"] as const;
 
 export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
 export type CodexWorkType = "research" | "architecture" | "implementation" | "verification" | "synthesis";
@@ -51,7 +54,14 @@ export type CodexRetrySelection = Pick<CodexWorkSelection, "model" | "reasoningE
 };
 
 const TIER_RANK: Record<WorkModelTier, number> = { luna: 0, terra: 1, sol: 2 };
-const EFFORT_RANK: Record<CodexReasoningEffort, number> = { low: 0, medium: 1, high: 2, max: 3 };
+const EFFORT_RANK: Record<CodexReasoningEffort, number> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  xhigh: 3,
+  ultra: 4,
+  max: 5,
+};
 
 const RESEARCH = /\b(research|compare|survey|primary sources?|literature|market|competitor|find out|summari[sz]e|analyse|analyze)\b/i;
 const ARCHITECTURE = /\b(architecture|architectural|system design|redesign|platform design|migration plan|technical strategy)\b/i;
@@ -71,9 +81,9 @@ const BROAD_TOOLS = /\b(browser|playwright|provider|production logs?|web search|
 const EXPLICIT_MAX_QUALITY = /\b(max(?:imum)? quality|highest quality|best available (?:model|reasoning)|use sol(?:\/max)?|sol\/max|deepest reasoning|think (?:very |really )?hard|do not economi[sz]e)\b/i;
 const EXPLICIT_HIGH_QUALITY = /\b(?:at|with|use|using|choose|select)?\s*high[- ]quality\b/i;
 const EXPLICIT_HIGH_EFFORT = /\bhigh reasoning effort\b|\breasoning effort(?:\s+(?:of|is|at)|\s*[:=])?\s*high\b/i;
-const EXPLICIT_TERRA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?terra(?:\/(?:low|medium|high|max))?\b|\bterra\/(?:low|medium|high|max)\b/i;
-const EXPLICIT_SOL = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?sol(?:\/(?:low|medium|high|max))?\b|\bsol\/(?:low|medium|high|max)\b/i;
-const EXPLICIT_LUNA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?luna(?:\/(?:low|medium|high|max))?\b|\bluna\/(?:low|medium|high|max)\b/i;
+const EXPLICIT_TERRA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?terra(?:\/(?:low|medium|high|xhigh|max|ultra))?\b|\bterra\/(?:low|medium|high|xhigh|max|ultra)\b/i;
+const EXPLICIT_SOL = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?sol(?:\/(?:low|medium|high|xhigh|max|ultra))?\b|\bsol\/(?:low|medium|high|xhigh|max|ultra)\b/i;
+const EXPLICIT_LUNA = /\b(?:use|using|choose|select|run(?: this)? (?:on|with))\s+(?:the\s+)?luna(?:\/(?:low|medium|high|xhigh|max|ultra))?\b|\bluna\/(?:low|medium|high|xhigh|max|ultra)\b/i;
 const DIFFICULT_ROOT_CAUSE = /\b(?:deep|difficult|recurring|intermittent|unknown|production) root cause\b|\broot cause\b.*\b(?:production|security|privacy|cross[- ]project|multi[- ]repo)\b/i;
 
 function boundedText(value: unknown, max = 120): string {
@@ -109,7 +119,9 @@ function explicitTextModel(task: string): WorkModelTier | null {
 }
 
 function explicitTextEffort(task: string): CodexReasoningEffort | null {
+  if (/\b(?:luna|terra|sol)\/ultra\b|\bultra(?:\s+reasoning(?:\s+effort)?)?\b/i.test(task)) return "ultra";
   if (EXPLICIT_MAX_QUALITY.test(task) || /\b(?:luna|terra|sol)\/max\b|\bmax(?:imum)? reasoning effort\b/i.test(task)) return "max";
+  if (/\b(?:luna|terra|sol)\/xhigh\b|\bx[- ]?high(?:\s+reasoning(?:\s+effort)?)?\b/i.test(task)) return "xhigh";
   if (EXPLICIT_HIGH_QUALITY.test(task) || EXPLICIT_HIGH_EFFORT.test(task) || /\b(?:luna|terra|sol)\/high\b/i.test(task)) return "high";
   if (/\b(?:luna|terra|sol)\/medium\b|\bmedium reasoning effort\b/i.test(task)) return "medium";
   if (/\b(?:luna|terra|sol)\/low\b|\blow reasoning effort\b/i.test(task)) return "low";
@@ -146,11 +158,14 @@ function inferUncertainty(task: string, workType: CodexWorkType, complexity: Cod
 }
 
 function inferProductionRisk(task: string, repo: string, readonly: boolean, risk: string): CodexProductionRisk {
-  if (risk === "consequential") return "critical";
   const security = SECURITY.test(task);
   const production = PRODUCTION.test(task);
+  // Human-gated consequential work needs care, but it is not automatically a
+  // reason to spend the frontier/max route. Reserve that for cases involving
+  // production or sensitive data where a reasoning failure itself is severe.
+  if (risk === "consequential" && (security || production)) return "critical";
   if (security && production) return "critical";
-  if (security || production || risk === "high") return "high";
+  if (security || production || risk === "high" || risk === "consequential") return "high";
   if (risk === "medium" || (repo && !readonly) || /\b(database|schema|migration|api)\b/i.test(task)) return "medium";
   return "low";
 }
@@ -179,13 +194,13 @@ function selectionLead(input: {
   model: WorkModelTier;
 }): string {
   if (input.explicitQuality) return "Explicit quality floor retained";
-  if (input.productionRisk === "critical") return "Security/privacy safety floor";
+  if (input.productionRisk === "critical") return "Exceptional security/privacy safety floor";
   if (DIFFICULT_ROOT_CAUSE.test(input.task)) return "Difficult root-cause work";
   if (input.workType === "synthesis" && input.crossProject) return "Cross-project synthesis";
-  if (input.workType === "architecture" && input.model === "sol") return "Long or high-risk architecture";
-  if (input.workType === "research" && input.model === "luna") return "Bounded research specialist";
+  if (input.workType === "architecture" && input.model === "terra") return "Architecture on Terra";
+  if (input.workType === "research" && input.model === "luna") return "Exact bounded research reflex";
   if (input.workType === "synthesis" && input.model === "luna") return "Bounded deterministic synthesis";
-  if (input.workType === "implementation" && input.complexity === "bounded") return "Deterministic bounded implementation";
+  if (input.workType === "implementation" && input.model === "terra") return "Implementation quality default";
   if (input.workType === "verification" && input.model === "luna") return "Routine deterministic verification";
   if (input.expectedDuration === "long") return "Long-running supervised work";
   return `${input.workType[0].toUpperCase()}${input.workType.slice(1)} workload`;
@@ -219,38 +234,18 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
     || proseModelFloor === "sol" || proseModelFloor === "terra";
   const difficultRootCause = DIFFICULT_ROOT_CAUSE.test(task);
 
-  let model: WorkModelTier;
-  if (workType === "research") {
-    model = complexity === "intense" || (crossProject && expectedDuration === "long")
-      ? "sol"
-      : complexity === "complex" || toolBreadth === "broad"
-        ? "terra"
-        : "luna";
-  } else if (workType === "architecture") {
-    model = complexity === "complex" || complexity === "intense" || expectedDuration === "long"
-      || productionRisk === "high" || crossProject ? "sol" : "terra";
-  } else if (workType === "implementation") {
-    model = complexity === "bounded" && productionRisk !== "high" && productionRisk !== "critical" && toolBreadth !== "broad"
-      ? "luna"
-      : complexity === "intense" || (complexity === "complex" && expectedDuration === "long")
-        || (difficultRootCause && productionRisk === "high")
-        ? "sol"
-        : "terra";
-  } else if (workType === "verification") {
-    model = complexity === "intense" || productionRisk === "critical" || (crossProject && expectedDuration === "long")
-      ? "sol"
-      : complexity === "complex" || productionRisk === "high" || toolBreadth === "broad"
-        ? "terra"
-        : "luna";
-  } else {
-    model = crossProject || complexity === "intense" || expectedDuration === "long"
-      ? "sol"
-      : complexity === "bounded" && toolBreadth === "narrow"
-        ? "luna"
-        : "terra";
-  }
-
-  if (productionRisk === "critical" || (SECURITY.test(task) && productionRisk === "high")) {
+  const exactCheapReflex = readonly
+    && complexity === "bounded"
+    && uncertainty === "low"
+    && expectedDuration === "short"
+    && toolBreadth === "narrow"
+    && (workType === "research" || workType === "verification" || workType === "synthesis");
+  // Terra is the normal durable-work choice. Luna is deliberately restricted
+  // to short, read-only, deterministic reflexes; difficult work gets more
+  // Terra reasoning rather than jumping straight to Sol.
+  let model: WorkModelTier = exactCheapReflex ? "luna" : "terra";
+  const requiresSolMax = productionRisk === "critical" || (SECURITY.test(task) && productionRisk === "high");
+  if (requiresSolMax) {
     model = "sol";
   } else if (difficultRootCause && model === "luna") {
     // Root-cause language is common in ordinary repair prompts. It warrants a
@@ -274,18 +269,23 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
         ? "low"
         : "medium";
   } else if (model === "terra") {
-    reasoningEffort = complexity === "complex" || uncertainty === "high" || productionRisk === "high"
-      || workType === "architecture" || toolBreadth === "broad" || difficultRootCause ? "high" : "medium";
-  } else {
-    reasoningEffort = explicitMaximum || productionRisk === "critical" || complexity === "intense"
+    reasoningEffort = complexity === "intense"
+      || (crossProject && expectedDuration === "long")
       || (workType === "architecture" && expectedDuration === "long")
-      || (workType === "synthesis" && crossProject) ? "max" : "high";
+      ? "ultra"
+      : "xhigh";
+  } else {
+    reasoningEffort = explicitMaximum || requiresSolMax ? "max" : "xhigh";
   }
   const structuredEffortFloor = parseCodexReasoningEffort(input.requestedReasoningEffort);
   const requestedEffort = structuredEffortFloor && proseEffortFloor
     ? maxEffort(structuredEffortFloor, proseEffortFloor)
     : structuredEffortFloor ?? proseEffortFloor;
   if (requestedEffort) reasoningEffort = maxEffort(reasoningEffort, requestedEffort);
+  // Critical production/security/privacy work is one of the exceptional
+  // situations where the safety route intentionally selects Sol/max even if
+  // a prior caller carried the incomparable Terra/ultra preference.
+  if (requiresSolMax) reasoningEffort = "max";
 
   const lead = selectionLead({
     task, workType, complexity, productionRisk, expectedDuration, crossProject, explicitQuality, model,
@@ -321,21 +321,34 @@ export function selectCodexRetryPolicy(input: {
   evidence?: unknown;
 }): CodexRetrySelection {
   const model = normalizeWorkModelTier(input.model);
-  const fallbackEffort: CodexReasoningEffort = model === "luna" ? "medium" : model === "sol" ? "max" : "medium";
+  const fallbackEffort: CodexReasoningEffort = model === "luna" ? "medium" : "xhigh";
   const reasoningEffort = normalizeCodexReasoningEffort(input.reasoningEffort, fallbackEffort);
   const modelReason = boundedText(input.modelReason, 300) || "Persisted adaptive Codex route";
-  if (Math.max(0, Math.floor(input.qualityFailureCount)) < 2 || model === "sol") {
+  const qualityFailureCount = Math.max(0, Math.floor(input.qualityFailureCount));
+  if (qualityFailureCount < 2 || model === "sol") {
     return { model, reasoningEffort, modelReason, escalated: false };
   }
-  const escalatedModel: WorkModelTier = model === "luna" ? "terra" : "sol";
-  const escalatedEffort: CodexReasoningEffort = escalatedModel === "terra" ? "high" : "max";
+  const escalatedModel: WorkModelTier = model === "terra" && reasoningEffort === "ultra" && qualityFailureCount >= 4
+    ? "sol"
+    : "terra";
+  const escalatedEffort: CodexReasoningEffort = escalatedModel === "sol"
+    ? "max"
+    : model === "luna"
+      ? "xhigh"
+      : "ultra";
+  if (escalatedModel === model && escalatedEffort === reasoningEffort) {
+    return { model, reasoningEffort, modelReason, escalated: false };
+  }
   const evidence = boundedText(input.evidence, 100) || "repeated supervisor-evidenced quality gaps";
   return {
     model: escalatedModel,
-    reasoningEffort: maxEffort(reasoningEffort, escalatedEffort),
+    // After separately evidenced Terra/ultra failures, the exceptional
+    // Sol/max route is deliberate—not an accidental comparison of unlike
+    // "ultra" delegation and single-agent reasoning labels.
+    reasoningEffort: escalatedEffort,
     modelReason: (
       `Escalated ${workModelLabel(model)}/${reasoningEffort} to ${workModelLabel(escalatedModel)}/${escalatedEffort} `
-      + `after ${Math.floor(input.qualityFailureCount)} evidenced quality failures: ${evidence}. Prior: ${modelReason}`
+      + `after ${qualityFailureCount} evidenced quality failures: ${evidence}. Prior: ${modelReason}`
     ).slice(0, 300),
     escalated: true,
   };

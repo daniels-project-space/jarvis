@@ -5,18 +5,21 @@ import { requestsConsequentialAction } from "../lib/work-safety";
 
 export const CODEX_MODEL_POLICY = {
   luna: { model: "gpt-5.6-luna", effort: "low" },
-  terra: { model: "gpt-5.6-terra", effort: "medium" },
-  // Sol is the frontier agentic model in the live ChatGPT/Codex catalogue.
-  // `max` keeps the highest tier genuinely high intelligence without `ultra`'s
-  // own automatic delegation competing with Jarvis's supervised work graph.
-  sol: { model: "gpt-5.6-sol", effort: "max" },
+  // Terra/xhigh is Daniel's normal serious-work route. Ultra is chosen only
+  // by the durable policy for unusually difficult tasks.
+  terra: { model: "gpt-5.6-terra", effort: "xhigh" },
+  // Sol stays available for exceptional safety/quality cases. Its ordinary
+  // default is xhigh; only the shared policy escalates it to max.
+  sol: { model: "gpt-5.6-sol", effort: "xhigh" },
 } as const;
 
 export type CodexModelSelection = (typeof CODEX_MODEL_POLICY)[WorkModelTier];
-export type CodexReasoningEffort = "low" | "medium" | "high" | "max";
+export type CodexReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export function normalizeReasoningEffort(value: unknown, fallback: CodexReasoningEffort): CodexReasoningEffort {
-  return value === "low" || value === "medium" || value === "high" || value === "max" ? value : fallback;
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" || value === "ultra"
+    ? value
+    : fallback;
 }
 
 export function codexModelFor(tier: string): CodexModelSelection {
@@ -113,10 +116,12 @@ export function pickConversationTier(text: string): WorkModelTier {
   // answer, but it is not Daniel's request and must not inflate a simple page
   // question into the frontier tier.
   const value = visibleTurnText(text).toLowerCase().trim();
-  if (
-    value.length > 700 ||
-    /\b(root cause|multi[- ]?(repo|project|file)|architecture migration|security incident|production outage|think (really |very )?hard|from first principles|deep dive)\b/.test(value)
-  ) return "sol";
+  if (/\b(?:production|live)\b.*\b(?:security|privacy|credential|customer data|data loss)\b|\b(?:security|privacy) incident\b/.test(value)) {
+    return "sol";
+  }
+  if (/\b(root cause|multi[- ]?(repo|project|file)|architecture migration|production outage|think (really |very )?hard|from first principles|deep dive)\b/.test(value)) {
+    return "terra";
+  }
   // The shared consequence classifier already protects execution at the tool
   // and Convex boundaries. Do not nevertheless ask the cheapest model to
   // interpret a short request that may create an external effect; Terra keeps

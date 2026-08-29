@@ -54,7 +54,7 @@ export type MissionSupervisorStartPayload = Readonly<{
     label: string;
     repo?: string;
     model: "luna" | "terra" | "sol";
-    reasoningEffort: "low" | "medium" | "high" | "max";
+    reasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
     modelReason: string;
     agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
     readonly: boolean;

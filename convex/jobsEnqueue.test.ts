@@ -84,8 +84,9 @@ describe("bounded exact textual work orders", () => {
 
     // Paul defaults to Sol, but a short one-line rename is intentionally Luna.
     expect(bounded).toMatchObject({ agentId: "paul", model: "luna" });
-    // A caller's cheap requested tier may never lower hard engineering work.
-    expect(hard).toMatchObject({ agentId: "paul", model: "sol" });
+    // A caller's cheap requested tier may never lower hard engineering work
+    // below the normal Terra durable-work floor.
+    expect(hard).toMatchObject({ agentId: "paul", model: "terra" });
   });
 
   it("persists every reproduced policy exploit behind the approval gate", async () => {

@@ -62,7 +62,7 @@ export type WorkOrderRevisionBinding = Readonly<{
   agentId: string;
   agentRole: string;
   minimumModel: WorkModelTier;
-  minimumReasoningEffort: "low" | "medium" | "high" | "max";
+  minimumReasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   // Optional only while protocol-v2 rows already in production are drained.
   // New work orders always carry this profile and bind it into the digest.
   backgroundExecutionProfile?: BackgroundExecutionProfile;
@@ -71,11 +71,11 @@ export type WorkOrderRevisionBinding = Readonly<{
   triggerMachineReason: TriggerAgentMachineReason;
 }>;
 
-const effortOrder = ["low", "medium", "high", "max"] as const;
+const effortOrder = ["low", "medium", "high", "xhigh", "ultra", "max"] as const;
 const defaultEffort: Record<WorkModelTier, (typeof effortOrder)[number]> = {
   luna: "low",
-  terra: "medium",
-  sol: "max",
+  terra: "xhigh",
+  sol: "xhigh",
 };
 
 function stringArray(value: unknown, limit: number, itemLimit: number): string[] {

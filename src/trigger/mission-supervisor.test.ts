@@ -1026,7 +1026,7 @@ describe("mission supervisor Trigger tick", () => {
       modelProvider: "codex-subscription",
       modelTier: "sol",
       modelId: "gpt-5.6-sol",
-      reasoningEffort: "max",
+      reasoningEffort: "xhigh",
       supervisorPromptVersion: "mastra-supervisor-network-v1",
       triggerRunId: RUN_ID,
       deploymentVersion: "20260723.1",
@@ -1233,7 +1233,7 @@ describe("mission supervisor Trigger tick", () => {
           kind: "delegate",
           workstreams: [expect.objectContaining({
             task,
-            model: "sol",
+            model: "terra",
             readonly: true,
             approvalRequired: true,
             risk: "consequential",
@@ -1306,7 +1306,7 @@ describe("mission supervisor Trigger tick", () => {
           workstreams: [{
             task,
             model: "sol",
-            reasoningEffort: "max",
+            reasoningEffort: "xhigh",
             readonly: true,
             approvalRequired: true,
             risk: "consequential",
@@ -1503,7 +1503,7 @@ describe("mission supervisor Trigger tick", () => {
         modelProvider: "codex-subscription",
         modelTier: "sol",
         modelId: "gpt-5.6-sol",
-        reasoningEffort: "max",
+        reasoningEffort: "xhigh",
       });
   });
 
@@ -1757,7 +1757,7 @@ describe("mission supervisor Trigger tick", () => {
         modelProvider: "codex-subscription",
         modelTier: "sol",
         modelId: "gpt-5.6-sol",
-        reasoningEffort: "max",
+        reasoningEffort: "xhigh",
         supervisorPromptVersion: "jarvis-mission-recovery-v1",
       });
   });
@@ -2220,7 +2220,7 @@ describe("mission supervisor Trigger tick", () => {
       modelProvider: "codex-subscription",
       modelTier: "sol",
       modelId: "gpt-5.6-sol",
-      reasoningEffort: "max",
+        reasoningEffort: "xhigh",
       supervisorPromptVersion: "jarvis-receipt-synthesis-v1",
     });
     expect(commit.decision).not.toHaveProperty("evidence");

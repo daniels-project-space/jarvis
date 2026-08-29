@@ -16,8 +16,8 @@ describe("subscription model policy", () => {
   it("maps increasing work tiers to the live Luna, Terra and Sol catalogue", () => {
     expect(CODEX_MODEL_POLICY).toEqual({
       luna: { model: "gpt-5.6-luna", effort: "low" },
-      terra: { model: "gpt-5.6-terra", effort: "medium" },
-      sol: { model: "gpt-5.6-sol", effort: "max" },
+      terra: { model: "gpt-5.6-terra", effort: "xhigh" },
+      sol: { model: "gpt-5.6-sol", effort: "xhigh" },
     });
   });
 
@@ -27,7 +27,8 @@ describe("subscription model policy", () => {
     expect(pickConversationTier("Hey Jarvis, what's on my calendar?")).toBe("luna");
     expect(pickConversationTier("Show me the weather in London")).toBe("luna");
     expect(pickConversationTier("Brainstorm a sharper product strategy for Jarvis and compare the trade-offs")).toBe("terra");
-    expect(pickConversationTier("Trace the root cause of this multi-repo production outage from first principles")).toBe("sol");
+    expect(pickConversationTier("Trace the root cause of this multi-repo production outage from first principles")).toBe("terra");
+    expect(pickConversationTier("Respond to the live production privacy incident affecting customer data")).toBe("sol");
   });
 
   it("does not route a substantive request to Luna merely because it starts with a greeting", () => {
@@ -76,10 +77,11 @@ describe("subscription model policy", () => {
     }
   });
 
-  it("allows Goal Mode to run Terra/high without changing the default tier policy", () => {
-    const args = codexExecPrefix("terra", "high");
-    expect(args).toContain('model_reasoning_effort="high"');
+  it("allows Goal Mode to run Terra/xhigh or Terra/ultra without changing the tier", () => {
+    const args = codexExecPrefix("terra", "xhigh");
+    expect(args).toContain('model_reasoning_effort="xhigh"');
     expect(args).toContain("gpt-5.6-terra");
+    expect(codexExecPrefix("terra", "ultra")).toContain('model_reasoning_effort="ultra"');
     expect(normalizeReasoningEffort("invented", "medium")).toBe("medium");
   });
 

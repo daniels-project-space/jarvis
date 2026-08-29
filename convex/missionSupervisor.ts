@@ -258,7 +258,7 @@ type RequestedWorkstreamInput = {
 type ModelTier = "luna" | "terra" | "sol";
 type PermanentAgent = "paul" | "atlas" | "iris" | "maya" | "sentry";
 type WorkRisk = "low" | "medium" | "high" | "consequential";
-type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 type WorkerReasoningEffort = Exclude<ReasoningEffort, "none">;
 type DecisionOrigin = "model" | "policy";
 type ModelProvider = "codex-subscription" | "deterministic-policy";
@@ -558,7 +558,7 @@ function jsonRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function workerEffortRank(value: unknown): number {
-  return ["low", "medium", "high", "max"].indexOf(String(value));
+  return ["low", "medium", "high", "xhigh", "ultra", "max"].indexOf(String(value));
 }
 
 function policyDelegationMatchesRequest(
