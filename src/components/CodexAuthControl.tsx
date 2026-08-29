@@ -1,7 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CODEX_AUTH_ENROLLMENT_CONFIRMATION } from "@/lib/codex-auth-control";
+import {
+  CODEX_AUTH_ENROLLMENT_CONFIRMATION,
+  CODEX_DEVICE_AUTH_URI,
+  openCodexDeviceAuthWindow,
+} from "@/lib/codex-auth-control";
 import { viewerFetch } from "@/lib/viewer-request";
 
 type AuthState =
@@ -93,10 +97,8 @@ export function CodexAuthControl({
   const reconnect = async () => {
     setBusy(true);
     openedCode.current = null;
-    loginWindow.current = window.open(
-      "about:blank",
-      "jarvis-chatgpt-auth",
-      "popup,width=560,height=720",
+    loginWindow.current = openCodexDeviceAuthWindow(
+      (url, target, features) => window.open(url, target, features),
     );
     if (loginWindow.current) loginWindow.current.opener = null;
     try {

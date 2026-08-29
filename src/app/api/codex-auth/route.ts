@@ -1,7 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { runs, tasks } from "@trigger.dev/sdk/v3";
 import { NextResponse, type NextRequest } from "next/server";
-import { CODEX_AUTH_ENROLLMENT_CONFIRMATION } from "@/lib/codex-auth-control";
+import {
+  CODEX_AUTH_ENROLLMENT_CONFIRMATION,
+  CODEX_DEVICE_AUTH_URI,
+} from "@/lib/codex-auth-control";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
 import type { codexAuthEnrollment } from "@/trigger/codex-auth-enrollment";
@@ -12,7 +15,6 @@ const PRIVATE_HEADERS = { "cache-control": "private, no-store" };
 const TICKET_COOKIE = "jarvis_codex_auth_enrollment";
 const TICKET_TTL_SECONDS = 20 * 60;
 const MAX_BODY_BYTES = 256;
-const DEVICE_URI = "https://auth.openai.com/codex/device";
 const DEVICE_CODE = /^[A-Z0-9]{4}-[A-Z0-9]{5}$/;
 
 type Ticket = Readonly<{ expiresAt: number; runId: string }>;
@@ -27,7 +29,7 @@ type PublicState =
 type PublicBody = {
   ok: boolean;
   state: PublicState;
-  verificationUri?: typeof DEVICE_URI;
+  verificationUri?: typeof CODEX_DEVICE_AUTH_URI;
   userCode?: string;
   expiresAt?: number;
 };
@@ -134,7 +136,7 @@ function finiteRunStatus(run: unknown): PublicBody {
       const safe = enrollment as Record<string, unknown>;
       if (
         safe.status === "waiting" &&
-        safe.verificationUri === DEVICE_URI &&
+        safe.verificationUri === CODEX_DEVICE_AUTH_URI &&
         typeof safe.userCode === "string" &&
         DEVICE_CODE.test(safe.userCode) &&
         typeof safe.expiresAt === "number" &&
@@ -145,7 +147,7 @@ function finiteRunStatus(run: unknown): PublicBody {
         return {
           ok: true,
           state: "waiting",
-          verificationUri: DEVICE_URI,
+          verificationUri: CODEX_DEVICE_AUTH_URI,
           userCode: safe.userCode,
           expiresAt: safe.expiresAt,
         };

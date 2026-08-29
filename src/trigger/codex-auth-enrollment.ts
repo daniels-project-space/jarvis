@@ -8,10 +8,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { metadata, task } from "@trigger.dev/sdk/v3";
+import { CODEX_DEVICE_AUTH_URI } from "../lib/codex-auth-control";
 import { parseChatgptSubscriptionAuthText } from "./subscription-auth";
 import { productionSubscriptionSessionController } from "./subscription-session-r2";
 
-export const CODEX_DEVICE_AUTH_URI = "https://auth.openai.com/codex/device";
+export { CODEX_DEVICE_AUTH_URI };
 const DEVICE_CODE = /\b[A-Z0-9]{4}-[A-Z0-9]{5}\b/;
 const LOGIN_TIMEOUT_MS = 16 * 60_000;
 const LOGIN_OUTPUT_MAX_BYTES = 96 * 1_024;
@@ -28,6 +29,20 @@ type SpawnLogin = (
   args: readonly string[],
   options: Parameters<typeof spawn>[2],
 ) => ChildProcessWithoutNullStreams;
+
+type EnrollmentFailureReason =
+  | "spawn_failed"
+  | "timed_out"
+  | "output_rejected"
+  | "login_rejected"
+  | "internal_error";
+
+class CodexEnrollmentError extends Error {
+  constructor(readonly reason: EnrollmentFailureReason) {
+    super(`Codex device enrollment failed: ${reason}`);
+    this.name = "CodexEnrollmentError";
+  }
+}
 
 function stripTerminalFormatting(value: string): string {
   // Codex colors the URL and code. Remove only terminal CSI sequences; the
@@ -111,6 +126,8 @@ export async function enrollCodexDeviceSession(
   let output = "";
   let prompt: DevicePrompt | null = null;
   let promptPublication = Promise.resolve();
+  let timedOut = false;
+  let outputRejected = false;
   const spawnLogin =
     options.spawnLogin ??
     ((command, args, spawnOptions) =>
@@ -129,6 +146,7 @@ export async function enrollCodexDeviceSession(
     const observe = (chunk: Buffer | string) => {
       output += String(chunk);
       if (Buffer.byteLength(output, "utf8") > LOGIN_OUTPUT_MAX_BYTES) {
+        outputRejected = true;
         child.kill("SIGKILL");
         return;
       }
@@ -147,13 +165,14 @@ export async function enrollCodexDeviceSession(
     child.stderr.on("data", observe);
     const exitCode = await new Promise<number | null>((resolve, reject) => {
       const timer = setTimeout(() => {
+        timedOut = true;
         child.kill("SIGKILL");
         resolve(null);
       }, LOGIN_TIMEOUT_MS);
       timer.unref?.();
       child.once("error", (error) => {
         clearTimeout(timer);
-        reject(error);
+        reject(new CodexEnrollmentError("spawn_failed"));
       });
       child.once("close", (code) => {
         clearTimeout(timer);
@@ -161,8 +180,12 @@ export async function enrollCodexDeviceSession(
       });
     });
     await promptPublication;
+    if (timedOut || exitCode === null)
+      throw new CodexEnrollmentError("timed_out");
+    if (outputRejected)
+      throw new CodexEnrollmentError("output_rejected");
     if (exitCode !== 0 || !prompt)
-      throw new Error("Codex device enrollment did not complete");
+      throw new CodexEnrollmentError("login_rejected");
 
     const authPath = join(home, "auth.json");
     const stat = lstatSync(authPath);
@@ -199,17 +222,29 @@ export const codexAuthEnrollment = task({
   run: async () => {
     metadata.set("authEnrollment", { status: "starting" });
     await metadata.flush();
-    const result = await enrollCodexDeviceSession({
-      onPrompt: async (prompt) => {
-        metadata.set("authEnrollment", { status: "waiting", ...prompt });
-        await metadata.flush();
-      },
-    });
-    metadata.set("authEnrollment", {
-      status: "connected",
-      tokenExpiresAt: result.tokenExpiresAt,
-    });
-    await metadata.flush();
-    return result;
+    try {
+      const result = await enrollCodexDeviceSession({
+        onPrompt: async (prompt) => {
+          metadata.set("authEnrollment", { status: "waiting", ...prompt });
+          await metadata.flush();
+        },
+      });
+      metadata.set("authEnrollment", {
+        status: "connected",
+        tokenExpiresAt: result.tokenExpiresAt,
+      });
+      await metadata.flush();
+      return result;
+    } catch (error) {
+      metadata.set("authEnrollment", {
+        status: "attention",
+        reason:
+          error instanceof CodexEnrollmentError
+            ? error.reason
+            : "internal_error",
+      });
+      await metadata.flush();
+      throw error;
+    }
   },
 });
