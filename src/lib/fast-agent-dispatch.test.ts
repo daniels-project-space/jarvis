@@ -9,6 +9,14 @@ describe("parseFastAgentDispatch", () => {
     });
   });
 
+  it("accepts the spoken Start Atlas phrasing used for the read-only worker smoke", () => {
+    expect(parseFastAgentDispatch("Start Atlas to research open-source speech systems."))
+      .toEqual({
+        task: "research open-source speech systems.",
+        agentId: "atlas",
+      });
+  });
+
   it("lets deterministic routing choose an unnamed specialist", () => {
     expect(parseFastAgentDispatch("Can you assign an agent to research the current UK rental market?"))
       .toEqual({ task: "research the current UK rental market?", agentId: undefined });
