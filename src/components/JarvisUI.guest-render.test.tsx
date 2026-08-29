@@ -28,6 +28,8 @@ vi.mock("../../convex/_generated/api", () => ({
       turnStatus: { _name: "chatQueue:turnStatus" },
     },
     creations: { list: { _name: "creations:list" } },
+    files: { quickSearchLibrary: { _name: "files:quickSearchLibrary" } },
+    projectState: { list: { _name: "projectState:list" } },
     commandCenter: { snapshot: { _name: "commandCenter:snapshot" } },
     controllerSession: { status: { _name: "controllerSession:status" } },
     jobs: { detail: { _name: "jobs:detail" } },
