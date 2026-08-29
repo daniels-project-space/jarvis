@@ -111,7 +111,7 @@ function runFailureDetail(run: unknown): PublicDetail | undefined {
     return undefined;
   }
   const message = String((record.error as Record<string, unknown>).message ?? "").toLowerCase();
-  if (/opt-in|capability|credential|provenance|template|keyring|configuration|environment|spend[ _-]?approved|plan authorization|billing/.test(message)) return "configuration";
+  if (/opt-in|capability|credential|provenance|template|keyring|configuration|environment|spend[ _-]?approved|plan authorization|plan (?:observation|response)|sandbox usage|billing/.test(message)) return "configuration";
   if (/publish|proof|receipt|deployment identity|attestation/.test(message)) return "publication";
   return message ? "provider" : "unknown";
 }

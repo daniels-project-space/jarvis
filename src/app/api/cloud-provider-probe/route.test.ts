@@ -137,6 +137,16 @@ describe("cloud provider probe owner control", () => {
     });
   });
 
+  it("treats an inaccessible plan observation as release setup", async () => {
+    const { cookie } = await startTicket();
+    mock.retrieve.mockResolvedValueOnce({
+      status: "FAILED",
+      error: { message: "Vercel plan observation was unavailable" },
+    });
+
+    expect(await (await GET(request("GET", { cookie }))).json()).toMatchObject({ detail: "configuration" });
+  });
+
   it("redacts Trigger retrieval and trigger failures", async () => {
     const { cookie } = await startTicket();
     mock.retrieve.mockRejectedValueOnce(new Error("TRIGGER_SECRET_KEY=must-not-leak"));
