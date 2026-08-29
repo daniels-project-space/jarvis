@@ -61,6 +61,18 @@ describe("routeWork", () => {
     expect(routeWork("Plan a visual trip with flights and hotels").agentId).toBe("maya");
   });
 
+  it("routes social content planning to Chloe without granting publish authority", () => {
+    const route = routeWork("Build a LinkedIn and Instagram content calendar with channel-ready draft captions");
+    expect(route).toMatchObject({
+      agentId: "chloe",
+      model: "terra",
+      approvalRequired: false,
+    });
+    expect(suggestedAcceptanceCriteria("Prepare the drafts", route)).toContain(
+      "Do not publish, send, boost, or spend without Daniel's approval receipt",
+    );
+  });
+
   it("corrects a planner that sends specialised visual work to Paul", () => {
     expect(normalizeWorkstream({
       task: "Redesign the compact task cards and improve their visual hierarchy",

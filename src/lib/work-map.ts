@@ -84,7 +84,7 @@ function plural(count: number, singular: string, pluralWord = `${singular}s`) {
 
 function workLabel(label: string) {
   const cleaned = String(label || "Jarvis task")
-    .replace(/^(?:jarvis|paul|atlas|iris|maya|sentry)\s*[·:—-]\s*/i, "")
+    .replace(/^(?:jarvis|paul|atlas|iris|maya|chloe|sentry)\s*[·:—-]\s*/i, "")
     .replace(/^planning\s*[·:—-]\s*/i, "")
     .replace(/^(?:in|for)\s+(?:daniels-project-space\/)?[a-z0-9._-]+\s*[·:—-]\s*/i, "")
     .replace(/\s+/g, " ")

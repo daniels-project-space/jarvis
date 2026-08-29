@@ -30,7 +30,7 @@ const planningInputKeys = [
   "maxPrimitives",
 ] as const;
 
-type SpecialistSlug = "paul" | "atlas" | "iris" | "maya" | "sentry";
+type SpecialistSlug = "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 type PlanningProfile = "short_fleet" | "durable_goal";
 type TerminalReason = "desired_proposals_reached" | "primitive_cap_reached";
 type PrimitiveType = "agent" | "workflow" | "tool" | "none";
@@ -633,6 +633,7 @@ Then briefly state whether the proposal was accepted, deduplicated, or rejected.
     const atlas = specialist("atlas");
     const iris = specialist("iris");
     const maya = specialist("maya");
+    const chloe = specialist("chloe");
     const sentry = specialist("sentry");
     const jarvisManifest = TEAM_BY_SLUG.jarvis;
 
@@ -669,12 +670,12 @@ Then briefly state whether the proposal was accepted, deduplicated, or rejected.
       description: jarvisManifest.description,
       instructions: `${jarvisManifest.instructions}
 
-Route each planning iteration to exactly one of Paul, Atlas, Iris, Maya, or Sentry.
+Route each planning iteration to exactly one of Paul, Atlas, Iris, Maya, Chloe, or Sentry.
 Choose work that is independent of already accepted work, stays within repository and project boundaries,
 and stop once enough independent workstreams have been proposed. You have no execution authority and no direct tools.`,
       model: withPlanningAbort(modelFor(jarvisManifest.defaultModel), providerAbort.signal),
       memory,
-      agents: { paul, atlas, iris, maya, sentry },
+      agents: { paul, atlas, iris, maya, chloe, sentry },
     });
 
     const requestContext = new RequestContext<PlanningRequestContext>([

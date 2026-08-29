@@ -1,7 +1,7 @@
 import type { WorkModelTier } from "../lib/work-models";
 import { SCOPED_TEAM_MANIFEST, type TeamManifestAgent } from "../lib/workflow-contract";
 
-export type AgentSlug = "jarvis" | "paul" | "atlas" | "iris" | "maya" | "sentry";
+export type AgentSlug = "jarvis" | "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 export type ModelTier = WorkModelTier;
 export type WorkRisk = "low" | "medium" | "high" | "consequential";
 

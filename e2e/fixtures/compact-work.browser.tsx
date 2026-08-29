@@ -44,12 +44,13 @@ function worker(
 
 const workers = [
   worker("approval", "Approval gate", "needs_input", {
+    agent: "chloe",
     needsDaniel: true,
     attentionReason: "Choose the production cap",
   }),
-  worker("validation", "Live validation", "running"),
-  worker("queued", "Queued background task", "queued"),
-  worker("held", "Held follow-up", "dependency_held"),
+  worker("validation", "Live validation", "running", { agent: "paul" }),
+  worker("queued", "Queued background task", "queued", { agent: "maya" }),
+  worker("held", "Held follow-up", "dependency_held", { agent: "atlas" }),
 ];
 
 const snapshot: CompactWorkSnapshot = {

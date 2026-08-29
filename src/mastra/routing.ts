@@ -20,6 +20,7 @@ const engineering =
 const operations = /\b(incident|monitor|health|uptime|failed job|stalled|latency|cost|credits|logs?|provider status|production issue)\b/i;
 const creative = /\b(draw|illustrat|image|visual|diagram|mind ?map|storyboard|brand|design|poster|thumbnail|creative)\b/i;
 const travel = /\b(travel|trip|flight|hotel|stay|itinerary|airport|destination|holiday|booking\.com)\b/i;
+const social = /\b(social media|instagram|tiktok|linkedIn|twitter|tweet|threads|caption|content calendar|social campaign|postiz|community post)\b/i;
 const research = /\b(research|compare|analyse|analyze|strategy|brainstorm|investigate|audit|learn|find out|market|competitor)\b/i;
 const complex = /\b(architecture|root cause|multi[- ]?(repo|project|file)|migration|redesign|overhaul|security|performance|production|end[- ]to[- ]end)\b/i;
 const trivial = /\b(status|list|locate|read|summari[sz]e|quick check|one[- ]line|rename|copy)\b/i;
@@ -34,6 +35,7 @@ export function routeWork(task: string, options?: { repo?: string; requestedMode
     && isBoundedNovitaPatchTask(task);
   let agentId: AgentSlug = "atlas";
   if (travel.test(text)) agentId = "maya";
+  else if (social.test(text)) agentId = "chloe";
   else if (creative.test(text)) agentId = "iris";
   else if (operations.test(text)) agentId = "sentry";
   else if (engineering.test(text) || options?.repo) agentId = "paul";
@@ -61,7 +63,7 @@ export function routeWork(task: string, options?: { repo?: string; requestedMode
   const risk: WorkRisk = isConsequential ? "consequential" : hard ? "high" : boundedOwnedCodePatch ? "low" : agentId === "paul" ? "medium" : "low";
   const approvalRequired = isConsequential;
   const priority = Math.min(100, 45 + (hard ? 25 : 0) + (isConsequential ? 20 : 0) + (operations.test(text) ? 10 : 0));
-  const reason = `${agentId} matches ${agentId === "paul" ? "engineering" : agentId === "maya" ? "travel" : agentId === "iris" ? "creative" : agentId === "sentry" ? "operations/review" : "research/strategy"}; ${model} selected for ${hard ? "complex" : easy ? "bounded" : "normal"} work${approvalRequired ? "; execution waits for explicit approval" : ""}`;
+  const reason = `${agentId} matches ${agentId === "paul" ? "engineering" : agentId === "maya" ? "travel" : agentId === "chloe" ? "social media" : agentId === "iris" ? "creative" : agentId === "sentry" ? "operations/review" : "research/strategy"}; ${model} selected for ${hard ? "complex" : easy ? "bounded" : "normal"} work${approvalRequired ? "; execution waits for explicit approval" : ""}`;
   return { agentId, model, modelFloor, risk, readonly, approvalRequired, priority, reason };
 }
 
@@ -71,6 +73,7 @@ export function suggestedAcceptanceCriteria(task: string, route: WorkRoute): str
   if (route.agentId === "atlas") criteria.push("Use current primary sources and distinguish facts from inference");
   if (route.agentId === "iris") criteria.push("Produce an editable asset or production-ready visual brief, not only prose");
   if (route.agentId === "maya") criteria.push("Show provider status, checked time, assumptions, and projected versus locked totals");
+  if (route.agentId === "chloe") criteria.push("Prepare channel-ready drafts and a measurable content plan", "Do not publish, send, boost, or spend without Daniel's approval receipt");
   if (route.agentId === "sentry") criteria.push("Verify the actual provider or user-visible surface after any repair");
   if (/deploy|production/i.test(task)) criteria.push("Do not call it live until the production alias is verified");
   return criteria;

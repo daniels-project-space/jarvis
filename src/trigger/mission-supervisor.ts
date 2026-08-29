@@ -136,7 +136,7 @@ type SupervisorDecision =
         model: ModelTier;
         reasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
         modelReason: string;
-        agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+        agentId: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
         readonly: boolean;
         approvalRequired: boolean;
         risk: "low" | "medium" | "high" | "consequential";
@@ -158,7 +158,7 @@ type SupervisorDecision =
             task: string;
             label: string;
             model: ModelTier;
-            agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+            agentId: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
             risk: "low" | "medium" | "high" | "consequential";
             acceptanceCriteria: string[];
           }
@@ -206,7 +206,7 @@ type RecoveryCandidate = {
   task: string;
   repo: string | null;
   model: ModelTier;
-  agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+  agentId: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
   risk: "low" | "medium" | "high" | "consequential";
   acceptanceCriteria: string[];
   terminalCode: string;
@@ -237,7 +237,7 @@ type RecoveryOutput = {
     task: string;
     label: string;
     model: ModelTier;
-    agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+    agentId: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
     risk: "low" | "medium" | "high" | "consequential";
     acceptanceCriteria: string[];
   }>;
@@ -318,7 +318,7 @@ const requestedWorkstreamSchema = z.object({
   model: z.enum(["luna", "terra", "sol"]).optional(),
   reasoningEffort: z.enum(["low", "medium", "high", "xhigh", "ultra", "max"]).optional(),
   modelReason: boundedString(300).optional(),
-  agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]).optional(),
+  agentId: z.enum(["paul", "atlas", "iris", "maya", "chloe", "sentry"]).optional(),
   readonly: z.boolean().optional(),
   approvalRequired: z.boolean().optional(),
   risk: z.enum(["low", "medium", "high", "consequential"]).optional(),
@@ -672,7 +672,7 @@ const planningWorkstreamSchema = z.object({
   model: z.enum(["luna", "terra", "sol"]),
   reasoningEffort: z.enum(["low", "medium", "high", "xhigh", "ultra", "max"]),
   modelReason: boundedString(300).min(1),
-  agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
+  agentId: z.enum(["paul", "atlas", "iris", "maya", "chloe", "sentry"]),
   readonly: z.boolean(),
   approvalRequired: z.boolean(),
   risk: z.enum(["low", "medium", "high", "consequential"]),
@@ -686,7 +686,7 @@ const planningResultSchema = z.object({
   proposals: z.array(planningWorkstreamSchema).max(6),
   iterations: positiveInteger.max(6),
   selectedAgents: z.array(
-    z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
+    z.enum(["paul", "atlas", "iris", "maya", "chloe", "sentry"]),
   ).max(5),
   terminalReason: z.enum([
     "desired_proposals_reached",
@@ -706,7 +706,7 @@ const recoveryRevisionSchema = z.object({
   task: boundedString(4_000).min(12),
   label: boundedString(80).min(3),
   model: z.enum(["luna", "terra", "sol"]),
-  agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
+  agentId: z.enum(["paul", "atlas", "iris", "maya", "chloe", "sentry"]),
   risk: z.enum(["low", "medium", "high", "consequential"]),
   acceptanceCriteria: z.array(boundedString(500).min(1)).min(1).max(8),
 }).strict();
@@ -1728,7 +1728,7 @@ function deterministicRetryDecision(
 
 const recoveryAuthoritySchema = z.object({
   model: z.enum(["luna", "terra", "sol"]),
-  agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
+  agentId: z.enum(["paul", "atlas", "iris", "maya", "chloe", "sentry"]),
   risk: z.enum(["low", "medium", "high", "consequential"]),
 }).strict();
 

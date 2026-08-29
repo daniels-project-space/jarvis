@@ -34,6 +34,20 @@ export type HubWidget = Readonly<{
   h: number;
 }>;
 
+export type HubWealth = Readonly<{
+  totalGBP: number;
+  asOf: number | null;
+  oldestPricedAt: number | null;
+  assetCount: number;
+  usdPerGbp: number | null;
+  categories: ReadonlyArray<Readonly<{ category: string; totalGBP: number }>>;
+  cashflow: Readonly<{
+    confirmedRentalGbp: number;
+    expensesAccruedGbp: number;
+    netCashflowGbp: number;
+  }>;
+}>;
+
 export type HubTodoCreateInput = Readonly<{
   text: string;
   priority?: number;
@@ -94,6 +108,7 @@ export function hubActionsReadiness(
 type HubActionPath =
   | "jarvisActions:listTodos"
   | "jarvisActions:listWidgets"
+  | "jarvisActions:getWealth"
   | "jarvisActions:createTodo"
   | "jarvisActions:updateTodo";
 
@@ -220,6 +235,68 @@ export async function listHubWidgets(options?: HubActionsRequestOptions): Promis
   );
 }
 
+function requireFiniteNumber(value: unknown, field: string): number {
+  const number = Number(value);
+  if (!Number.isFinite(number)) throw new Error(`Project Hub jarvisActions:getWealth returned invalid ${field}`);
+  return number;
+}
+
+function requireNullableTimestamp(value: unknown, field: string): number | null {
+  if (value === null) return null;
+  const timestamp = requireFiniteNumber(value, field);
+  if (timestamp < 0 || timestamp > 4_102_444_800_000) {
+    throw new Error(`Project Hub jarvisActions:getWealth returned invalid ${field}`);
+  }
+  return timestamp;
+}
+
+function requireHubWealth(value: unknown): HubWealth {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Project Hub jarvisActions:getWealth failed");
+  }
+  const row = value as Record<string, unknown>;
+  if (!Array.isArray(row.categories) || row.categories.length > 24) {
+    throw new Error("Project Hub jarvisActions:getWealth failed");
+  }
+  const cashflow = row.cashflow;
+  if (typeof cashflow !== "object" || cashflow === null || Array.isArray(cashflow)) {
+    throw new Error("Project Hub jarvisActions:getWealth failed");
+  }
+  const categories = row.categories.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Project Hub jarvisActions:getWealth failed");
+    }
+    const category = entry as Record<string, unknown>;
+    if (typeof category.category !== "string" || !category.category.trim() || category.category.length > 40) {
+      throw new Error("Project Hub jarvisActions:getWealth failed");
+    }
+    return {
+      category: category.category,
+      totalGBP: requireFiniteNumber(category.totalGBP, "category total"),
+    };
+  });
+  const cashflowRow = cashflow as Record<string, unknown>;
+  return {
+    totalGBP: requireFiniteNumber(row.totalGBP, "total"),
+    asOf: requireNullableTimestamp(row.asOf, "as-of time"),
+    oldestPricedAt: requireNullableTimestamp(row.oldestPricedAt, "oldest price time"),
+    assetCount: Math.max(0, Math.floor(requireFiniteNumber(row.assetCount, "asset count"))),
+    usdPerGbp: row.usdPerGbp === null ? null : requireFiniteNumber(row.usdPerGbp, "exchange rate"),
+    categories,
+    cashflow: {
+      confirmedRentalGbp: requireFiniteNumber(cashflowRow.confirmedRentalGbp, "rental cashflow"),
+      expensesAccruedGbp: requireFiniteNumber(cashflowRow.expensesAccruedGbp, "accrued expenses"),
+      netCashflowGbp: requireFiniteNumber(cashflowRow.netCashflowGbp, "net cashflow"),
+    },
+  };
+}
+
+export async function getHubWealth(options?: HubActionsRequestOptions): Promise<HubWealth> {
+  return requireHubWealth(
+    await requestHubAction<unknown>("query", "jarvisActions:getWealth", {}, options),
+  );
+}
+
 export async function createHubTodo(
   input: HubTodoCreateInput,
   options?: HubActionsRequestOptions,
@@ -251,4 +328,10 @@ export function hubActionsFailureMessage(error: unknown): string {
   return error instanceof HubActionsUnavailableError
     ? "Project Hub to-do access is not configured. Nothing changed."
     : "Project Hub to-do access is temporarily unavailable. Nothing changed.";
+}
+
+export function hubWealthFailureMessage(error: unknown): string {
+  return error instanceof HubActionsUnavailableError
+    ? "Project Hub wealth access is not configured yet."
+    : "Project Hub wealth data is temporarily unavailable.";
 }

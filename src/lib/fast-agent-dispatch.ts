@@ -1,9 +1,9 @@
 export type FastAgentDispatch = {
   task: string;
-  agentId?: "paul" | "atlas" | "iris" | "maya" | "sentry";
+  agentId?: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 };
 
-const namedAgents = new Set(["paul", "atlas", "iris", "maya", "sentry"]);
+const namedAgents = new Set(["paul", "atlas", "iris", "maya", "chloe", "sentry"]);
 const vagueTask = /^(?:it|that|this|the task|the issue|something|what we discussed)(?:\s+please)?[.!?]*$/i;
 const projectFeatureTask = /(?:\b(?:add(?:ed)?|build|implement(?:ed)?|create(?:d)?|make|fix(?:ed)?|improve(?:d)?|redesign(?:ed)?|change(?:d)?|update(?:d)?)\b.*\b(?:feature|button|control|page|screen|view|workflow|flow|form|filter|search|setting|tab|dashboard|ui|ux|integration|functionality|bug)\b|\b(?:feature|button|control|page|screen|view|workflow|flow|form|filter|search|setting|tab|dashboard|ui|ux|integration|functionality|bug)\b.*\b(?:add(?:ed)?|build|implement(?:ed)?|create(?:d)?|make|fix(?:ed)?|improve(?:d)?|redesign(?:ed)?|change(?:d)?|update(?:d)?)\b)/i;
 const exploratoryHostRequest = /^(?:what|which|why|how|when|where|should|can\s+we|could\s+we)\b/i;
@@ -18,8 +18,8 @@ export function parseFastAgentDispatch(input: string): FastAgentDispatch | null 
   if (!text || /\b(?:agents|team|fleet|mission|multiple|several)\b/i.test(text)) return null;
 
   const patterns = [
-    /\b(?:launch|start|send|assign|spin\s+up|put)\s+(?:(?:an?|the)\s+)?(agent|paul|atlas|iris|maya|sentry)(?:\s+agent)?\s+(?:to|on|for)\s+(.+)$/i,
-    /\b(?:have|get|ask)\s+(?:(?:an?|the)\s+)?(agent|paul|atlas|iris|maya|sentry)(?:\s+agent)?\s+(?:to|working\s+on)\s+(.+)$/i,
+    /\b(?:launch|start|send|assign|spin\s+up|put)\s+(?:(?:an?|the)\s+)?(agent|paul|atlas|iris|maya|chloe|sentry)(?:\s+agent)?\s+(?:to|on|for)\s+(.+)$/i,
+    /\b(?:have|get|ask)\s+(?:(?:an?|the)\s+)?(agent|paul|atlas|iris|maya|chloe|sentry)(?:\s+agent)?\s+(?:to|working\s+on)\s+(.+)$/i,
   ];
   const match = patterns.map((pattern) => text.match(pattern)).find(Boolean);
   if (!match) return null;

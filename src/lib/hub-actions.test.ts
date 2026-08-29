@@ -6,6 +6,7 @@ import {
   HubActionsTimeoutError,
   HubActionsUnavailableError,
   createHubTodo,
+  getHubWealth,
   hubActionsReadiness,
   hubActionsRequestArgs,
   listHubTodos,
@@ -57,6 +58,31 @@ describe("Project Hub Jarvis actions capability", () => {
       format: "json",
     });
     expect(fetchImpl.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("reads only the bounded aggregate wealth façade and rejects malformed totals", async () => {
+    const value = {
+      totalGBP: 123_456,
+      asOf: 1_800_000_000_000,
+      oldestPricedAt: 1_799_000_000_000,
+      assetCount: 7,
+      usdPerGbp: 1.3,
+      categories: [{ category: "cash", totalGBP: 12_000 }],
+      cashflow: { confirmedRentalGbp: 900, expensesAccruedGbp: 300, netCashflowGbp: 600 },
+    };
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => response(value));
+
+    await expect(getHubWealth({ environment: ENV, fetchImpl, hubUrl: "https://hub.example" }))
+      .resolves.toEqual(value);
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toEqual({
+      path: "jarvisActions:getWealth",
+      args: { vaultToken: "dedicated-jarvis-actions-token" },
+      format: "json",
+    });
+
+    const malformed = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => response({ ...value, totalGBP: "not-a-number" }));
+    await expect(getHubWealth({ environment: ENV, fetchImpl: malformed }))
+      .rejects.toThrow("invalid total");
   });
 
   it("fails closed on a bounded overall deadline even when an injected transport ignores abort", async () => {

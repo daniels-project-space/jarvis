@@ -83,6 +83,31 @@ function harness(options: {
 }
 
 describe("managed Codex subscription session controller", () => {
+  it("publishes a freshly enrolled same-account session behind a new writer fence", async () => {
+    const { controller } = harness();
+    const initial = await controller.acquire();
+    const enrolled = auth(NOW + 4 * 60 * 60_000, 9);
+
+    await expect(controller.reseed(enrolled)).resolves.toMatchObject({
+      version: initial.version + 1,
+      tokenExpiresAt: NOW + 4 * 60 * 60_000,
+    });
+    const next = await controller.acquire();
+    expect(next.version).toBe(initial.version + 1);
+    expect(next.auth.tokens.access_token).toBe(enrolled.tokens.access_token);
+    expect(next.auth.tokens.refresh_token).toBe(CONTROLLER_REFRESH_SENTINEL);
+  });
+
+  it("rejects device enrollment for a different ChatGPT account", async () => {
+    const { controller } = harness();
+    const foreign = auth(NOW + 4 * 60 * 60_000, 9);
+    foreign.tokens.account_id = "different-account";
+
+    await expect(controller.reseed(foreign)).rejects.toMatchObject({
+      code: "source_rejected",
+    });
+  });
+
   it("linearizes N simultaneous startups and never distributes the real refresh state", async () => {
     const rotate = vi.fn<SessionRotator>(async (_current, context) => {
       await context.markEffect();

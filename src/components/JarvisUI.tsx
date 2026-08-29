@@ -120,8 +120,8 @@ import {
 } from "@/lib/novita-patch-proposer-status";
 import { BackgroundReadinessControl } from "./BackgroundReadinessControl";
 import { CloudProviderProbeControl } from "./CloudProviderProbeControl";
+import { CodexAuthControl } from "./CodexAuthControl";
 import { BrowserErrandApprovals } from "./BrowserErrandApprovals";
-import NotificationBell from "./NotificationBell";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
 import {
   authoritativeCancellationReceipt,
@@ -686,11 +686,25 @@ function OptionsPanel({
     <>
       <div className="fixed inset-0 z-[55]" onClick={onClose} />
       <div className="scrollbar-thin absolute right-3 top-14 z-[56] max-h-[calc(100dvh-5rem)] w-[min(340px,92vw)] overflow-y-auto rounded-2xl border border-white/12 bg-[rgba(14,22,38,0.72)] p-4 shadow-2xl backdrop-blur-2xl md:right-5">
-        <div className="mb-1 flex items-center justify-between">
-          <span className="hud-label !text-cyan">options</span>
-          <button onClick={onClose} className="hud-label hover:text-cyan">close</button>
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-sm font-medium text-ice">Jarvis settings</span>
+          <button onClick={onClose} className="text-xs text-slate transition hover:text-cyan">Close</button>
         </div>
-        <div className="divide-y divide-white/5">
+        <div>
+          {owner && (
+            <div className="rounded-xl border border-cyan/15 bg-cyan/[.035] p-3">
+              <div className="mb-2">
+                <div className="text-[13px] text-ice">ChatGPT connection</div>
+                <div className="text-[10px] leading-relaxed text-slate">Reconnect here if Jarvis hears you but cannot answer.</div>
+              </div>
+              <CodexAuthControl />
+            </div>
+          )}
+          <details className="group mt-3 rounded-xl border border-white/[.07] bg-black/10">
+            <summary className="cursor-pointer list-none px-3 py-2.5 text-xs text-slate transition hover:text-ice">
+              <span className="inline-flex items-center gap-2"><span className="transition group-open:rotate-90">›</span> More settings</span>
+            </summary>
+            <div className="divide-y divide-white/5 border-t border-white/[.05] px-3">
           <Row label="Agent intelligence" hint="Codex CLI via ChatGPT subscription · foreground and agents">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-cyan">Codex CLI · adaptive</span>
           </Row>
@@ -817,6 +831,8 @@ function OptionsPanel({
               ))}
             </div>
           </div>
+            </div>
+          </details>
         </div>
       </div>
     </>
@@ -2282,11 +2298,13 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Orbit bubbles: when a new panel takes the stage, the previous one shrinks
   // into a bobbing bubble beside the orb — tap to bring it back.
   const [bubbles, setBubbles] = useState<{ type: string; value: string; title?: string }[]>([]);
+  const [orbitBubblesOpen, setOrbitBubblesOpen] = useState(false);
   const prevPanelRef = useRef<{ type: string; value: string; title?: string; updatedAt: number } | null>(null);
 
   // Speech deliberately has no engine or voice switch: every device uses the
   // same neural Jarvis identity.
   const [optionsOpen, setOptionsOpen] = useState(false);
+  const [authRepairRecovered, setAuthRepairRecovered] = useState(false);
   const [googleOAuthNotice, setGoogleOAuthNotice] = useState<GoogleOAuthReturnNotice | null>(null);
   const setMoodMut = (args: Record<string, unknown>) => privateMutation("ui:setMood", args);
   const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: true });
@@ -2516,7 +2534,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
   // Chat presence: full column ↔ floating type bar ↔ hidden ("zen"). Zen keeps
   // JARVIS always listening (wake word forced on) with no chrome in the way.
-  const [chatMode, setChatModeRaw] = useState<"full" | "bar" | "off">("full");
+  const [chatMode, setChatModeRaw] = useState<"full" | "bar" | "off">("bar");
   const chatModeRef = useRef<"full" | "bar" | "off">("full");
   const setChatMode = (m: "full" | "bar" | "off", persist = true) => {
     chatModeRef.current = m;
@@ -3798,7 +3816,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const narrationId = `dispatch:${Date.now()}`;
     const background = options.background === true;
     const owner = intent.agentId
-      ? ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry" } as const)[intent.agentId]
+      ? ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", chloe: "Chloe", sentry: "Sentry" } as const)[intent.agentId]
       : "the right specialist";
     if (controllerSessionReadiness?.state === "repair_required") {
       const repair = controllerSessionStatusPresentation("repair_required", controllerSessionReadiness.code);
@@ -5821,59 +5839,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         />
       )}
       {/* top HUD strip */}
-      <header className="flex items-center justify-between gap-2 px-3 pb-2 pt-3 sm:px-5 sm:pt-4">
-        <div className="flex min-w-0 items-baseline gap-2 sm:gap-3">
-          <h1 className="font-display shrink-0 text-lg font-bold tracking-[0.32em] text-green-400 sm:text-xl sm:tracking-[0.42em]" style={{ fontFamily: "var(--font-chakra)" }}>
+      <header className="pointer-events-none flex items-center justify-between gap-2 px-3 pb-1 pt-2.5 sm:px-5 sm:pt-3">
+        <div className="flex min-w-0 items-baseline gap-2">
+          <h1
+            className="font-display shrink-0 text-sm font-bold tracking-[0.34em] transition-[color,text-shadow] duration-700 sm:text-base"
+            style={{ fontFamily: "var(--font-chakra)", color: moodColor, textShadow: `0 0 18px ${moodColor}55` }}
+          >
             JARVIS
           </h1>
-          <span className="hud-label hidden sm:inline">personal ai · online</span>
         </div>
-        <div className="flex min-w-0 items-center gap-2 sm:gap-4">
-          <NotificationBell />
-          <span className="flex items-center gap-1.5">
-            <span className={`h-1.5 w-1.5 rounded-full ${live === "live" ? "bg-cyan" : "bg-emerald-400"} breathe`} />
-            <span className="hud-label">{status}</span>
-          </span>
-          <button
-            onClick={toggleWake}
-            title={wake ? "standby on — say 'hey Jarvis'" : "enable wake word"}
-            className={`hud-label rounded px-1 transition ${wake ? "!text-cyan" : "hover:text-cyan"}`}
-          >
-            <span className="sm:hidden">{wake ? "◉" : "wake"}</span>
-            <span className="hidden sm:inline">{wake ? "◉ hey jarvis" : "wake"}</span>
-          </button>
-          <button
-            onClick={() => setChatMode(chatMode === "full" ? "bar" : chatMode === "bar" ? "off" : "full")}
-            title="chat layout — full column / type bar / hidden (always listening)"
-            className="hud-label rounded px-1 transition hover:text-cyan"
-          >
-            <span className="sm:hidden">{chatMode === "full" ? "▤" : chatMode === "bar" ? "▁" : "◌"}</span>
-            <span className="hidden sm:inline">{chatMode === "full" ? "▤ chat" : chatMode === "bar" ? "▁ bar" : "◌ zen"}</span>
-          </button>
-          <span className="hidden md:inline"><Clock /></span>
-          <button
-            onClick={async () => {
-              const r = await subscribePush(saveSub);
-              await refreshPermissions();
-              alert(
-                r === "subscribed"
-                  ? "Notifications on — JARVIS will ping this device."
-                  : r === "unsupported"
-                    ? "On iPhone: Share → Add to Home Screen, then open JARVIS from that icon."
-                    : r === "denied"
-                      ? "Notifications are blocked in browser settings."
-                      : "Push isn't available here.",
-              );
-            }}
-            title="notifications"
-            className={`hud-label hidden rounded px-1 hover:text-cyan sm:block ${permissions.notifications === "granted" ? "!text-emerald-300" : ""}`}
-          >
-            {permissions.notifications === "granted" ? "alerts ✓" : "alerts"}
-          </button>
+        <div className="pointer-events-auto flex min-w-0 items-center gap-1.5">
           <button
             onClick={() => setOptionsOpen((o) => !o)}
-            title="options"
-            className={`rounded px-1 text-sm transition ${optionsOpen ? "text-cyan" : "text-slate hover:text-cyan"}`}
+            title="Jarvis settings"
+            aria-label="Open Jarvis settings"
+            className={`grid h-7 w-7 place-items-center rounded-full border text-xs transition ${optionsOpen ? "border-cyan/40 bg-cyan/10 text-cyan" : "border-white/5 bg-black/10 text-slate/65 hover:border-cyan/25 hover:text-cyan"}`}
           >
             <span className="inline-block transition-transform duration-500" style={{ transform: optionsOpen ? "rotate(90deg)" : "none" }}>⚙</span>
           </button>
@@ -5931,6 +5911,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           controllerSessionReadiness={controllerSessionReadiness}
         />
       )}
+      {Boolean(viewerToken) && !guest
+        && controllerSessionReadiness?.state === "repair_required"
+        && !authRepairRecovered && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="fixed bottom-16 left-1/2 z-[54] flex w-[min(92vw,560px)] -translate-x-1/2 flex-wrap items-center justify-between gap-2 rounded-2xl border border-amber/25 bg-[#17130b]/95 px-3 py-2.5 text-xs text-amber-50 shadow-2xl backdrop-blur-xl"
+          >
+            <span className="min-w-0 flex-1">Jarvis heard you, but ChatGPT needs reconnecting before he can answer.</span>
+            <CodexAuthControl compact onConnected={() => setAuthRepairRecovered(true)} />
+          </div>
+        )}
 
       <div className={`relative mx-auto flex w-full flex-1 flex-col overflow-clip p-3 pt-2 sm:p-4 ${chatMode === "bar" ? "pb-24" : ""}`}>
         {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
@@ -5939,20 +5931,32 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           <span className="bk" />
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
           {bubbles.length > 0 && (!panel || panelMin) && (
-            <div className="absolute left-1.5 top-1/2 z-30 flex max-h-full -translate-y-1/2 flex-col gap-3 md:left-2.5">
-              {bubbles.map((b, i) => (
-                <OrbitBubble
-                  key={(b.title ?? b.type) + i}
-                  b={b}
-                  delay={i * 1.4}
-                  onOpen={() => {
-                    closedPanelRef.current = null; // explicit restore is never a resurrection
-                    setBubbles((bs) => bs.filter((_, j) => j !== i));
-                    void setPanel({ type: b.type, value: b.value, title: b.title });
-                  }}
-                  onDismiss={() => setBubbles((bs) => bs.filter((_, j) => j !== i))}
-                />
-              ))}
+            <div className="group absolute left-1.5 top-1/2 z-30 -translate-y-1/2 md:left-2.5">
+              <button
+                type="button"
+                onClick={() => setOrbitBubblesOpen((value) => !value)}
+                aria-expanded={orbitBubblesOpen}
+                aria-label={`${bubbles.length} contextual Jarvis ${bubbles.length === 1 ? "item" : "items"}`}
+                className="grid h-7 w-7 place-items-center rounded-full border border-cyan/15 bg-[#07131e]/65 text-[9px] text-cyan/70 shadow-lg backdrop-blur-xl transition hover:border-cyan/40 hover:text-cyan focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan"
+              >
+                {bubbles.length}
+              </button>
+              <div className={`absolute left-0 top-9 flex max-h-[70vh] flex-col gap-2 transition duration-200 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 ${orbitBubblesOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}>
+                {bubbles.map((b, i) => (
+                  <OrbitBubble
+                    key={(b.title ?? b.type) + i}
+                    b={b}
+                    delay={i * 1.4}
+                    onOpen={() => {
+                      closedPanelRef.current = null; // explicit restore is never a resurrection
+                      setBubbles((bs) => bs.filter((_, j) => j !== i));
+                      setOrbitBubblesOpen(false);
+                      void setPanel({ type: b.type, value: b.value, title: b.title });
+                    }}
+                    onDismiss={() => setBubbles((bs) => bs.filter((_, j) => j !== i))}
+                  />
+                ))}
+              </div>
             </div>
           )}
           {panel && panelMin && (
@@ -5971,6 +5975,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             snapshot={visibleCommandSnapshot}
             detail={workDetail}
             hidden={overlayUp || workMapOpen}
+            showCollapsed={false}
             onExpandedChange={setCommandExpanded}
             onSelectedJobChange={setWorkDetailJobId}
             externalOpenRequest={workMapOpenRequest}
@@ -5989,6 +5994,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </div>
             </div>
           ) : null}
+          {!fullBleed && (
+            <div
+              aria-hidden="true"
+              data-jarvis-mood-halo={activeMood}
+              className="pointer-events-none absolute inset-[8%] z-0 rounded-full opacity-90 transition-[background,box-shadow] duration-700"
+              style={{
+                background: `radial-gradient(circle at center, ${moodColor}24 0%, ${moodColor}12 28%, transparent 68%)`,
+                boxShadow: `inset 0 0 90px ${moodColor}0d, 0 0 80px ${moodColor}16`,
+              }}
+            />
+          )}
           {/* arc-reactor HUD ring + orb — for a compact overlay they glide into
               the right corner (orb stays visible, small); a full-bleed panel
               hides them entirely. On phones there's no room for a corner, so a
@@ -6366,7 +6382,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       {/* bar mode: chat collapsed to a floating type bar — the screen gets the room */}
       {!panelFull && (
         <div
-          className={`safe-floating-bottom fixed inset-x-0 z-40 mx-auto w-[min(94vw,780px)] will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+          tabIndex={0}
+          className={`group safe-floating-bottom fixed inset-x-0 z-40 mx-auto overflow-visible will-change-transform motion-reduce:transition-none transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${input.trim() || sending || pendingFileIds.length || selectedFileIds.length ? "w-[min(94vw,680px)]" : "w-12 hover:w-[min(94vw,680px)] focus-within:w-[min(94vw,680px)]"} ${
             chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
           }`}
         >
@@ -6393,77 +6410,78 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </button>
             </div>
           )}
-          <div className="glass flex min-w-0 max-w-full items-stretch gap-2 overflow-hidden rounded-2xl p-2 shadow-2xl">
-            <button
-              onClick={() => setChatMode("full")}
-              title="expand chat"
-              className="hud-label shrink-0 rounded-xl px-2 hover:text-cyan"
-            >
-              ▲
-            </button>
-            {guest && chatMode === "bar" ? (
-              <GuestChatFileAccess embedded={false} onRequestOwnerAccess={() => window.location.reload()} />
-            ) : !guest && (
-              <button
-                type="button"
-                onClick={() => setChatMode("full")}
-                title={pendingFileIds.length ? `indexing ${pendingFileIds.length} private files` : "add or review private files"}
-                aria-label={pendingFileIds.length ? `Review ${pendingFileIds.length} files still indexing` : "Add or review private files"}
-                className={`shrink-0 rounded-xl px-2 text-xs ${pendingFileIds.length ? "bg-amber/15 text-amber ring-1 ring-amber/30" : selectedFileIds.length ? "bg-cyan/15 text-cyan ring-1 ring-cyan/30" : "text-slate hover:text-cyan"}`}
-              >
-                ▤{selectedFileIds.length + pendingFileIds.length ? ` ${selectedFileIds.length + pendingFileIds.length}` : ""}
-              </button>
-            )}
-            {voiceRecoveryVisible && (
-              <button
-                type="button"
-                onClick={retryVoicePlayback}
-                aria-label="Resume Jarvis voice playback"
-                className="shrink-0 rounded-xl bg-amber/10 px-2.5 text-amber ring-1 ring-amber/30"
-              >
-                ◖
-              </button>
-            )}
+          <div className="glass flex h-12 min-w-0 max-w-full items-stretch gap-1 overflow-hidden rounded-full p-1 shadow-2xl">
             <button
               type="button"
               onClick={runVoiceAction}
               title={voiceAction.title}
               aria-label={voiceAction.ariaLabel}
               data-jarvis-voice-action={voiceAction.action}
-              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm ring-1 transition ${voiceActionTone}`}
+              className={`grid h-10 w-10 shrink-0 place-items-center rounded-full text-sm ring-1 transition ${voiceActionTone}`}
             >
               <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
-              <span className="max-sm:hidden">{voiceAction.label}</span>
             </button>
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && submit(input)}
-              placeholder={pendingFileIds.length ? "Indexing files before send…" : busy ? "Ask another thing while I work…" : "Talk to me…"}
-              className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
-            />
-            <button
-              onClick={() => submit(input)}
-              disabled={sending || Boolean(pendingFileIds.length) || (!input.trim() && !selectedFileIds.length)}
-              aria-label={pendingFileIds.length ? "Send waits for file indexing" : "Send message"}
-              className="grid w-10 shrink-0 place-items-center rounded-xl bg-cyan/15 px-0 py-2 text-sm font-medium text-cyan ring-1 ring-cyan/40 transition hover:bg-cyan/25 disabled:opacity-40 sm:w-auto sm:px-3.5"
-            >
-              <span className="sm:hidden">↑</span><span className="max-sm:hidden">send</span>
-            </button>
+            <div className={`flex min-w-0 flex-1 items-stretch gap-1 transition-opacity duration-200 ${input.trim() || sending || pendingFileIds.length || selectedFileIds.length ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}>
+              <button
+                onClick={() => setChatMode("full")}
+                title="Open conversations and files"
+                aria-label="Open conversations and files"
+                className="grid w-8 shrink-0 place-items-center rounded-full text-[10px] text-slate transition hover:bg-white/5 hover:text-cyan"
+              >
+                ↗
+              </button>
+              {guest && chatMode === "bar" ? (
+                <GuestChatFileAccess embedded={false} onRequestOwnerAccess={() => window.location.reload()} />
+              ) : !guest && selectedFileIds.length + pendingFileIds.length > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => setChatMode("full")}
+                  aria-label={`Review ${selectedFileIds.length + pendingFileIds.length} selected files`}
+                  className="shrink-0 rounded-full bg-cyan/10 px-2 text-[10px] text-cyan"
+                >
+                  ▤ {selectedFileIds.length + pendingFileIds.length}
+                </button>
+              ) : null}
+              {voiceRecoveryVisible && (
+                <button
+                  type="button"
+                  onClick={retryVoicePlayback}
+                  aria-label="Resume Jarvis voice playback"
+                  className="shrink-0 rounded-full bg-amber/10 px-2 text-amber ring-1 ring-amber/30"
+                >
+                  ◖
+                </button>
+              )}
+              <input
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submit(input)}
+                placeholder={pendingFileIds.length ? "Indexing files…" : busy ? "Ask while I work…" : "Message Jarvis"}
+                className="min-w-0 flex-1 rounded-full bg-black/20 px-3 text-sm text-ice outline-none ring-1 ring-white/[.07] transition focus:ring-cyan/40"
+              />
+              <button
+                onClick={() => submit(input)}
+                disabled={sending || Boolean(pendingFileIds.length) || (!input.trim() && !selectedFileIds.length)}
+                aria-label={pendingFileIds.length ? "Send waits for file indexing" : "Send message"}
+                className="grid w-9 shrink-0 place-items-center rounded-full bg-cyan/12 text-sm font-medium text-cyan ring-1 ring-cyan/25 transition hover:bg-cyan/22 disabled:opacity-35"
+              >
+                ↑
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      {/* zen mode: no chat at all — JARVIS is always listening */}
+      {/* Hidden-chat mode keeps one unobtrusive state dot for recovery. */}
       <button
         onClick={() => speaking ? stopTalking() : setChatMode("bar")}
-        className={`glass fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full px-3.5 py-2 text-xs text-slate will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:text-ice ${
+        aria-label={speaking ? "Stop Jarvis speaking" : "Show Jarvis chat controls"}
+        className={`glass fixed bottom-4 right-4 z-40 grid h-9 w-9 place-items-center rounded-full text-slate will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:text-ice ${
           chatMode === "off" && !panelFull ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-20 opacity-0"
         }`}
-        title={speaking ? "interrupt Jarvis" : "bring the chat back"}
+        title={speaking ? "Stop speaking" : "Show chat"}
       >
         <span className={`h-1.5 w-1.5 rounded-full ${speaking ? "bg-red-300 animate-pulse" : live === "live" ? "bg-cyan animate-pulse" : wake ? "bg-cyan breathe" : "bg-slate"}`} />
-        {speaking ? "hush" : live === "live" ? "live" : wake ? "listening — say “hey jarvis”" : "tap to chat"}
       </button>
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}

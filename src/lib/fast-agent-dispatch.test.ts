@@ -17,6 +17,14 @@ describe("parseFastAgentDispatch", () => {
       });
   });
 
+  it("recognises Chloe as a real named employee in voice dispatch", () => {
+    expect(parseFastAgentDispatch("Ask Chloe to prepare next week's social content calendar"))
+      .toEqual({
+        task: "prepare next week's social content calendar",
+        agentId: "chloe",
+      });
+  });
+
   it("lets deterministic routing choose an unnamed specialist", () => {
     expect(parseFastAgentDispatch("Can you assign an agent to research the current UK rental market?"))
       .toEqual({ task: "research the current UK rental market?", agentId: undefined });

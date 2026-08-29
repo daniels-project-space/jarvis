@@ -119,7 +119,7 @@ type StartOptions = {
     model?: "luna" | "terra" | "sol";
     reasoningEffort?: "low" | "medium" | "high" | "max";
     modelReason?: string;
-    agentId?: "paul" | "atlas" | "iris" | "maya" | "sentry";
+    agentId?: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
     readonly?: boolean;
     approvalRequired?: boolean;
     risk?: "low" | "medium" | "high" | "consequential";
@@ -168,7 +168,7 @@ type CommitDecision =
         model: "luna" | "terra" | "sol";
         reasoningEffort: "low" | "medium" | "high" | "max";
         modelReason: string;
-        agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+        agentId: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
         readonly: boolean;
         approvalRequired: boolean;
         risk: "low" | "medium" | "high" | "consequential";
@@ -190,7 +190,7 @@ type CommitDecision =
             task: string;
             label: string;
             model: "luna" | "terra" | "sol";
-            agentId: "paul" | "atlas" | "iris" | "maya" | "sentry";
+            agentId: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
             risk: "low" | "medium" | "high" | "consequential";
             acceptanceCriteria: string[];
           }

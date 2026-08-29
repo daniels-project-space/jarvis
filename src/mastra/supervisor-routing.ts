@@ -13,7 +13,7 @@ import {
 export const workstreamSchema = z.object({
   label: z.string().min(3).max(80),
   task: z.string().min(12).max(4000),
-  agentId: z.enum(["paul", "atlas", "iris", "maya", "sentry"]),
+  agentId: z.enum(["paul", "atlas", "iris", "maya", "chloe", "sentry"]),
   repo: z.string().nullable(),
   model: z.enum(["luna", "terra", "sol"]),
   reasoningEffort: z.enum(["low", "medium", "high", "xhigh", "ultra", "max"]),
@@ -44,7 +44,7 @@ export function normalizeWorkstream(input: {
     readonly: input.readonly,
   });
   const requestedAgent = input.agentId as AgentSlug | undefined;
-  const deterministicSpecialist = ["iris", "maya", "sentry"].includes(route.agentId)
+  const deterministicSpecialist = ["iris", "maya", "chloe", "sentry"].includes(route.agentId)
     ? route.agentId
     : null;
   const agentId = (

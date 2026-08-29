@@ -353,6 +353,60 @@ export class ManagedSubscriptionSessionController {
     throw new SubscriptionSessionError("writer_timeout");
   }
 
+  /**
+   * Publishes a fresh, owner-enrolled ChatGPT session without replaying an
+   * uncertain refresh token. The trusted bootstrap fixes the account
+   * identity; an enrollment from a different ChatGPT account is rejected.
+   *
+   * This is deliberately a fenced state transition rather than a state-file
+   * delete. An older writer that wakes after enrollment cannot replace the
+   * newly committed snapshot because it no longer owns the current fence.
+   */
+  async reseed(auth: ChatgptSubscriptionAuth): Promise<{ version: number; tokenExpiresAt: number }> {
+    let trusted: ChatgptSubscriptionAuth;
+    try {
+      trusted = await this.options.bootstrap();
+      subscriptionAccessTokenExpiresAt(trusted);
+    } catch {
+      throw new SubscriptionSessionError("configuration_missing");
+    }
+    const tokenExpiresAt = subscriptionAccessTokenExpiresAt(auth);
+    if (auth.tokens.account_id !== trusted.tokens.account_id) {
+      throw new SubscriptionSessionError("source_rejected");
+    }
+    if (tokenExpiresAt < this.clock.now() + CODEX_CONSUMER_REFRESH_GUARD_MS) {
+      throw new SubscriptionSessionError("snapshot_stale");
+    }
+
+    const startedAt = this.clock.now();
+    while (this.clock.now() - startedAt <= this.waitMs) {
+      const observed = await this.ensureState();
+      if (observed.value.writer && observed.value.writer.expiresAt > this.clock.now()) {
+        await this.clock.sleep(Math.min(100, Math.max(1, observed.value.writer.expiresAt - this.clock.now())));
+        continue;
+      }
+      const lease = await this.tryAcquireWriter(observed);
+      if (!lease) {
+        await this.clock.sleep(25);
+        continue;
+      }
+      try {
+        await this.commitSnapshot(lease.writer, auth);
+        const committed = await this.options.store.readState();
+        if (!committed.value?.snapshot || committed.value.snapshot.fence !== lease.writer.fence) {
+          throw new SubscriptionSessionError("writer_fence_lost");
+        }
+        return {
+          version: committed.value.snapshot.version,
+          tokenExpiresAt: committed.value.snapshot.tokenExpiresAt,
+        };
+      } finally {
+        await this.releaseWriter(lease.writer).catch(() => undefined);
+      }
+    }
+    throw new SubscriptionSessionError("writer_timeout");
+  }
+
   private async ensureState(): Promise<{ value: SessionState; etag: string }> {
     for (let attempt = 0; attempt < 20; attempt++) {
       const current = await this.options.store.readState();

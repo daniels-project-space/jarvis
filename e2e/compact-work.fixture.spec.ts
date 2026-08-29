@@ -38,6 +38,8 @@ test.describe("compact work fixture", () => {
     await expect(page.getByRole("main", { name: "Jarvis compact work fixture" })).toBeVisible();
     await expect(page.locator("[data-fleet-surface=collapsed]")).toBeVisible();
     await expect(page.locator("[data-work-card]")).toHaveCount(2);
+    await expect(page.locator("[data-work-avatar=chloe]")).toHaveCount(1);
+    await expect(page.locator("[data-work-avatar=paul]")).toHaveCount(1);
     await expect(page.locator("[data-work-more]")).toHaveText("+2 more workview all ›");
 
     const more = page.getByRole("button", { name: "Open all 4 active Jarvis tasks; 2 more available" });
@@ -48,6 +50,7 @@ test.describe("compact work fixture", () => {
     await page.keyboard.press("Enter");
     await expect(page.locator("[data-fleet-surface=expanded]")).toBeVisible();
     await expect(page.locator("[data-active-job]")).toHaveCount(4);
+    await expect(page.locator("[data-work-avatar]")).toHaveCount(4);
     await expect(page.locator("[data-fleet-surface=collapsed]")).toHaveCount(0);
     await page.screenshot({ path: testInfo.outputPath("compact-work-expanded.png"), fullPage: true });
 

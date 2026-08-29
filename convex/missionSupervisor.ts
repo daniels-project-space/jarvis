@@ -103,6 +103,7 @@ const agentValidator = v.union(
   v.literal("atlas"),
   v.literal("iris"),
   v.literal("maya"),
+  v.literal("chloe"),
   v.literal("sentry"),
 );
 const riskValidator = v.union(
@@ -248,7 +249,7 @@ type RequestedWorkstreamInput = {
   model?: "luna" | "terra" | "sol";
   reasoningEffort?: WorkerReasoningEffort;
   modelReason?: string;
-  agentId?: "paul" | "atlas" | "iris" | "maya" | "sentry";
+  agentId?: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
   readonly?: boolean;
   approvalRequired?: boolean;
   risk?: "low" | "medium" | "high" | "consequential";
@@ -256,7 +257,7 @@ type RequestedWorkstreamInput = {
 };
 
 type ModelTier = "luna" | "terra" | "sol";
-type PermanentAgent = "paul" | "atlas" | "iris" | "maya" | "sentry";
+type PermanentAgent = "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 type WorkRisk = "low" | "medium" | "high" | "consequential";
 type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 type WorkerReasoningEffort = Exclude<ReasoningEffort, "none">;
@@ -439,7 +440,7 @@ function normalizeWorkstreams(
   model?: "luna" | "terra" | "sol";
   reasoningEffort?: WorkerReasoningEffort;
   modelReason?: string;
-  agentId?: "paul" | "atlas" | "iris" | "maya" | "sentry";
+  agentId?: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
   readonly?: boolean;
   approvalRequired?: boolean;
   risk?: "low" | "medium" | "high" | "consequential";

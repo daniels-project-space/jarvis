@@ -512,7 +512,7 @@ describe("FleetCommandCenter", () => {
 
     expect(markup).toContain('data-supervisor-authority="ready:4"');
     expect(markup).not.toMatch(/>pause<\/button>/);
-    expect(markup).not.toMatch(/>cancel<\/button>/);
+    expect(markup).not.toContain(">Stop worker</button>");
     expect(markup).not.toMatch(/>steer<\/button>/);
   });
 
@@ -553,11 +553,12 @@ describe("FleetCommandCenter", () => {
       />,
     );
 
-    expect(controls).toEqual(["provide_input", "approve", "decline"]);
+    expect(controls).toEqual(["cancel", "provide_input", "approve", "decline"]);
     expect(markup).toContain("data-fleet-worker-detail");
-    expect(markup).toMatch(/>approve<\/button>/);
-    expect(markup).toMatch(/>decline<\/button>/);
-    expect(markup).not.toMatch(/>(?:pause|resume|cancel|steer|retry)(?: exact control)?<\/button>/);
+    expect(markup).toContain(">Approve</button>");
+    expect(markup).toContain(">Decline</button>");
+    expect(markup).toContain(">Stop worker</button>");
+    expect(markup).not.toMatch(/>(?:pause|resume|steer|retry)(?: exact control)?<\/button>/);
     expect(markup).not.toContain('aria-label="Answer Jarvis"');
   });
 
@@ -582,9 +583,9 @@ describe("FleetCommandCenter", () => {
     );
 
     expect(markup).toContain('data-supervisor-authority="ready:4"');
-    expect(markup).toMatch(/>pause<\/button>/);
-    expect(markup).toMatch(/>cancel<\/button>/);
-    expect(markup).toMatch(/>steer<\/button>/);
+    expect(markup).toContain(">Pause work</button>");
+    expect(markup).toContain(">Stop worker</button>");
+    expect(markup).toContain(">Adjust task</button>");
   });
 
   it("renders the supervisor question and answer separately from steering without adding another surface", () => {

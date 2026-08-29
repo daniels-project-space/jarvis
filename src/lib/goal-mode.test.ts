@@ -27,9 +27,24 @@ describe("Goal Mode contracts", () => {
     });
   });
 
-  it("uses Luna only for bounded low-risk evidence and preserves stronger quality floors", () => {
-    const evidence = selectGoalWorkstreamPolicy({
+  it("uses Luna only for explicit low-latency bounded evidence and preserves Terra by default", () => {
+    const normalEvidence = selectGoalWorkstreamPolicy({
       task: "Run a bounded deterministic read-only audit and verify the exact configuration evidence.",
+      agentId: "atlas",
+      repo: "daniels-project-space/youtube-studio-ai",
+      readonly: true,
+      mcp: [],
+    });
+    expect(normalEvidence).toMatchObject({
+      model: "terra",
+      reasoningEffort: "xhigh",
+      workType: "research",
+      complexity: "bounded",
+      productionRisk: "low",
+    });
+
+    const evidence = selectGoalWorkstreamPolicy({
+      task: "Low-latency: run a bounded deterministic read-only audit and verify the exact configuration evidence.",
       agentId: "atlas",
       repo: "daniels-project-space/youtube-studio-ai",
       readonly: true,

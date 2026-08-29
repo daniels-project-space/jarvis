@@ -42,14 +42,54 @@ const EDGE_STYLE: Record<FleetEdge["readiness"], string> = {
 const COMPACT_WORK_CARD_LIMIT = 2;
 const EXECUTING_WORK_STATES = new Set<FleetNode["state"]>(["dispatching", "running", "reviewing", "integrating"]);
 
+const AGENT_PRESENTATION: Record<string, {
+  name: string;
+  role: string;
+  spriteX: string;
+  spriteY: string;
+}> = {
+  jarvis: { name: "JARVIS", role: "Chief of staff", spriteX: "0%", spriteY: "0%" },
+  paul: { name: "Paul", role: "Principal developer", spriteX: "33.333%", spriteY: "0%" },
+  atlas: { name: "Atlas", role: "Research strategist", spriteX: "66.667%", spriteY: "0%" },
+  iris: { name: "Iris", role: "Creative director", spriteX: "100%", spriteY: "0%" },
+  maya: { name: "Maya", role: "Travel planner", spriteX: "0%", spriteY: "100%" },
+  sentry: { name: "Sentry", role: "Reliability lead", spriteX: "33.333%", spriteY: "100%" },
+  chloe: { name: "Chloe", role: "Social media manager", spriteX: "66.667%", spriteY: "100%" },
+};
+
+function agentPresentation(id: string) {
+  return AGENT_PRESENTATION[id] ?? {
+    name: id.charAt(0).toUpperCase() + id.slice(1),
+    role: "Jarvis specialist",
+    spriteX: "100%",
+    spriteY: "100%",
+  };
+}
+
 function agentName(id: string) {
-  return ({ paul: "Paul", atlas: "Atlas", iris: "Iris", maya: "Maya", sentry: "Sentry", jarvis: "JARVIS" } as Record<string, string>)[id]
-    ?? id.charAt(0).toUpperCase() + id.slice(1);
+  return agentPresentation(id).name;
+}
+
+function AgentAvatar({ agent, size = 34 }: { agent: string; size?: number }) {
+  const presentation = agentPresentation(agent);
+  return <span
+    data-work-avatar={agent}
+    role="img"
+    aria-label={`${presentation.name}, ${presentation.role}`}
+    className="block shrink-0 rounded-full border border-cyan/25 bg-[#050b11] bg-no-repeat shadow-[0_0_14px_rgba(0,231,255,.12)]"
+    style={{
+      width: size,
+      height: size,
+      backgroundImage: "url('/agents/jarvis-team-v1.webp')",
+      backgroundSize: "400% 200%",
+      backgroundPosition: `${presentation.spriteX} ${presentation.spriteY}`,
+    }}
+  />;
 }
 
 export function workTaskTitle(label: string): string {
   const cleaned = String(label || "Jarvis task")
-    .replace(/^(?:jarvis|paul|atlas|iris|maya|sentry)\s*[·:—-]\s*/i, "")
+    .replace(/^(?:jarvis|paul|atlas|iris|maya|chloe|sentry)\s*[·:—-]\s*/i, "")
     .replace(/^planning\s*[·:—-]\s*/i, "")
     .replace(/^(?:in|for)\s+(?:daniels-project-space\/)?[a-z0-9._-]+\s*[·:—-]\s*/i, "")
     .replace(/\s+/g, " ")
@@ -289,6 +329,20 @@ const SUPERVISOR_CONTROL_ACTIONS = new Set<FleetControl>([
   "steer",
   "provide_input",
 ]);
+
+const CONTROL_LABEL: Partial<Record<FleetControl, string>> = {
+  pause: "Pause work",
+  resume: "Resume work",
+  cancel: "Stop worker",
+  steer: "Adjust task",
+  provide_input: "Answer Jarvis",
+  approve: "Approve",
+  decline: "Decline",
+};
+
+function controlLabel(control: FleetControl) {
+  return CONTROL_LABEL[control] ?? control.replaceAll("_", " ");
+}
 
 export function isSupervisorControlAction(
   action: FleetControl,
@@ -561,12 +615,13 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
     </div>}
     {steering && <div className="flex gap-1"><input aria-label="Steering instruction" value={steeringInput} disabled={Boolean(acting)} onChange={(event) => { clearPendingSupervisorRequest(); setSteeringInput(event.target.value); }} maxLength={2000} placeholder="Adjust the unfinished boundary…" className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-cyan/40 disabled:opacity-50" /><button type="button" disabled={!steeringInput.trim() || Boolean(acting)} onClick={() => void apply("steer")} className="rounded-lg border border-cyan/25 px-2 text-[9px] text-cyan disabled:opacity-40">send steer</button></div>}
     <div className="flex flex-wrap justify-end gap-1">
-      {controls.filter((control) => control !== "provide_input").map((control) => <button key={control} type="button" disabled={Boolean(acting)} onClick={() => void apply(control)} className={`rounded-lg border px-2 py-1 text-[8px] uppercase tracking-[0.12em] disabled:opacity-40 ${control === "cancel" || control === "decline" ? "border-rose-400/20 text-rose-300" : "border-white/10 text-slate hover:border-cyan/30 hover:text-cyan"}`}>{acting === control ? "working…" : control.replaceAll("_", " ")}</button>)}
+      {controls.filter((control) => control !== "provide_input").map((control) => <button key={control} data-work-control={control} type="button" disabled={Boolean(acting)} onClick={() => void apply(control)} className={`rounded-lg border px-2 py-1 text-[8px] uppercase tracking-[0.08em] disabled:opacity-40 ${control === "cancel" || control === "decline" ? "border-rose-400/20 text-rose-300" : "border-white/10 text-slate hover:border-cyan/30 hover:text-cyan"}`}>{acting === control ? "working…" : controlLabel(control)}</button>)}
     </div>
   </div>;
 }
 
 const SUPERVISED_CHILD_CONTROLS = new Set<FleetControl>([
+  "cancel",
   "provide_input",
   "approve",
   "decline",
@@ -611,6 +666,7 @@ export function WorkerDetail({
   return <section data-fleet-worker-detail className="flex min-h-0 flex-1 flex-col gap-2 rounded-xl border border-white/[0.08] bg-black/20 p-3">
     <div className="flex min-w-0 items-start gap-2">
       <button type="button" onClick={onBack} className="shrink-0 text-xs text-cyan" aria-label="Back to fleet">←</button>
+      <AgentAvatar agent={node.agent} size={36} />
       <div className="min-w-0 flex-1"><div className="truncate text-xs text-ice">{workTaskTitle(node.label)}</div><div className="mt-0.5 truncate font-mono text-[8px] uppercase tracking-[0.12em] text-slate">{agentName(node.agent)} · {workModelLabel(node.model, node.reasoningEffort)} · attempt {node.attempt}/{node.maxAttempts}</div>{node.modelReason && <div className="mt-1 text-[9px] leading-snug text-slate">Why this model · {node.modelReason}</div>}</div>
       <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[8px] ${STATE_STYLE[node.state]}`}>{node.state.replace("_", " ")}</span>
     </div>
@@ -988,7 +1044,8 @@ function CompactLiveWorkBubbleView({
               <circle cx="20" cy="20" r="16" fill="rgba(3,10,16,.82)" stroke="rgba(255,255,255,.09)" strokeWidth="2.5" />
               <circle data-work-progress-ring className={`work-progress-ring ${ringClass}`} cx="20" cy="20" r="16" fill="none" pathLength={circumference} strokeDasharray={circumference} strokeDashoffset={circumference - percent} strokeLinecap="round" strokeWidth="2.5" />
             </svg>
-            <span className={`relative font-mono text-[9px] font-semibold ${textClass}`}>{percent}<span className="text-[6px]">%</span></span>
+            <AgentAvatar agent={node.agent} size={27} />
+            <span className={`absolute -bottom-0.5 -right-0.5 rounded-full border border-black/80 bg-[#071019] px-1 font-mono text-[6px] font-semibold ${textClass}`}>{percent}%</span>
           </span>
           <span className="min-w-0 self-center">
             <span className={`flex items-center gap-1 truncate font-mono text-[7px] uppercase tracking-[0.1em] ${textClass}`}><span>{agentName(node.agent)}</span><span className="text-white/20">·</span><span>{status}</span></span>
@@ -1000,7 +1057,7 @@ function CompactLiveWorkBubbleView({
             <span className={`font-mono text-[7px] ${textClass}`}>{cardRealtime === "realtime" ? "live" : cardRealtime === "connecting" ? "syncing" : <LiveWorkFreshness progressAt={node.progressAt} realtime={false} />}</span>
             <span className="work-progress-arrow text-[11px] text-cyan/50 transition-transform duration-200 group-hover:translate-x-px motion-reduce:transform-none">›</span>
           </span>
-          <span className="absolute inset-x-2 bottom-0 h-px overflow-hidden rounded-full bg-white/[0.06]" aria-hidden="true"><span data-work-progress-meter className={`work-progress-meter block h-full rounded-full ${meterClass}`} style={{ width: `${percent}%` }} /></span>
+          <span className={`absolute inset-x-2 bottom-0 h-px overflow-hidden rounded-full bg-white/[0.06] ${EXECUTING_WORK_STATES.has(node.state) ? "work-progress-glint" : ""}`} aria-hidden="true"><span data-work-progress-meter className={`work-progress-meter block h-full rounded-full ${meterClass}`} style={{ width: `${percent}%` }} /></span>
         </button>;
       })}
         {hiddenCount > 0 && <button
@@ -1071,7 +1128,7 @@ export type FleetOpenRequest = {
   jobId?: string;
 };
 
-export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpandedChange, onSelectedJobChange, initialExpanded = false, externalOpenRequest, onExternalOpenHandled }: { snapshot: CompactWorkSnapshot; detail?: CompactJobDetail | null; hidden?: boolean; onExpandedChange?: (expanded: boolean) => void; onSelectedJobChange?: (jobId: string | null) => void; initialExpanded?: boolean; externalOpenRequest?: FleetOpenRequest | null; onExternalOpenHandled?: () => void }) {
+export function FleetCommandCenter({ snapshot, detail, hidden = false, showCollapsed = true, onExpandedChange, onSelectedJobChange, initialExpanded = false, externalOpenRequest, onExternalOpenHandled }: { snapshot: CompactWorkSnapshot; detail?: CompactJobDetail | null; hidden?: boolean; showCollapsed?: boolean; onExpandedChange?: (expanded: boolean) => void; onSelectedJobChange?: (jobId: string | null) => void; initialExpanded?: boolean; externalOpenRequest?: FleetOpenRequest | null; onExternalOpenHandled?: () => void }) {
   const [expanded, setExpanded] = useState(initialExpanded);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const handledExternalRequest = useRef<number | null>(null);
@@ -1138,7 +1195,9 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
     onExternalOpenHandled?.();
   }, [externalOpenRequest, onExpandedChange, onExternalOpenHandled, onSelectedJobChange]);
   if (!active || !fleet || hidden) return null;
-  if (!expanded) return <CompactLiveWorkBubble snapshot={snapshot} onOpen={(jobId) => { if (jobId) selectJob(jobId); setOpen(true); }} />;
+  if (!expanded) return showCollapsed
+    ? <CompactLiveWorkBubble snapshot={snapshot} onOpen={(jobId) => { if (jobId) selectJob(jobId); setOpen(true); }} />
+    : null;
 
   const projectCount = hierarchy.reduce((count, mission) => count + mission.projects.length, 0);
   const planningCount = hierarchyJobs.filter((node) => node.projectionKind === "supervisor_planning").length;
@@ -1159,7 +1218,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, onExpande
                 <header className="flex min-w-0 items-center gap-2 px-0.5"><div className="min-w-0 flex-1 truncate font-mono text-[8px] text-sky-200">{project.repository?.replace(/^daniels-project-space\//, "") ?? "Read-only evidence"}</div><span className="shrink-0 font-mono text-[7px] text-slate">{project.jobs.length} task{project.jobs.length === 1 ? "" : "s"}</span></header>
                 <div className="mt-1 grid gap-1 sm:grid-cols-2">{project.jobs.map((node) => {
                   const planning = node.projectionKind === "supervisor_planning";
-                  const content = <><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{workTaskTitle(node.label)}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{agentName(node.agent)} · {workStatusLabel(node)}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{workModelLabel(node.model, node.reasoningEffort)}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">{node.attentionLabel ?? "Your input is needed"}</div>}{!node.needsDaniel && node.attentionLabel && <div className="mt-1 text-[8px] text-sky-300">{node.attentionLabel}</div>}</>;
+                  const content = <div className="flex min-w-0 gap-2"><AgentAvatar agent={node.agent} size={30} /><div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{workTaskTitle(node.label)}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{agentName(node.agent)} · {workStatusLabel(node)}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{workModelLabel(node.model, node.reasoningEffort)}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">{node.attentionLabel ?? "Your input is needed"}</div>}{!node.needsDaniel && node.attentionLabel && <div className="mt-1 text-[8px] text-sky-300">{node.attentionLabel}</div>}</div></div>;
                   return planning
                     ? <div key={node.jobId} data-supervisor-planning={node.jobId} role="status" className={`min-w-0 rounded-lg border p-2 text-left ${STATE_STYLE[node.state]}`} aria-label={`${agentName(node.agent)} planning ${node.label}`}>{content}</div>
                     : <button type="button" key={node.jobId} data-active-job={node.jobId} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-lg border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}>{content}</button>;

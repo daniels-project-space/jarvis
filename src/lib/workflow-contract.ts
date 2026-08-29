@@ -3,7 +3,7 @@ import teamManifest from "../../agents/jarvis-team.manifest.json";
 export const WORKFLOW_CONTRACT_VERSION = "1.0";
 
 export type TeamManifestAgent = {
-  slug: "jarvis" | "paul" | "atlas" | "iris" | "maya" | "sentry";
+  slug: "jarvis" | "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
   name: string;
   role: string;
   description: string;

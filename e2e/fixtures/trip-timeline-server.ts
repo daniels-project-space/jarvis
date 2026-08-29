@@ -47,6 +47,7 @@ const contentTypes: Record<string, string> = {
   "/offline-map.js": "text/javascript; charset=utf-8",
   "/city-itinerary": "text/html; charset=utf-8",
   "/city-itinerary.js": "text/javascript; charset=utf-8",
+  "/agents/jarvis-team-v1.webp": "image/webp",
 };
 
 const csp = [
@@ -332,6 +333,7 @@ async function main() {
   const workMapJsPath = join(outputDir, "work-map.js");
   const compactWorkJsPath = join(outputDir, "compact-work.js");
   const orbMoodJsPath = join(outputDir, "orb-mood.js");
+  const teamAvatarPath = join(projectRoot, "public/agents/jarvis-team-v1.webp");
   await Promise.all([
     access(fixtureJsPath),
     access(fixtureCssPath),
@@ -348,6 +350,7 @@ async function main() {
     access(workMapJsPath),
     access(compactWorkJsPath),
     access(orbMoodJsPath),
+    access(teamAvatarPath),
   ]);
 
   const server = createServer(async (request, response) => {
@@ -497,6 +500,14 @@ async function main() {
   if (pathname === "/compact-work.css") {
     response.writeHead(200);
     response.end(workMapCss);
+    return;
+  }
+  if (pathname === "/agents/jarvis-team-v1.webp") {
+    response.writeHead(200, {
+      "Content-Type": "image/webp",
+      "Cache-Control": "public, max-age=3600",
+    });
+    response.end(await readFile(teamAvatarPath));
     return;
   }
   if (pathname === "/location") {

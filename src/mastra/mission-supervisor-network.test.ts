@@ -19,7 +19,7 @@ import {
   type SupervisorPlanningTickInput,
 } from "./mission-supervisor-network";
 
-type SpecialistId = "paul" | "atlas" | "iris" | "maya" | "sentry";
+type SpecialistId = "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 
 type Proposal = {
   task: string;
@@ -326,7 +326,7 @@ describe("runSupervisorPlanningNetwork real Mastra runtime", () => {
         label: "Build supervisor",
       });
       expect(Object.hasOwn(result.proposals[0], "missionId")).toBe(false);
-      expect(tiers).toEqual(["sol", "terra", "terra", "terra", "terra", "sol"]);
+      expect(tiers).toEqual(["terra", "terra", "terra", "terra", "terra", "terra", "terra"]);
       expect(harness.calls.map((call) => call.kind)).toEqual([
         "routing",
         "specialist-tool",
@@ -697,8 +697,8 @@ describe("runSupervisorPlanningNetwork real Mastra runtime", () => {
         },
       );
 
-      expect(firstTiers).toHaveLength(6);
-      expect(secondTiers).toHaveLength(6);
+      expect(firstTiers).toHaveLength(7);
+      expect(secondTiers).toHaveLength(7);
       expect(firstResult.proposals.map((item) => item.label)).toEqual(["First invocation"]);
       expect(secondResult.proposals.map((item) => item.label)).toEqual(["Second invocation"]);
       expect(secondResult.selectedAgents).toEqual(["maya"]);

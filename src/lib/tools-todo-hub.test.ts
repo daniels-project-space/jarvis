@@ -27,6 +27,7 @@ describe("Hub to-do tool outcomes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubEnv("JARVIS_HUB_ACTIONS_TOKEN", "dedicated-jarvis-actions-token");
+    mock.convexMutation.mockResolvedValue(true);
   });
 
   it("reports a confirmed creation truthfully when its optional count read times out", async () => {
@@ -57,5 +58,31 @@ describe("Hub to-do tool outcomes", () => {
     );
     expect(fetchImpl.mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}")).path))
       .toEqual(["jarvisActions:createTodo", "jarvisActions:listTodos"]);
+  });
+
+  it("shows the real bounded Project Hub net worth instead of claiming the path is unavailable", async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      expect(body.path).toBe("jarvisActions:getWealth");
+      return Response.json({ value: {
+        totalGBP: 123_456,
+        asOf: 1_800_000_000_000,
+        oldestPricedAt: 1_799_000_000_000,
+        assetCount: 7,
+        usdPerGbp: 1.3,
+        categories: [
+          { category: "property", totalGBP: 100_000 },
+          { category: "cash", totalGBP: 23_456 },
+        ],
+        cashflow: { confirmedRentalGbp: 900, expensesAccruedGbp: 300, netCashflowGbp: 600 },
+      } });
+    });
+    vi.stubGlobal("fetch", fetchImpl);
+
+    await expect(executeTool("net_worth", {})).resolves.toContain("£123,456");
+    expect(mock.convexMutation).toHaveBeenCalledWith(
+      "ui:setPanel",
+      expect.objectContaining({ title: "net worth" }),
+    );
   });
 });

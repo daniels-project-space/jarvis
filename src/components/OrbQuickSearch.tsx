@@ -35,6 +35,7 @@ export function OrbQuickSearch({
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(false);
+  const [hovered, setHovered] = useState(false);
   const search = query.trim();
   const files = useJarvisQuery(
     api.files.quickSearchLibrary,
@@ -52,6 +53,7 @@ export function OrbQuickSearch({
     [creations, files, projects, search, snapshot],
   );
   const visible = active && search.length >= 2;
+  const expanded = active || hovered || query.length > 0;
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -71,9 +73,21 @@ export function OrbQuickSearch({
   if (!owner || hidden) return null;
 
   return (
-    <div data-orb-quick-search className="pointer-events-auto absolute left-1/2 top-[8%] z-40 w-[min(316px,calc(100%-28px))] -translate-x-1/2 sm:top-[9%]">
-      <div className={`flex items-center gap-2 rounded-full border bg-[#07131e]/90 px-3 py-2 shadow-[0_10px_30px_rgba(0,0,0,.3)] backdrop-blur-xl transition ${visible ? "border-cyan/55" : "border-white/10 hover:border-cyan/35"}`}>
-        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5 shrink-0 text-cyan/80" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="10.8" cy="10.8" r="6.4" /><path d="m16 16 4 4" /></svg>
+    <div
+      data-orb-quick-search
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      className={`pointer-events-auto absolute left-1/2 top-2 z-40 -translate-x-1/2 transition-[width] duration-200 ${expanded ? "w-[min(244px,calc(100%-72px))]" : "w-9"}`}
+    >
+      <div className={`flex h-9 items-center overflow-hidden rounded-full border bg-[#07131e]/70 px-[10px] shadow-[0_8px_22px_rgba(0,0,0,.22)] backdrop-blur-xl transition ${visible ? "border-cyan/55" : expanded ? "border-cyan/25" : "border-white/[.07] hover:border-cyan/30"}`}>
+        <button
+          type="button"
+          onClick={() => inputRef.current?.focus()}
+          aria-label="Search Jarvis work and files"
+          className="grid h-4 w-4 shrink-0 place-items-center text-cyan/65 transition hover:text-cyan"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="10.8" cy="10.8" r="6.4" /><path d="m16 16 4 4" /></svg>
+        </button>
         <input
           ref={inputRef}
           value={query}
@@ -90,10 +104,10 @@ export function OrbQuickSearch({
           aria-expanded={visible}
           aria-haspopup="listbox"
           aria-controls="orb-quick-search-results"
-          placeholder="Search work & files"
-          className="min-w-0 flex-1 bg-transparent text-[11px] text-ice outline-none placeholder:text-slate/70"
+          placeholder="Search everything"
+          tabIndex={expanded ? 0 : -1}
+          className={`min-w-0 bg-transparent text-[10px] text-ice outline-none placeholder:text-slate/60 transition-all duration-200 ${expanded ? "ml-2 flex-1 opacity-100" : "pointer-events-none w-0 opacity-0"}`}
         />
-        <kbd className="hidden rounded border border-white/10 px-1.5 py-0.5 font-mono text-[7px] text-slate sm:block">⌘K</kbd>
       </div>
       {visible && (
         <div id="orb-quick-search-results" role="listbox" aria-label="Quick search results" className="mt-2 overflow-hidden rounded-2xl border border-white/10 bg-[#07131e]/[.98] p-1.5 shadow-[0_18px_52px_rgba(0,0,0,.48)] backdrop-blur-xl">

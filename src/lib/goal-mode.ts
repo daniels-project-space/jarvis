@@ -31,7 +31,7 @@ export const GOAL_ROUTE_KINDS = [
 
 export type GoalRouteKind = (typeof GOAL_ROUTE_KINDS)[number];
 export type GoalReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
-export type GoalAgentId = "jarvis" | "paul" | "atlas" | "iris" | "maya" | "sentry";
+export type GoalAgentId = "jarvis" | "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 
 export type GoalRoute = {
   kind: GoalRouteKind;
@@ -57,8 +57,8 @@ export type GoalWorkstream = {
  * Keep Goal Mode's final quality gate strong without spending Terra/Sol on a
  * mechanically bounded evidence read. Writable, production, root-cause,
  * media-generation and broad-tool nodes retain the adaptive router's
- * Terra/Sol floor; only low-risk bounded read-only research/verification may
- * use Luna.
+ * Terra/Sol floor. Luna remains available only when the owner explicitly asks
+ * for low latency and the node is bounded, read-only, and low risk.
  */
 export function selectGoalWorkstreamPolicy(
   workstream: Pick<GoalWorkstream, "task" | "agentId" | "repo" | "readonly" | "mcp">,
@@ -372,7 +372,7 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
     throw new Error(`Goal plan must contain 2-${limit} bounded workstreams`);
   }
   const used = new Set<string>();
-  const allowedAgents = new Set(["paul", "atlas", "iris", "maya", "sentry"]);
+  const allowedAgents = new Set(["paul", "atlas", "iris", "maya", "chloe", "sentry"]);
   const streams: GoalWorkstream[] = rawStreams.map((raw, index) => {
     const row = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
     const id = slug(row.id, `work-${index + 1}`);
@@ -501,7 +501,7 @@ export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: 
     acceptanceCriteria.length ? `Daniel's acceptance criteria:\n${acceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
     `Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. Break the outcome into 2-${maxBuildSessions} bounded sessions. Assign Paul to engineering/integration, Atlas to evidence research, Iris to media/visual quality, Maya to travel/calendar work, and Sentry to reliability/security review. When quality defects are found, fix their generation, render, configuration, or data root cause; detection filters are secondary regression guards and a rejection-only gate does not satisfy the outcome. Express only real ordering requirements as dependsOn edges. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
     "End with exactly one compact JSON object after GOAL_PLAN_JSON:. It must use this shape:",
-    '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
+    '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|chloe|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
     "The JSON is a machine contract. Keep the whole response and JSON concise enough to fit in 7,500 characters.",
   ].filter(Boolean).join("\n\n");
 }

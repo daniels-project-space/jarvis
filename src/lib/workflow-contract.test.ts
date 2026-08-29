@@ -28,7 +28,7 @@ describe("versioned durable-work contract", () => {
     });
     expect(PERMANENT_TEAM).toEqual(SCOPED_TEAM_MANIFEST.agents);
     expect(SCOPED_TEAM_MANIFEST.agents.map((agent) => agent.slug)).toEqual([
-      "jarvis", "paul", "atlas", "iris", "maya", "sentry",
+      "jarvis", "paul", "atlas", "iris", "maya", "chloe", "sentry",
     ]);
 
     const serialized = JSON.stringify(SCOPED_TEAM_MANIFEST);
