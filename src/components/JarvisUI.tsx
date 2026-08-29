@@ -175,7 +175,6 @@ import {
   type BrowserSpeechPreview,
 } from "@/lib/browser-speech-preview";
 import {
-  compactChatFeedback,
   foregroundUiProgress,
   shouldOfferForegroundRecovery,
   type CompactFeedbackPhase,
@@ -1558,6 +1557,40 @@ function LiveResearchIndicator({ state }: { state: LiveResearchState }) {
   );
 }
 
+type VoiceActionPresentation = {
+  action: "interrupt" | "toggle-live" | "finish-recording";
+  ariaLabel: string;
+  title: string;
+  label: string;
+  glyph: string;
+  tone: "idle" | "connecting" | "listening" | "recording" | "interrupt";
+};
+
+/**
+ * Every composer has one voice affordance. The action follows the actual
+ * capture/playback state rather than making Daniel choose between two related
+ * microphone buttons whose ownership can change underneath him.
+ */
+export function voiceActionPresentation(args: {
+  live: "off" | "connecting" | "live";
+  recording: boolean;
+  speaking: boolean;
+}): VoiceActionPresentation {
+  if (args.speaking) {
+    return { action: "interrupt", ariaLabel: "Interrupt Jarvis", title: "Stop Jarvis speaking", label: "hush", glyph: "■", tone: "interrupt" };
+  }
+  if (args.live === "connecting") {
+    return { action: "toggle-live", ariaLabel: "Cancel Jarvis voice connection", title: "Cancel voice connection", label: "connecting", glyph: "…", tone: "connecting" };
+  }
+  if (args.live === "live") {
+    return { action: "toggle-live", ariaLabel: "Stop Jarvis live listening", title: "Stop live listening", label: "listening", glyph: "●", tone: "listening" };
+  }
+  if (args.recording) {
+    return { action: "finish-recording", ariaLabel: "Finish recording your voice message", title: "Finish recording", label: "done", glyph: "■", tone: "recording" };
+  }
+  return { action: "toggle-live", ariaLabel: "Start Jarvis live listening", title: "Start live voice", label: "voice", glyph: "●", tone: "idle" };
+}
+
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const viewerToken = useViewerSession();
@@ -1799,7 +1832,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     panelFullRef.current = panelFull;
   }, [panelFull]);
-  const [openAttachmentAfterExpand, setOpenAttachmentAfterExpand] = useState(false);
   useEffect(() => {
     if (!embedded || !parentOrigin || window.parent === window) return;
     // The trusted host owns the iframe dimensions. Send only semantic state so
@@ -1812,21 +1844,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     });
     window.parent.postMessage({ jarvis: "layout", mode, expanded: mode !== "compact" }, parentOrigin);
   }, [embedded, embeddedExpanded, panel, panelFull, panelMin, panelRoute?.presentation, parentOrigin]);
-  useEffect(() => {
-    if (!embedded || !embeddedExpanded || !openAttachmentAfterExpand || guest) return;
-    const frame = window.requestAnimationFrame(() => {
-      const trigger = document.getElementById("jarvis-attachment-trigger") as HTMLButtonElement | null;
-      trigger?.click();
-      trigger?.focus();
-      setOpenAttachmentAfterExpand(false);
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [embedded, embeddedExpanded, guest, openAttachmentAfterExpand]);
-  const openCompactAttachmentComposer = () => {
-    unlockSpeechPlayback();
-    setOpenAttachmentAfterExpand(true);
-    setEmbeddedExpanded(true);
-  };
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [pendingFileIds, setPendingFileIds] = useState<string[]>([]);
   const [fileNotice, setFileNotice] = useState<ChatFileNotice>(null);
@@ -2771,11 +2788,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const message = event.data ?? {};
       if (message.jarvis === "host-show") {
         setChatMode("off", false);
-        setEmbeddedExpanded(false);
+        setEmbeddedExpanded(true);
+      }
+      if (message.jarvis === "host-hover-close") {
+        // The host collapses only an unpinned hover expansion. A live turn
+        // stays visible so its caption and recovery action are never hidden.
+        if (!liveCaptureIsActiveOrStarting() && !speaking) setEmbeddedExpanded(false);
       }
       if (message.jarvis === "host-mute-set" && typeof message.muted === "boolean") {
         setAudioMutedPreference(message.muted);
         if (message.muted && liveCaptureIsActiveOrStarting()) void toggleLive();
+      }
+      if (message.jarvis === "host-hide") {
+        setEmbeddedExpanded(false);
       }
       if (message.jarvis === "host-hide" && liveCaptureIsActiveOrStarting()) void toggleLive();
       if (message.jarvis === "host-wake-state") setWake(message.listening === true);
@@ -5342,13 +5367,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         : recording || live === "live"
           ? "listening"
           : "idle";
-  const compactFeedbackText = compactChatFeedback({
-    phase: hostPhase,
-    caption: caption ? { who: caption.who, text: caption.text } : null,
-    latestUser: latestUserMessage?.text ? visibleTurnText(latestUserMessage.text) : undefined,
-    latestAssistant: hostAssistant?.text ? safeEmbeddedMessageText(hostAssistant) : undefined,
-    assistantStreaming: hostAssistant?.status === "streaming",
-  });
   const foregroundRecoveryVisible = submissionRetryReady || shouldOfferForegroundRecovery({
     elapsedMs: foregroundElapsedMs,
     hasActiveTurn: Boolean(activeDurableTurn.current),
@@ -5387,6 +5405,25 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     || durableRecovery === "cancelling"
     || (durableRecovery === "retry-ready" && !durableRetryReady);
   const voiceRecoveryVisible = ttsRuntimeStatus === "blocked" || voiceReplayReady;
+  const voiceAction = voiceActionPresentation({ live, recording, speaking });
+  const runVoiceAction = () => {
+    if (voiceAction.action === "interrupt") {
+      stopTalking();
+      return;
+    }
+    if (voiceAction.action === "finish-recording") {
+      void toggleMic();
+      return;
+    }
+    void toggleLive();
+  };
+  const voiceActionTone = voiceAction.tone === "interrupt"
+    ? "bg-red-500/15 text-red-300 ring-red-500/40"
+    : voiceAction.tone === "recording"
+      ? "bg-amber/20 text-amber ring-amber/50"
+      : voiceAction.tone === "connecting" || voiceAction.tone === "listening"
+        ? "bg-cyan/20 text-cyan ring-cyan/50"
+        : "glass text-slate hover:text-ice ring-white/10";
 
   // How the stage shares with an overlay:
   //  • compactAside — a sized widget (weather/shop/places/ranking/…): the panel
@@ -5423,133 +5460,42 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         data-voice-state={orbState}
         data-jarvis-mood={activeMood}
         data-jarvis-mood-source={moodSource}
-        className={`relative flex h-dvh w-full flex-col justify-between gap-2 overflow-hidden rounded-2xl border border-white/10 bg-[#05070d]/95 p-2.5 shadow-2xl backdrop-blur-xl transition ${composerDragActive ? "ring-1 ring-inset ring-cyan/60" : ""}`}
+        className={`relative grid h-dvh w-full place-items-center overflow-visible rounded-full bg-transparent transition ${composerDragActive ? "ring-1 ring-inset ring-cyan/60" : ""}`}
         onDragEnter={composerDropHandlers.onDragEnter}
         onDragOver={composerDropHandlers.onDragOver}
         onDragLeave={composerDropHandlers.onDragLeave}
         onDrop={(event) => {
           // Files need the full chat (progress, pending chip, auto-send) to
-          // be mounted; text drops can stay collapsed since the mini composer
-          // is already visible here.
+          // be mounted before the drop reaches its normal target.
           if (event.dataTransfer.files.length > 0) setEmbeddedExpanded(true);
           composerDropHandlers.onDrop(event);
         }}
       >
-        <div className="flex min-w-0 items-start gap-2 pr-16">
-          <button
-            type="button"
-            onClick={() => speaking ? stopTalking() : void toggleLive()}
-            aria-label={speaking ? "Interrupt Jarvis" : live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
-            className={`mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-full ring-1 ${
-              live === "live" || orbState === "listening"
-                ? "bg-cyan/20 text-cyan ring-cyan/50"
-                : orbState === "thinking"
-                  ? "bg-amber/15 text-amber ring-amber/40"
-                  : "bg-cyan/10 text-cyan ring-cyan/25"
-            }`}
-          >
-            <span className={`h-2.5 w-2.5 rounded-full bg-current ${orbState === "idle" ? "" : "animate-pulse"}`} />
-          </button>
-          <div className="min-w-0 flex-1">
-            <div className="hud-label flex items-center gap-2 text-cyan">
-              <span>JARVIS</span>
-              <span className="truncate text-slate">{status}</span>
-            </div>
-            <p className="mt-1 line-clamp-1 text-xs leading-relaxed text-ice/80">{compactFeedbackText}</p>
-          </div>
-        </div>
-        <div className="absolute right-2 top-2 flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setEmbeddedExpanded(true)}
-            aria-label="Open Jarvis chat"
-            title="Open chat"
-            className="grid h-8 w-8 place-items-center rounded-full text-sm text-slate ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
-          >
-            ↗
-          </button>
-          <button
-            type="button"
-            onClick={hideEmbedded}
-            aria-label="Close Jarvis"
-            className="grid h-8 w-8 place-items-center rounded-full text-lg text-slate ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
-          >
-            ×
-          </button>
-        </div>
-        {hostProgress > 0 && (
-          <div
-            role="progressbar"
-            aria-label={`Jarvis ${status} progress`}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={Math.round(hostProgress * 100)}
-            className="h-1 overflow-hidden rounded-full bg-white/8"
-          >
-            <span
-              className="block h-full rounded-full bg-gradient-to-r from-cyan/70 to-amber/80 transition-[width] duration-300 ease-out"
-              style={{ width: `${Math.round(hostProgress * 100)}%` }}
-            />
-          </div>
-        )}
-        {liveResearch.phase !== "idle" && <LiveResearchIndicator state={liveResearch} />}
-        {foregroundRecoveryVisible && (
-          <div className="flex items-center justify-between gap-2 rounded-lg bg-amber/[0.06] px-2 py-1 text-[10px] text-slate ring-1 ring-amber/20">
-            <span className="min-w-0 truncate">{foregroundRecoveryMessage}</span>
-            <button
-              type="button"
-              onClick={foregroundRecoveryAction}
-              disabled={foregroundRecoveryActionDisabled}
-              className="shrink-0 text-amber disabled:opacity-40"
-            >
-              {foregroundRecoveryActionLabel}
-            </button>
-          </div>
-        )}
-        <div className="flex min-w-0 gap-2">
-          {!guest && (
-            <button
-              type="button"
-              data-jarvis-compact-attachment
-              onClick={openCompactAttachmentComposer}
-              aria-label="Attach files, images, documents, or folders"
-              title="Attach files or open saved private files"
-              className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-sm text-slate ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
-            >
-              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <path d="m20.5 11.5-8.9 8.9a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7l-9.7 9.7a2 2 0 0 1-2.8-2.8l9-9" />
-              </svg>
-            </button>
-          )}
-          {voiceRecoveryVisible && (
-            <button
-              type="button"
-              onClick={retryVoicePlayback}
-              aria-label="Resume Jarvis voice playback"
-              title="Resume voice"
-              className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber/10 text-amber ring-1 ring-amber/30"
-            >
-              ◖
-            </button>
-          )}
-          <input
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => event.key === "Enter" && submit(input)}
-            placeholder={busy ? "Jarvis is working…" : "Message Jarvis…"}
-            className="min-w-0 flex-1 rounded-xl bg-black/35 px-3 py-2 text-xs text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
-          />
-          <button
-            type="button"
-            onClick={() => void submit(input)}
-            disabled={sending || !input.trim()}
-            aria-label="Send message"
-            className="grid w-9 shrink-0 place-items-center rounded-xl bg-cyan/15 text-cyan ring-1 ring-cyan/40 disabled:opacity-40"
-          >
-            ↑
-          </button>
-        </div>
-        <span className="sr-only" aria-live="polite">Jarvis is {status}</span>
+        <button
+          type="button"
+          data-jarvis-mini-orb
+          onClick={() => {
+            unlockSpeechPlayback();
+            setEmbeddedExpanded(true);
+          }}
+          onFocus={() => setEmbeddedExpanded(true)}
+          aria-label={`Open Jarvis. ${status}.`}
+          aria-describedby="jarvis-mini-orb-status"
+          className={`group relative grid h-14 w-14 place-items-center rounded-full border bg-[#050b12]/95 shadow-[0_0_0_1px_rgba(103,232,249,0.12),0_10px_30px_rgba(0,0,0,0.45),0_0_24px_rgba(34,211,238,0.16)] transition duration-200 hover:scale-105 focus-visible:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan/80 ${
+            orbState === "thinking"
+              ? "border-amber/55 text-amber"
+              : orbState === "speaking"
+                ? "border-violet-300/55 text-violet-200"
+                : orbState === "listening"
+                  ? "border-cyan/70 text-cyan"
+                  : "border-cyan/35 text-cyan"
+          }`}
+        >
+          <span aria-hidden="true" className={`absolute inset-1 rounded-full border border-current/25 ${orbState === "idle" ? "" : "animate-pulse"}`} />
+          <span aria-hidden="true" className="absolute inset-2.5 rounded-full border border-current/35" />
+          <span aria-hidden="true" className={`h-3.5 w-3.5 rounded-full bg-current shadow-[0_0_18px_currentColor] ${orbState === "idle" ? "" : "animate-pulse"}`} />
+        </button>
+        <span id="jarvis-mini-orb-status" className="sr-only" aria-live="polite">Jarvis is {status}. Focus, hover, or activate the orb to open the compact assistant.</span>
       </div>
     );
   }
@@ -5585,7 +5531,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             hideEmbedded();
           }}
           aria-label="Close Jarvis"
-          className="absolute right-3 top-3 z-[70] grid h-9 w-9 place-items-center rounded-full bg-black/35 text-xl text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
+          className="absolute right-2.5 top-2.5 z-[70] grid h-8 w-8 place-items-center rounded-full bg-black/35 text-lg text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
         >
           ×
         </button>
@@ -5597,7 +5543,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           }}
           aria-label="Collapse Jarvis"
           title="Collapse to the quick launcher"
-          className="absolute right-14 top-3 z-[70] grid h-9 w-9 place-items-center rounded-full bg-black/35 text-sm text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
+          className="absolute right-12 top-2.5 z-[70] grid h-8 w-8 place-items-center rounded-full bg-black/35 text-xs text-white/60 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan"
         >
           ↙
         </button>
@@ -5644,9 +5590,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               />
               <button
                 type="button"
-                aria-label={speaking ? "Interrupt Jarvis" : live === "live" ? "Stop Jarvis live listening" : "Start Jarvis live listening"}
-                title={speaking ? "Tap to interrupt" : live === "live" ? "Tap to stop listening" : "Tap to start listening"}
-                onClick={() => speaking ? stopTalking() : void toggleLive()}
+                aria-label={voiceAction.ariaLabel}
+                title={voiceAction.title}
+                onClick={runVoiceAction}
+                data-jarvis-voice-action={voiceAction.action}
                 className="absolute inset-[20%] z-20 rounded-full bg-transparent"
               />
             </>
@@ -5665,7 +5612,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         </div>
 
         {!embeddedWorkspacePanel && <div className="relative z-50 flex min-h-0 flex-1 flex-col border-t border-white/10 bg-black/35 backdrop-blur-md">
-          <div className="scrollbar-thin min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-2.5">
+          <div className="scrollbar-thin min-h-0 flex-1 space-y-1.5 overflow-y-auto px-2.5 py-2">
             {messages.length === 0 && (
               <p className="pt-3 text-center text-xs text-slate">Ask Jarvis anything.</p>
             )}
@@ -5679,7 +5626,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               .filter((message) => message.text || message.status === "streaming")
               .map((message) => (
                 <div key={message._id} className={message.role === "user" ? "text-right" : "text-left"}>
-                  <span className={`inline-block max-w-[90%] whitespace-pre-wrap rounded-xl px-3 py-1.5 text-xs leading-relaxed ${
+                  <span className={`inline-block max-w-[90%] whitespace-pre-wrap rounded-xl px-2.5 py-1.5 text-xs leading-relaxed ${
                     message.role === "user" ? "bg-amber/10 text-amber" : "bg-cyan/[0.08] text-ice"
                   }`}>
                     {message.text || (
@@ -5716,8 +5663,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </div>
             </div>
           )}
-          <div className="border-t border-white/10 p-2">
-            <div className="flex gap-2">
+          <div className="border-t border-white/10 p-1.5">
+            <div className="flex gap-1.5">
               {guest ? (
                 <GuestChatFileAccess embedded onRequestOwnerAccess={() => void connectEmbeddedOwner()} />
               ) : (
@@ -5738,31 +5685,33 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 onClick={retryVoicePlayback}
                 aria-label="Resume Jarvis voice playback"
                 title="Resume voice"
-                className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber/10 text-amber ring-1 ring-amber/30"
+                className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-amber/10 text-amber ring-1 ring-amber/30"
               >
                 ◖
               </button>
             )}
             <button
               type="button"
-              onClick={() => speaking ? stopTalking() : void toggleLive()}
-              className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl text-xs ring-1 ${live === "live" ? "bg-cyan/20 text-cyan ring-cyan/40" : "bg-white/5 text-slate ring-white/10"}`}
-              aria-label={live === "live" ? "Stop live listening" : "Start live listening"}
+              onClick={runVoiceAction}
+              title={voiceAction.title}
+              aria-label={voiceAction.ariaLabel}
+              data-jarvis-voice-action={voiceAction.action}
+              className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg text-xs ring-1 transition ${voiceActionTone}`}
             >
-              {speaking ? "■" : "●"}
+              <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
             </button>
             <input
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={(event) => event.key === "Enter" && submit(input)}
               placeholder={pendingFileIds.length ? "Indexing files before send…" : "Message Jarvis…"}
-              className="min-w-0 flex-1 rounded-xl bg-black/35 px-3 text-sm text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
+              className="min-w-0 flex-1 rounded-lg bg-black/35 px-2.5 text-xs text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
             />
             <button
               type="button"
               onClick={() => void submit(input)}
               disabled={sending || Boolean(pendingFileIds.length) || (!input.trim() && !selectedFileIds.length)}
-              className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan/15 text-cyan ring-1 ring-cyan/40 disabled:opacity-40"
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-cyan/15 text-cyan ring-1 ring-cyan/40 disabled:opacity-40"
               aria-label={pendingFileIds.length ? "Send waits for file indexing" : "Send message"}
             >
               ↑
@@ -6194,32 +6143,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </button>
             )}
             <button
-              onClick={() => void toggleLive()}
-              title="live conversation"
-              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2 text-sm transition sm:px-3 ${
-                live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "glass text-slate hover:text-ice"
-              }`}
+              type="button"
+              onClick={runVoiceAction}
+              title={voiceAction.title}
+              aria-label={voiceAction.ariaLabel}
+              data-jarvis-voice-action={voiceAction.action}
+              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2 text-sm ring-1 transition sm:px-3 ${voiceActionTone}`}
             >
-              {live === "connecting" ? (
-                <span className="h-1.5 w-1.5 animate-ping rounded-full bg-cyan" />
-              ) : live === "live" ? (
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan" />
-              ) : null}
-              <span className="max-sm:hidden">live</span><span className="sm:hidden">◉</span>
-            </button>
-            <button
-              onClick={toggleMic}
-              disabled={live === "live"}
-              title={live === "live" ? "Live conversation is continuously listening" : "voice input"}
-              className={`shrink-0 rounded-xl px-2 text-sm transition sm:px-3 ${
-                live === "live"
-                  ? "bg-cyan/10 text-cyan ring-1 ring-cyan/30"
-                  : recording
-                    ? "bg-amber/20 text-amber ring-1 ring-amber/50"
-                    : "glass text-slate hover:text-ice"
-              }`}
-            >
-              <span className="max-sm:hidden">{live === "live" ? "mic on" : recording ? "■ done" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
+              <span aria-hidden="true" className={voiceAction.tone === "connecting" ? "animate-pulse" : voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
+              <span className="max-sm:hidden">{voiceAction.label}</span>
             </button>
             {!guest && <>
               <button
@@ -6237,15 +6169,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 📷
               </button>
             </>}
-            {(speaking || (live === "live" && caption?.who === "jarvis")) && (
-              <button
-                onClick={stopTalking}
-                title="stop talking"
-                className="shrink-0 rounded-xl bg-red-500/15 px-3 text-sm text-red-300 ring-1 ring-red-500/40"
-              >
-                hush
-              </button>
-            )}
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -6411,28 +6334,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               </button>
             )}
             <button
-              onClick={() => void toggleLive()}
-              title="live conversation"
-              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm transition ${
-                live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "text-slate hover:text-ice"
-              }`}
+              type="button"
+              onClick={runVoiceAction}
+              title={voiceAction.title}
+              aria-label={voiceAction.ariaLabel}
+              data-jarvis-voice-action={voiceAction.action}
+              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm ring-1 transition ${voiceActionTone}`}
             >
-              {live === "connecting" ? <span className="h-1.5 w-1.5 animate-ping rounded-full bg-cyan" /> : live === "live" ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan" /> : null}
-              <span className="max-sm:hidden">live</span><span className="sm:hidden">◉</span>
+              <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
+              <span className="max-sm:hidden">{voiceAction.label}</span>
             </button>
-            <button
-              onClick={toggleMic}
-              disabled={live === "live"}
-              title={live === "live" ? "Live conversation is continuously listening" : "voice input"}
-              className={`shrink-0 rounded-xl px-2.5 text-sm transition ${live === "live" ? "bg-cyan/10 text-cyan ring-1 ring-cyan/30" : recording ? "bg-amber/20 text-amber ring-1 ring-amber/50" : "text-slate hover:text-ice"}`}
-            >
-              <span className="max-sm:hidden">{live === "live" ? "mic on" : recording ? "■" : "mic"}</span><span className="sm:hidden">{recording ? "■" : "●"}</span>
-            </button>
-            {(speaking || (live === "live" && caption?.who === "jarvis")) && (
-              <button onClick={stopTalking} title="stop talking" className="shrink-0 rounded-xl bg-red-500/15 px-2.5 text-sm text-red-300 ring-1 ring-red-500/40">
-                hush
-              </button>
-            )}
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}

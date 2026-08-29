@@ -40,12 +40,16 @@ type FakeElement = {
   dataset: Record<string, string>;
   isConnected: boolean;
   onclick?: (() => void) | null;
+  onmouseenter?: (() => void) | null;
+  onmouseleave?: (() => void) | null;
+  onfocus?: (() => void) | null;
   onload?: (() => void) | null;
   remove: ReturnType<typeof vi.fn>;
   setAttribute: ReturnType<typeof vi.fn>;
   src?: string;
   style: Record<string, string> & { cssText?: string };
   textContent?: string;
+  tabIndex?: number;
   title?: string;
   type?: string;
 };
@@ -341,8 +345,8 @@ describe("Project Hub Jarvis loader", () => {
     const harness = createLoader();
     const receive = harness.listeners.get("message")?.[0];
 
-    expect(harness.frame.style.cssText).toContain("width:min(320px,calc(100vw - 16px))");
-    expect(harness.frame.style.cssText).toContain("height:min(190px,calc(100dvh - 82px))");
+    expect(harness.frame.style.cssText).toContain("width:64px");
+    expect(harness.frame.style.cssText).toContain("height:64px");
 
     receive?.({
       origin: "https://hostile.example",
@@ -356,8 +360,8 @@ describe("Project Hub Jarvis loader", () => {
       source: harness.frameWindow,
       data: { jarvis: "layout", mode: "chat", width: "100vw" },
     });
-    expect(harness.frame.style.width).toBe("min(460px,calc(100vw - 16px))");
-    expect(harness.frame.style.height).toBe("min(620px,calc(100dvh - 82px))");
+    expect(harness.frame.style.width).toBe("min(420px,calc(100vw - 16px))");
+    expect(harness.frame.style.height).toBe("min(560px,calc(100dvh - 76px))");
 
     receive?.({
       origin: JARVIS_ORIGIN,
@@ -373,9 +377,27 @@ describe("Project Hub Jarvis loader", () => {
       source: harness.frameWindow,
       data: { jarvis: "layout", expanded: false },
     });
-    expect(harness.frame.style.width).toBe("min(320px,calc(100vw - 16px))");
-    expect(harness.frame.style.height).toBe("min(190px,calc(100dvh - 82px))");
-    expect(harness.frame.style.bottom).toBe("66px");
+    expect(harness.frame.style.width).toBe("64px");
+    expect(harness.frame.style.height).toBe("64px");
+    expect(harness.frame.style.bottom).toBe("12px");
+    expect(harness.frame.style.borderRadius).toBe("999px");
+  });
+
+  it("expands the persistent mini orb on hover and folds it back after the pointer leaves", () => {
+    vi.useFakeTimers();
+    const harness = createLoader();
+
+    harness.frame.onmouseenter?.();
+    vi.advanceTimersByTime(120);
+    expect(harness.window.JARVIS.visible).toBe(true);
+    expect(harness.frame.style.width).toBe("min(420px,calc(100vw - 16px))");
+    expect(harness.messages).toContainEqual({ jarvis: "host-show" });
+
+    harness.frame.onmouseleave?.();
+    vi.advanceTimersByTime(220);
+    expect(harness.window.JARVIS.visible).toBe(false);
+    expect(harness.frame.style.width).toBe("64px");
+    expect(harness.messages).toContainEqual({ jarvis: "host-hover-close" });
   });
 
   it("shows bounded realtime work stages in the collapsed host control", () => {
@@ -448,7 +470,7 @@ describe("Project Hub Jarvis loader", () => {
     expect(harness.messages).toContainEqual({ jarvis: "host-command", text: "open the bitcoin chart" });
   });
 
-  it("closes the mobile overlay immediately when the embedded X requests hide", () => {
+  it("folds the expanded overlay back to its persistent mini orb when the embedded close requests hide", () => {
     const harness = createLoader();
     harness.window.JARVIS.show();
     expect(harness.window.JARVIS.visible).toBe(true);
@@ -462,9 +484,11 @@ describe("Project Hub Jarvis loader", () => {
 
     expect(harness.window.JARVIS.visible).toBe(false);
     expect(harness.frame.style).toMatchObject({
-      opacity: "0",
-      pointerEvents: "none",
-      transform: "translateY(14px)",
+      opacity: "1",
+      pointerEvents: "auto",
+      transform: "translateY(0)",
+      width: "64px",
+      height: "64px",
     });
     expect(harness.messages).toContainEqual({ jarvis: "host-hide" });
   });

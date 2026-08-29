@@ -54,9 +54,27 @@ vi.mock("next/dynamic", () => ({
 }));
 
 import Home from "../app/page";
-import JarvisUI, { MessageFileBadges, safeEmbeddedMessageText, Viewport } from "./JarvisUI";
+import JarvisUI, { MessageFileBadges, safeEmbeddedMessageText, Viewport, voiceActionPresentation } from "./JarvisUI";
 
 describe("guest Home application render", () => {
+  it("uses one stateful voice action instead of competing live and microphone controls", () => {
+    expect(voiceActionPresentation({ live: "off", recording: false, speaking: false })).toMatchObject({
+      action: "toggle-live", ariaLabel: "Start Jarvis live listening", label: "voice",
+    });
+    expect(voiceActionPresentation({ live: "connecting", recording: false, speaking: false })).toMatchObject({
+      action: "toggle-live", ariaLabel: "Cancel Jarvis voice connection", label: "connecting",
+    });
+    expect(voiceActionPresentation({ live: "live", recording: false, speaking: false })).toMatchObject({
+      action: "toggle-live", ariaLabel: "Stop Jarvis live listening", label: "listening",
+    });
+    expect(voiceActionPresentation({ live: "off", recording: true, speaking: false })).toMatchObject({
+      action: "finish-recording", ariaLabel: "Finish recording your voice message",
+    });
+    expect(voiceActionPresentation({ live: "live", recording: false, speaking: true })).toMatchObject({
+      action: "interrupt", ariaLabel: "Interrupt Jarvis", label: "hush",
+    });
+  });
+
   it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {
     const markup = renderToStaticMarkup(<Home />);
 
@@ -71,13 +89,14 @@ describe("guest Home application render", () => {
     expect(markup).not.toContain('src="r2://owner-only-frame"');
   });
 
-  it("server-renders an unresolved embed as a usable compact surface with a dependable close control", () => {
+  it("server-renders an unresolved embed as an accessible mini orb that opens the full assistant", () => {
     queryTrace.calls = [];
     const markup = renderToStaticMarkup(<JarvisUI embedded />);
 
     expect(markup).toContain("data-jarvis-embed-surface");
-    expect(markup).toContain('aria-label="Close Jarvis"');
-    expect(markup).toContain("This text remains visible to the guest.");
+    expect(markup).toContain("data-jarvis-mini-orb");
+    expect(markup).toContain('aria-label="Open Jarvis. online."');
+    expect(markup).toContain("Focus, hover, or activate the orb");
     expect(markup).not.toMatch(/locked|pairing/i);
     expect(queryTrace.calls).toContainEqual({
       name: "chatQueue:listRecentMessages",

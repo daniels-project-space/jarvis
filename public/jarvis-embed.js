@@ -68,10 +68,10 @@
   f.title = "JARVIS";
   f.allow = "microphone; autoplay; clipboard-write; display-capture";
   f.style.cssText =
-    "position:fixed;bottom:66px;right:8px;width:min(320px,calc(100vw - 16px));height:min(190px,calc(100dvh - 82px));max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border:0;" +
-    "border-radius:28px;z-index:2147483000;background:#05070d;color-scheme:dark;" +
+    "position:fixed;bottom:12px;right:12px;width:64px;height:64px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border:0;" +
+    "border-radius:999px;z-index:2147483000;background:transparent;color-scheme:dark;" +
     "box-shadow:none;transition:opacity .2s ease,transform .28s cubic-bezier(.22,1,.36,1),width .24s cubic-bezier(.22,1,.36,1),height .24s cubic-bezier(.22,1,.36,1);" +
-    "opacity:0;transform:translateY(14px);pointer-events:none;";
+    "opacity:1;transform:translateY(0);pointer-events:auto;";
 
   // The trusted Jarvis frame may request only a semantic layout state. The
   // host owns the actual dimensions so postMessage can never inject arbitrary
@@ -80,17 +80,18 @@
     var layout = mode === "workspace" ? "workspace" : mode === "chat" || mode === true ? "chat" : "compact";
     f.dataset.jarvisLayout = layout;
     f.style.right = layout === "workspace" ? "8px" : "8px";
-    f.style.bottom = layout === "workspace" ? "8px" : "66px";
+    f.style.bottom = layout === "workspace" ? "8px" : layout === "chat" ? "60px" : "12px";
     f.style.width = layout === "workspace"
       ? "min(1180px,calc(100vw - 16px))"
       : layout === "chat"
-        ? "min(460px,calc(100vw - 16px))"
-        : "min(320px,calc(100vw - 16px))";
+        ? "min(420px,calc(100vw - 16px))"
+        : "64px";
     f.style.height = layout === "workspace"
       ? "calc(100dvh - 16px)"
       : layout === "chat"
-        ? "min(620px,calc(100dvh - 82px))"
-        : "min(190px,calc(100dvh - 82px))";
+        ? "min(560px,calc(100dvh - 76px))"
+        : "64px";
+    f.style.borderRadius = layout === "compact" ? "999px" : "24px";
   }
 
   // One host-owned control in every app. Individual products no longer need
@@ -102,7 +103,9 @@
   controls.style.cssText =
     "all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483001;display:flex;align-items:center;gap:6px;" +
     "padding:5px;border:1px solid rgba(130,220,255,.24);border-radius:18px;background:rgba(4,9,16,.9);" +
-    "box-shadow:0 14px 48px rgba(0,0,0,.42),inset 0 1px rgba(255,255,255,.06);backdrop-filter:blur(18px);";
+    "box-shadow:0 14px 48px rgba(0,0,0,.42),inset 0 1px rgba(255,255,255,.06);backdrop-filter:blur(18px);" +
+    "opacity:0;transform:translateX(10px);pointer-events:none;transition:opacity .18s ease,transform .18s ease;";
+  controls.setAttribute("aria-hidden", "true");
   var jarvisButton = document.createElement("button");
   jarvisButton.type = "button";
   jarvisButton.setAttribute("aria-label", "Open Jarvis; tap once if wake listening needs microphone permission");
@@ -153,6 +156,17 @@
   controls.appendChild(jarvisButton);
   controls.appendChild(selectorButton);
   controls.appendChild(muteButton);
+
+  function setUniversalControlsVisible(nextVisible) {
+    var showControls = nextVisible === true;
+    controls.setAttribute("aria-hidden", showControls ? "false" : "true");
+    controls.style.opacity = showControls ? "1" : "0";
+    controls.style.transform = showControls ? "translateX(0)" : "translateX(10px)";
+    controls.style.pointerEvents = showControls ? "auto" : "none";
+    [jarvisButton, selectorButton, muteButton].forEach(function (control) {
+      control.tabIndex = showControls ? 0 : -1;
+    });
+  }
 
   var framePhase = "online";
   var frameProgress = 0;
@@ -404,6 +418,7 @@
       var firstMount = !f.isConnected;
       if (firstMount) document.body.appendChild(f);
       if (!controls.isConnected) document.body.appendChild(controls);
+      setUniversalControlsVisible(visible);
       paintUniversalControls();
       if (firstMount) {
       try {
@@ -430,12 +445,50 @@
     paintUniversalControls();
   }
 
+  var hoverOpenTimer = null;
+  var hoverCloseTimer = null;
+
+  function clearHoverTimer(timer) {
+    if (timer) clearTimeout(timer);
+    return null;
+  }
+
+  function collapseHoverPreview() {
+    if (!visible || framePhase !== "online") return;
+    // Keep a keyboard-open or active voice surface stable. The mini orb is
+    // intentionally unobtrusive, but it must not hide a live caption or steal
+    // focus while someone is using it.
+    if (document.activeElement === f) return;
+    visible = false;
+    setFrameLayout("compact");
+    setUniversalControlsVisible(false);
+    post({ jarvis: "host-hover-close" });
+    paintUniversalControls();
+  }
+
+  f.onmouseenter = function () {
+    hoverCloseTimer = clearHoverTimer(hoverCloseTimer);
+    hoverOpenTimer = clearHoverTimer(hoverOpenTimer);
+    hoverOpenTimer = setTimeout(function () { show(); }, 120);
+  };
+  f.onmouseleave = function () {
+    hoverOpenTimer = clearHoverTimer(hoverOpenTimer);
+    hoverCloseTimer = clearHoverTimer(hoverCloseTimer);
+    hoverCloseTimer = setTimeout(collapseHoverPreview, 220);
+  };
+  f.onfocus = function () {
+    hoverCloseTimer = clearHoverTimer(hoverCloseTimer);
+    show();
+  };
+
   function show() {
     mount();
     visible = true;
+    setFrameLayout("chat");
     f.style.opacity = "1";
     f.style.transform = "translateY(0)";
     f.style.pointerEvents = "auto";
+    setUniversalControlsVisible(true);
     post({ jarvis: "host-show" });
     postHostContext();
     if (navigator.userActivation && navigator.userActivation.isActive) enableWakeFromGesture();
@@ -448,9 +501,13 @@
     pendingTranscript = "";
     if (commandTimer) clearTimeout(commandTimer);
     commandTimer = null;
-    f.style.opacity = "0";
-    f.style.transform = "translateY(14px)";
-    f.style.pointerEvents = "none";
+    hoverOpenTimer = clearHoverTimer(hoverOpenTimer);
+    hoverCloseTimer = clearHoverTimer(hoverCloseTimer);
+    setFrameLayout("compact");
+    f.style.opacity = "1";
+    f.style.transform = "translateY(0)";
+    f.style.pointerEvents = "auto";
+    setUniversalControlsVisible(false);
     post({ jarvis: "host-hide" });
     paintUniversalControls();
   }
@@ -989,6 +1046,8 @@
         ? data.mode
         : data.expanded === true ? "chat" : "compact";
       setFrameLayout(requestedLayout);
+      visible = requestedLayout !== "compact";
+      setUniversalControlsVisible(visible);
     } else if (data.jarvis === "wake" || data.jarvis === "notify") {
       show();
     } else if (data.jarvis === "hide") {
