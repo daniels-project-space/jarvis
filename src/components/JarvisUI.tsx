@@ -115,6 +115,7 @@ import {
   type NovitaPatchProposerStatus,
 } from "@/lib/novita-patch-proposer-status";
 import { BackgroundReadinessControl } from "./BackgroundReadinessControl";
+import { CloudProviderProbeControl } from "./CloudProviderProbeControl";
 import { BrowserErrandApprovals } from "./BrowserErrandApprovals";
 import NotificationBell from "./NotificationBell";
 import { GuestSafeAttachment } from "./GuestSafeAttachment";
@@ -695,6 +696,11 @@ function OptionsPanel({
               {controllerSession.label}
             </span>
           </Row>
+          {owner && (
+            <Row label="Cloud worker release" hint="Manual bounded provider check · no user task or model run">
+              <CloudProviderProbeControl />
+            </Row>
+          )}
           {owner && (
             <Row label="Background readiness" hint="Manual no-spend check · no workspace or model run">
               <BackgroundReadinessControl />
