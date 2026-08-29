@@ -5184,6 +5184,15 @@ export async function executeTool(
         ? args.acceptance_criteria.map(String).slice(0, 8)
         : suggestedAcceptanceCriteria(task, route);
       const protocolV2 = v2AdmissionEnabled();
+      // Voice and text dispatch must give the same truthful admission result as
+      // Goal Mode. Do not create a durable mission/job that will only become a
+      // blocked worker later when the live provider proof is unavailable.
+      if (protocolV2) {
+        const readiness = await cloudProviderAdmissionReadinessAtRuntime();
+        if (!readiness.ready) {
+          return `Agent dispatch is temporarily unavailable because secure workspace readiness evidence is ${readiness.code.replaceAll("_", " ")}. No mission, job, or Trigger worker was started; retry after the provider rollout is repaired.`;
+        }
+      }
       const [projectAdmission] = protocolV2 ? await resolveMissionProjectAdmissions([repo]) : [undefined];
       const missionId = await convexMutation(admissionMutationName("mission"), {
         authTokenHash,

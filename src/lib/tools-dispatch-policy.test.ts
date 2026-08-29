@@ -6,6 +6,7 @@ const mock = vi.hoisted(() => ({
   convexMutation: vi.fn(),
   convexQuery: vi.fn(),
   resolveProjectSourceAdmission: vi.fn(),
+  cloudProviderAdmissionReadinessAtRuntime: vi.fn(),
   wakeAgentFleet: vi.fn(),
 }));
 
@@ -19,6 +20,9 @@ vi.mock("./control-context", () => ({
 vi.mock("./agent-fleet-dispatch", () => ({ wakeAgentFleet: mock.wakeAgentFleet }));
 vi.mock("./source-admission-server", () => ({
   resolveProjectSourceAdmission: mock.resolveProjectSourceAdmission,
+}));
+vi.mock("./cloud-provider-admission-runtime", () => ({
+  cloudProviderAdmissionReadinessAtRuntime: mock.cloudProviderAdmissionReadinessAtRuntime,
 }));
 vi.mock("./mission-protocol-rollout", () => ({
   admissionMutationName: (kind: "mission" | "job") => kind === "mission" ? "missions:createV2" : "jobs:enqueueV2",
@@ -61,7 +65,24 @@ describe("dispatch_agent adaptive work policy", () => {
     mock.resolveProjectSourceAdmission.mockImplementation(async (repository?: string) =>
       repository ? jarvisAdmission : evidenceAdmission,
     );
+    mock.cloudProviderAdmissionReadinessAtRuntime.mockResolvedValue({ ready: true });
     mock.wakeAgentFleet.mockResolvedValue(true);
+  });
+
+  it("does not create a voice-started mission when the live worker proof is unavailable", async () => {
+    mock.cloudProviderAdmissionReadinessAtRuntime.mockResolvedValueOnce({
+      ready: false,
+      code: "missing_receipt",
+    });
+
+    await expect(executeTool("dispatch_agent", {
+      task: "Research the current provider choices and summarize the tradeoffs.",
+      agent_id: "atlas",
+    })).resolves.toContain("No mission, job, or Trigger worker was started");
+
+    expect(mock.resolveProjectSourceAdmission).not.toHaveBeenCalled();
+    expect(mock.convexMutation).not.toHaveBeenCalled();
+    expect(mock.wakeAgentFleet).not.toHaveBeenCalled();
   });
 
   it("persists the adaptive model and reasoning decision before waking a voice-started worker", async () => {
