@@ -7,6 +7,9 @@ const PCM_FRAME_BYTES = TARGET_SAMPLE_RATE / 10 * 2; // 100 ms, matching Sherpa'
 const CONNECT_TIMEOUT_MS = 2_500;
 const FINAL_TIMEOUT_MS = 900;
 const MAX_BUFFERED_AUDIO_BYTES = TARGET_SAMPLE_RATE * 2 * 5;
+const STREAMING_STT_CAPTURE_WORKLET = "jarvis-streaming-stt-capture";
+const STREAMING_STT_CAPTURE_WORKLET_URL = "/streaming-stt-capture.worklet.js";
+const captureWorkletLoads = new WeakMap<AudioContext, Promise<void>>();
 
 // A build-time opt-in keeps already deployed Jarvis instances on their proven
 // browser/recorded-audio path until the separate WSS host is actually ready.
@@ -22,6 +25,20 @@ export type SelfHostedStreamingSpeech = {
 
 function normalizedText(value: unknown): string {
   return typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+}
+
+function loadStreamingSttCaptureWorklet(context: AudioContext): Promise<void> {
+  const existing = captureWorkletLoads.get(context);
+  if (existing) return existing;
+  const load = context.audioWorklet.addModule(STREAMING_STT_CAPTURE_WORKLET_URL);
+  captureWorkletLoads.set(context, load);
+  // A transient module fetch failure must not poison a persistent microphone
+  // context: the next voice turn can retry the modern path before using the
+  // compatibility fallback.
+  void load.catch(() => {
+    if (captureWorkletLoads.get(context) === load) captureWorkletLoads.delete(context);
+  });
+  return load;
 }
 
 function pcm16(samples: Float32Array, inputRate: number): ArrayBuffer {
@@ -67,7 +84,7 @@ export function startSelfHostedStreamingSpeech(args: {
   onPartial: (text: string) => void;
 }): SelfHostedStreamingSpeech {
   let socket: WebSocket | null = null;
-  let processor: ScriptProcessorNode | null = null;
+  let capture: ScriptProcessorNode | AudioWorkletNode | null = null;
   let muted: GainNode | null = null;
   let stopped = false;
   let ended = false;
@@ -79,12 +96,22 @@ export function startSelfHostedStreamingSpeech(args: {
   let frameParts: ArrayBuffer[] = [];
   let frameBytes = 0;
   let started = false;
+  let awaitingWorkletFlush = false;
+  let finishWorkletFlush: (() => void) | null = null;
+  let flushWorkletCapture: (() => Promise<void>) | null = null;
 
   const detach = () => {
-    processor?.disconnect();
+    capture?.disconnect();
+    if (typeof AudioWorkletNode !== "undefined" && capture instanceof AudioWorkletNode) {
+      capture.port.onmessage = null;
+      capture.port.close();
+    }
     muted?.disconnect();
-    processor = null;
+    capture = null;
     muted = null;
+    awaitingWorkletFlush = false;
+    finishWorkletFlush = null;
+    flushWorkletCapture = null;
   };
   const settle = (text = "") => {
     if (stopped) return;
@@ -127,19 +154,83 @@ export function startSelfHostedStreamingSpeech(args: {
     if (frameBytes >= PCM_FRAME_BYTES) flushAudioFrame();
   };
 
-  // ScriptProcessor is supported in the browsers that support this app's
-  // existing MediaRecorder path. The muted destination keeps its callback
-  // alive without replaying microphone audio to the speaker.
-  processor = args.context.createScriptProcessor(2048, 1, 1);
+  // Keep the capture branch audible to Web Audio but silent to the listener.
+  // Both the worklet and the older ScriptProcessor fallback use this sink.
   muted = args.context.createGain();
   muted.gain.value = 0;
-  processor.onaudioprocess = (event) => {
-    if (stopped || ended) return;
-    sendAudio(pcm16(event.inputBuffer.getChannelData(0), args.context.sampleRate));
-  };
-  args.source.connect(processor);
-  processor.connect(muted);
   muted.connect(args.context.destination);
+
+  const connectLegacyCapture = () => {
+    if (stopped || ended || capture || !muted) return;
+    // ScriptProcessor remains only as a compatibility fallback for browsers
+    // without AudioWorklet. Its muted destination keeps the callback alive
+    // without replaying microphone audio to the speaker.
+    const processor = args.context.createScriptProcessor(2048, 1, 1);
+    processor.onaudioprocess = (event) => {
+      if (stopped || ended) return;
+      sendAudio(pcm16(event.inputBuffer.getChannelData(0), args.context.sampleRate));
+    };
+    capture = processor;
+    args.source.connect(processor);
+    processor.connect(muted);
+  };
+
+  const connectLowLatencyCapture = async (): Promise<boolean> => {
+    if (stopped || ended || capture || !muted) return false;
+    // AudioWorklet runs on the audio rendering thread rather than the busy
+    // UI thread. That removes visible-page jank from the microphone cadence
+    // while preserving the server's documented 100 ms PCM protocol.
+    if (!args.context.audioWorklet || typeof AudioWorkletNode === "undefined") return false;
+    try {
+      await loadStreamingSttCaptureWorklet(args.context);
+      if (stopped || ended || capture || !muted) return false;
+      const worklet = new AudioWorkletNode(args.context, STREAMING_STT_CAPTURE_WORKLET, {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        channelCount: 1,
+        channelCountMode: "explicit",
+      });
+      worklet.port.onmessage = (event: MessageEvent<unknown>) => {
+        if (event.data instanceof ArrayBuffer) {
+          // A final worklet flush is allowed to deliver its last partial frame
+          // after `finish()` has stopped partial transcript updates.
+          if (stopped || (ended && !awaitingWorkletFlush)) return;
+          sendAudio(event.data);
+          return;
+        }
+        if (
+          typeof event.data === "object"
+          && event.data !== null
+          && (event.data as { type?: unknown }).type === "flushed"
+        ) {
+          finishWorkletFlush?.();
+        }
+      };
+      flushWorkletCapture = () => new Promise<void>((resolve) => {
+        const timeout = window.setTimeout(() => {
+          if (finishWorkletFlush === finish) finishWorkletFlush = null;
+          resolve();
+        }, 120);
+        const finish = () => {
+          window.clearTimeout(timeout);
+          if (finishWorkletFlush === finish) finishWorkletFlush = null;
+          resolve();
+        };
+        finishWorkletFlush = finish;
+        worklet.port.postMessage({ type: "flush" });
+      });
+      capture = worklet;
+      args.source.connect(worklet);
+      worklet.connect(muted);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  void connectLowLatencyCapture().then((connected) => {
+    if (!connected) connectLegacyCapture();
+  });
 
   void ticket().then((issued) => {
     if (!issued || stopped) return settle();
@@ -193,6 +284,9 @@ export function startSelfHostedStreamingSpeech(args: {
       // Never make an existing voice turn wait on a host that is absent, cold,
       // or still opening. The recorded-audio path remains immediately eligible.
       if (!started) return "";
+      awaitingWorkletFlush = true;
+      await flushWorkletCapture?.();
+      awaitingWorkletFlush = false;
       flushAudioFrame();
       if (started && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "end" }));
       const timeout = new Promise<string>((resolve) => window.setTimeout(() => resolve(""), FINAL_TIMEOUT_MS));

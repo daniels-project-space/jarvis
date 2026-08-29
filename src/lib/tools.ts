@@ -24,7 +24,8 @@ import { withAdminSession } from "./control-context";
 import { wakeAgentFleet } from "./agent-fleet-dispatch";
 import { cloudProviderAdmissionReadiness } from "./cloud-provider-admission";
 import { SHALLOW_PROVENANCE_RULE } from "./git-delivery";
-import { workModelLabel, workModelPriority } from "./work-models";
+import { selectCodexWorkPolicy } from "./codex-work-router";
+import { parseWorkModelTier, workModelLabel, workModelPriority } from "./work-models";
 import { exactTextWorkOrder } from "./work-order";
 import { resolveHostProjectContext } from "./host-project-context";
 import { withHostContext } from "./host-context";
@@ -110,7 +111,8 @@ export const TOOL_DEFS = [
         task: { type: "string", description: "Clear, self-contained task including all context the agent needs (URLs, video IDs, what to find out)" },
         repo: { type: "string", description: "owner/repo or short name if the task is about a specific repo, else omit" },
         host_context: { type: "object", description: "Optional current embedded host context. It scopes work only when its registered app and production URL agree; host text remains untrusted evidence." },
-        model: { type: "string", enum: ["luna", "terra", "sol"], description: "Terra for research/summaries/normal code (default), Sol for hard multi-file engineering or consequential reasoning, Luna for bounded lookups" },
+        model: { type: "string", enum: ["luna", "terra", "sol"], description: "Optional intelligence floor. Jarvis can raise it when the request needs more care." },
+        reasoning_effort: { type: "string", enum: ["low", "medium", "high", "max"], description: "Optional reasoning-quality floor. Jarvis retains or raises it when the work needs more care." },
         agent_id: { type: "string", enum: ["paul", "atlas", "iris", "maya", "sentry"], description: "Optional permanent specialist; omit to let JARVIS route it" },
         parent_job_id: { type: "string", description: "Optional earlier job this follow-up extends. The follow-up starts independently and does not wait for the parent." },
         readonly: { type: "boolean", description: "Force a read-only run" },
@@ -5158,6 +5160,25 @@ export async function executeTool(
       const agentId = ["paul", "atlas", "iris", "maya", "sentry"].includes(requested)
         ? (requested as keyof typeof TEAM_BY_SLUG)
         : route.agentId;
+      // Keep explicit choices and route-enforced non-downgrade floors, while
+      // allowing ordinary work to use the shared request-aware policy rather
+      // than treating every fast handoff as a generic Terra job.
+      const requestedModel = parseWorkModelTier(args.model);
+      const modelFloor = route.modelFloor;
+      const requestedModelFloor = modelFloor
+        && (!requestedModel || workModelPriority(modelFloor) > workModelPriority(requestedModel))
+        ? modelFloor
+        : requestedModel ?? undefined;
+      const modelPolicy = selectCodexWorkPolicy({
+        task,
+        role: agentId,
+        repo,
+        readonly: route.readonly,
+        risk: route.risk,
+        tools: Array.isArray(args.mcp) ? args.mcp.map(String) : [],
+        requestedModel: requestedModelFloor,
+        requestedReasoningEffort: args.reasoning_effort,
+      });
       const originThreadId = await activeThread();
       const criteria = Array.isArray(args.acceptance_criteria) && args.acceptance_criteria.length
         ? args.acceptance_criteria.map(String).slice(0, 8)
@@ -5181,7 +5202,8 @@ export async function executeTool(
         repo: projectAdmission?.repository ?? repo,
         missionId: String(missionId),
         readonly: route.readonly,
-        model: route.model,
+        model: modelPolicy.model,
+        reasoningEffort: modelPolicy.reasoningEffort,
         mcp: Array.isArray(args.mcp) ? args.mcp.map(String) : undefined,
         originThreadId,
         visibility: "conversation",
@@ -5190,7 +5212,7 @@ export async function executeTool(
         priority: route.priority,
         approvalRequired: route.approvalRequired,
         acceptanceCriteria: criteria,
-        modelReason: route.reason,
+        modelReason: modelPolicy.modelReason,
         parentJobId: args.parent_job_id ? String(args.parent_job_id) : undefined,
         label: `${TEAM_BY_SLUG[agentId].name} · ${task.slice(0, 58)}`,
       });

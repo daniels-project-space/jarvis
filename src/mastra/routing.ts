@@ -6,6 +6,8 @@ import { isBoundedNovitaPatchTask } from "../lib/novita-patch-proposer-attestati
 export type WorkRoute = {
   agentId: AgentSlug;
   model: ModelTier;
+  /** A non-downgrade quality floor distinct from the ordinary adaptive tier. */
+  modelFloor?: ModelTier;
   risk: WorkRisk;
   readonly: boolean;
   approvalRequired: boolean;
@@ -48,13 +50,18 @@ export function routeWork(task: string, options?: { repo?: string; requestedMode
   // Never allow an explicit cheap tier to silently reduce high-risk or hard
   // engineering quality; Daniel's workspace standard prioritizes correctness.
   if ((hard || isConsequential) && model !== "sol") model = "sol";
+  const modelFloor: ModelTier | undefined = hard || isConsequential
+    ? "sol"
+    : boundedOwnedCodePatch
+      ? "terra"
+      : undefined;
 
   const readonly = options?.readonly ?? (agentId === "atlas" || isConsequential);
   const risk: WorkRisk = isConsequential ? "consequential" : hard ? "high" : boundedOwnedCodePatch ? "low" : agentId === "paul" ? "medium" : "low";
   const approvalRequired = isConsequential;
   const priority = Math.min(100, 45 + (hard ? 25 : 0) + (isConsequential ? 20 : 0) + (operations.test(text) ? 10 : 0));
   const reason = `${agentId} matches ${agentId === "paul" ? "engineering" : agentId === "maya" ? "travel" : agentId === "iris" ? "creative" : agentId === "sentry" ? "operations/review" : "research/strategy"}; ${model} selected for ${hard ? "complex" : easy ? "bounded" : "normal"} work${approvalRequired ? "; execution waits for explicit approval" : ""}`;
-  return { agentId, model, risk, readonly, approvalRequired, priority, reason };
+  return { agentId, model, modelFloor, risk, readonly, approvalRequired, priority, reason };
 }
 
 export function suggestedAcceptanceCriteria(task: string, route: WorkRoute): string[] {

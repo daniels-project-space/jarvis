@@ -79,6 +79,7 @@ describe("routeWork", () => {
     })).toMatchObject({
       agentId: "paul",
       model: "terra",
+      modelFloor: "terra",
       risk: "low",
       readonly: false,
       approvalRequired: false,
