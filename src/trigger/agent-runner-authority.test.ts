@@ -8,6 +8,7 @@ import type { Id } from "../../convex/_generated/dataModel";
 import schema from "../../convex/schema";
 import { testMissionAdmission } from "../../convex/testSourceAdmission";
 import { workGroupAuthority } from "../lib/work-scheduler";
+import { WORK_ORDER_MACHINE_TEMPLATE } from "../lib/work-order-revision";
 import { canonicalWorkspaceCheckpoint } from "../lib/workspace-checkpoint";
 import { CloudWorkspaceError, type CloudWorkspace } from "./cloud-workspace";
 import type { CloudWorkspaceCleanupProvider } from "./cloud-workspace-providers";
@@ -552,6 +553,7 @@ afterEach(() => {
   delete process.env.JARVIS_MISSION_SUPERVISOR_ROLLOUT;
   delete process.env.GITHUB_TOKEN;
   delete process.env.JARVIS_GIT_REVIEW_RECEIPT_KEYRING;
+  delete process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE;
   vi.unstubAllGlobals();
 });
 
@@ -1208,6 +1210,7 @@ describe("production Trigger worker authority harness", () => {
 
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {
     configureFakeControllerAuthority();
+    process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE = "node22";
     const t = convexTest(schema, modules);
     const { jobId, reservation } = await reservedWritableJob(
       t,
@@ -1230,6 +1233,15 @@ describe("production Trigger worker authority harness", () => {
     expect(specialist).toEqual({ processed: 1 });
     expect(specialistDependencies.runCloudWorkspaceAgent).toHaveBeenCalledWith(
       expect.objectContaining({ reasoningEffort: "max" }),
+    );
+    expect(specialistDependencies.prepareCloudWorkspaceExecution).toHaveBeenCalledWith(
+      expect.objectContaining({ template: "node22" }),
+    );
+    expect(specialistBridge.trace.filter((call) =>
+      call.path === "jobs:bindCloudWorkspace" || call.path === "jobs:cloudCheckpointForReplay",
+    ).every((call) => call.args.template === WORK_ORDER_MACHINE_TEMPLATE)).toBe(true);
+    expect(specialistDependencies.persistPortableCheckpoint).toHaveBeenCalledWith(
+      expect.objectContaining({ template: WORK_ORDER_MACHINE_TEMPLATE }),
     );
     const sealed = await t.run(async (ctx) => ({
       job: await ctx.db.get(jobId),

@@ -124,6 +124,7 @@ import type {
   TriggerAgentMachinePreset,
   TriggerAgentMachineReason,
 } from "../lib/trigger-machine";
+import { WORK_ORDER_MACHINE_TEMPLATE } from "../lib/work-order-revision";
 import { createR2CheckpointStore } from "./cloud-checkpoint-r2";
 import {
   configuredCloudWorkspaceCleanupProvider,
@@ -2365,7 +2366,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const lockfileDigest = repoDir && existsSync(join(repoDir, "package-lock.json"))
           ? sha256Bytes(readFileSync(join(repoDir, "package-lock.json")))
           : sha256Bytes("no-lockfile");
-        const workspaceTemplate = String(process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? DEFAULT_CLOUD_WORKSPACE_TEMPLATE);
+        // The provider's actual template is independently attested (Vercel's
+        // stock `node22`). The durable work-order template additionally names
+        // the pinned Codex runtime, so never use one value for both fences.
+        const providerWorkspaceTemplate = String(
+          process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE ?? DEFAULT_CLOUD_WORKSPACE_TEMPLATE,
+        );
+        const workOrderTemplate = WORK_ORDER_MACHINE_TEMPLATE;
         await reportPreparationStage("checkpoint store", "acquiring scoped checkpoint store", 5);
         const checkpointStore = await createR2CheckpointStore();
         const workspaceBaseSha = baseSha || sha256Bytes(String(job.jobId));
@@ -2389,7 +2396,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           providerName: workspace.provider, providerWorkspaceId: workspace.providerWorkspaceId,
           providerSessionId: workspace.providerSessionId,
           baseSha: workspaceBaseSha, runtime: workspaceRuntime, lockfileDigest,
-          template: workspaceTemplate, sourceArchiveDigest: sourceArchive.sha256,
+          template: workOrderTemplate, sourceArchiveDigest: sourceArchive.sha256,
           sourceArchiveBytes: sourceArchive.bytes.byteLength,
         }).catch(() => false));
         const recordReplayDecision = async (disposition: "replay" | "hydrate" | "reject", reason: string) => {
@@ -2401,7 +2408,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const replayDecision: any = await convexQuery("jobs:cloudCheckpointForReplay", {
           jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), authorityDigest,
           providerName: cloudProvider.name, baseSha: workspaceBaseSha, runtime: workspaceRuntime,
-          lockfileDigest, template: workspaceTemplate, sourceArchiveDigest: sourceArchive.sha256,
+          lockfileDigest, template: workOrderTemplate, sourceArchiveDigest: sourceArchive.sha256,
           sourceArchiveBytes: sourceArchive.bytes.byteLength,
         });
         if (!replayDecision || replayDecision.disposition === "reject") {
@@ -2417,7 +2424,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               current: {
                 jobId: String(job.jobId), attempt: expectedAttempt, baseSha: workspaceBaseSha,
                 sourceArchiveSha256: sourceArchive.sha256, sourceArchiveBytes: sourceArchive.bytes.byteLength,
-                runtime: workspaceRuntime, lockfileDigest, template: workspaceTemplate, attemptKey,
+                runtime: workspaceRuntime, lockfileDigest, template: workOrderTemplate, attemptKey,
               },
               assertCurrent: assertCurrentWorkspace,
               bindWorkspace: bindCloudWorkspace,
@@ -2442,7 +2449,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           const preparedWorkspace = await prepareCloudWorkspaceExecution({
             providerFactory: () => cloudProvider,
             hydrateArchive: async () => sourceArchive,
-            attemptKey, template: workspaceTemplate, runtime: workspaceRuntime, lockfileDigest,
+            attemptKey, template: providerWorkspaceTemplate, runtime: workspaceRuntime, lockfileDigest,
             bindWorkspace: bindCloudWorkspace,
             assertCurrent: assertCurrentWorkspace,
             onStage: async (stage) => {
@@ -2559,7 +2566,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           sourceArchiveBytes: sourceArchive.bytes.byteLength,
           runtime: workspaceRuntime,
           lockfileDigest,
-          template: workspaceTemplate,
+          template: workOrderTemplate,
           attemptKey: `${String(job.jobId)}:${expectedAttempt}`,
           causationId: `${String(job.workerRunId)}:${expectedAttempt}`,
           assertCurrent: assertCurrentWorkspace,
