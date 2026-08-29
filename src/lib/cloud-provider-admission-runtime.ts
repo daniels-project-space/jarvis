@@ -9,6 +9,8 @@ const PROOF_VARIABLES = [
   "JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID",
   "JARVIS_CLOUD_PROVIDER_PROBE_RECEIPT",
 ] as const;
+const TRIGGER_PROJECT_REF = process.env.TRIGGER_PROJECT_REF_JARVIS ?? "proj_wjwbdgeipgpddvrazxnp";
+const TRIGGER_PRODUCTION_ENVIRONMENT = "prod";
 
 type StoredEnvironmentVariable = Readonly<{ name: string; value: string; isSecret: boolean }>;
 
@@ -34,7 +36,10 @@ export async function cloudProviderAdmissionReadinessAtRuntime(
 ): Promise<CloudProviderAdmissionReadiness> {
   const dependencies: RuntimeDependencies = {
     environment: process.env,
-    retrieve: async (name) => await envvars.retrieve(name),
+    // Vercel has no Trigger task context, so this must use the explicit
+    // project/environment overload. The SDK then authenticates with the
+    // server-only TRIGGER_SECRET_KEY already used by owner control routes.
+    retrieve: async (name) => await envvars.retrieve(TRIGGER_PROJECT_REF, TRIGGER_PRODUCTION_ENVIRONMENT, name),
     ...overrides,
   };
   try {
