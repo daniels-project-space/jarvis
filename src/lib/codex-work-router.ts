@@ -75,6 +75,10 @@ const UNCERTAIN = /\b(unknown|unclear|ambiguous|intermittent|novel|exploratory|i
 const CERTAIN = /\b(deterministic|exact|known|mechanical|typo|rename|contract[- ]defined|reproduce the supplied|fixed fixture)\b/i;
 const LONG = /\b(long[- ]running|multi[- ]hour|hours|days|multi[- ]day|end[- ]to[- ]end|cross[- ]project|multi[- ]repo|overhaul)\b/i;
 const SHORT = /\b(quick|brief|bounded|one[- ]file|single[- ]file|small|routine|deterministic|mechanical)\b/i;
+// Luna is a true reflex path, not an inferred cost-saving default. A caller
+// must explicitly ask for a latency-sensitive response, and every other
+// low-risk/read-only constraint still has to hold below.
+const EXPLICIT_LOW_LATENCY = /\b(low[- ]latency|latency[- ]sensitive|instant(?:aneous)? response|real[- ]time reflex|fast reflex)\b/i;
 const SECURITY = /\b(security|privacy|authentication|authorization|permissions?|credentials?|secrets?|tenant isolation|customer data|personal data|pii|payment)\b/i;
 const PRODUCTION = /\b(production|live|deploy|release|customer-facing|user data|data loss|outage|incident)\b/i;
 const BROAD_TOOLS = /\b(browser|playwright|provider|production logs?|web search|multiple repositories|cross[- ]project|multi[- ]repo)\b/i;
@@ -244,12 +248,14 @@ export function selectCodexWorkPolicy(input: CodexWorkPolicyInput): CodexWorkSel
   const exactCheapReflex = readonly
     && complexity === "bounded"
     && uncertainty === "low"
+    && productionRisk === "low"
     && expectedDuration === "short"
     && toolBreadth === "narrow"
+    && EXPLICIT_LOW_LATENCY.test(task)
     && (workType === "research" || workType === "verification" || workType === "synthesis");
-  // Terra is the normal durable-work choice. Luna is deliberately restricted
-  // to short, read-only, deterministic reflexes; difficult work gets more
-  // Terra reasoning rather than jumping straight to Sol.
+  // Terra/xhigh is the ordinary durable-work default. Luna is deliberately
+  // restricted to explicitly latency-sensitive, short read-only reflexes;
+  // difficult work gets more Terra reasoning rather than jumping to Sol.
   let model: WorkModelTier = exactCheapReflex ? "luna" : "terra";
   const requiresSolMax = productionRisk === "critical" || (SECURITY.test(task) && productionRisk === "high");
   if (requiresSolMax) {

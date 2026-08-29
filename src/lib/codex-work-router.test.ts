@@ -216,6 +216,31 @@ describe("adaptive Codex work policy", () => {
     })).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
   });
 
+  it("keeps even a low-risk bounded reflex on Terra unless low latency is explicit", () => {
+    const reflex = {
+      task: "Research the exact fixed fixture and summarize one verified fact",
+      role: "atlas",
+      readonly: true,
+      workType: "research" as const,
+      complexity: "bounded" as const,
+      uncertainty: "low" as const,
+      productionRisk: "low" as const,
+      expectedDuration: "short" as const,
+      toolBreadth: "narrow" as const,
+    };
+    expect(selectCodexWorkPolicy(reflex)).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
+    expect(selectCodexWorkPolicy({
+      ...reflex,
+      task: "Low-latency: research the exact fixed fixture and summarize one verified fact",
+    })).toMatchObject({ model: "luna", reasoningEffort: "medium" });
+    expect(selectCodexWorkPolicy({
+      ...reflex,
+      task: "Low-latency: verify the current production release status",
+      workType: "verification",
+      productionRisk: "high",
+    })).toMatchObject({ model: "terra", reasoningEffort: "xhigh" });
+  });
+
   it("keeps emphatic quality language on Terra ultra unless Sol/max is explicit", () => {
     expect(selectCodexWorkPolicy({
       task: "Think really hard and produce the highest quality architecture recommendation",
