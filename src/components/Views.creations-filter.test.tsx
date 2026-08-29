@@ -24,6 +24,13 @@ describe("CreationsView category filters", () => {
     expect(markup).toContain("Clear documents filter");
   });
 
+  it("honors the focused search supplied by the orb result's Show action", () => {
+    const markup = renderToStaticMarkup(<CreationsView value={JSON.stringify({ folder: "Library / General", search: "brief" })} />);
+
+    expect(markup).toContain("Project brief");
+    expect(markup).not.toContain("Campaign image");
+  });
+
   it("recomputes the visible rows when the Documents category is cleared", () => {
     const rows: CreationRow[] = [
       { _id: "doc-1", kind: "doc", title: "Project brief", category: "documents", folder: "Library / General", updatedAt: 1 },

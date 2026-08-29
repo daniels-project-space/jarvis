@@ -151,6 +151,41 @@ export function workMapActiveJobCount(snapshot: CompactWorkSnapshot) {
   return new Set(relevantNodes(snapshot).map((node) => node.jobId)).size;
 }
 
+function mapContextTerms(context: string) {
+  return [...new Set(
+    (context.toLowerCase().match(/[a-z0-9][a-z0-9-]{1,}/g) ?? [])
+      .filter((term) => term.length > 2),
+  )].slice(0, 10);
+}
+
+/**
+ * The orbit is an orienting aid, not a second dashboard. Select only a few
+ * branches adjacent to the current turn, then let the user expand one real
+ * folder/project tile into an existing detailed surface.
+ */
+export function selectContextualWorkMapCategories(
+  categories: WorkMapCategory[],
+  context: string | undefined,
+  limit = 3,
+): WorkMapCategory[] {
+  const terms = mapContextTerms(context ?? "");
+  const scored = categories.map((category, index) => {
+    const corpus = [category.label, category.detail, ...category.branches.flatMap((branch) => [branch.label, branch.detail])]
+      .join(" ")
+      .toLowerCase();
+    const matches = terms.reduce((total, term) => total + (corpus.includes(term) ? 1 : 0), 0);
+    const working = category.branches.some((branch) => branch.working || branch.children.some((child) => child.working)) ? 1 : 0;
+    // General remains available when there is no meaningful conversational
+    // context, but it does not displace a directly relevant working project.
+    const general = category.id === "general" ? 1 : 0;
+    return { category, index, score: matches * 100 + working * 14 + general };
+  });
+  return scored
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, Math.max(1, Math.min(4, Math.floor(limit))))
+    .map(({ category }) => category);
+}
+
 /** The topology yields to every stage surface that would compete for attention. */
 export function shouldHideWorkMap(input: WorkMapVisibilityInput) {
   return input.chatMode === "full"

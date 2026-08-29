@@ -2038,7 +2038,7 @@ export function filterCreationRows(
 }
 
 export function CreationsView({ value }: { value: string }) {
-  let filter: { kind?: string | null; category?: string | null; folder?: string | null } = { kind: null, category: null, folder: null };
+  let filter: { kind?: string | null; category?: string | null; folder?: string | null; search?: string } = { kind: null, category: null, folder: null };
   try {
     filter = JSON.parse(value);
   } catch {
@@ -2047,7 +2047,7 @@ export function CreationsView({ value }: { value: string }) {
   const [kind, setKind] = useState<string | null>(filter.kind ?? null);
   const [category, setCategory] = useState<string | null>(filter.category ?? null);
   const [folder, setFolder] = useState<string | null>(filter.folder ?? null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(filter.search ?? "");
   const [editing, setEditing] = useState<{ id: string; title: string; folder: string } | null>(null);
   const queriedRows = useJarvisQuery(api.creations.list, { limit: 100 }) as CreationRow[] | undefined;
   const rows = useMemo(() => queriedRows ?? [], [queriedRows]);

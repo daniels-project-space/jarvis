@@ -54,7 +54,7 @@ async function openWorkMapFromKeyboard(page: Page) {
   });
   await page.keyboard.press("Enter");
 
-  const close = page.getByRole("button", { name: "Close Jarvis work map" });
+  const close = page.getByRole("button", { name: "Close contextual Jarvis work map" });
   await expect(close).toBeFocused();
   await expect(page.locator("[data-work-map]")).toBeVisible();
   expect((await summary).status()).toBe(200);
@@ -81,7 +81,7 @@ test.describe("work map bubble fixture", () => {
     expect(unsafeRequests).toEqual([]);
   });
 
-  test("keeps every mobile category collision-free and anchored when motion is reduced", async ({ page }, testInfo) => {
+  test("keeps the small contextual dot set collision-free and anchored when motion is reduced", async ({ page }, testInfo) => {
     const unsafeRequests = await fenceFixtureTraffic(page);
 
     await page.emulateMedia({ reducedMotion: "reduce" });
@@ -120,8 +120,8 @@ test.describe("work map bubble fixture", () => {
         };
       });
 
-      expect(layout.categories).toHaveLength(6);
-      expect(new Set(layout.categories.map((category) => category.id)).size).toBe(6);
+      expect(layout.categories).toHaveLength(3);
+      expect(new Set(layout.categories.map((category) => category.id)).size).toBe(3);
       expect(layout.map.left + layout.map.width / 2).toBeCloseTo(width / 2, 1);
       expect(layout.map.top + layout.map.height / 2).toBeCloseTo(height / 2, 1);
       expect(layout.pulseAnimations).not.toHaveLength(0);

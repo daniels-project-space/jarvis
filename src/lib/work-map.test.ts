@@ -4,6 +4,7 @@ import {
   buildWorkMap,
   isWorkMapNodeWorking,
   shouldHideWorkMap,
+  selectContextualWorkMapCategories,
   workMapActiveJobCount,
   workMapPosition,
   WORK_MAP_MAX_LEAVES,
@@ -133,6 +134,19 @@ describe("work map projection", () => {
         expect(point.y).toBeLessThan(66);
       }
     }
+  });
+
+  it("shows only the small set of categories adjacent to the current turn", () => {
+    const map = buildWorkMap(snapshot([
+      node({ jobId: "marketing", label: "Plan marketing launch", state: "queued" }),
+      node({ jobId: "research", label: "Research studio references", state: "running" }),
+      node({ jobId: "operations", label: "Deploy release", state: "queued" }),
+    ]), { documentCount: 4 });
+
+    const contextual = selectContextualWorkMapCategories(map, "find the studio research project", 2);
+    expect(contextual).toHaveLength(2);
+    expect(contextual[0]?.id).toBe("research");
+    expect(contextual.map((category) => category.id)).not.toContain("marketing");
   });
 
   it.each([375, 390, 540])("keeps all root chips separate in a %ipx phone viewport", (viewportWidth) => {

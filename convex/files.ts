@@ -602,6 +602,24 @@ export const listLibrary = query({
   },
 });
 
+// The orb palette searches the complete owner-visible private library through
+// Convex's metadata index. It returns only the same display-safe fields as the
+// ordinary library; R2 coordinates and extraction contents stay server-side.
+export const quickSearchLibrary = query({
+  args: { search: v.string(), limit: v.optional(v.number()), ...viewerAuthArgs },
+  handler: async (ctx, args) => {
+    await requireViewer(ctx, args);
+    const search = args.search.trim().slice(0, 160);
+    if (search.length < 2) return [];
+    const limit = Math.min(12, Math.max(1, Math.floor(args.limit ?? 8)));
+    const rows = await ctx.db
+      .query("files")
+      .withSearchIndex("search_metadata", (q) => q.search("searchText", search).eq("libraryVisible", true))
+      .take(limit);
+    return rows.map(publicFile);
+  },
+});
+
 export const paginatedLibrary = query({
   args: {
     paginationOpts: paginationOptsValidator,

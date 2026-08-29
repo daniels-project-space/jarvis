@@ -12,6 +12,7 @@ import {
   type WorkMapTodoSummary,
   workMapActiveJobCount,
   workMapPosition,
+  selectContextualWorkMapCategories,
 } from "@/lib/work-map";
 
 type WorkMapRequest = {
@@ -52,10 +53,6 @@ function categoryWorking(category: WorkMapCategory) {
   return category.branches.some(branchWorking);
 }
 
-function categoryVisibleCount(category: WorkMapCategory) {
-  return category.branches.reduce((count, branch) => count + (branch.children.length || 1), 0);
-}
-
 function actionLabel(action: WorkMapLeaf["action"]) {
   if (action === "documents") return "Open documents";
   if (action === "todos") return "Open to-do list";
@@ -69,6 +66,7 @@ export function WorkMapBubble({
   owner,
   reduceMotion = false,
   initialOpen = false,
+  contextText,
   onOpenChangeAction,
   onOpenDocumentsAction,
   onOpenTodosAction,
@@ -81,6 +79,7 @@ export function WorkMapBubble({
   owner: boolean;
   reduceMotion?: boolean;
   initialOpen?: boolean;
+  contextText?: string;
   onOpenChangeAction?: (open: boolean) => void;
   onOpenDocumentsAction: () => void;
   onOpenTodosAction: (items: WorkMapTodoItem[]) => void;
@@ -96,6 +95,10 @@ export function WorkMapBubble({
   const categories = useMemo(
     () => buildWorkMap(snapshot, { documentCount, todos }),
     [documentCount, snapshot, todos],
+  );
+  const orbitCategories = useMemo(
+    () => selectContextualWorkMapCategories(categories, contextText, 3),
+    [categories, contextText],
   );
   const expandedCategory = categories.find((category) => category.id === expandedCategoryId) ?? null;
   const expandedBranch = expandedCategory?.branches.find((branch) => branch.id === expandedBranchId) ?? null;
@@ -180,27 +183,28 @@ export function WorkMapBubble({
         aria-expanded="false"
         aria-label={`Open Jarvis work map${activeCount ? `, ${activeCount} active worker ${activeCount === 1 ? "task" : "tasks"}` : ""}`}
         onClick={openMap}
-        className="work-map-trigger glass absolute left-1/2 top-[68%] z-30 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full !border-cyan/25 bg-[#071019]/88 px-2.5 py-1.5 text-left shadow-[0_8px_24px_rgba(0,0,0,.3)] transition hover:-translate-y-px hover:!border-cyan/55 motion-reduce:hover:translate-y-0 motion-reduce:transition-none sm:left-auto sm:right-[calc(50%-184px)] sm:top-[61%] sm:translate-x-0"
+        className="work-map-trigger glass absolute left-1/2 top-[68%] z-30 inline-flex h-8 w-8 -translate-x-1/2 items-center justify-center rounded-full !border-cyan/25 bg-[#071019]/88 shadow-[0_8px_24px_rgba(0,0,0,.3)] transition hover:-translate-y-px hover:!border-cyan/55 motion-reduce:hover:translate-y-0 motion-reduce:transition-none sm:left-auto sm:right-[calc(50%-184px)] sm:top-[61%] sm:translate-x-0"
       >
         <span className={`work-map-trigger-dot ${activeCount ? "work-map-pulse" : ""}`} aria-hidden="true" />
-        <span className="font-mono text-[8px] uppercase tracking-[0.12em] text-cyan">work map</span>
-        {activeCount > 0 && <span className="font-mono text-[8px] text-ice">{activeCount}</span>}
+        <span className="h-1 w-1 rounded-full bg-cyan/65" aria-hidden="true" />
+        <span className="h-1 w-1 rounded-full bg-cyan/35" aria-hidden="true" />
       </button>
     );
   }
 
-  const visibleCount = expandedCategory ? categoryVisibleCount(expandedCategory) : 0;
+  const tileBranches = expandedCategory?.branches.slice(0, 2) ?? [];
+  const visibleCount = expandedCategory ? tileBranches.reduce((count, branch) => count + (branch.children.length || 1), 0) : 0;
   const overflowCount = expandedCategory ? Math.max(0, expandedCategory.workCount - visibleCount) : 0;
   return (
     <section
       data-work-map
       id="jarvis-work-map"
       aria-label="Jarvis work map"
-      className={`work-map-surface pointer-events-auto absolute left-1/2 top-1/2 z-30 h-[min(510px,76vh)] w-[min(820px,calc(100%-12px))] -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-[28px] bg-[radial-gradient(ellipse_at_50%_50%,rgba(6,16,24,.12),rgba(6,16,24,.05)_46%,transparent_78%)] motion-reduce:transition-none sm:w-[min(820px,calc(100%-28px))] ${reduceMotion ? "work-map-static" : ""}`}
+      className={`work-map-surface pointer-events-auto absolute left-1/2 top-1/2 z-30 h-[min(420px,68vh)] w-[min(680px,calc(100%-12px))] -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-[28px] bg-[radial-gradient(ellipse_at_50%_50%,rgba(6,16,24,.12),rgba(6,16,24,.05)_46%,transparent_78%)] motion-reduce:transition-none sm:w-[min(680px,calc(100%-28px))] ${reduceMotion ? "work-map-static" : ""}`}
     >
       <svg aria-hidden="true" viewBox="0 0 100 100" preserveAspectRatio="none" className="pointer-events-none absolute inset-0 h-full w-full overflow-visible">
-        {categories.map((category, index) => {
-          const point = workMapPosition(index, categories.length);
+        {orbitCategories.map((category, index) => {
+          const point = workMapPosition(index, orbitCategories.length);
           const active = categoryWorking(category);
           return <g key={category.id}>
             <line className={active ? "work-map-live-line" : "work-map-line"} x1="50" y1="50" x2={point.x} y2={point.y} />
@@ -209,18 +213,17 @@ export function WorkMapBubble({
         })}
       </svg>
 
-      <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 grid h-[102px] w-[102px] -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border border-cyan/35 bg-cyan/[0.02] text-center shadow-[0_0_42px_rgba(34,211,238,.13)]">
-        <div><div className="font-mono text-[9px] uppercase tracking-[0.22em] text-cyan">Jarvis</div><div className="mt-1 text-[10px] text-ice">work map</div></div>
+      <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 grid h-[86px] w-[86px] -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border border-cyan/35 bg-cyan/[0.02] text-center shadow-[0_0_42px_rgba(34,211,238,.13)]">
+        <div className="grid grid-cols-3 gap-1.5" aria-hidden="true"><span className="h-1 w-1 rounded-full bg-cyan/80" /><span className="h-1 w-1 rounded-full bg-cyan/45" /><span className="h-1 w-1 rounded-full bg-cyan/65" /></div>
       </div>
 
-      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between px-4 py-3">
-        <div className="min-w-0"><div className="font-mono text-[8px] uppercase tracking-[0.18em] text-cyan">Live work topology</div><p className="mt-0.5 truncate text-[10px] text-slate">Open one branch at a time</p></div>
-        <button ref={closeButtonRef} type="button" onClick={() => close()} className="rounded-full border border-white/10 px-2.5 py-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate transition hover:border-cyan/45 hover:text-cyan" aria-label="Close Jarvis work map">close</button>
+      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-end px-3 py-3">
+        <button ref={closeButtonRef} type="button" onClick={() => close()} className="grid h-7 w-7 place-items-center rounded-full border border-white/10 font-mono text-[11px] text-slate transition hover:border-cyan/45 hover:text-cyan" aria-label="Close contextual Jarvis work map">×</button>
       </header>
 
       <div className="absolute inset-0 z-10" aria-live="off">
-        {categories.map((category, index) => {
-          const point = workMapPosition(index, categories.length);
+        {orbitCategories.map((category, index) => {
+          const point = workMapPosition(index, orbitCategories.length);
           const selected = expandedCategoryId === category.id;
           const active = categoryWorking(category);
           return <button
@@ -234,12 +237,12 @@ export function WorkMapBubble({
               setExpandedBranchId(null);
             }}
             style={{ left: `${point.x}%`, top: `${point.y}%` }}
-            className={`work-map-category absolute w-[min(98px,24vw)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border px-2 py-2 text-left transition-[background,border-color,box-shadow,transform] duration-300 motion-reduce:transition-none sm:w-[min(136px,28vw)] sm:px-2.5 ${
-              selected ? "border-cyan/70 bg-cyan/[0.13] shadow-[0_0_22px_rgba(34,211,238,.18)]" : "border-white/10 bg-[#08131d]/86 hover:border-cyan/40 hover:bg-[#0b1b28]/94"
+            className={`work-map-category absolute grid h-5 w-5 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border transition-[background,border-color,box-shadow,transform] duration-300 motion-reduce:transition-none ${
+              selected ? "scale-125 border-cyan/80 bg-cyan/30 shadow-[0_0_22px_rgba(34,211,238,.42)]" : "border-cyan/40 bg-[#08131d]/95 hover:scale-125 hover:border-cyan/80 hover:bg-cyan/20"
             }`}
           >
-            <span className="flex min-w-0 items-center gap-1.5"><span className={`work-map-state-dot ${active ? "work-map-pulse" : ""}`} aria-hidden="true" /><span className="truncate font-mono text-[9px] uppercase tracking-[0.11em] text-ice">{category.label}</span></span>
-            <span className="mt-1 block truncate text-[8px] text-slate">{category.workCount ? `${category.workCount} worker ${category.workCount === 1 ? "task" : "tasks"}` : category.detail}</span>
+            <span className={`work-map-state-dot ${active ? "work-map-pulse" : ""}`} aria-hidden="true" />
+            <span className="sr-only">Open {category.label}</span>
           </button>;
         })}
       </div>
@@ -249,11 +252,11 @@ export function WorkMapBubble({
           id="jarvis-work-map-branch"
           data-work-map-branch={expandedCategory.id}
           aria-label={`${expandedCategory.label} branch`}
-          className="work-map-branch absolute inset-x-3 bottom-3 z-20 max-h-[34%] overflow-y-auto rounded-2xl border border-white/10 bg-[#07131e]/95 p-2.5 shadow-[0_12px_44px_rgba(0,0,0,.38)] sm:inset-x-[12%] sm:max-h-[42%]"
+          className="work-map-branch absolute inset-x-5 bottom-4 z-20 max-h-[42%] overflow-y-auto rounded-2xl border border-cyan/20 bg-[#07131e]/95 p-2.5 shadow-[0_12px_44px_rgba(0,0,0,.38)] sm:inset-x-[20%]"
         >
-          <header className="mb-2 flex min-w-0 items-center gap-2"><div className="min-w-0 flex-1"><h2 className="truncate text-[11px] text-ice">{expandedCategory.label}</h2><p className="truncate text-[8px] text-slate">{expandedCategory.detail}</p></div><span className="font-mono text-[8px] text-cyan">{expandedCategory.workCount || "ready"}</span></header>
+          <header className="mb-2 flex min-w-0 items-center gap-2"><div className="min-w-0 flex-1"><h2 className="truncate font-mono text-[9px] uppercase tracking-[0.14em] text-cyan">{expandedCategory.label}</h2><p className="truncate text-[9px] text-slate">{expandedCategory.detail}</p></div><span className="font-mono text-[8px] text-cyan">{expandedCategory.workCount || "ready"}</span></header>
           <div className="grid gap-1 sm:grid-cols-2">
-            {expandedCategory.branches.map((branch) => {
+            {tileBranches.map((branch) => {
               const selected = expandedBranchId === branch.id;
               const working = branchWorking(branch);
               const isExpandable = branch.children.length > 0;

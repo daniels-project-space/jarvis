@@ -110,6 +110,19 @@ async function makeReady(
 }
 
 describe("durable private chat files", () => {
+  it("searches the complete visible library by safe metadata without leaking private object coordinates", async () => {
+    const t = convexTest(schema, modules);
+    const match = await makeReady(t, "main", "release-notes.pdf", "f".repeat(64), "private rollout details", "application/pdf");
+    await makeReady(t, "main", "weekly-photo.png", "a".repeat(64), "unrelated private visual", "image/png");
+
+    await expect(t.query(api.files.quickSearchLibrary, { search: "release", workerToken: WORKER }))
+      .resolves.toEqual([expect.objectContaining({ fileId: String(match.fileId), name: "release-notes.pdf" })]);
+    const results = await t.query(api.files.quickSearchLibrary, { search: "release", workerToken: WORKER });
+    expect(JSON.stringify(results)).not.toContain("r2Key");
+    expect(JSON.stringify(results)).not.toContain("private rollout details");
+    await expect(t.query(api.files.quickSearchLibrary, { search: "release" })).rejects.toThrow();
+  });
+
   it("reuses a file across chats only after an explicit durable thread link", async () => {
     const t = convexTest(schema, modules);
     const sha256 = "a".repeat(64);

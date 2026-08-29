@@ -94,7 +94,11 @@ import { normalizeIncidentSignature } from "@/lib/incident-signature";
 import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter, type FleetOpenRequest } from "./CompactWorkBar";
 import { WorkMapBubble } from "./WorkMapBubble";
+import { OrbQuickSearch } from "./OrbQuickSearch";
 import { shouldHideWorkMap, type WorkMapTodoItem } from "@/lib/work-map";
+import { PROJECT_REGISTRY } from "@/lib/project-registry";
+import { readyPrivateFilePanel } from "@/lib/private-file-panel";
+import type { OrbSearchCreation, OrbSearchProject, OrbSearchResult } from "@/lib/orb-quick-search";
 import { isGuestViewerSession, useViewerSession } from "@/lib/viewer-session";
 import { googleOAuthReturnNotice, type GoogleOAuthReturnNotice } from "@/lib/google-oauth-return";
 import {
@@ -1762,14 +1766,35 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     api.commandCenter.fleetSnapshot,
     embedded || guest || !activeThreadReady ? "skip" : {},
   ) as CompactWorkSnapshot | undefined;
-  const workMapDocuments = useJarvisQuery(
+  const quickSearchCreations = useJarvisQuery(
     api.creations.list,
-    embedded || guest ? "skip" : { category: "documents", limit: 60 },
-  ) as unknown[] | undefined;
-  // Keep the map count aligned with the exact Documents surface it opens.
-  // Uploaded chat attachments live in a different library and should not imply
-  // they are available from this shortcut.
-  const workMapDocumentCount = workMapDocuments?.length ?? 0;
+    embedded || guest ? "skip" : { limit: 100 },
+  ) as OrbSearchCreation[] | undefined;
+  const projectStateRows = useJarvisQuery(
+    api.projectState.list,
+    embedded || guest ? "skip" : {},
+  ) as Array<{ slug: string; status?: string; summary?: string }> | undefined;
+  // The search and work orbit share the exact saved-work source. Attachments
+  // remain in their own private library and are searched only after a query.
+  const workMapDocumentCount = quickSearchCreations?.filter((creation) => creation.category === "documents").length ?? 0;
+  const quickSearchProjects = useMemo<OrbSearchProject[]>(() => {
+    const states = new Map((projectStateRows ?? []).map((project) => [project.slug, project]));
+    const catalogued = PROJECT_REGISTRY.map((project) => {
+      const state = states.get(project.slug);
+      return {
+        slug: project.slug,
+        name: project.name,
+        status: state?.status,
+        summary: state?.summary,
+        purpose: project.purpose,
+        productionUrl: project.productionUrl,
+      };
+    });
+    const uncatalogued = (projectStateRows ?? [])
+      .filter((project) => !PROJECT_REGISTRY.some((candidate) => candidate.slug === project.slug))
+      .map((project) => ({ slug: project.slug, name: project.slug, status: project.status, summary: project.summary }));
+    return [...catalogued, ...uncatalogued];
+  }, [projectStateRows]);
   const controllerSessionReadiness = useJarvisQuery(
     api.controllerSession.status,
     guest ? "skip" : {},
@@ -1980,6 +2005,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => () => clearCaptionTimers(), []);
   const [commandExpanded, setCommandExpanded] = useState(false);
   const [workMapOpen, setWorkMapOpen] = useState(false);
+  const [orbSearchContext, setOrbSearchContext] = useState("");
   const workMapRequestSequence = useRef(0);
   const [workMapOpenRequest, setWorkMapOpenRequest] = useState<FleetOpenRequest | null>(null);
   const openMapWork = useCallback((jobId?: string) => {
@@ -1995,6 +2021,60 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setPanelFull(false);
     setPanelMin(false);
     void setPanel({ type: "widget", value: JSON.stringify({ kind: "todos", label: "To-do list", items }), title: "To-do list" });
+  }, [setPanel]);
+  const openSearchCreation = useCallback((creation: OrbSearchCreation) => {
+    setPanelFull(false);
+    setPanelMin(false);
+    if (creation.kind === "image" && creation.url) return void setPanel({ type: "image", value: creation.url, title: creation.title });
+    if (creation.kind === "pdf" && creation.url) return void setPanel({ type: "pdf", value: creation.url, title: creation.title });
+    if (creation.kind === "canvas" && creation.data) {
+      let value = creation.data;
+      try {
+        const parsed = JSON.parse(creation.data);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) value = JSON.stringify({ ...parsed, creationId: creation._id });
+      } catch { /* CanvasView owns its safe unavailable state. */ }
+      return void setPanel({ type: "canvas", value, title: `map · ${creation.title}` });
+    }
+    if (creation.kind === "board") return void setPanel({ type: "board", value: JSON.stringify({ creationId: creation._id }), title: `board · ${creation.title}` });
+    if (creation.kind === "trip") return void setPanel({ type: "trip", value: JSON.stringify({ creationId: creation._id }), title: `trip · ${creation.title}` });
+    if (creation.kind === "scene") return void setPanel({ type: "scene", value: JSON.stringify({ creationId: creation._id }), title: `visual · ${creation.title}` });
+    if (creation.kind === "doc") return void setPanel({ type: "doc", value: JSON.stringify({ creationId: creation._id }), title: `draft · ${creation.title}` });
+    if (creation.kind === "chart" && creation.data) return void setPanel({ type: "widget", value: creation.data, title: creation.title });
+    if (creation.kind === "list" && creation.data) return void setPanel({ type: "list", value: creation.data, title: creation.title });
+    if (creation.data) void setPanel({ type: "markdown", value: creation.data, title: creation.title });
+  }, [setPanel]);
+  const openSearchResult = useCallback((result: OrbSearchResult) => {
+    if (result.source === "work") {
+      const jobId = typeof result.payload.jobId === "string" ? result.payload.jobId : "";
+      if (jobId) openMapWork(jobId);
+      return;
+    }
+    if (result.source === "creation") {
+      openSearchCreation(result.payload as unknown as OrbSearchCreation);
+      return;
+    }
+    if (result.source === "file") {
+      const fileId = typeof result.payload.fileId === "string" ? result.payload.fileId : "";
+      if (fileId) window.open(`/api/files/${encodeURIComponent(fileId)}`, "_blank", "noopener,noreferrer");
+      return;
+    }
+    const url = typeof result.payload.productionUrl === "string" ? result.payload.productionUrl : "";
+    if (url) window.open(url, "_blank", "noopener,noreferrer");
+  }, [openMapWork, openSearchCreation]);
+  const showSearchResult = useCallback((result: OrbSearchResult) => {
+    if (result.source === "creation") {
+      const creation = result.payload as unknown as OrbSearchCreation;
+      setPanelFull(false);
+      setPanelMin(false);
+      void setPanel({ type: "creations", value: JSON.stringify({ folder: creation.folder, search: creation.title }), title: "saved work" });
+      return;
+    }
+    if (result.source !== "file") return;
+    const panel = readyPrivateFilePanel(result.payload as { fileId: string; name?: string; relativePath?: string; mimeType?: string; status?: string });
+    if (!panel) return;
+    setPanelFull(false);
+    setPanelMin(false);
+    void setPanel(panel);
   }, [setPanel]);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
   // comes back. Fresh panel content pops it open again.
@@ -5941,11 +6021,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             owner={Boolean(viewerToken) && !guest && !embedded}
             hidden={workMapHidden}
             reduceMotion={prefs.reduceMotion}
+            contextText={orbSearchContext || (latestUserMessage?.text ? visibleTurnText(latestUserMessage.text) : undefined)}
             onOpenChangeAction={setWorkMapOpen}
             onOpenDocumentsAction={openMapDocuments}
             onOpenTodosAction={openMapTodos}
             onOpenWorkAction={(jobId) => openMapWork(jobId)}
             onOpenAllWorkAction={() => openMapWork()}
+          />
+          <OrbQuickSearch
+            owner={Boolean(viewerToken) && !guest && !embedded}
+            hidden={fullBleed || overlayUp}
+            creations={quickSearchCreations}
+            projects={quickSearchProjects}
+            snapshot={visibleCommandSnapshot}
+            onQueryChangeAction={setOrbSearchContext}
+            onOpenAction={openSearchResult}
+            onShowAction={showSearchResult}
           />
           {!overlayUp && live === "off" && prefs.liveDefault && permissions.microphone !== "granted" && permissions.microphone !== "unsupported" && (
             <button

@@ -24,7 +24,6 @@ describe("WorkMapBubble", () => {
   it("stays as a tiny bubble until Daniel opens it", () => {
     const markup = renderToStaticMarkup(<WorkMapBubble snapshot={snapshot} owner documentCount={3} {...actions} />);
     expect(markup).toContain("data-work-map-trigger");
-    expect(markup).toContain("work map");
     expect(markup).toContain("1 active worker task");
     expect(markup).not.toContain("data-work-map=\"true\"");
   });
@@ -32,7 +31,7 @@ describe("WorkMapBubble", () => {
   it("renders a real constrained SVG/DOM topology with category controls, working leaf affordances, and no canvas", () => {
     const markup = renderToStaticMarkup(<WorkMapBubble snapshot={snapshot} owner initialOpen documentCount={3} reduceMotion {...actions} />);
     expect(markup).toContain("data-work-map=\"true\"");
-    expect(markup).toContain("Live work topology");
+    expect(markup).toContain("contextual Jarvis work map");
     expect(markup).toContain("data-work-map-category=\"general\"");
     expect(markup).toContain("data-work-map-category=\"projects\"");
     expect(markup).toContain("data-work-map-category=\"marketing\"");
