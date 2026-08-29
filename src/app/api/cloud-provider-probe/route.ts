@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { runs, tasks } from "@trigger.dev/sdk/v3";
 import { NextResponse, type NextRequest } from "next/server";
 import { CLOUD_PROVIDER_PROBE_CONFIRMATION } from "@/lib/cloud-provider-probe-control";
+import { configuredCloudWorkspaceProviderName } from "@/lib/cloud-provider-selection";
 import { isSameOriginRequest } from "@/lib/control-session";
 import { controlActor, isOwnerActor } from "@/lib/request-auth";
 import type { cloudProviderProbeBootstrap } from "@/trigger/cloud-provider-probe-bootstrap";
@@ -16,9 +17,14 @@ const TICKET_TTL_SECONDS = 20 * 60;
 type Ticket = Readonly<{ expiresAt: number; runId: string }>;
 type PublicStatus = "idle" | "queued" | "running" | "attested" | "attention" | "unavailable";
 type PublicDetail = "configuration" | "provider" | "publication" | "unknown";
+type PublicProvider = "vercel" | "sandbox0" | "e2b" | "cloudflare" | "unconfigured";
 
-function response(body: { ok: boolean; status: PublicStatus; detail?: PublicDetail }, status = 200): NextResponse {
+function response(body: { ok: boolean; status: PublicStatus; detail?: PublicDetail; provider?: PublicProvider }, status = 200): NextResponse {
   return NextResponse.json(body, { status, headers: PRIVATE_HEADERS });
+}
+
+function currentProvider(): PublicProvider {
+  return configuredCloudWorkspaceProviderName(process.env) ?? "unconfigured";
 }
 
 function sign(encoded: string, sessionHash: string): string {
@@ -128,7 +134,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     const run = await runs.retrieve<typeof cloudProviderProbeBootstrap>(ticket.runId);
     const status = runStatus(run);
     const detail = status === "attention" ? runFailureDetail(run) : undefined;
-    return response({ ok: true, status, ...(detail ? { detail } : {}) });
+    return response({ ok: true, status, ...(detail ? { detail } : {}), ...(status === "attention" ? { provider: currentProvider() } : {}) });
   } catch {
     // Provider/task errors can include sensitive details. The UI receives only
     // a finite status and can safely offer a fresh owner confirmation.

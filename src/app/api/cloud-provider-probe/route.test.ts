@@ -13,6 +13,7 @@ vi.mock("@trigger.dev/sdk/v3", () => ({
   tasks: { trigger: mock.trigger },
 }));
 vi.mock("@/lib/control-session", () => ({ isSameOriginRequest: mock.sameOrigin }));
+vi.mock("@/lib/cloud-provider-selection", () => ({ configuredCloudWorkspaceProviderName: () => "vercel" }));
 vi.mock("@/lib/request-auth", () => ({
   controlActor: mock.controlActor,
   isOwnerActor: (actor: { kind?: string }) => actor.kind === "owner",
@@ -108,7 +109,7 @@ describe("cloud provider probe owner control", () => {
     mock.retrieve.mockResolvedValueOnce({ status: "FAILED", error: { message: "a safe scoped credential for the selected provider is unavailable" } });
 
     const res = await GET(request("GET", { cookie }));
-    expect(await res.json()).toEqual({ ok: true, status: "attention", detail: "configuration" });
+    expect(await res.json()).toEqual({ ok: true, status: "attention", detail: "configuration", provider: "vercel" });
   });
 
   it("classifies a failed task without returning its raw error", async () => {
@@ -119,7 +120,7 @@ describe("cloud provider probe owner control", () => {
     });
 
     const body = await (await GET(request("GET", { cookie }))).json();
-    expect(body).toEqual({ ok: true, status: "attention", detail: "publication" });
+    expect(body).toEqual({ ok: true, status: "attention", detail: "publication", provider: "vercel" });
     expect(JSON.stringify(body)).not.toContain("must-not-leak");
   });
 
@@ -134,6 +135,7 @@ describe("cloud provider probe owner control", () => {
       ok: true,
       status: "attention",
       detail: "configuration",
+      provider: "vercel",
     });
   });
 
@@ -144,7 +146,7 @@ describe("cloud provider probe owner control", () => {
       error: { message: "Vercel plan observation was unavailable" },
     });
 
-    expect(await (await GET(request("GET", { cookie }))).json()).toMatchObject({ detail: "configuration" });
+    expect(await (await GET(request("GET", { cookie }))).json()).toMatchObject({ detail: "configuration", provider: "vercel" });
   });
 
   it("redacts Trigger retrieval and trigger failures", async () => {
