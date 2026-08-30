@@ -1260,6 +1260,29 @@ describe("production Trigger worker authority harness", () => {
       attempt: 1,
       codexTurnReceiptPhase: "completed",
     });
+
+    const controllerBatch = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      workerToken: WORKER,
+    });
+    const controllerReservation = controllerBatch.reservations[0];
+    expect(controllerReservation).toBeTruthy();
+    const controllerBridge = bridgeProductionRunnerToConvex(t);
+    const controllerDependencies = injectedRunnerDependencies();
+    expect(await invokeHarness(
+      controllerReservation,
+      "immutable-readonly-controller-run",
+      controllerDependencies,
+    )).toEqual({ processed: 1 });
+    expect(controllerDependencies.runCloudWorkspaceAgent).not.toHaveBeenCalled();
+    expect(controllerBridge.trace.filter((call) => call.path === "jobs:checkpointAndRequeue")).toHaveLength(0);
+    const finished = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(finished).toMatchObject({
+      status: "done",
+      attempt: 1,
+      verificationVerdict: "pass",
+      sourceBranch: "main",
+    });
   });
 
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {

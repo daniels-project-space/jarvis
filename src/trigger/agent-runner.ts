@@ -1783,6 +1783,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           ? job.branch
           : "";
         const resumeBranch = validatedGoalBranch || persistedBranch || branch || "";
+        // Read-only work deliberately has no worker branch, but its review
+        // receipt is still anchored to the admitted source branch. Rebuild
+        // the cold-receipt binding from that durable authority instead of an
+        // empty delivery branch, otherwise the controller rejects its own
+        // valid HMAC envelope after the specialist exits.
+        const continuationReviewBranch = resumeBranch
+          || (job.readonly ? String(job.sourceBranch ?? "") : "");
         const integrationContinuation = Boolean(job.integrationAttemptId && job.deliveryPolicy === "mission_integration");
         const continuationPolicy = String(job.deliveryMode ?? (job.readonly ? "read_only" : "manual"));
         const controllerContinuation = Boolean(
@@ -1848,7 +1855,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             const binding: GitReviewBinding = {
               jobId: String(job.jobId), attempt: expectedAttempt, repository: repo,
               workOrderRevisionDigest: String(job.workOrderRevisionDigest ?? ""),
-              branch: resumeBranch, baseSha: String(receipt?.baseSha ?? ""),
+              branch: continuationReviewBranch, baseSha: String(receipt?.baseSha ?? ""),
               agentEvidenceSha256: String(receipt?.agentEvidenceSha256 ?? ""), headSha: String(receipt?.headSha ?? ""),
             };
             const envelope = {
