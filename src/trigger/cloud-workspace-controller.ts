@@ -39,7 +39,11 @@ function boundedProcess(
       else resolve({ code, stdout: Buffer.concat(chunks), stderr });
     };
     const timer = setTimeout(() => { child.kill("SIGKILL"); finish(new Error(`${command} timed out`)); }, options.timeoutMs);
-    timer.unref?.();
+    // Keep this timer referenced. A pending provider promise alone does not
+    // necessarily keep Trigger's Node event loop awake; unref'ing the only
+    // local handle allowed the runtime to suspend after one opportunistic
+    // pulse. The finally block always clears the interval when the provider
+    // effect settles, so retaining it cannot leak or prolong a completed task.
     child.stdout.on("data", (chunk: Buffer) => {
       bytes += chunk.byteLength;
       if (bytes > options.maxBytes) { child.kill("SIGKILL"); finish(new Error(`${command} output exceeded limit`)); return; }
