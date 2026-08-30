@@ -27,6 +27,8 @@ describe("live voice bootstrap policy", () => {
     expect(source).not.toContain("shouldAutoStartLiveVoice({");
     expect(source).not.toContain('setPref("liveDefault"');
     expect(source).not.toContain('label="Continuous voice"');
+    expect(source).toContain('prewarmForegroundReply();');
+    expect(source).toContain('viewerFetchWithTimeout("/api/chat/warm", { method: "POST" }, 4_000)');
   });
 
   it("bounds speech-service retry pressure", () => {
@@ -101,6 +103,7 @@ describe("live voice bootstrap policy", () => {
       source.indexOf("async function runToggleLive"),
       source.indexOf("async function enableMicrophone"),
     );
+    expect(toggleLive).toContain("prewarmForegroundReply();");
     expect(ensureMic).toContain("if (liveMicOpeningRef.current) return liveMicOpeningRef.current");
     expect(ensureMic.match(/getUserMedia\(/g)).toHaveLength(1);
     expect(toggleLive).not.toContain("withClientDeadline(microphone");

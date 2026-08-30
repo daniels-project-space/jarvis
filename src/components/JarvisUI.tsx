@@ -2635,6 +2635,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setChatMode(embedded ? "off" : "full", false);
     showCaption({ who: "you", text: "Listening…" });
     unlockSpeechPlayback();
+    // A cold foreground runner currently spends several seconds acquiring its
+    // isolated subscription session and initializing the Codex app-server.
+    // Start that exact runner on the wake fragment, while Daniel is still
+    // speaking, instead of placing the startup delay after transcription.
+    prewarmForegroundReply();
     // Show the Hub overlay and begin the neural voice load immediately, while
     // SpeechRecognition is still collecting a same-breath command.
     if (embedded) postToParent({ jarvis: "wake" });
@@ -2644,6 +2649,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     import("../lib/wakeword").then((m) => {
       setWake(false);
       setChatMode(embedded ? "off" : "full", false);
+      // `onDetected` normally starts this first. Keep final-result delivery as
+      // a coalesced fallback for browsers that omit interim speech events.
+      prewarmForegroundReply();
       const command = m.commandAfterWake(transcript);
       void (async () => {
         // A wake activation becomes one persistent conversation session. The
@@ -3103,6 +3111,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(metric),
     }, 4_000).catch(() => undefined);
+  }
+
+  const foregroundPrewarmAtRef = useRef(0);
+  function prewarmForegroundReply() {
+    if (guest) return;
+    const now = Date.now();
+    if (now - foregroundPrewarmAtRef.current < 60_000) return;
+    foregroundPrewarmAtRef.current = now;
+    // This endpoint carries no transcript and admits no message. A failed or
+    // billing-held prewarm is harmless: normal durable submission retains its
+    // existing exact-ID recovery path and visible error state.
+    void viewerFetchWithTimeout("/api/chat/warm", { method: "POST" }, 4_000)
+      .catch(() => undefined);
   }
 
   function retryVoicePlayback() {
@@ -4458,6 +4479,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     // in-flight microphone session rather than re-arm standby recognition.
     liveStartPendingRef.current = true;
     liveManuallyStopped.current = false;
+    // A deliberate tap has the same latency budget as a wake-word turn. The
+    // one-minute client fence and server lease make this a no-op when the wake
+    // fragment already started (or found) the foreground runner.
+    prewarmForegroundReply();
     const remoteLease = createLiveRemoteLease();
     unlockSpeechPlayback();
     // Live capture supersedes passive wake listening. Releasing this distinct
