@@ -845,6 +845,10 @@ export default defineSchema({
     workerRuntime: v.optional(v.string()),
     providerRunState: v.optional(v.string()),
     providerObservedAt: v.optional(v.number()),
+    // Server-minted only around one bounded provider-side workspace effect.
+    // The stale runner reaper honors this durable deadline even when the
+    // Trigger event loop cannot schedule ordinary heartbeat callbacks.
+    providerEffectLeaseUntil: v.optional(v.number()),
     // Exact reason for a system-held cloud setup pause. It is deliberately
     // separate from human-readable progress so bounded cleanup never parses
     // broad failure text.
@@ -1020,6 +1024,7 @@ export default defineSchema({
     workerRuntime: v.optional(v.string()),
     providerRunState: v.optional(v.string()),
     providerObservedAt: v.optional(v.number()),
+    providerEffectLeaseUntil: v.optional(v.number()),
     cloudWorkspaceBlockCode: v.optional(v.string()),
     controllerSessionHoldCode: v.optional(v.string()),
     controllerSessionRepairRequired: v.optional(v.boolean()),

@@ -172,6 +172,12 @@ function bridgeProductionRunnerToConvex(
       case "jobs:touchHeartbeat":
         value = await t.mutation(api.jobs.touchHeartbeat, body.args as any);
         break;
+      case "jobs:beginProviderEffectLease":
+        value = await t.mutation(api.jobs.beginProviderEffectLease, body.args as any);
+        break;
+      case "jobs:endProviderEffectLease":
+        value = await t.mutation(api.jobs.endProviderEffectLease, body.args as any);
+        break;
       case "jobs:updateProgress":
         value = await t.mutation(api.jobs.updateProgress, body.args as any);
         break;
@@ -1916,6 +1922,14 @@ describe("production Trigger worker authority harness", () => {
       "provider list",
       "provider create",
     ]);
+    expect(bridge.trace
+      .filter((call) => call.path === "jobs:beginProviderEffectLease" || call.path === "jobs:endProviderEffectLease")
+      .map((call) => call.path)).toEqual([
+      "jobs:beginProviderEffectLease",
+      "jobs:beginProviderEffectLease",
+      "jobs:endProviderEffectLease",
+    ]);
+    expect(state.job).not.toHaveProperty("providerEffectLeaseUntil");
   });
 
   it.each([

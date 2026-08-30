@@ -1711,6 +1711,19 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           : { jobId: job.jobId, expectedAttempt, workerRunId: claimedWorkerRunId },
         signal,
       ).catch(() => false);
+      const providerEffectLeaseMutation = async (path: "jobs:beginProviderEffectLease" | "jobs:endProviderEffectLease") => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(new Error("provider effect lease mutation timed out")), 10_000);
+        try {
+          return await convexMutation(path, {
+            jobId: job.jobId,
+            expectedAttempt,
+            workerRunId: claimedWorkerRunId,
+          }, controller.signal);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
       const reportPreparationStage = async (stage: string, progress: string, percent: number) => {
         options.onProgress?.({
           jobId: String(job.jobId),
@@ -2476,30 +2489,59 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected provider creation", "rejected");
           }
           dependencies.onAuthorityBoundary("provider_create", providerAuthority);
-          const preparedWorkspace = await prepareCloudWorkspaceExecution({
-            providerFactory: () => cloudProvider,
-            hydrateArchive: async () => sourceArchive,
-            attemptKey, template: providerWorkspaceTemplate, runtime: workspaceRuntime, lockfileDigest,
-            bindWorkspace: bindCloudWorkspace,
-            assertCurrent: assertCurrentWorkspace,
-            onStage: async (stage) => {
-              const stages = {
-                provider_list: ["provider list", "enumerating bounded provider workspace history", 11],
-                provider_create: ["provider create", "creating exact private provider workspace", 13],
-                source_upload: ["source upload", "hydrating validated source into private workspace", 15],
-                dependency_hydration: ["dependency hydrate", "hydrating locked dependencies before relocking egress", 17],
-              } as const;
-              const [durableStage, progress, percent] = stages[stage];
-              await reportPreparationStage(durableStage, progress, percent);
-            },
-            onHeartbeat: async (_stage, signal) => {
-              // Provider creates, source uploads, and locked dependency
-              // hydration can be quiet for minutes. Keep the exact current
-              // attempt live without manufacturing causal progress.
-              await touchActiveHeartbeat(signal);
-            },
-          });
-          providerWorkspace = preparedWorkspace.workspace;
+          let providerEffectLeaseActive = false;
+          try {
+            const preparedWorkspace = await prepareCloudWorkspaceExecution({
+              providerFactory: () => cloudProvider,
+              hydrateArchive: async () => sourceArchive,
+              attemptKey, template: providerWorkspaceTemplate, runtime: workspaceRuntime, lockfileDigest,
+              bindWorkspace: bindCloudWorkspace,
+              assertCurrent: assertCurrentWorkspace,
+              onStage: async (stage) => {
+                if (!deliveryFence) {
+                  const lease = await providerEffectLeaseMutation("jobs:beginProviderEffectLease").catch(() => null);
+                  if (!lease || typeof lease !== "object" || !Number.isFinite(Number((lease as { leaseUntil?: unknown }).leaseUntil))) {
+                    throw new CloudWorkspaceError(
+                      cloudProvider.name,
+                      "stale_attempt",
+                      `attempt fence rejected provider effect ${stage}`,
+                      "deferred",
+                    );
+                  }
+                  providerEffectLeaseActive = true;
+                }
+                const stages = {
+                  provider_list: ["provider list", "enumerating bounded provider workspace history", 11],
+                  provider_create: ["provider create", "creating exact private provider workspace", 13],
+                  source_upload: ["source upload", "hydrating validated source into private workspace", 15],
+                  dependency_hydration: ["dependency hydrate", "hydrating locked dependencies before relocking egress", 17],
+                } as const;
+                const [durableStage, progress, percent] = stages[stage];
+                await reportPreparationStage(durableStage, progress, percent);
+              },
+              onHeartbeat: async (_stage, signal) => {
+                // Provider creates, source uploads, and locked dependency
+                // hydration can be quiet for minutes. Keep the exact current
+                // attempt live without manufacturing causal progress. The
+                // durable provider-effect lease remains the correctness fence
+                // if the provider SDK blocks this event loop entirely.
+                await touchActiveHeartbeat(signal);
+              },
+            });
+            providerWorkspace = preparedWorkspace.workspace;
+          } finally {
+            if (providerEffectLeaseActive) {
+              const cleared = await providerEffectLeaseMutation("jobs:endProviderEffectLease").catch(() => false);
+              if (cleared !== true) {
+                throw new CloudWorkspaceError(
+                  cloudProvider.name,
+                  "stale_attempt",
+                  "provider effect completed without a confirmed durable lease release",
+                  "deferred",
+                );
+              }
+            }
+          }
         }
         if (repoDir) {
           // The trusted hydration checkout must not coexist with Codex. The

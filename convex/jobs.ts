@@ -85,6 +85,11 @@ import {
 } from "../src/lib/supervisor-fleet-manifest";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
+// Provider workspace operations have a hard 15-minute controller deadline.
+// Mint a little server-owned margin for cleanup/response delivery so the
+// five-minute stale heartbeat reaper cannot consume an exact live attempt
+// while a provider SDK call prevents the Trigger event loop from pulsing.
+const PROVIDER_EFFECT_LEASE_MS = 18 * 60 * 1000;
 // A configuration hold can resolve automatically after a verified provider
 // deploy, but old intent must not be resurrected indefinitely.  Before this
 // horizon it remains a silent, resumable system hold; afterwards it receives
@@ -2928,6 +2933,7 @@ export const claimDispatched = mutation({
       await patchJobWithRuntime(ctx, j, {
         status: "running", stage: "delivery", progress: "resuming verified controller delivery", startedAt: now,
         heartbeatAt: now, nextRunAt: undefined, dispatchLeaseUntil: undefined, dispatchId: a.dispatchId,
+        providerEffectLeaseUntil: undefined,
         workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), deliveryGeneration: generation, activeDeliveryAttemptId: deliveryId, workerRuntime: "trigger",
         triggerObservedMachinePreset: a.triggerObservedMachinePreset,
         triggerObservedMachineReason: triggerObservedReason,
@@ -2985,6 +2991,7 @@ export const claimDispatched = mutation({
       triggerPlatformAttempt: a.triggerPlatformAttempt,
       providerRunState: "executing",
       providerObservedAt: now,
+      providerEffectLeaseUntil: undefined,
     });
     await ctx.db.patch(dispatchReceipt._id, {
       status: "claimed",
@@ -3767,6 +3774,12 @@ export const reapStale = mutation({
         if (j) await upsertJobRuntime(ctx, j);
         continue;
       }
+      // The exact claimed specialist records this lease immediately before a
+      // bounded provider-side operation. Unlike a JavaScript interval it is
+      // durable even when the provider SDK monopolizes the Trigger event
+      // loop. The server fixes the horizon; a dead worker becomes eligible
+      // again automatically when the deadline expires.
+      if (Number(j.providerEffectLeaseUntil ?? 0) > now) continue;
       // A delivery controller is not a specialist workspace.  Its source
       // attempt is already closed with an immutable receipt, so reaping this
       // run must queue only another bounded controller generation.
@@ -4011,6 +4024,86 @@ export const touchHeartbeat = mutation({
     await ctx.db.patch(runtime._id, { heartbeatAt: now, updatedAt: now });
     // Attempt rows are immutable evidence except for causal/terminal updates;
     // runtime owns the compact liveness clock used by the five-minute reaper.
+    return true;
+  },
+});
+
+async function exactProviderEffectClaim(
+  ctx: MutationCtx,
+  a: { jobId: Id<"jobs">; expectedAttempt: number; workerRunId: string },
+) {
+  const job = await ctx.db.get(a.jobId);
+  if (
+    !job
+    || job.status !== "running"
+    || job.dispatchPhase !== "specialist"
+    || (job.attempt ?? 1) !== a.expectedAttempt
+    || job.workerRunId !== a.workerRunId.slice(0, 120)
+  ) return null;
+  const runtime = await jobRuntimeFor(ctx, a.jobId);
+  const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+  const receipt = await claimedDispatchReceiptForRow(ctx, job, a.workerRunId.slice(0, 120));
+  if (
+    !runtime
+    || runtime.status !== "running"
+    || runtime.attempt !== a.expectedAttempt
+    || runtime.workerRunId !== job.workerRunId
+    || !attempt
+    || attempt.status !== "running"
+    || attempt.workerRunId !== job.workerRunId
+    || attempt.dispatchId !== job.dispatchId
+    || attempt.dispatchReceiptId !== job.dispatchReceiptId
+    || attempt.dispatchReceiptDigest !== job.dispatchReceiptDigest
+    || attempt.dispatchPayloadDigest !== job.dispatchPayloadDigest
+    || !receipt
+    || receipt.attempt !== a.expectedAttempt
+    || receipt.phase !== "specialist"
+  ) return null;
+  return { job, runtime, attempt };
+}
+
+// A worker cannot choose or extend the lease horizon. It may only renew the
+// server-fixed bound while it still owns the exact specialist attempt and
+// immutable claimed dispatch receipt.
+export const beginProviderEffectLease = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    expectedAttempt: v.number(),
+    workerRunId: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const claim = await exactProviderEffectClaim(ctx, a);
+    if (!claim) return null;
+    const now = Date.now();
+    const leaseUntil = now + PROVIDER_EFFECT_LEASE_MS;
+    await patchJobWithRuntime(ctx, claim.job, {
+      providerEffectLeaseUntil: leaseUntil,
+      providerObservedAt: now,
+      heartbeatAt: now,
+    });
+    return { leaseUntil };
+  },
+});
+
+export const endProviderEffectLease = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    expectedAttempt: v.number(),
+    workerRunId: v.string(),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const claim = await exactProviderEffectClaim(ctx, a);
+    if (!claim) return false;
+    const now = Date.now();
+    await patchJobWithRuntime(ctx, claim.job, {
+      providerEffectLeaseUntil: undefined,
+      providerObservedAt: now,
+      heartbeatAt: now,
+    });
     return true;
   },
 });

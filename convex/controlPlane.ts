@@ -121,6 +121,9 @@ export function projectJobRuntime(job: any) {
     workerRuntime: typeof job.workerRuntime === "string" ? job.workerRuntime.slice(0, 40) : undefined,
     providerRunState: typeof job.providerRunState === "string" ? job.providerRunState.slice(0, 40) : undefined,
     providerObservedAt: typeof job.providerObservedAt === "number" ? job.providerObservedAt : undefined,
+    providerEffectLeaseUntil: typeof job.providerEffectLeaseUntil === "number"
+      ? job.providerEffectLeaseUntil
+      : undefined,
     cloudWorkspaceBlockCode: typeof job.cloudWorkspaceBlockCode === "string" ? job.cloudWorkspaceBlockCode.slice(0, 80) : undefined,
     controllerSessionHoldCode: typeof job.controllerSessionHoldCode === "string" ? job.controllerSessionHoldCode.slice(0, 80) : undefined,
     controllerSessionRepairRequired: job.controllerSessionRepairRequired === true ? true : undefined,
@@ -327,7 +330,17 @@ export async function upsertJobRuntime(ctx: any, job: any) {
   await refreshWorkGroupQueueProjection(ctx, projected.schedulingGroupKey);
 }
 
-const LIVE_JOB_ACTIVITY_FIELDS = ["stage", "percent", "progress", "heartbeatAt", "progressAt", "providerRunState", "providerObservedAt", "updatedAt"] as const;
+const LIVE_JOB_ACTIVITY_FIELDS = [
+  "stage",
+  "percent",
+  "progress",
+  "heartbeatAt",
+  "progressAt",
+  "providerRunState",
+  "providerObservedAt",
+  "providerEffectLeaseUntil",
+  "updatedAt",
+] as const;
 
 // Progress heartbeats intentionally do not rewrite the durable job. When a
 // later authority transition patches an unrelated field (for example a pull
