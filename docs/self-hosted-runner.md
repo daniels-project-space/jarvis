@@ -12,11 +12,39 @@ below blocks before source hydration, workspace creation, or Codex execution.
 
 ## Recommended free deployment
 
-Run one runner on Daniel's own always-on Mac, Linux box, or free-tier VM. Put
+Run one runner on Daniel's own always-on Linux box or free-tier Linux VM. Put
 it behind an HTTPS reverse tunnel such as Cloudflare Tunnel. Do not expose the
 runner's container daemon, SSH, Docker socket, or workspace filesystem to the
 internet. The public tunnel may reach only the runner API, protected by its
 own bearer. Do not use the retired Jarvis VPS as this runner.
+
+The repository now includes the actual host service rather than only the
+Trigger-side adapter:
+
+```bash
+npm run runner:selfhost
+```
+
+It binds to loopback, keeps a small crash-recovery ledger outside every
+workspace, and launches one rootless Podman container per attempt. The pinned
+image must contain Node.js 22, git, tar, a POSIX shell, `setsid`, and the cgroup
+v2 files used by the live resource probe. Docker is deliberately not an
+accepted fallback: a rootful Docker daemon would weaken the isolation claim.
+
+Build the included image as that unprivileged runner user. `BASE_IMAGE` must
+itself be a published digest, never a tag. The resulting local image ID is also
+an immutable accepted identity, so a registry is optional:
+
+```bash
+podman build \
+  --build-arg BASE_IMAGE=docker.io/library/node@sha256:<audited-node-22-digest> \
+  --iidfile /var/lib/jarvis-selfhost-runner/image.id \
+  -f infra/selfhost-runner/Containerfile .
+```
+
+Set `JARVIS_SELF_HOST_RUNNER_IMAGE` to the exact `sha256:…` value in
+`image.id`. Rebuilds produce a new identity and therefore require a fresh
+Verify release attestation; the service never follows a mutable tag.
 
 The host must create a fresh rootless container or VM per workspace, cap it at
 2 vCPU / 4096 MiB / 55 minutes or lower, disable all egress by default, and
@@ -46,6 +74,28 @@ JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST=<sha256 of the immutable image policy>
 JARVIS_CLOUD_PROVIDER_PROBE=live
 JARVIS_CLOUD_PROVIDER_PROBE_KEYRING=<existing controller-only keyring>
 ```
+
+Configure the runner host separately. These values stay on that host and are
+not synchronized into the disposable container:
+
+```text
+JARVIS_SELF_HOST_RUNNER_SERVER=live
+JARVIS_SELF_HOST_RUNNER_BIND=127.0.0.1
+JARVIS_SELF_HOST_RUNNER_PORT=47821
+JARVIS_SELF_HOST_RUNNER_STATE_DIR=/var/lib/jarvis-selfhost-runner
+JARVIS_SELF_HOST_RUNNER_IMAGE=ghcr.io/<owner>/<image>@sha256:<immutable-digest>
+JARVIS_SELF_HOST_RUNNER_TEMPLATE=<same identity configured in Trigger>
+JARVIS_SELF_HOST_RUNNER_RUNTIME=<same runtime identity configured in Trigger>
+JARVIS_SELF_HOST_RUNNER_LOCKFILE_DIGEST=<same 64-character digest configured in Trigger>
+JARVIS_SELF_HOST_RUNNER_TOKEN=<same dedicated runner bearer configured in Trigger>
+```
+
+Run Podman rootless under a dedicated unprivileged OS user. The service itself
+refuses non-loopback binding, mutable image tags, non-Podman runtimes, excess
+CPU/memory/TTL/output limits, unknown JSON fields, mismatched sessions, and
+filesystem traversal. Configure the tunnel to forward only to
+`http://127.0.0.1:47821`; TLS ends at the tunnel, while the Trigger adapter
+requires the public endpoint to be HTTPS and refuses redirects.
 
 The URL must be an HTTPS URL without query parameters, fragments, or embedded
 credentials. Both the URL and bearer must be present. The adapter sends the

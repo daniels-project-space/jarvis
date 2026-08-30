@@ -1,0 +1,20 @@
+# Supply a digest-pinned Debian Node 22 image at build time. There is no
+# mutable default because the runner's live attestation binds this image.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER 0:0
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates git procps tar util-linux \
+  && rm -rf /var/lib/apt/lists/* \
+  && command -v node \
+  && command -v git \
+  && command -v setsid \
+  && command -v tar
+
+# The host forces this numeric identity too. It owns only tmpfs workspace and
+# /tmp mounts; the image root stays read-only at runtime.
+USER 65532:65532
+WORKDIR /workspace/repository
+ENTRYPOINT ["/bin/sh"]

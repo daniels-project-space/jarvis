@@ -27,6 +27,7 @@ vi.mock("../../convex/_generated/api", () => ({
     },
     files: { listForThread: { _name: "files:listForThread" } },
     creations: { list: { _name: "creations:list" } },
+    projectState: { list: { _name: "projectState:list" } },
     googleAuth: { getConnectionStatus: { _name: "googleAuth:getConnectionStatus" } },
     commandCenter: { snapshot: { _name: "commandCenter:snapshot" }, fleetSnapshot: { _name: "commandCenter:fleetSnapshot" } },
     controllerSession: { status: { _name: "controllerSession:status" } },

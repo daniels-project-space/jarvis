@@ -17,6 +17,7 @@
     "deploy:trigger": "npm run verify:novita-patch-proposer && npx --yes trigger.dev@4.5.1 deploy",
     "harness:codex-session": "tsx scripts/codex-session-concurrency-harness.ts",
     "foreground:selfhost": "node --conditions=react-server --import tsx scripts/self-hosted-foreground-runner.ts",
+    "runner:selfhost": "node --import tsx scripts/self-hosted-runner-server.ts",
     "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts",
     "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts",
     "owner:pair": "tsx scripts/create-owner-pairing-link.ts"
