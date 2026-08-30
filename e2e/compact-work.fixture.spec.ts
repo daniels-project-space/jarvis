@@ -51,8 +51,20 @@ test.describe("compact work fixture", () => {
     await expect(page.locator("[data-fleet-surface=expanded]")).toBeVisible();
     await expect(page.locator("[data-active-job]")).toHaveCount(4);
     await expect(page.locator("[data-work-avatar]")).toHaveCount(4);
+    await expect(page.locator('[data-work-progress-bar="fleet"]')).toHaveAttribute("aria-valuenow", "55");
+    await expect(page.locator("[data-active-job] [data-expanded-work-progress]")).toHaveCount(4);
     await expect(page.locator("[data-fleet-surface=collapsed]")).toHaveCount(0);
     await page.screenshot({ path: testInfo.outputPath("compact-work-expanded.png"), fullPage: true });
+
+    await page.getByRole("button", { name: "Open Chloe detail for Approval gate" }).click();
+    await expect(page.locator("[data-fleet-worker-detail]")).toBeVisible();
+    await expect(page.locator('[data-work-progress-bar="job-approval"]')).toHaveAttribute("aria-valuenow", "55");
+    await expect(page.getByRole("button", { name: "Stop worker" })).toBeVisible();
+    await expect(page.locator("[data-worker-activity]")).not.toHaveAttribute("open", "");
+    await expect(page.getByText("Technical activity log", { exact: true })).toBeVisible();
+    const detailBox = await page.locator("[data-fleet-surface=expanded]").boundingBox();
+    expect(detailBox?.height).toBeLessThanOrEqual(600);
+    await page.screenshot({ path: testInfo.outputPath("compact-work-worker-detail.png"), fullPage: true });
 
     expect(unsafeRequests).toEqual([]);
   });

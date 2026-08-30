@@ -97,6 +97,11 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain("Terra/high for bounded implementation and validation");
     expect(markup).toContain("Sol · max effort");
     expect(markup).toContain("Sol/max for integration authority review");
+    expect(markup).toContain('data-work-progress-bar="fleet"');
+    expect(markup).toContain('aria-label="Build one live fleet surface overall progress"');
+    expect(markup).toContain('aria-valuenow="64"');
+    expect(markup).toContain('data-expanded-work-progress="job-1"');
+    expect(markup).toContain('data-expanded-work-progress="job-2"');
     expect(markup).not.toContain("Legacy completed tile");
     expect(markup).not.toContain("Live fleet dependency graph");
     expect(markup).not.toContain("Fleet workstreams");
@@ -555,6 +560,12 @@ describe("FleetCommandCenter", () => {
 
     expect(controls).toEqual(["cancel", "provide_input", "approve", "decline"]);
     expect(markup).toContain("data-fleet-worker-detail");
+    expect(markup).toContain('data-work-progress-bar="job-1"');
+    expect(markup).toContain('aria-label="Unified fleet surface progress"');
+    expect(markup).toContain('aria-valuenow="64"');
+    expect(markup).toContain('data-work-control="cancel"');
+    expect(markup).toContain("data-worker-activity");
+    expect(markup.indexOf('data-work-control="cancel"')).toBeLessThan(markup.indexOf("data-worker-activity"));
     expect(markup).toContain(">Approve</button>");
     expect(markup).toContain(">Decline</button>");
     expect(markup).toContain(">Stop worker</button>");

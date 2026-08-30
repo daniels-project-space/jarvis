@@ -1,6 +1,6 @@
 import { createRoot } from "react-dom/client";
 import { FleetCommandCenter } from "../../src/components/CompactWorkBar";
-import type { CompactWorkSnapshot, FleetNode } from "../../src/lib/active-work";
+import type { CompactJobDetail, CompactWorkSnapshot, FleetNode } from "../../src/lib/active-work";
 
 function worker(
   id: string,
@@ -47,6 +47,7 @@ const workers = [
     agent: "chloe",
     needsDaniel: true,
     attentionReason: "Choose the production cap",
+    controls: ["cancel", "provide_input"],
   }),
   worker("validation", "Live validation", "running", { agent: "paul" }),
   worker("queued", "Queued background task", "queued", { agent: "maya" }),
@@ -94,13 +95,43 @@ const snapshot: CompactWorkSnapshot = {
   }],
 };
 
+const approvalDetail: CompactJobDetail = {
+  jobId: "job-approval",
+  status: "needs_input",
+  attempt: 1,
+  stage: "fixture validation",
+  percent: 55,
+  progress: "Choose the production cap",
+  sourceBranch: "agent/fixture-approval",
+  sourceHeadSha: null,
+  integrationBranch: "main",
+  workerBranch: "agent/fixture-approval",
+  branch: "agent/fixture-approval",
+  mergeCommitSha: null,
+  label: "Approval gate",
+  agentId: "chloe",
+  repo: "daniels-project-space/jarvis",
+  progressAt: 1,
+  model: "terra",
+  reasoningEffort: "high",
+  modelReason: "local fixture",
+  workerRuntime: "trigger",
+  workerRunId: null,
+  generation: 1,
+  maxAttempts: 2,
+  integrationState: "not_applicable",
+  deliveryStatus: null,
+  startedAt: 1,
+  stallReason: null,
+};
+
 function CompactWorkFixture() {
   return (
     <main
       aria-label="Jarvis compact work fixture"
       style={{ background: "#05070d", height: "100dvh", overflow: "hidden", position: "relative", width: "100vw" }}
     >
-      <FleetCommandCenter snapshot={snapshot} />
+      <FleetCommandCenter snapshot={snapshot} detail={approvalDetail} />
     </main>
   );
 }

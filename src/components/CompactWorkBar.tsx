@@ -128,6 +128,73 @@ function workPhaseLabel(phase: string, nodes: readonly FleetNode[]): string {
   return phase;
 }
 
+function workProgressTone(node: Pick<FleetNode, "needsDaniel" | "attentionKind">) {
+  if (node.needsDaniel) return "bg-amber";
+  if (node.attentionKind === "system" || node.attentionKind === "recovery") return "bg-sky-400";
+  return "bg-cyan";
+}
+
+function WorkProgressTrack({
+  percent,
+  active,
+  tone,
+  marker,
+}: {
+  percent: number;
+  active: boolean;
+  tone: string;
+  marker?: string;
+}) {
+  const bounded = Math.max(0, Math.min(100, percent));
+  return <span
+    aria-hidden="true"
+    data-expanded-work-progress={marker}
+    className={`relative block h-1 overflow-hidden rounded-full bg-white/[0.07] ${active ? "work-progress-glint" : ""}`}
+  >
+    <span
+      data-work-progress-meter
+      className={`work-progress-meter block h-full rounded-full ${tone}`}
+      style={{ width: `${bounded}%` }}
+    />
+  </span>;
+}
+
+function WorkProgressBar({
+  label,
+  percent,
+  active,
+  tone,
+  status,
+  progressAt,
+  marker,
+}: {
+  label: string;
+  percent: number;
+  active: boolean;
+  tone: string;
+  status: string;
+  progressAt: number | null;
+  marker: string;
+}) {
+  const bounded = Math.max(0, Math.min(100, percent));
+  return <div
+    data-work-progress-bar={marker}
+    role="progressbar"
+    aria-label={label}
+    aria-valuemin={0}
+    aria-valuemax={100}
+    aria-valuenow={bounded}
+    aria-valuetext={`${bounded}% · ${status} · ${progressStamp(progressAt)}`}
+    className="rounded-lg border border-white/[0.06] bg-black/15 px-2 py-1.5"
+  >
+    <div className="mb-1 flex min-w-0 items-center gap-2 font-mono text-[8px] uppercase tracking-[0.08em]">
+      <span className="min-w-0 flex-1 truncate text-slate">{status}</span>
+      <span className="shrink-0 text-ice">{bounded}%</span>
+    </div>
+    <WorkProgressTrack percent={bounded} active={active} tone={tone} marker={marker} />
+  </div>;
+}
+
 function progressStamp(value: number | null) {
   return value ? new Date(value).toISOString().replace("T", " ").slice(0, 19) + "Z" : "not recorded";
 }
@@ -258,7 +325,7 @@ function LiveLog({ node, metadata }: { node: FleetNode; metadata?: Record<string
         pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
         setFollowing(pinned.current);
       }}
-      className="scrollbar-thin min-h-[150px] flex-1 overflow-auto rounded-xl border border-white/[0.08] bg-[#05070a]/95 font-mono text-[10px] leading-[1.65]">
+      className="scrollbar-thin h-full min-h-[150px] overflow-auto rounded-xl border border-white/[0.08] bg-[#05070a]/95 font-mono text-[10px] leading-[1.65]">
       <div className="sticky top-0 z-10 flex items-center border-b border-white/[0.07] bg-[#080b10]/95 px-3 py-2">
         <span className="min-w-0 flex-1 truncate uppercase tracking-[0.14em] text-slate-400">agent://{node.agent}/{node.stage}</span>
         <button type="button" onClick={() => { pinned.current = true; setFollowing(true); if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }} className={following ? "text-cyan/65" : "text-amber"}>{following ? "● follow" : "resume ↓"}</button>
@@ -663,19 +730,31 @@ export function WorkerDetail({
     workerMissionId,
     mission,
   });
-  return <section data-fleet-worker-detail className="flex min-h-0 flex-1 flex-col gap-2 rounded-xl border border-white/[0.08] bg-black/20 p-3">
+  return <section data-fleet-worker-detail className="scrollbar-thin flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded-xl border border-white/[0.08] bg-black/20 p-3">
     <div className="flex min-w-0 items-start gap-2">
       <button type="button" onClick={onBack} className="shrink-0 text-xs text-cyan" aria-label="Back to fleet">←</button>
       <AgentAvatar agent={node.agent} size={36} />
       <div className="min-w-0 flex-1"><div className="truncate text-xs text-ice">{workTaskTitle(node.label)}</div><div className="mt-0.5 truncate font-mono text-[8px] uppercase tracking-[0.12em] text-slate">{agentName(node.agent)} · {workModelLabel(node.model, node.reasoningEffort)} · attempt {node.attempt}/{node.maxAttempts}</div>{node.modelReason && <div className="mt-1 text-[9px] leading-snug text-slate">Why this model · {node.modelReason}</div>}</div>
       <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[8px] ${STATE_STYLE[node.state]}`}>{node.state.replace("_", " ")}</span>
     </div>
+    <WorkProgressBar
+      label={`${workTaskTitle(node.label)} progress`}
+      percent={node.percent}
+      active={EXECUTING_WORK_STATES.has(node.state)}
+      tone={workProgressTone(node)}
+      status={workStatusLabel(node)}
+      progressAt={node.progressAt}
+      marker={node.jobId}
+    />
     <div className="grid grid-cols-2 gap-1 text-[9px] text-slate"><div className="truncate">status · <span className="text-ice">{workStatusLabel(node)}</span></div><div className="truncate">merge · <span className="text-ice">{node.mergeState}</span></div><div className="truncate">handoffs · <span className="text-ice">{node.dependenciesReady}/{node.dependencyCount}</span></div><div className="truncate">runtime · <span className="text-ice">{node.workerRuntime ?? "not assigned"}</span></div><div className="col-span-2 truncate">last meaningful progress · <span className="font-mono text-ice">{progressStamp(node.progressAt)}</span></div></div>
     {node.recoverySummary && <div className="rounded-lg border border-blue-400/15 bg-blue-400/[0.05] px-2 py-1 text-[9px] text-blue-200">Recovery · {node.recoverySummary}</div>}
     {node.attentionReason && <div className={`rounded-lg border px-2 py-1 text-[9px] ${node.needsDaniel ? "border-amber/20 bg-amber/[0.06] text-amber" : "border-sky-400/20 bg-sky-400/[0.06] text-sky-200"}`}>{node.attentionLabel ?? (node.needsDaniel ? "Your input is needed" : "Jarvis is recovering")} · {node.attentionReason}</div>}
-    <LazyWorkerLog node={node} />
     {error && <div role="alert" data-control-error className="rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{error}</div>}
     <Controls key={`job:${node.jobId}`} controls={controls} target={{ jobId: node.jobId }} onError={setError} />
+    <details data-worker-activity className="rounded-xl border border-white/[0.07] bg-black/15 p-2">
+      <summary className="cursor-pointer select-none font-mono text-[8px] uppercase tracking-[0.1em] text-slate hover:text-cyan">Technical activity log</summary>
+      <div className="mt-2 h-[min(34vh,260px)]"><LazyWorkerLog node={node} /></div>
+    </details>
   </section>;
 }
 
@@ -1204,9 +1283,9 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, showColla
   const activeJobCount = hierarchyJobs.length - planningCount;
   const fleetPhase = workPhaseLabel(fleet.phase, hierarchyJobs);
   return (
-    <aside data-fleet-surface="expanded" aria-label="Live Jarvis fleet" className="materialize glass absolute inset-x-1 bottom-1 z-40 flex h-[min(78vh,680px)] min-h-0 flex-col overflow-hidden rounded-2xl !border-cyan/25 bg-[#071019]/96 p-3 shadow-2xl md:inset-y-2 md:left-2 md:right-auto md:h-auto md:w-[min(760px,62%)]">
+    <aside data-fleet-surface="expanded" aria-label="Live Jarvis fleet" className={`materialize glass absolute inset-x-1 bottom-1 z-40 flex min-h-0 flex-col overflow-hidden rounded-2xl !border-cyan/25 bg-[#071019]/96 p-3 shadow-2xl md:left-2 md:right-auto md:w-[min(760px,62%)] ${retainedSelectedId ? "h-auto max-h-[min(72vh,560px)] md:bottom-auto md:top-2" : "h-[min(78vh,680px)] md:inset-y-2 md:h-auto"}`}>
       <header className="flex min-w-0 shrink-0 items-start gap-2 border-b border-white/[0.07] pb-2">
-        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">Jarvis live work</div><h2 className="mt-0.5 truncate text-sm text-ice">{workTaskTitle(fleet.goal)}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleetPhase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {activeJobCount} active tasks{planningCount > 0 ? ` · ${planningCount} planning` : ""}</span></div></div>
+        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">Jarvis live work</div><h2 className="mt-0.5 truncate text-sm text-ice">{workTaskTitle(fleet.goal)}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleetPhase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {activeJobCount} active tasks{planningCount > 0 ? ` · ${planningCount} planning` : ""}</span></div><div className="mt-1.5"><WorkProgressBar label={`${workTaskTitle(fleet.goal)} overall progress`} percent={fleet.percent} active={hierarchyJobs.some((node) => EXECUTING_WORK_STATES.has(node.state))} tone="bg-cyan" status={fleetPhase} progressAt={hierarchyJobs.reduce<number | null>((latest, node) => Math.max(latest ?? 0, node.progressAt ?? 0) || null, null)} marker="fleet" /></div></div>
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
@@ -1218,7 +1297,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, showColla
                 <header className="flex min-w-0 items-center gap-2 px-0.5"><div className="min-w-0 flex-1 truncate font-mono text-[8px] text-sky-200">{project.repository?.replace(/^daniels-project-space\//, "") ?? "Read-only evidence"}</div><span className="shrink-0 font-mono text-[7px] text-slate">{project.jobs.length} task{project.jobs.length === 1 ? "" : "s"}</span></header>
                 <div className="mt-1 grid gap-1 sm:grid-cols-2">{project.jobs.map((node) => {
                   const planning = node.projectionKind === "supervisor_planning";
-                  const content = <div className="flex min-w-0 gap-2"><AgentAvatar agent={node.agent} size={30} /><div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{workTaskTitle(node.label)}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{agentName(node.agent)} · {workStatusLabel(node)}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{workModelLabel(node.model, node.reasoningEffort)}</div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">{node.attentionLabel ?? "Your input is needed"}</div>}{!node.needsDaniel && node.attentionLabel && <div className="mt-1 text-[8px] text-sky-300">{node.attentionLabel}</div>}</div></div>;
+                  const content = <div className="flex min-w-0 gap-2"><AgentAvatar agent={node.agent} size={30} /><div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{workTaskTitle(node.label)}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{agentName(node.agent)} · {workStatusLabel(node)}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{workModelLabel(node.model, node.reasoningEffort)}</div><div className="mt-1.5"><WorkProgressTrack percent={node.percent} active={EXECUTING_WORK_STATES.has(node.state)} tone={workProgressTone(node)} marker={node.jobId} /></div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">{node.attentionLabel ?? "Your input is needed"}</div>}{!node.needsDaniel && node.attentionLabel && <div className="mt-1 text-[8px] text-sky-300">{node.attentionLabel}</div>}</div></div>;
                   return planning
                     ? <div key={node.jobId} data-supervisor-planning={node.jobId} role="status" className={`min-w-0 rounded-lg border p-2 text-left ${STATE_STYLE[node.state]}`} aria-label={`${agentName(node.agent)} planning ${node.label}`}>{content}</div>
                     : <button type="button" key={node.jobId} data-active-job={node.jobId} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-lg border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}>{content}</button>;
