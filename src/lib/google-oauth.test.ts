@@ -95,6 +95,22 @@ describe("Google OAuth access-token cache", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("rejects a stored connection carrying a Google Calendar grant before token refresh", async () => {
+    process.env.GOOGLE_CLIENT_ID = "client";
+    process.env.GOOGLE_CLIENT_SECRET = "secret";
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    const { encryptGoogleRefreshToken, getGoogleAccessTokenForGmail } = await import("./google-oauth");
+    mock.controlQuery.mockResolvedValueOnce({
+      encryptedRefreshToken: encryptGoogleRefreshToken("refresh-token"),
+      scope: `${GOOGLE_GMAIL_READONLY_SCOPE} https://www.googleapis.com/auth/calendar.events`,
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getGoogleAccessTokenForGmail([GOOGLE_GMAIL_READONLY_SCOPE])).rejects.toThrow(/non-Gmail grant/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("does not offer reconnect as a way to obtain Gmail modify authority", async () => {
     process.env.GOOGLE_CLIENT_ID = "client";
     process.env.GOOGLE_CLIENT_SECRET = "secret";
@@ -126,6 +142,22 @@ describe("Google OAuth access-token cache", () => {
     // was saved. The readiness probe may inspect the envelope but must not
     // contact Google or emit an access token.
     process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 8).toString("base64");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(googleOAuthStoredConnectionReadiness()).resolves.toBe("needs_reconnect");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a saved connection with a Google Calendar grant as needing reconnect", async () => {
+    process.env.GOOGLE_CLIENT_ID = "client";
+    process.env.GOOGLE_CLIENT_SECRET = "secret";
+    process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    const { encryptGoogleRefreshToken, googleOAuthStoredConnectionReadiness } = await import("./google-oauth");
+    mock.controlQuery.mockResolvedValueOnce({
+      encryptedRefreshToken: encryptGoogleRefreshToken("refresh-token"),
+      scope: `${GOOGLE_GMAIL_READONLY_SCOPE} https://www.googleapis.com/auth/calendar.readonly`,
+    });
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 

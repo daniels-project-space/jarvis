@@ -13,6 +13,12 @@ export const GOOGLE_OAUTH_SCOPES = [
   GOOGLE_GMAIL_COMPOSE_SCOPE,
 ].join(" ");
 
+const GOOGLE_GMAIL_COMPATIBILITY_SCOPES = new Set([
+  GOOGLE_GMAIL_READONLY_SCOPE,
+  GOOGLE_GMAIL_COMPOSE_SCOPE,
+  GOOGLE_GMAIL_MODIFY_SCOPE,
+]);
+
 function grantedScopes(scope: string): Set<string> {
   return new Set(scope.split(/\s+/).map((value) => value.trim()).filter(Boolean));
 }
@@ -22,10 +28,24 @@ export function hasGoogleScopes(scope: string, required: readonly string[]): boo
   return required.every((value) => granted.has(value));
 }
 
+/**
+ * Jarvis deliberately retains Google only as Gmail transport. A refresh token
+ * carrying Calendar, Drive, profile, or any other Google grant must be
+ * reconnected rather than stored or reused through this app.
+ */
+export function hasOnlyGoogleGmailScopes(scope: string): boolean {
+  const granted = grantedScopes(scope);
+  return (
+    granted.size > 0 &&
+    [...granted].every((value) => GOOGLE_GMAIL_COMPATIBILITY_SCOPES.has(value))
+  );
+}
+
 export function googleCapabilities(scope: string) {
   return {
     gmail:
-      hasGoogleScopes(scope, [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_COMPOSE_SCOPE]) ||
-      hasGoogleScopes(scope, [GOOGLE_GMAIL_MODIFY_SCOPE]),
+      hasOnlyGoogleGmailScopes(scope) &&
+      (hasGoogleScopes(scope, [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_COMPOSE_SCOPE]) ||
+        hasGoogleScopes(scope, [GOOGLE_GMAIL_MODIFY_SCOPE])),
   };
 }

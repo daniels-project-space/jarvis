@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { adminSessionHash, controlMutation, validateAdminSession } from "@/lib/control-session";
 import { encryptGoogleRefreshToken, GoogleOAuthError, isGoogleOAuthConfigurationReady } from "@/lib/google-oauth";
+import { hasOnlyGoogleGmailScopes } from "@/lib/google-scopes";
 
 // Feature 4a: completes the Google OAuth connect flow started by
 // src/app/api/auth/google/start/route.ts. Validates the CSRF `state`
@@ -112,6 +113,12 @@ export async function GET(req: NextRequest) {
     // Gmail client without a recorded grant must fail closed.
     const scope = typeof payload.scope === "string" ? payload.scope.trim() : "";
     if (!scope) return redirectWithStatus(req, "error", "missing_scope");
+    // Gmail is the only Google capability Jarvis retains. If Google returns a
+    // legacy Calendar/Drive/profile grant, do not persist a refresh token that
+    // carries authority this app neither needs nor exposes.
+    if (!hasOnlyGoogleGmailScopes(scope)) {
+      return redirectWithStatus(req, "error", "unexpected_scope");
+    }
     const encryptedRefreshToken = encryptGoogleRefreshToken(payload.refresh_token);
 
     await controlMutation("googleAuth:upsertConnection", {

@@ -6,6 +6,7 @@ import {
   GOOGLE_GMAIL_MODIFY_SCOPE,
   GOOGLE_GMAIL_READONLY_SCOPE,
   hasGoogleScopes,
+  hasOnlyGoogleGmailScopes,
 } from "./google-scopes";
 
 // Google OAuth connect infrastructure — shared access-token helper. This file
@@ -147,6 +148,7 @@ export async function googleOAuthStoredConnectionReadiness(): Promise<GoogleOAut
 
   if (raw == null) return "missing";
   if (!isEncryptedConnection(raw)) return "needs_reconnect";
+  if (!hasOnlyGoogleGmailScopes(raw.scope)) return "needs_reconnect";
 
   try {
     decryptGoogleRefreshToken(raw.encryptedRefreshToken);
@@ -175,6 +177,11 @@ async function loadCredentials(): Promise<Credentials> {
   }
 
   if (stored) {
+    if (!hasOnlyGoogleGmailScopes(stored.scope)) {
+      throw new GoogleOAuthError(
+        "The stored Google connection contains a non-Gmail grant. Reconnect Gmail from Options before using it.",
+      );
+    }
     const clientId = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
     if (!clientId || !clientSecret) {
@@ -239,23 +246,6 @@ async function refreshGoogleAccessToken(credentials: Credentials): Promise<strin
     scope: credentials.scope,
   };
   return tokenCache.value;
-}
-
-/**
- * Returns a live OAuth access token for Gmail-compatible callers, refreshing
- * it from the stored (or legacy) refresh token when the cached one is near
- * expiry.
- * Mirrors the token-exchange shape and the ~45s safety margin already used
- * by accessToken() in src/lib/booking-email.ts.
- */
-export async function getGoogleAccessToken(): Promise<string> {
-  // Reload the connection before trusting the in-memory token. A reconnect
-  // can replace Daniel's Google account or its grants while this process is
-  // warm; serving the old bearer token until expiry would cross that boundary.
-  const credentials = await loadCredentials();
-  const key = credentialCacheKey(credentials);
-  if (tokenCache && tokenCache.expiresAt > Date.now() && tokenCache.credentialKey === key) return tokenCache.value;
-  return await refreshGoogleAccessToken(credentials);
 }
 
 /**

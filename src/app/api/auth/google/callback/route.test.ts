@@ -80,6 +80,20 @@ describe("Google OAuth callback scope persistence", () => {
     expect(mock.encrypt).not.toHaveBeenCalled();
   });
 
+  it("rejects a refresh token carrying any Google Calendar grant", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => Response.json({
+      refresh_token: "refresh",
+      access_token: "access",
+      scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/calendar.events",
+    }));
+
+    const response = await GET(callbackRequest());
+
+    expect(response.headers.get("location")).toContain("google_oauth_detail=unexpected_scope");
+    expect(mock.controlMutation).not.toHaveBeenCalled();
+    expect(mock.encrypt).not.toHaveBeenCalled();
+  });
+
   it("does not exchange an authorization code unless all secure OAuth settings are ready", async () => {
     mock.configured.mockReturnValue(false);
 
