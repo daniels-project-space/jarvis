@@ -6083,6 +6083,29 @@ export const control = mutation({
     if (
       a.action === "cancel"
       && row.status === "cancelled"
+      && !isSupervisorOwnedJob(row)
+    ) {
+      if (!row.dispatchId) return true;
+      const attempt = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
+      if (!attempt?.completedAt
+        || (attempt.providerWorkspaceId && !attempt.providerTerminatedAt)
+        || !await closeClaimedDispatchReceipt(
+          ctx,
+          row,
+          row.deliveryRunId ?? row.workerRunId,
+          "legacy goal cancellation already committed",
+        )) return false;
+      await patchJobWithRuntime(ctx, row, {
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        deliveryRunId: undefined,
+      });
+      return true;
+    }
+    if (
+      a.action === "cancel"
+      && row.status === "cancelled"
       && isSupervisorOwnedJob(row)
     ) {
       // Early protocol-2 operator cancellations sealed a canonical terminal
@@ -6101,10 +6124,20 @@ export const control = mutation({
         || exact.receipt.resultDigest !== await sha256Hex(result)
         || exact.receipt.evidenceDigest !== await sha256Hex(evidence)
       ) return false;
-      if (row.result !== result || row.verificationNote !== evidence) {
+      if (row.dispatchId && !await closeClaimedDispatchReceipt(
+        ctx,
+        row,
+        row.deliveryRunId ?? row.workerRunId,
+        "operator cancellation already committed",
+      )) return false;
+      if (row.result !== result || row.verificationNote !== evidence || row.dispatchId || row.workerRunId || row.deliveryRunId) {
         await patchJobWithRuntime(ctx, row, {
           result,
           verificationNote: evidence,
+          dispatchId: undefined,
+          dispatchLeaseUntil: undefined,
+          workerRunId: undefined,
+          deliveryRunId: undefined,
         });
       }
       return true;
@@ -6261,6 +6294,12 @@ export const control = mutation({
           evidence: cancellationEvidence,
         }, now);
       }
+      if (row.dispatchId && !await closeClaimedDispatchReceipt(
+        ctx,
+        row,
+        row.deliveryRunId ?? row.workerRunId,
+        "job cancelled by owner control",
+      )) return false;
       await patchJobWithRuntime(ctx, row, {
         ...invalidateDeliveryLease(row),
         status: "cancelled",
@@ -6274,6 +6313,10 @@ export const control = mutation({
         completedAt: now,
         progress: "cancelled by Daniel",
         nextRunAt: undefined,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        deliveryRunId: undefined,
         deliveryLeaseUntil: undefined,
         deliveryLeaseToken: undefined,
       });

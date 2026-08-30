@@ -1733,8 +1733,7 @@ export const renewAdvance = mutation({
   },
 });
 
-async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefinement[], wave: number) {
-  const integrationBranch = mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
+function acceptedGoalReadOnlyBoundary(mission: any) {
   const acceptedPlan = mission.plan && typeof mission.plan === "object"
     ? mission.plan as GoalPlan
     : null;
@@ -1742,10 +1741,15 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
   // accepted all-read-only mission into branches, checkpoints, merge receipts
   // or write authority. This also keeps verification-only waves on the cheap
   // immutable completion path.
-  const acceptedReadOnlyBoundary = Boolean(
+  return Boolean(
     acceptedPlan?.workstreams?.length
       && acceptedPlan.workstreams.every((stream) => stream.readonly),
   );
+}
+
+async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefinement[], wave: number) {
+  const integrationBranch = mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
+  const acceptedReadOnlyBoundary = acceptedGoalReadOnlyBoundary(mission);
   const ids: string[] = [];
   for (const refinement of refinements.slice(0, 3)) {
     const readonly = acceptedReadOnlyBoundary || refinement.readonly;
@@ -1780,6 +1784,118 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
   }
   return ids;
 }
+
+/** Repair the finite rollout set created before read-only refinement authority
+ * was inherited from the accepted plan. Only an unclaimed/terminal current
+ * attempt can be superseded; a provider-backed attempt must already carry its
+ * durable termination observation. The append-only work-order revision and a
+ * fresh attempt keep old workers fenced rather than mutating their authority. */
+export const repairReadOnlyRefinementAuthority = mutation({
+  args: {
+    id: v.id("missions"),
+    limit: v.optional(v.number()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const mission: any = await ctx.db.get(args.id);
+    const activeRefinement = mission?.status === "running" && mission?.phase === "refining";
+    const blockedRefinement = mission?.status === "needs_input" && mission?.phase === "blocked"
+      && mission?.pausedPhase === "refining";
+    if (!mission || mission.mode !== "goal" || (!activeRefinement && !blockedRefinement)
+      || !acceptedGoalReadOnlyBoundary(mission)) {
+      return { repaired: [] as string[], remaining: 0 };
+    }
+    const now = Date.now();
+    const limit = Math.max(1, Math.min(8, Math.floor(args.limit ?? 4)));
+    const jobs = await ctx.db.query("jobs")
+      .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
+      .take(100);
+    const mismatched = jobs.filter((job: any) => job.goalStage === "refining"
+      && Number(job.goalWave ?? 0) === Number(mission.revisionWave ?? 0)
+      && job.readonly !== true);
+    const repaired: string[] = [];
+    for (const job of jobs) {
+      if (repaired.length >= limit || job.goalStage !== "refining"
+        || Number(job.goalWave ?? 0) !== Number(mission.revisionWave ?? 0)
+        || job.readonly === true || !["pending", "error", "cancelled", "paused"].includes(job.status)
+        || job.dispatchId) continue;
+      let current = await readExactWorkAttempt(ctx, job._id, Number(job.attempt ?? 1));
+      // Exhaustion historically advanced the job counter once without
+      // allocating that impossible child. Recover the exact terminal parent;
+      // never treat an arbitrary missing current attempt as safe evidence.
+      if (current.kind === "missing" && job.status !== "pending" && Number(job.attempt ?? 1) > 1) {
+        current = await readExactWorkAttempt(ctx, job._id, Number(job.attempt) - 1);
+      }
+      if (current.kind === "ambiguous"
+        || (current.kind === "missing" && job.status !== "pending")
+        || (current.kind === "exact" && (["running", "dispatching"].includes(current.attempt.status)
+          || !current.attempt.completedAt
+          || (current.attempt.providerWorkspaceId && !current.attempt.providerTerminatedAt)))) continue;
+      if (current.kind === "exact" && !current.attempt.completedAt) await ctx.db.patch(current.attempt._id, {
+        status: "cancelled",
+        completedAt: now,
+        lastEventAt: now,
+      });
+      // `readonly` is part of immutable scheduling admission, so the repair
+      // must supersede the unsafe row rather than rewriting it in place.
+      await patchJobWithRuntime(ctx, job, {
+        ...freshGoalSpecialistAttemptPatch(job),
+        status: "cancelled",
+        stage: "superseded",
+        progress: "superseded by accepted read-only refinement authority",
+        dispatchReady: false,
+        goalWave: -1,
+        completedAt: now,
+        heartbeatAt: now,
+        progressAt: now,
+        nextRunAt: undefined,
+      });
+      const replacementId = await insertGoalJob(ctx, {
+        task: String(job.task),
+        policyTask: String(job.policyTask ?? job.task),
+        missionId: String(mission._id),
+        label: String(job.label ?? "Read-only refinement").slice(0, 80),
+        repo: job.repo,
+        readonly: true,
+        model: job.model as WorkModelTier,
+        reasoningEffort: job.reasoningEffort as GoalReasoningEffort,
+        mcp: Array.isArray(job.mcp) ? job.mcp : ["context7"],
+        originThreadId: job.originThreadId,
+        agentId: job.agentId ?? "paul",
+        risk: "low",
+        priority: Number(job.priority ?? 96),
+        acceptanceCriteria: Array.isArray(job.acceptanceCriteria) ? job.acceptanceCriteria : [],
+        modelReason: "Goal Mode repaired a legacy refinement to the accepted read-only mission authority",
+        sourceBranch: mission.sourceBranch,
+        maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.refining,
+        goalStage: "refining",
+        goalWorkstreamId: String(job.goalWorkstreamId ?? `readonly-repair-${repaired.length + 1}`),
+        goalWave: Number(mission.revisionWave ?? 0),
+      });
+      repaired.push(`${String(job._id)}:${String(replacementId)}`);
+    }
+    if (repaired.length) {
+      const allRepaired = repaired.length === mismatched.length;
+      await patchMissionWithRuntime(ctx, mission, {
+        agentCount: Number(mission.agentCount ?? 0) + repaired.length,
+        ...(allRepaired ? {
+          status: "running",
+          phase: "refining",
+          pausedPhase: undefined,
+          failureReason: undefined,
+          advanceLeaseUntil: undefined,
+        } : {}),
+        updatedAt: now,
+      });
+      if (allRepaired) await resolveGoalAttention(ctx, mission._id);
+      await recordMissionEvent(ctx, String(mission._id), "goal_readonly_refinement_repaired",
+      `Repaired ${repaired.length} legacy refinement ${repaired.length === 1 ? "job" : "jobs"} to the accepted read-only authority`,
+      "refining", mission.percent, { jobIds: repaired, wave: Number(mission.revisionWave ?? 0) });
+    }
+    return { repaired, remaining: Math.max(0, mismatched.length - repaired.length) };
+  },
+});
 
 async function upsertGoalAttention(ctx: any, mission: any, detail: string) {
   const now = Date.now();

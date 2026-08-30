@@ -2385,6 +2385,7 @@ describe("production Trigger worker authority harness", () => {
     const { jobId, reservation } = await reservedWritableJob(t, "runner-spoofed-capacity-hold");
     await t.mutation(api.jobs.claimDispatched, {
       ...workerPayload(reservation),
+      jobId: jobId as any,
       workerRunId: "spoofed-capacity-run",
       workerToken: WORKER,
     });

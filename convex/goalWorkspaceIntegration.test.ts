@@ -767,6 +767,100 @@ describe("real Convex multi-agent workspace and integration races", () => {
     });
   });
 
+  it("repairs an unclaimed legacy writable refinement with a fenced read-only revision", async () => {
+    const refining = await goalAwaitingPlan();
+    const readonlyPlan = {
+      summary: "Read-only lifecycle evidence mission",
+      route: "existing_project",
+      primaryRepo: REPO,
+      assumptions: [],
+      workstreams: [{
+        id: "lifecycle-evidence",
+        label: "Lifecycle evidence",
+        task: "Inspect the lifecycle and run existing checks without changing source.",
+        agentId: "atlas",
+        repo: REPO,
+        readonly: true,
+        dependsOn: [],
+        acceptanceCriteria: ["Read-only evidence is complete"],
+        mcp: [],
+      }],
+      validation: { criteria: ["Evidence is complete"], tests: [], liveChecks: [] },
+    };
+    await recordPlanFixture(refining.t, {
+      id: refining.missionId,
+      expectedAdvanceAttempt: 1,
+      plan: readonlyPlan,
+      workerToken: TOKEN,
+    });
+    await refining.t.run(async (ctx) => {
+      const mission: any = await ctx.db.get(refining.missionId);
+      await ctx.db.patch(refining.missionId, {
+        phase: "validating",
+        advanceAttempt: 1,
+        // Simulate the pre-fix enqueue decision while keeping a valid stored
+        // job/revision. The accepted plan is restored before repair.
+        plan: {
+          ...mission.plan,
+          workstreams: mission.plan.workstreams.map((stream: any) => ({ ...stream, readonly: false })),
+        },
+      });
+    });
+    await refining.t.mutation(api.goalMode.recordValidation, {
+      id: refining.missionId,
+      expectedAdvanceAttempt: 1,
+      validation: {
+        verdict: "refine",
+        summary: "One more existing check is required",
+        evidence: [],
+        gaps: ["Race assertion output is missing"],
+        refinements: [{
+          id: "legacy-race-check",
+          label: "Legacy race check",
+          task: "Run the selected existing race tests and report exact output without changing source.",
+          readonly: false,
+          acceptanceCriteria: ["Existing race tests pass"],
+        }],
+      },
+      workerToken: TOKEN,
+    });
+    const legacy: any = await refining.t.run(async (ctx) => {
+      const mission: any = await ctx.db.get(refining.missionId);
+      await ctx.db.patch(refining.missionId, { plan: readonlyPlan });
+      return (await ctx.db.query("jobs")
+        .withIndex("by_mission", (q) => q.eq("missionId", String(refining.missionId)))
+        .collect()).find((row) => row.goalStage === "refining");
+    });
+    expect(legacy).toMatchObject({ readonly: false, status: "pending", attempt: 1 });
+    const repair = await refining.t.mutation(api.goalMode.repairReadOnlyRefinementAuthority, {
+      id: refining.missionId,
+      workerToken: TOKEN,
+    });
+    expect(repair.repaired).toHaveLength(1);
+    expect(repair.repaired[0]).toMatch(new RegExp(`^${String(legacy._id)}:`));
+    const replacementId = repair.repaired[0].slice(repair.repaired[0].indexOf(":") + 1);
+    const state = await refining.t.run(async (ctx) => ({
+      legacy: await ctx.db.get(legacy._id),
+      replacement: await ctx.db.get(ctx.db.normalizeId("jobs", replacementId)!),
+    }));
+    expect(state.legacy).toMatchObject({
+      status: "cancelled",
+      stage: "superseded",
+      goalWave: -1,
+      dispatchReady: false,
+    });
+    expect(state.replacement).toMatchObject({
+      readonly: true,
+      deliveryMode: "read_only",
+      risk: "low",
+      status: "pending",
+      goalWave: 1,
+      percent: 0,
+      workOrderRevision: 1,
+      triggerMachineReason: "admitted_bounded_read",
+    });
+  });
+
   it("defines one terminal-release truth table for every outcome path", () => {
     const effect = (observation?: "applied" | "not_applied" | "unknown", providerHeadSha?: string) => ({
       effectId: "final", effectKind: "update_ref", expectedBaseSha: BASE,

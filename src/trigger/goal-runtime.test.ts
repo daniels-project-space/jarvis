@@ -25,7 +25,7 @@ describe("Goal Mode external runtime", () => {
       outcomeEvidence: [],
       stopConditionsSatisfied: [],
       gaps: ["mobile navigation clips"],
-      refinements: [{ id: "mobile", label: "Mobile", task: "Repair the mobile navigation and verify the real flow.", acceptanceCriteria: ["No clipping"] }],
+      refinements: [{ id: "mobile", label: "Mobile", task: "Repair the mobile navigation and verify the real flow.", readonly: false, acceptanceCriteria: ["No clipping"] }],
     }, 2);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("https://factory.test/api/mutation");

@@ -161,6 +161,35 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; vi.useRealTimers();
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
 describe("real Convex specialist/controller race matrix", () => {
+  it("closes the exact claimed dispatch when a legacy goal cancellation is replayed", async () => {
+    const f = await unclaimedDispatchFixture("cancel-claimed-goal-worker");
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation),
+      workerRunId: "cancelled-goal-run",
+      workerToken: WORKER,
+    })).toMatchObject({ workerRunId: "cancelled-goal-run" });
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+    // The same owner command is idempotent and must not leave a claimed
+    // dispatch that can poison a later mission repair.
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({ status: "cancelled" });
+    expect(state.jobs[0]).not.toHaveProperty("dispatchId");
+    expect(state.jobs[0]).not.toHaveProperty("workerRunId");
+    expect(state.attempts[0]).toMatchObject({ status: "cancelled" });
+    expect(state.dispatches).toEqual([expect.objectContaining({ status: "closed" })]);
+  });
+
   it("fences a worker input hold and closes its exact claimed dispatch without retrying", async () => {
     const f = await specialistFixture("read_only");
     expect(await f.t.mutation(api.jobs.requestInput, {
