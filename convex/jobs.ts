@@ -4778,20 +4778,19 @@ export const bindWorkspaceSource = mutation({
     if (attempt?.parentAttempt !== undefined) {
       const checkpointContinuation = GIT_OID.test(String(attempt.parentCheckpointHeadSha ?? ""))
         && attempt.parentCheckpointHeadSha === checkoutHeadSha;
-      const parent = await attemptFor(ctx, args.jobId, attempt.parentAttempt);
-      // If the prior worker stopped before the write-once Codex turn receipt,
-      // there is no mutable workspace state to preserve. A continuation may
-      // safely hydrate the same immutable admitted source again. Once Codex
-      // was authorized, however, only an exact checkpoint head can cross the
-      // attempt boundary.
-      const cleanPreCodexRetry = !attempt.parentCheckpointHeadSha
-        && checkoutHeadSha === args.sourceHeadSha
-        && parent?.sourceHeadSha === args.sourceHeadSha
-        && parent.workspaceBaseSha === args.sourceHeadSha
-        && !parent.codexTurnReceiptId
-        && !parent.checkpointHeadSha
-        && ["checkpointed", "error"].includes(String(parent.status));
-      if (!checkpointContinuation && !cleanPreCodexRetry) return false;
+      // The server-minted child attempt carries the only permitted workspace
+      // lineage across the attempt boundary. A checkpoint-bearing child must
+      // resume that exact immutable head. A child deliberately created with
+      // no parent checkpoint (for example, a rejected Goal contract or a
+      // provider hold before execution) starts a fresh generation from the
+      // still-sealed admitted source. Requiring the immediate parent itself
+      // to have bound a workspace deadlocks chains of pre-execution holds and
+      // stale controller corrections, even though no mutable checkout exists
+      // to preserve. The current attempt authority and row source equality
+      // below still prevent a caller from selecting another ref or commit.
+      const freshAdmittedGeneration = attempt.parentCheckpointHeadSha === undefined
+        && checkoutHeadSha === args.sourceHeadSha;
+      if (!checkpointContinuation && !freshAdmittedGeneration) return false;
     }
     if (row.sourceHeadSha !== args.sourceHeadSha || row.sourceBranch !== args.sourceBranch) return false;
     if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, workspaceBaseSha: checkoutHeadSha, lastEventAt: Date.now() });

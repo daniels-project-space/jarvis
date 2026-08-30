@@ -576,6 +576,28 @@ describe("real Convex multi-agent workspace and integration races", () => {
     ]) {
       expect(corrected[field], field).toBeUndefined();
     }
+
+    // A semantic correction is a new specialist generation, not a workspace
+    // continuation. Its server-minted attempt intentionally has no parent
+    // checkpoint and must be able to bind the original sealed source even
+    // when the rejected controller generation never created a workAttempt.
+    await f.t.run(async (ctx) => {
+      const correction: any = await ctx.db.get(validatorJobId);
+      await patchJobWithRuntime(ctx, correction, { nextRunAt: Date.now() });
+    });
+    const [correction] = await dispatch(f.t, 1, "validator-contract-correction");
+    expect(String(correction.reservation.jobId)).toBe(String(validatorJobId));
+    const correctionAuthority = await jobExecutionAuthority(f.t, validatorJobId, 2);
+    expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
+      jobId: validatorJobId,
+      expectedAttempt: 2,
+      authorityDigest: correctionAuthority.authorityDigest,
+      workerRunId: String(correction.claim!.workerRunId),
+      sourceBranch: String(corrected.sourceBranch),
+      sourceHeadSha: String(corrected.sourceHeadSha),
+      checkoutHeadSha: String(corrected.sourceHeadSha),
+      workerToken: TOKEN,
+    })).toBe(true);
   });
 
   it("projects all 320 action-scope decisions identically into Goal Mode producers", async () => {
