@@ -16,5 +16,8 @@ RUN apt-get update \
 # The host forces this numeric identity too. It owns only tmpfs workspace and
 # /tmp mounts; the image root stays read-only at runtime.
 USER 65532:65532
-WORKDIR /workspace/repository
+# Keep the image working directory outside the runtime tmpfs. Older rootless
+# Podman releases materialize WORKDIR as root before applying a tmpfs mount,
+# which leaves /workspace/repository unwritable by the enforced numeric user.
+WORKDIR /
 ENTRYPOINT ["/bin/sh"]

@@ -27,7 +27,6 @@ export type SelfHostedRunnerConfig = Readonly<{
   image: string;
   template: string;
   runtime: string;
-  lockfileDigest: string;
   limits: RunnerLimits;
   maxActiveWorkspaces: number;
 }>;
@@ -37,6 +36,7 @@ export type RunnerWorkspace = Readonly<{
   workspaceId: string;
   sessionId: string;
   attemptKeyHash: string;
+  sourcePolicyDigest: string;
   policyDigest: string;
   containerId: string;
   createdAt: number;
@@ -158,7 +158,8 @@ function stateRecord(value: unknown): RunnerState {
   const workspaces = input.workspaces.map((value) => {
     const row = record(value);
     if (row.version !== 1 || !ID.test(String(row.workspaceId)) || !ID.test(String(row.sessionId))
-      || !SHA256.test(String(row.attemptKeyHash)) || !SHA256.test(String(row.policyDigest)) || !ID.test(String(row.containerId))
+      || !SHA256.test(String(row.attemptKeyHash)) || !SHA256.test(String(row.sourcePolicyDigest))
+      || !SHA256.test(String(row.policyDigest)) || !ID.test(String(row.containerId))
       || !Number.isSafeInteger(row.createdAt) || !Number.isSafeInteger(row.expiresAt)) {
       throw new Error("runner workspace state is malformed");
     }
@@ -167,6 +168,7 @@ function stateRecord(value: unknown): RunnerState {
       workspaceId: String(row.workspaceId),
       sessionId: String(row.sessionId),
       attemptKeyHash: String(row.attemptKeyHash),
+      sourcePolicyDigest: String(row.sourcePolicyDigest),
       policyDigest: String(row.policyDigest),
       containerId: String(row.containerId),
       createdAt: Number(row.createdAt),
@@ -215,7 +217,6 @@ export class SelfHostedRunnerService {
       image: config.image,
       template: config.template,
       runtime: config.runtime,
-      lockfileDigest: config.lockfileDigest,
       limits: config.limits,
       maxActiveWorkspaces: config.maxActiveWorkspaces,
     })).digest("hex");
@@ -316,17 +317,22 @@ export class SelfHostedRunnerService {
     if (!ATTEMPT.test(attemptKey)
       || body.template !== this.config.template
       || body.runtime !== this.config.runtime
-      || body.lockfileDigest !== this.config.lockfileDigest
       || !SHA256.test(String(body.lockfileDigest))) {
       throw new RunnerHttpError(409, "workspace_policy_mismatch");
     }
     const limits = limitsFrom(body.limits, this.config.limits);
     const attemptKeyHash = createHash("sha256").update(attemptKey).digest("hex");
+    const sourcePolicyDigest = createHash("sha256").update(JSON.stringify({
+      template: body.template,
+      runtime: body.runtime,
+      lockfileDigest: body.lockfileDigest,
+    })).digest("hex");
     return await this.exclusive(async () => {
       await this.reapUnlocked();
       const existing = this.state.workspaces.find((entry) => entry.attemptKeyHash === attemptKeyHash);
       if (existing) {
         if (existing.policyDigest !== this.policyDigest
+          || existing.sourcePolicyDigest !== sourcePolicyDigest
           || JSON.stringify(existing.limits) !== JSON.stringify(limits)
           || !(await this.backend.isRunning(existing))) {
           throw new RunnerHttpError(409, "stale_attempt");
@@ -343,6 +349,7 @@ export class SelfHostedRunnerService {
         workspaceId,
         sessionId,
         attemptKeyHash,
+        sourcePolicyDigest,
         policyDigest: this.policyDigest,
         containerId: safeId(created.containerId),
         createdAt,

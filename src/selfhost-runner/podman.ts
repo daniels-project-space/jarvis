@@ -196,8 +196,11 @@ export class PodmanSelfHostedRunnerBackend implements SelfHostedRunnerBackend {
       "--env", "PATH=/usr/local/bin:/usr/bin:/bin",
       "--env", "LANG=C",
       "--env", "LC_ALL=C",
-      "--tmpfs", `/workspace:rw,nosuid,nodev,size=${this.config.workspaceTmpfsMb}m,mode=0700,uid=${this.config.user.split(":")[0]},gid=${this.config.user.split(":")[1]}`,
-      "--tmpfs", `/tmp:rw,nosuid,nodev,size=256m,mode=0700,uid=${this.config.user.split(":")[0]},gid=${this.config.user.split(":")[1]}`,
+      // Podman 4.x rejects uid/gid in --tmpfs even though the kernel accepts
+      // them. A sticky tmpfs plus one enforced container uid gives the same
+      // isolation without depending on that newer parser extension.
+      "--mount", `type=tmpfs,destination=/workspace,tmpfs-size=${this.config.workspaceTmpfsMb * 1024 * 1024},tmpfs-mode=1777`,
+      "--mount", "type=tmpfs,destination=/tmp,tmpfs-size=268435456,tmpfs-mode=1777",
       "--entrypoint", "/bin/sh",
       this.config.image,
       "-c", "mkdir -p /workspace/repository && exec sleep infinity",

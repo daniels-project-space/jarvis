@@ -46,6 +46,8 @@ describe("rootless Podman self-host runner", () => {
       "--security-opt", "no-new-privileges",
       "--read-only",
       "--user", "65532:65532",
+      "--mount", "type=tmpfs,destination=/workspace,tmpfs-size=1073741824,tmpfs-mode=1777",
+      "--mount", "type=tmpfs,destination=/tmp,tmpfs-size=268435456,tmpfs-mode=1777",
     ]));
     expect(call.args.join(" ")).not.toMatch(/(?:TOKEN|SECRET|VAULT|CONVEX|TRIGGER|GITHUB|CODEX_HOME)/);
     expect(call.args.at(-3)).toContain("@sha256:");
@@ -85,6 +87,7 @@ describe("rootless Podman self-host runner", () => {
       workspaceId: "ws-safe",
       sessionId: "session-safe",
       attemptKeyHash: "c".repeat(64),
+      sourcePolicyDigest: "e".repeat(64),
       policyDigest: "d".repeat(64),
       containerId: "a".repeat(64),
       createdAt: 1,

@@ -6,7 +6,6 @@ import { SelfHostedRunnerService, type RunnerLimits, type SelfHostedRunnerConfig
 
 const LOOPBACK = new Set(["127.0.0.1", "::1"]);
 const TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
-const SHA256 = /^[a-f0-9]{64}$/;
 const MAX_HTTP_BODY_BYTES = 25 * 1024 * 1024;
 
 function required(name: string): string {
@@ -27,8 +26,6 @@ export function selfHostedRunnerServerConfig(): { bind: string; port: number; ru
   if (!LOOPBACK.has(bind)) throw new Error("self-hosted runner must bind to loopback behind an HTTPS tunnel");
   const token = required("JARVIS_SELF_HOST_RUNNER_TOKEN");
   if (!TOKEN.test(token)) throw new Error("JARVIS_SELF_HOST_RUNNER_TOKEN must be a 32+ character base64url bearer");
-  const lockfileDigest = required("JARVIS_SELF_HOST_RUNNER_LOCKFILE_DIGEST");
-  if (!SHA256.test(lockfileDigest)) throw new Error("runner lockfile digest must be sha256");
   const limits: RunnerLimits = {
     ttlMs: integer("JARVIS_SELF_HOST_RUNNER_TTL_MS", 55 * 60_000, 60_000, 55 * 60_000),
     commandTimeoutMs: integer("JARVIS_SELF_HOST_RUNNER_COMMAND_TIMEOUT_MS", 15 * 60_000, 1_000, 15 * 60_000),
@@ -48,7 +45,6 @@ export function selfHostedRunnerServerConfig(): { bind: string; port: number; ru
       image: required("JARVIS_SELF_HOST_RUNNER_IMAGE"),
       template: required("JARVIS_SELF_HOST_RUNNER_TEMPLATE"),
       runtime: required("JARVIS_SELF_HOST_RUNNER_RUNTIME"),
-      lockfileDigest,
       limits,
       maxActiveWorkspaces: 1,
     },

@@ -55,7 +55,6 @@ describe("self-hosted runner host protocol", () => {
       image: `registry.example/jarvis-runner@sha256:${"b".repeat(64)}`,
       template: "jarvis-node22-codex-0.144.5",
       runtime: "node-22:codex-0.144.5",
-      lockfileDigest: "c".repeat(64),
       limits: LIMITS,
       maxActiveWorkspaces: 1,
     }, backend);
@@ -139,6 +138,30 @@ describe("self-hosted runner host protocol", () => {
     }));
     expect(retried.status).toBe(204);
     expect(backend.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts per-repository lockfile identities while fencing an attempt to its original source policy", async () => {
+    const create = (attemptKey: string, lockfileDigest: string) => service.handle(request("/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        attemptKey,
+        template: "jarvis-node22-codex-0.144.5",
+        runtime: "node-22:codex-0.144.5",
+        lockfileDigest,
+        limits: LIMITS,
+      }),
+    }));
+    const first = await create("multi-repo:1", "a".repeat(64));
+    expect(first.status).toBe(201);
+    const workspace = await first.json() as { workspaceId: string; sessionId: string };
+    expect((await create("multi-repo:1", "b".repeat(64))).status).toBe(409);
+    await service.handle(request(`/v1/workspaces/${workspace.workspaceId}`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: workspace.sessionId, reason: "terminal" }),
+    }));
+    expect((await create("another-repo:1", "b".repeat(64))).status).toBe(201);
   });
 
   it("rejects traversal and over-limit file operations before touching the backend", async () => {

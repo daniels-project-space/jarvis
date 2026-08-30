@@ -86,9 +86,13 @@ JARVIS_SELF_HOST_RUNNER_STATE_DIR=/var/lib/jarvis-selfhost-runner
 JARVIS_SELF_HOST_RUNNER_IMAGE=ghcr.io/<owner>/<image>@sha256:<immutable-digest>
 JARVIS_SELF_HOST_RUNNER_TEMPLATE=<same identity configured in Trigger>
 JARVIS_SELF_HOST_RUNNER_RUNTIME=<same runtime identity configured in Trigger>
-JARVIS_SELF_HOST_RUNNER_LOCKFILE_DIGEST=<same 64-character digest configured in Trigger>
 JARVIS_SELF_HOST_RUNNER_TOKEN=<same dedicated runner bearer configured in Trigger>
 ```
+
+The controller supplies the exact lockfile digest separately for every
+repository attempt. The runner validates and binds it to that attempt, but it
+must not pin one repository digest globally: doing so would make the live probe
+and real multi-repository work mutually incompatible.
 
 Run Podman rootless under a dedicated unprivileged OS user. The service itself
 refuses non-loopback binding, mutable image tags, non-Podman runtimes, excess
