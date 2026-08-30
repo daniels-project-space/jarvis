@@ -15,6 +15,7 @@
     "test:e2e:media": "node scripts/private-media-e2e.mjs",
     "verify:novita-patch-proposer": "tsx scripts/verify-novita-patch-proposer-config.ts",
     "deploy:trigger": "npm run verify:novita-patch-proposer && npx --yes trigger.dev@4.5.1 deploy",
+    "deploy:vercel": "tsx scripts/deploy-vercel-production.ts",
     "harness:codex-session": "tsx scripts/codex-session-concurrency-harness.ts",
     "foreground:selfhost": "node --conditions=react-server --import tsx scripts/self-hosted-foreground-runner.ts",
     "runner:selfhost": "node --import tsx scripts/self-hosted-runner-server.ts",

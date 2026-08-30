@@ -16,8 +16,8 @@ describe("GET /api/health", () => {
     });
   });
 
-  it("uses the explicit release revision when a manual Vercel deploy exposes an empty git SHA", async () => {
-    vi.stubEnv("VERCEL_GIT_COMMIT_SHA", "");
+  it("prefers the explicit release revision when a manual deploy inherits stale Git metadata", async () => {
+    vi.stubEnv("VERCEL_GIT_COMMIT_SHA", "a".repeat(40));
     vi.stubEnv("RELEASE_SHA", "b".repeat(40));
 
     await expect(GET().json()).resolves.toMatchObject({
