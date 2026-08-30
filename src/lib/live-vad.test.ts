@@ -181,6 +181,12 @@ describe("live full-duplex voice gate", () => {
       "How can I explain this to you —",
       true,
     )).toBe(false);
+    expect(shouldCloseLiveUtterance(
+      state,
+      state.lastVoice + LIVE_TRUSTED_BROWSER_FINAL_QUESTION_END_SILENCE_MS + 1,
+      "Can you delete that file?",
+      true,
+    )).toBe(false);
   });
 
   it("extends endpointing for an unfinished connective and a self-correction", () => {

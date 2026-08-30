@@ -41,6 +41,26 @@ export function isStableBrowserSpeechRevision(
 }
 
 /**
+ * Chromium commonly reports a final Web Speech result with confidence `0`,
+ * which means "not supplied" rather than "known to be wrong". That result is
+ * usable only when the immediately preceding same-session revision already
+ * contained the exact final words (or an exact prefix) and no newer VAD frame
+ * appeared. Callers still decide whether the utterance is safe enough for this
+ * narrow path; mutating commands must retain authoritative server STT.
+ */
+export function isStableBrowserFinalRevision(
+  previous: BrowserSpeechPreview | null,
+  current: BrowserSpeechPreview,
+): boolean {
+  if (!previous || !current.isFinal || previous.sessionId !== current.sessionId) return false;
+  if (current.observedVoiceAt < previous.observedVoiceAt) return false;
+  const previousText = normalized(previous.text);
+  const currentText = normalized(current.text);
+  if (!previousText || !currentText) return false;
+  return previousText === currentText || isStableBrowserSpeechRevision(previous, current);
+}
+
+/**
  * If both server recognizers are temporarily unavailable, a fenced browser
  * preview may rescue the already-recorded utterance instead of asking the user
  * to repeat it. This recovery threshold is intentionally stricter for an
@@ -74,20 +94,32 @@ export function recoverLiveTranscriptFromBrowser(args: {
  * live session, and no VAD-accepted speech occurred after that final result.
  */
 export function chooseLiveTranscriptSource(args: {
+  previous?: BrowserSpeechPreview | null;
   preview: BrowserSpeechPreview | null;
   sessionId: string;
   currentVoiceAt: number;
   sessionActive: boolean;
+  allowStableFinalWithoutConfidence?: boolean;
 }): LiveTranscriptSource {
   const preview = args.preview;
   const text = normalized(preview?.text ?? "");
+  const strongConfidence = Boolean(
+    preview
+    && Number.isFinite(preview.confidence)
+    && preview.confidence >= BROWSER_SPEECH_FINAL_MIN_CONFIDENCE,
+  );
+  const stableUnknownConfidence = Boolean(
+    preview
+    && args.allowStableFinalWithoutConfidence === true
+    && preview.confidence === 0
+    && isStableBrowserFinalRevision(args.previous ?? null, preview),
+  );
   if (
     !args.sessionActive
     || !preview
     || preview.sessionId !== args.sessionId
     || !preview.isFinal
-    || !Number.isFinite(preview.confidence)
-    || preview.confidence < BROWSER_SPEECH_FINAL_MIN_CONFIDENCE
+    || (!strongConfidence && !stableUnknownConfidence)
     || preview.observedVoiceAt !== args.currentVoiceAt
     || !text
   ) return { source: "server" };

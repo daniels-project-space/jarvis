@@ -151,6 +151,7 @@ export function isTrustedBrowserFinalQuestionEndpoint(
 ): boolean {
   const normalized = normalizedTranscript(transcript);
   return trustedBrowserFinal
+    && !MUTATING_OR_SENSITIVE_INTENT.test(normalized)
     && !isUnfinishedPartial(normalized)
     && isClearCompleteQuestion(normalized);
 }

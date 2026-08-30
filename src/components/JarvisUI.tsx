@@ -5092,11 +5092,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           void import("../lib/tts").then((m) => m.stopSpeaking());
           setSpeaking(false);
         }
+        const allowStableFinalWithoutConfidence = isTrustedBrowserFinalQuestionEndpoint(
+          browserPreview?.text,
+          true,
+        );
         const trustedBrowserFinal = chooseLiveTranscriptSource({
+          previous: previousBrowserPreview,
           preview: browserPreview,
           sessionId: voiceRequestId,
           currentVoiceAt: vad.lastVoice,
           sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+          allowStableFinalWithoutConfidence,
         }).source === "browser-final";
         const trustedBrowserFinalQuestion = isTrustedBrowserFinalQuestionEndpoint(
           browserPreview?.text,
@@ -5150,11 +5156,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       document.documentElement.dataset.jarvisSpeechClosedMs = String(Math.round(speechClosedAt));
       showCaption({ who: "you", text: "Processing…" });
       const streamedText = await selfHostedStreaming.current?.finish() ?? "";
+      // SpeechRecognition mutates these refs from its event callback. Preserve
+      // that runtime state across the recorder await; TypeScript cannot infer
+      // callback writes from the linear control flow here.
+      const finalBrowserPreview = browserPreview as BrowserSpeechPreview | null;
+      const finalPreviousBrowserPreview = previousBrowserPreview as BrowserSpeechPreview | null;
       const transcriptSource = chooseLiveTranscriptSource({
-        preview: browserPreview,
+        previous: finalPreviousBrowserPreview,
+        preview: finalBrowserPreview,
         sessionId: voiceRequestId,
         currentVoiceAt: vad.lastVoice,
         sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+        allowStableFinalWithoutConfidence: isTrustedBrowserFinalQuestionEndpoint(
+          finalBrowserPreview?.text,
+          true,
+        ),
       });
       let text: string;
       if (isMeaningfulSpeechTranscript(streamedText)) {

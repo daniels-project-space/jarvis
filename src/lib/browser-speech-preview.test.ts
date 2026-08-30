@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import {
   BROWSER_SPEECH_FINAL_MIN_CONFIDENCE,
   chooseLiveTranscriptSource,
+  isStableBrowserFinalRevision,
   isStableBrowserSpeechRevision,
   recoverLiveTranscriptFromBrowser,
   type BrowserSpeechPreview,
@@ -64,6 +65,66 @@ describe("browser speech preview", () => {
         sessionActive: true,
       })).toEqual({ source: "server" });
     }
+  });
+
+  it("accepts an unknown-confidence final only after an exact stable revision and explicit safe admission", () => {
+    const previous = preview({ text: "How does Sesame make voice replies faster", observedVoiceAt: 4_000 });
+    const final = preview({
+      text: previous.text,
+      isFinal: true,
+      confidence: 0,
+      observedVoiceAt: previous.observedVoiceAt,
+    });
+    expect(isStableBrowserFinalRevision(previous, final)).toBe(true);
+    expect(chooseLiveTranscriptSource({
+      previous,
+      preview: final,
+      sessionId: final.sessionId,
+      currentVoiceAt: final.observedVoiceAt,
+      sessionActive: true,
+      allowStableFinalWithoutConfidence: true,
+    })).toEqual({ source: "browser-final", text: final.text });
+
+    expect(chooseLiveTranscriptSource({
+      previous,
+      preview: final,
+      sessionId: final.sessionId,
+      currentVoiceAt: final.observedVoiceAt,
+      sessionActive: true,
+    })).toEqual({ source: "server" });
+  });
+
+  it("rejects unstable, low-confidence, stale, and cross-session final revisions", () => {
+    const previous = preview({ text: "How does Sesame make voice replies", observedVoiceAt: 4_000 });
+    const base = preview({
+      text: "How does another system make voice replies",
+      isFinal: true,
+      confidence: 0,
+      observedVoiceAt: 4_000,
+    });
+    expect(isStableBrowserFinalRevision(previous, base)).toBe(false);
+    for (const candidate of [
+      base,
+      { ...base, text: previous.text, confidence: 0.4 },
+      { ...base, text: previous.text, sessionId: "voice-session-2" },
+    ]) {
+      expect(chooseLiveTranscriptSource({
+        previous,
+        preview: candidate,
+        sessionId: "voice-session-1",
+        currentVoiceAt: 4_000,
+        sessionActive: true,
+        allowStableFinalWithoutConfidence: true,
+      })).toEqual({ source: "server" });
+    }
+    expect(chooseLiveTranscriptSource({
+      previous,
+      preview: { ...base, text: previous.text },
+      sessionId: "voice-session-1",
+      currentVoiceAt: 4_090,
+      sessionActive: true,
+      allowStableFinalWithoutConfidence: true,
+    })).toEqual({ source: "server" });
   });
 
   it("falls back to one server decision on cancellation, stale speech, or session mismatch", () => {
