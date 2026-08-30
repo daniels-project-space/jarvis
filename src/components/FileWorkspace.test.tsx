@@ -14,5 +14,7 @@ describe("FileWorkspaceView", () => {
     expect(markup).toContain("brief.md");
     expect(markup).toContain("Find names, folders, text, tags");
     expect(markup).toContain("compact");
+    expect(markup).toContain('data-file-folder="Acme"');
+    expect(markup).toContain('draggable="true"');
   });
 });

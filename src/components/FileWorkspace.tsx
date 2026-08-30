@@ -6,9 +6,12 @@ import { useJarvisQuery } from "@/lib/secure-convex";
 import { viewerFetchWithTimeout } from "@/lib/viewer-request";
 import {
   buildWorkspaceFolders,
+  visibleWorkspaceFolders,
   visibleWorkspaceFiles,
   workspaceCollectionCounts,
+  workspaceFolderAncestors,
   workspaceFolderFor,
+  workspaceParentPath,
   type WorkspaceCollection,
   type WorkspaceFile,
   type WorkspaceSort,
@@ -71,6 +74,9 @@ export function FileWorkspaceView({ value = "", files: source }: { value?: strin
   const [tags, setTags] = useState("");
   const [draft, setDraft] = useState<Draft | null>(null);
   const [draftText, setDraftText] = useState("");
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set());
+  const [draggedIds, setDraggedIds] = useState<string[]>([]);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -102,10 +108,26 @@ export function FileWorkspaceView({ value = "", files: source }: { value?: strin
   }), [fileOverrides, source]);
   const folders = useMemo(() => buildWorkspaceFolders(localFiles), [localFiles]);
   const folderByPath = useMemo(() => new Map(folders.map((folder) => [folder.path, folder])), [folders]);
+  const visibleFolders = useMemo(() => visibleWorkspaceFolders(folders, expandedFolders), [expandedFolders, folders]);
   const counts = useMemo(() => workspaceCollectionCounts(localFiles), [localFiles]);
   const visible = useMemo(() => visibleWorkspaceFiles({ files: localFiles, folderPath, collection, query, sort }), [collection, folderPath, localFiles, query, sort]);
   const childFolders = collection === "all" ? (folderByPath.get(folderPath)?.childFolders ?? []) : [];
   const focused = localFiles.find((file) => file.fileId === focusedId) ?? null;
+
+  const openFolder = (path: string) => {
+    setCollection("all");
+    setFolderPath(path);
+    setExpandedFolders((current) => new Set([...current, ...workspaceFolderAncestors(path)]));
+  };
+
+  const toggleFolder = (path: string) => {
+    setExpandedFolders((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
 
   const focusFile = (file: WorkspaceFile) => {
     setFocusedId(file.fileId);
@@ -141,13 +163,76 @@ export function FileWorkspaceView({ value = "", files: source }: { value?: strin
 
   const moveSelected = async () => {
     const ids = selectedIds.length ? selectedIds : focused ? [focused.fileId] : [];
-    if (!ids.length) return;
-    for (const id of ids) {
-      const file = localFiles.find((row) => row.fileId === id);
-      if (file) await updateMetadata(file, { folderPath: movePath });
-    }
-    setSelectedIds([]);
+    await moveFiles(ids, movePath);
   };
+
+  const moveFiles = async (ids: string[], targetPath: string) => {
+    const uniqueIds = [...new Set(ids)].filter((id) => localFiles.some((file) => file.fileId === id));
+    if (!uniqueIds.length) return;
+    setBusy(true);
+    setNotice("");
+    const updated: Record<string, WorkspaceFile> = {};
+    let failures = 0;
+    for (const id of uniqueIds) {
+      const response = await viewerFetchWithTimeout(`/api/files/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ folderPath: targetPath }),
+      }, 15_000).catch(() => null);
+      const body = response ? await response.json().catch(() => null) as { file?: WorkspaceFile } | null : null;
+      if (response?.ok && body?.file) updated[id] = body.file;
+      else failures += 1;
+    }
+    if (Object.keys(updated).length) {
+      setFileOverrides((current) => ({ ...current, ...updated }));
+      setSelectedIds([]);
+      setMovePath(targetPath);
+      setNotice(`Moved ${Object.keys(updated).length} ${Object.keys(updated).length === 1 ? "file" : "files"} to ${targetPath || "All files"}.${failures ? ` ${failures} could not be moved.` : ""}`);
+    } else {
+      setNotice("Those files could not be moved.");
+    }
+    setDraggedIds([]);
+    setDropTarget(null);
+    setBusy(false);
+  };
+
+  const startFileDrag = (event: React.DragEvent<HTMLElement>, fileId: string) => {
+    const ids = selectedIds.includes(fileId) ? selectedIds : [fileId];
+    setDraggedIds(ids);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-jarvis-file-ids", JSON.stringify(ids));
+    event.dataTransfer.setData("text/plain", ids.join(","));
+  };
+
+  const dropFiles = (event: React.DragEvent<HTMLElement>, targetPath: string) => {
+    event.preventDefault();
+    let ids = draggedIds;
+    if (!ids.length) {
+      try {
+        const value = JSON.parse(event.dataTransfer.getData("application/x-jarvis-file-ids"));
+        if (Array.isArray(value)) ids = value.filter((item): item is string => typeof item === "string");
+      } catch { /* only Jarvis file drags are accepted */ }
+    }
+    void moveFiles(ids, targetPath);
+  };
+
+  const folderDropProps = (path: string) => ({
+    onDragEnter: (event: React.DragEvent<HTMLElement>) => {
+      if (!draggedIds.length) return;
+      event.preventDefault();
+      setDropTarget(path);
+    },
+    onDragOver: (event: React.DragEvent<HTMLElement>) => {
+      if (!draggedIds.length) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+    },
+    onDragLeave: (event: React.DragEvent<HTMLElement>) => {
+      if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+      setDropTarget((current) => current === path ? null : current);
+    },
+    onDrop: (event: React.DragEvent<HTMLElement>) => dropFiles(event, path),
+  });
 
   const toggleFavorite = async (file: WorkspaceFile) => {
     setBusy(true);
@@ -208,28 +293,36 @@ export function FileWorkspaceView({ value = "", files: source }: { value?: strin
       <aside className="hidden w-48 shrink-0 border-r border-white/[.07] bg-black/10 p-3 sm:block">
         <p className="mb-3 px-2 font-mono text-[8px] uppercase tracking-[.18em] text-cyan/70">Library</p>
         <nav className="space-y-1" aria-label="Smart file collections">
-          {COLLECTIONS.map((item) => <button key={item.id} type="button" onClick={() => { setCollection(item.id); setFolderPath(""); }} className={`flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-[11px] transition ${collection === item.id ? "bg-cyan/10 text-cyan ring-1 ring-cyan/20" : "text-slate hover:bg-white/[.04] hover:text-ice"}`}><span className="w-4 text-center text-cyan/70">{item.glyph}</span><span className="flex-1">{item.label}</span><span className="font-mono text-[8px] opacity-60">{counts[item.id]}</span></button>)}
+          {COLLECTIONS.map((item) => <button key={item.id} type="button" onClick={() => { setCollection(item.id); setFolderPath(""); }} {...(item.id === "all" ? folderDropProps("") : {})} className={`flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-[11px] transition ${dropTarget === "" && item.id === "all" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/55" : collection === item.id ? "bg-cyan/10 text-cyan ring-1 ring-cyan/20" : "text-slate hover:bg-white/[.04] hover:text-ice"}`}><span className="w-4 text-center text-cyan/70">{item.glyph}</span><span className="flex-1">{item.label}</span><span className="font-mono text-[8px] opacity-60">{counts[item.id]}</span></button>)}
         </nav>
         <p className="mb-2 mt-5 px-2 font-mono text-[8px] uppercase tracking-[.18em] text-slate">Folders</p>
         <div className="max-h-[42vh] space-y-0.5 overflow-y-auto">
-          {folders.filter((folder) => folder.path).map((folder) => <button key={folder.path} type="button" onClick={() => { setCollection("all"); setFolderPath(folder.path); }} className={`flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[10px] ${folderPath === folder.path ? "bg-white/[.07] text-ice" : "text-slate hover:text-ice"}`} style={{ paddingLeft: `${8 + (folder.depth - 1) * 8}px` }}><span className="text-cyan/60">▹</span><span className="truncate">{folder.name}</span><span className="ml-auto font-mono text-[7px] opacity-50">{folder.fileCount}</span></button>)}
+          {visibleFolders.map((folder) => {
+            const hasChildren = folder.childFolders.length > 0;
+            const expanded = expandedFolders.has(folder.path);
+            return <div key={folder.path} data-file-folder={folder.path} {...folderDropProps(folder.path)} className={`flex items-center rounded-lg pr-1 text-[10px] transition ${dropTarget === folder.path ? "bg-cyan/15 text-cyan ring-1 ring-cyan/45" : folderPath === folder.path ? "bg-white/[.07] text-ice" : "text-slate hover:bg-white/[.025] hover:text-ice"}`} style={{ paddingLeft: `${4 + (folder.depth - 1) * 8}px` }}>
+              {hasChildren ? <button type="button" onClick={() => toggleFolder(folder.path)} className="grid h-7 w-6 shrink-0 place-items-center text-[9px] text-cyan/60" aria-label={`${expanded ? "Collapse" : "Expand"} ${folder.name}`}>{expanded ? "▾" : "▸"}</button> : <span className="block w-6 shrink-0" />}
+              <button type="button" onClick={() => openFolder(folder.path)} className="flex min-w-0 flex-1 items-center gap-1.5 py-1.5 text-left"><span className="text-cyan/60">▱</span><span className="truncate">{folder.name}</span><span className="ml-auto font-mono text-[7px] opacity-50">{folder.fileCount}</span></button>
+            </div>;
+          })}
         </div>
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
         <div className="flex flex-wrap items-center gap-2 border-b border-white/[.07] p-3">
-          <button type="button" onClick={() => { const next = folderPath.includes("/") ? folderPath.slice(0, folderPath.lastIndexOf("/")) : ""; setFolderPath(next); setCollection("all"); }} disabled={!folderPath} className="grid h-8 w-8 place-items-center rounded-lg border border-white/10 text-slate disabled:opacity-25" aria-label="Parent folder">‹</button>
-          <div className="min-w-[150px] flex-1"><p className="truncate text-xs text-ice">{collection === "all" ? folderPath || "All files" : COLLECTIONS.find((item) => item.id === collection)?.label}</p><p className="font-mono text-[7px] uppercase tracking-[.12em] text-slate">{visible.length} visible · {localFiles.length} indexed</p></div>
+          <button type="button" onClick={() => openFolder(workspaceParentPath(folderPath))} disabled={!folderPath} className="grid h-8 w-8 place-items-center rounded-lg border border-white/10 text-slate disabled:opacity-25" aria-label="Parent folder">‹</button>
+          <div className="min-w-[150px] flex-1"><div className="flex min-w-0 items-center gap-1 overflow-hidden text-xs text-ice">{collection === "all" ? <><button type="button" onClick={() => openFolder("")} {...folderDropProps("")} className={`shrink-0 rounded px-1 py-0.5 transition ${dropTarget === "" ? "bg-cyan/15 text-cyan" : "hover:text-cyan"}`}>All files</button>{workspaceFolderAncestors(folderPath).map((path) => <span key={path} className="contents"><span className="text-slate/50">/</span><button type="button" onClick={() => openFolder(path)} {...folderDropProps(path)} className={`min-w-0 truncate rounded px-1 py-0.5 transition ${dropTarget === path ? "bg-cyan/15 text-cyan" : "hover:text-cyan"}`}>{path.slice(path.lastIndexOf("/") + 1)}</button></span>)}</> : COLLECTIONS.find((item) => item.id === collection)?.label}</div><p className="font-mono text-[7px] uppercase tracking-[.12em] text-slate">{visible.length} visible · {localFiles.length} indexed{draggedIds.length ? " · drop onto a folder to move" : ""}</p></div>
           <label className="flex h-8 min-w-[180px] flex-1 items-center rounded-full border border-white/10 bg-black/20 px-3 focus-within:border-cyan/35"><span className="mr-2 text-cyan/60">⌕</span><input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value.slice(0, 120))} placeholder="Find names, folders, text, tags" className="min-w-0 flex-1 bg-transparent text-[11px] text-ice outline-none placeholder:text-slate/60" /></label>
           <select value={sort} onChange={(event) => persistView(event.target.value as WorkspaceSort)} className="h-8 rounded-lg border border-white/10 bg-[#07131e] px-2 text-[9px] text-slate"><option value="updated">recent</option><option value="name">name</option><option value="size">size</option><option value="type">type</option></select>
           <button type="button" onClick={() => persistView(sort, density === "compact" ? "comfortable" : "compact")} className="h-8 rounded-lg border border-white/10 px-2 font-mono text-[8px] text-slate">{density === "compact" ? "roomy" : "compact"}</button>
         </div>
 
         {selectedIds.length > 0 && <div className="flex items-center gap-2 border-b border-cyan/15 bg-cyan/[.04] px-3 py-2 text-[10px] text-cyan"><span>{selectedIds.length} selected</span><input value={movePath} onChange={(event) => setMovePath(event.target.value)} placeholder="Folder/path" className="ml-auto h-7 min-w-0 rounded-lg border border-white/10 bg-black/20 px-2 text-ice outline-none" /><button type="button" disabled={busy} onClick={() => void moveSelected()} className="rounded-lg border border-cyan/20 px-2 py-1">move</button><button type="button" disabled={busy} onClick={() => void removeSelected()} className="rounded-lg border border-red-400/20 px-2 py-1 text-red-200">delete</button></div>}
+        {notice && <p role="status" className="border-b border-cyan/10 bg-cyan/[.035] px-3 py-1.5 text-[9px] text-cyan">{notice}</p>}
 
         <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
-          {childFolders.length > 0 && <section className="mb-4"><h2 className="mb-2 font-mono text-[8px] uppercase tracking-[.16em] text-slate">Folders</h2><div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-4">{childFolders.map((path) => { const folder = folderByPath.get(path)!; return <button key={path} type="button" onClick={() => setFolderPath(path)} className="group rounded-xl border border-white/[.07] bg-white/[.025] p-3 text-left transition hover:border-cyan/25 hover:bg-cyan/[.04]"><span className="text-cyan/60">▱</span><span className="ml-2 text-[11px] text-ice">{folder.name}</span><span className="mt-1 block font-mono text-[7px] text-slate">{folder.fileCount} items</span></button>; })}</div></section>}
-          <section><h2 className="mb-2 font-mono text-[8px] uppercase tracking-[.16em] text-slate">Files</h2>{visible.length ? <div className={density === "compact" ? "space-y-1" : "grid grid-cols-1 gap-2 lg:grid-cols-2 2xl:grid-cols-3"}>{visible.map((file) => { const checked = selectedIds.includes(file.fileId); return <article key={file.fileId} className={`group flex min-w-0 items-center gap-2 rounded-xl border p-2.5 transition ${focusedId === file.fileId ? "border-cyan/40 bg-cyan/[.06]" : "border-white/[.07] bg-black/10 hover:border-white/15"}`}><input type="checkbox" checked={checked} onChange={() => setSelectedIds((current) => checked ? current.filter((id) => id !== file.fileId) : [...current, file.fileId])} aria-label={`Select ${file.name}`} className="accent-cyan" /><button type="button" onClick={() => focusFile(file)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/[.04] text-cyan/70">{fileGlyph(file.mimeType)}</button><button type="button" onClick={() => focusFile(file)} className="min-w-0 flex-1 text-left"><span className="block truncate text-[11px] text-ice">{file.name}</span><span className="block truncate font-mono text-[7px] text-slate">{kindLabel(file.mimeType)} · {fileSize(file.sizeBytes)} · {workspaceFolderFor(file) || "root"}</span></button>{file.reviewState === "favorite" && <span title="Favorite" className="text-amber">◇</span>}</article>; })}</div> : <div className="rounded-2xl border border-dashed border-white/10 p-10 text-center text-[11px] text-slate">No files here. Move a file into this folder or clear the search.</div>}</section>
+          {childFolders.length > 0 && <section className="mb-4"><h2 className="mb-2 font-mono text-[8px] uppercase tracking-[.16em] text-slate">Folders</h2><div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-4">{childFolders.map((path) => { const folder = folderByPath.get(path)!; return <button key={path} type="button" data-file-folder-card={path} onClick={() => openFolder(path)} {...folderDropProps(path)} className={`group rounded-xl border p-3 text-left transition ${dropTarget === path ? "border-cyan/60 bg-cyan/[.1] shadow-[0_0_22px_rgba(34,211,238,.12)]" : "border-white/[.07] bg-white/[.025] hover:border-cyan/25 hover:bg-cyan/[.04]"}`}><span className="text-cyan/60">▱</span><span className="ml-2 text-[11px] text-ice">{folder.name}</span><span className="mt-1 block font-mono text-[7px] text-slate">{folder.fileCount} items{draggedIds.length ? " · drop to move" : ""}</span></button>; })}</div></section>}
+          <section><h2 className="mb-2 font-mono text-[8px] uppercase tracking-[.16em] text-slate">Files</h2>{visible.length ? <div className={density === "compact" ? "space-y-1" : "grid grid-cols-1 gap-2 lg:grid-cols-2 2xl:grid-cols-3"}>{visible.map((file) => { const checked = selectedIds.includes(file.fileId); return <article key={file.fileId} data-workspace-file={file.fileId} draggable={!busy} onDragStart={(event) => startFileDrag(event, file.fileId)} onDragEnd={() => { setDraggedIds([]); setDropTarget(null); }} className={`group flex min-w-0 items-center gap-2 rounded-xl border p-2.5 transition ${draggedIds.includes(file.fileId) ? "scale-[.99] border-cyan/45 bg-cyan/[.08] opacity-65" : focusedId === file.fileId ? "border-cyan/40 bg-cyan/[.06]" : "border-white/[.07] bg-black/10 hover:border-white/15"}`}><input type="checkbox" checked={checked} onChange={() => setSelectedIds((current) => checked ? current.filter((id) => id !== file.fileId) : [...current, file.fileId])} aria-label={`Select ${file.name}`} className="accent-cyan" /><button type="button" onClick={() => focusFile(file)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/[.04] text-cyan/70">{fileGlyph(file.mimeType)}</button><button type="button" onClick={() => focusFile(file)} className="min-w-0 flex-1 cursor-grab text-left active:cursor-grabbing"><span className="block truncate text-[11px] text-ice">{file.name}</span><span className="block truncate font-mono text-[7px] text-slate">{kindLabel(file.mimeType)} · {fileSize(file.sizeBytes)} · {workspaceFolderFor(file) || "root"}</span></button>{file.reviewState === "favorite" && <span title="Favorite" className="text-amber">◇</span>}</article>; })}</div> : <div className="rounded-2xl border border-dashed border-white/10 p-10 text-center text-[11px] text-slate">No files here. Move a file into this folder or clear the search.</div>}</section>
         </div>
       </main>
 
@@ -240,7 +333,6 @@ export function FileWorkspaceView({ value = "", files: source }: { value?: strin
         <label className="mb-3 block text-[9px] text-slate">Tags<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="important, client" className="mt-1 h-8 w-full rounded-lg border border-white/10 bg-black/20 px-2 text-[11px] text-ice outline-none focus:border-cyan/35" /></label>
         <div className="grid grid-cols-2 gap-2"><button type="button" disabled={busy} onClick={() => void updateMetadata(focused, { name: rename, folderPath: movePath, tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean) })} className="rounded-lg bg-cyan/10 px-2 py-2 text-[10px] text-cyan ring-1 ring-cyan/25">save details</button><a href={`/api/files/${encodeURIComponent(focused.fileId)}`} target="_blank" rel="noreferrer" className="rounded-lg border border-white/10 px-2 py-2 text-center text-[10px] text-slate">open original</a><button type="button" disabled={busy} onClick={() => void loadEditor(focused)} className="rounded-lg border border-white/10 px-2 py-2 text-[10px] text-slate">edit text</button><button type="button" disabled={busy} onClick={() => void toggleFavorite(focused)} className="rounded-lg border border-white/10 px-2 py-2 text-[10px] text-slate">{focused.reviewState === "favorite" ? "unfavorite" : "favorite"}</button></div>
         {focused.summary && <p className="mt-3 text-[10px] leading-relaxed text-slate">{focused.summary}</p>}
-        {notice && <p role="status" className="mt-3 rounded-lg bg-white/[.04] px-2 py-1.5 text-[9px] text-cyan">{notice}</p>}
         <button type="button" disabled={busy} onClick={() => void removeSelected()} className="mt-4 text-[9px] text-red-300/70 hover:text-red-200">delete permanently…</button>
       </aside>}
 

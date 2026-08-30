@@ -67,6 +67,32 @@ export function buildWorkspaceFolders(files: WorkspaceFile[]): WorkspaceFolder[]
   })).sort((a, b) => a.path.localeCompare(b.path));
 }
 
+export function workspaceParentPath(path: string): string {
+  const normalized = normalizeWorkspacePath(path);
+  const boundary = normalized.lastIndexOf("/");
+  return boundary < 0 ? "" : normalized.slice(0, boundary);
+}
+
+export function workspaceFolderAncestors(path: string): string[] {
+  const parts = normalizeWorkspacePath(path).split("/").filter(Boolean);
+  return parts.map((_, index) => parts.slice(0, index + 1).join("/"));
+}
+
+/**
+ * The root is implicit. Top-level folders are always visible; deeper folders
+ * are revealed only when every ancestor in their path is expanded.
+ */
+export function visibleWorkspaceFolders(
+  folders: WorkspaceFolder[],
+  expandedPaths: ReadonlySet<string>,
+): WorkspaceFolder[] {
+  return folders.filter((folder) => {
+    if (!folder.path) return false;
+    const ancestors = workspaceFolderAncestors(workspaceParentPath(folder.path));
+    return ancestors.every((ancestor) => expandedPaths.has(ancestor));
+  });
+}
+
 function isDocument(file: WorkspaceFile) {
   return /^(?:text\/|application\/(?:pdf|json|xml|yaml|x-yaml|msword|vnd\.openxmlformats-officedocument))/i.test(file.mimeType);
 }

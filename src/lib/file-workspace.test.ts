@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { buildWorkspaceFolders, parseFileWorkspaceIntent, visibleWorkspaceFiles, workspaceCollectionCounts, type WorkspaceFile } from "./file-workspace";
+import {
+  buildWorkspaceFolders,
+  parseFileWorkspaceIntent,
+  visibleWorkspaceFiles,
+  visibleWorkspaceFolders,
+  workspaceCollectionCounts,
+  workspaceFolderAncestors,
+  workspaceParentPath,
+  type WorkspaceFile,
+} from "./file-workspace";
 
 const files: WorkspaceFile[] = [
   { fileId: "a", name: "plan.md", relativePath: "Acme/Launch/plan.md", mimeType: "text/markdown", sizeBytes: 10, status: "ready", tags: ["launch"], reviewState: "favorite", createdAt: 1, updatedAt: 100 },
@@ -9,11 +18,21 @@ const files: WorkspaceFile[] = [
 
 describe("file workspace hierarchy", () => {
   it("builds a real nested folder tree with aggregate counts", () => {
-    expect(buildWorkspaceFolders(files)).toEqual(expect.arrayContaining([
+    const folders = buildWorkspaceFolders(files);
+    expect(folders).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: "", fileCount: 3, childFolders: ["Acme"] }),
       expect.objectContaining({ path: "Acme", fileCount: 2, childFolders: ["Acme/Launch"] }),
       expect.objectContaining({ path: "Acme/Launch", fileCount: 1 }),
     ]));
+    expect(visibleWorkspaceFolders(folders, new Set())).toEqual([
+      expect.objectContaining({ path: "Acme" }),
+    ]);
+    expect(visibleWorkspaceFolders(folders, new Set(["Acme"]))).toEqual([
+      expect.objectContaining({ path: "Acme" }),
+      expect.objectContaining({ path: "Acme/Launch" }),
+    ]);
+    expect(workspaceParentPath("Acme / Launch / Assets")).toBe("Acme/Launch");
+    expect(workspaceFolderAncestors("Acme/Launch/Assets")).toEqual(["Acme", "Acme/Launch", "Acme/Launch/Assets"]);
   });
 
   it("filters folders, smart collections, tags, and stable sorting", () => {
