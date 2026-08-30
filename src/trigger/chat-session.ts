@@ -1002,8 +1002,9 @@ export const chatHandoff = task({
 export const chatDispatcher = schedules.task({
   id: "jarvis-chat-dispatcher",
   // A lost Trigger response remains ambiguous, so recover it durably rather
-  // than terminally failing the turn. This intentionally matches the
-  // foreground one-minute recovery boundary.
+  // than terminally failing the turn. Normal turns and the browser watchdog
+  // remain event-driven; this lower-frequency schedule is only the final
+  // unattended dead-man switch.
   cron: FOREGROUND_DURABLE_RECOVERY_CRON,
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,

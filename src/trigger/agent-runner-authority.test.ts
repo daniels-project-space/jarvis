@@ -558,12 +558,12 @@ afterEach(() => {
 });
 
 describe("production Trigger worker authority harness", () => {
-  it("uses a finite worker envelope, a checkpoint margin, and a minute recovery sweep", () => {
+  it("uses a finite worker envelope, a checkpoint margin, and a low-cost recovery sweep", () => {
     expect(AGENT_WORKER_MAX_DURATION_SECONDS).toBe(30 * 60);
     expect(AGENT_WORKER_CHECKPOINT_MARGIN_MS).toBe(2 * 60_000);
     expect(AGENT_WORKER_SOFT_DEADLINE_MS).toBe(28 * 60_000);
     expect(trigger.definitions.get("jarvis-agent-worker").maxDuration).toBe(AGENT_WORKER_MAX_DURATION_SECONDS);
-    expect(trigger.definitions.get("jarvis-agent-fleet-supervisor").cron).toBe("*/1 * * * *");
+    expect(trigger.definitions.get("jarvis-agent-fleet-supervisor").cron).toBe("*/5 * * * *");
   });
 
   it("reaps only expired browser leases during maintenance without launching browser or worker work", async () => {

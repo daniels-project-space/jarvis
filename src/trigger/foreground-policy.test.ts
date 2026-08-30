@@ -23,7 +23,7 @@ describe("foreground conversation policy", () => {
   it("keeps one authoritative warm foreground owner with a bounded handoff", () => {
     expect(FOREGROUND_QUEUE).toBe("jarvis-foreground");
     expect(FOREGROUND_CONCURRENCY).toBe(1);
-    expect(FOREGROUND_DURABLE_RECOVERY_CRON).toBe("*/1 * * * *");
+    expect(FOREGROUND_DURABLE_RECOVERY_CRON).toBe("*/5 * * * *");
     expect(FOREGROUND_TURN_TIMEOUT_MS).toBeLessThanOrEqual(3 * 60_000);
     expect(FOREGROUND_MAX_DURATION_SECONDS).toBe(4 * 60 * 60);
     expect(FOREGROUND_ADMISSION_RESERVE_MS).toBeGreaterThan(FOREGROUND_TURN_TIMEOUT_MS);

@@ -170,6 +170,10 @@ export const AGENT_WORKER_MAX_DURATION_SECONDS = 30 * 60;
 export const AGENT_WORKER_CHECKPOINT_MARGIN_MS = 2 * 60_000;
 export const AGENT_WORKER_SOFT_DEADLINE_MS =
   AGENT_WORKER_MAX_DURATION_SECONDS * 1_000 - AGENT_WORKER_CHECKPOINT_MARGIN_MS;
+// Enqueue paths wake the fleet directly. This scheduled pass only repairs a
+// lost wake or expired lease, so polling every minute spent managed invocations
+// without accelerating healthy work.
+export const AGENT_FLEET_SUPERVISOR_CRON = "*/5 * * * *";
 // Provider teardown can spend up to its control deadline. Keep this small and
 // concurrent so a provider outage cannot consume the fleet supervisor window.
 export const CLOUD_WORKSPACE_CLEANUP_BATCH_SIZE = 2;
@@ -3601,9 +3605,9 @@ export const agentWorker = task({
 export const agentFleetSupervisor = schedules.task({
   id: "jarvis-agent-fleet-supervisor",
   // Dispatch reservations expire after two minutes and missing worker
-  // heartbeats after five. A minute sweep bounds their durable recovery to one
-  // additional minute; this controller never runs a model or workspace.
-  cron: "*/1 * * * *",
+  // heartbeats after five. Event-driven wakes handle normal work; this bounded
+  // sweep is recovery-only and never runs a model or workspace.
+  cron: AGENT_FLEET_SUPERVISOR_CRON,
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,
