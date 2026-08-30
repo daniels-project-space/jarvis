@@ -14,6 +14,7 @@ import {
 import schema from "./schema";
 import { GENERATED_GATED_ACTION_MATRIX } from "../src/mastra/fixtures/action-scope-regressions";
 import { goalWorkApprovalPolicy } from "./workPolicy";
+import { validatorAuditSnapshot } from "./goalMode";
 import { testProjectSourceAdmission } from "./testSourceAdmission";
 import { patchJobWithRuntime } from "./controlPlane";
 import { ensureGoalNodeHandoff, verifiedGoalHandoffsForJob } from "./goalHandoffs";
@@ -598,6 +599,24 @@ describe("real Convex multi-agent workspace and integration races", () => {
       checkoutHeadSha: String(corrected.sourceHeadSha),
       workerToken: TOKEN,
     })).toBe(true);
+    const audit = await f.t.run(async (ctx) => {
+      const currentMission = await ctx.db.get(f.missionId);
+      const currentJobs = await ctx.db.query("jobs")
+        .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId)))
+        .take(100);
+      return JSON.parse(await validatorAuditSnapshot(ctx, currentMission, currentJobs));
+    });
+    expect(audit.executionTraces.find((trace: any) => trace.jobId === String(validatorJobId)))
+      .toMatchObject({
+        currentAttempt: 2,
+        terminalReceipt: null,
+        attempts: [expect.objectContaining({
+          attempt: 2,
+          exactSourceBound: true,
+          authorityBound: true,
+          workspaceBound: false,
+        })],
+      });
   });
 
   it("projects all 320 action-scope decisions identically into Goal Mode producers", async () => {
@@ -1483,6 +1502,8 @@ describe("real Convex multi-agent workspace and integration races", () => {
       sourceBranch: (final.mission as any)?.integrationBranch,
       sourceHeadSha: "c".repeat(40),
     });
+    expect(String((validator as any)?.task)).toContain('"executionTraces"');
+    expect(String((validator as any)?.task)).toContain('"authorityBound":true');
     expect((validator as any)?.workerBranch).toBeUndefined();
     await f.t.run(async (ctx) => {
       await ctx.db.patch(validator!._id, {

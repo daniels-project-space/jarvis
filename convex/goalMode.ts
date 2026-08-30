@@ -52,6 +52,7 @@ import {
 } from "../src/lib/source-admission";
 import { selectCodexWorkPolicy, type CodexWorkSelection } from "../src/lib/codex-work-router";
 import type { WorkModelTier } from "../src/lib/work-models";
+import { exactTerminalWorkReceipt } from "./workReceiptAuthority";
 
 const ADVANCE_LEASE_MS = 10 * 60 * 1000;
 const COORDINATOR_RECEIPT_FRESH_MS = 10 * 60 * 1000;
@@ -717,15 +718,57 @@ async function hasTerminalReviewedOutcomes(ctx: any, jobs: any[]) {
   return true;
 }
 
-async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Promise<string> {
+export async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Promise<string> {
   const capturedAt = Date.now();
-  const [eventRows, receipt] = await Promise.all([
+  const [eventRows, receipt, executionTraces] = await Promise.all([
     ctx.db
       .query("workEvents")
       .withIndex("by_mission", (q: any) => q.eq("missionId", String(mission._id)))
       .order("desc")
       .take(200),
     ctx.db.query("goalCoordinatorReceipts").withIndex("by_createdAt").order("desc").first(),
+    Promise.all(jobs.map(async (job: any) => {
+      const [attempts, terminal] = await Promise.all([
+        ctx.db.query("workAttempts")
+          .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id))
+          .order("desc")
+          .take(3),
+        ["done", "error", "needs_input", "cancelled"].includes(String(job.status))
+          ? exactTerminalWorkReceipt(ctx, job)
+          : null,
+      ]);
+      return {
+        jobId: String(job._id),
+        currentAttempt: Number(job.attempt ?? 1),
+        attempts: attempts.reverse().map((attempt: any) => ({
+          attempt: Number(attempt.attempt),
+          status: attempt.status,
+          parentAttempt: attempt.parentAttempt ?? null,
+          sourceHeadSha: attempt.sourceHeadSha ?? null,
+          workspaceBaseSha: attempt.workspaceBaseSha ?? null,
+          exactSourceBound: Boolean(attempt.sourceHeadSha
+            && attempt.workspaceBaseSha
+            && attempt.sourceHeadSha === attempt.workspaceBaseSha),
+          authorityBound: Boolean(attempt.authorityDigest
+            && attempt.workOrderRevisionDigest
+            && attempt.dispatchReceiptDigest),
+          provider: attempt.providerName ?? null,
+          workspaceBound: Boolean(attempt.providerWorkspaceId
+            && attempt.providerSessionId
+            && attempt.providerWorkspaceId !== attempt.providerSessionId),
+          codexTurnReceiptPhase: attempt.codexTurnReceiptPhase ?? null,
+          checkpointDigest: attempt.checkpointDigest ?? null,
+          completedAt: attempt.completedAt ?? null,
+        })),
+        terminalReceipt: terminal ? {
+          status: terminal.receipt.status,
+          terminalCode: terminal.receipt.terminalCode,
+          verification: terminal.receipt.verification,
+          recoveryDisposition: terminal.receipt.recoveryDisposition,
+          receiptDigest: terminal.receipt.receiptDigest,
+        } : null,
+      };
+    })),
   ]);
   const pauseResumeEvents = eventRows
     .filter((event: any) => event.type === "pause" || event.type === "resume")
@@ -795,6 +838,12 @@ async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Prom
       goalWave: Number(job.goalWave ?? 0),
       verificationVerdict: job.verificationVerdict ?? null,
     })),
+    // This is a bounded, server-derived trace: at most the three newest
+    // immutable attempts per accepted job, with provider/session identities
+    // reduced to booleans. It lets a validator distinguish real durable
+    // execution evidence from a model's prose without exposing credentials or
+    // accepting caller-supplied live-state claims.
+    executionTraces,
     pauseResumeEvents,
     coordinator,
   });
