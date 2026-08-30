@@ -2113,6 +2113,19 @@ describe("production Trigger worker authority harness", () => {
       expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
       expect((dependencies.prepareSubscriptionEnv as any)).not.toHaveBeenCalled();
 
+      // No source, provider workspace, or Codex turn was created. Exhausting
+      // the nominal model-attempt budget at this configuration boundary must
+      // not prevent recovery once a fresh deployment proof is present.
+      await t.run(async (ctx) => {
+        const job: any = await ctx.db.get(jobId);
+        const runtime: any = await ctx.db.query("jobRuntime")
+          .withIndex("by_job", (q) => q.eq("jobId", jobId))
+          .unique();
+        await ctx.db.patch(jobId, { maxAttempts: 1 });
+        await ctx.db.patch(runtime._id, { maxAttempts: 1 });
+        expect(job?.attempt).toBe(1);
+      });
+
       expect(await t.mutation(api.jobs.resumeCloudWorkspaceBlocks, {
         limit: 8,
         workerToken: WORKER,
@@ -2121,6 +2134,7 @@ describe("production Trigger worker authority harness", () => {
       expect(resumed).toMatchObject({
         status: "pending",
         attempt: 2,
+        maxAttempts: 2,
         providerRunState: "queued",
         progress: "Secure worker ready · continuing automatically",
       });

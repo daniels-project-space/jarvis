@@ -4903,13 +4903,22 @@ export const resumeCloudWorkspaceBlocks = mutation({
       const previous = await attemptFor(ctx, row._id, row.attempt ?? 1);
       if (!previous || previous.status !== "paused" || !previous.completedAt) continue;
       const nextAttempt = (row.attempt ?? 1) + (shouldAdvanceAttempt(Boolean(previous.workerRunId)) ? 1 : 0);
-      if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) continue;
+      // A deployment/configuration hold happens before source hydration,
+      // provider workspace creation, or a Codex turn. Preserve immutable run
+      // lineage by allocating a fresh attempt, but do not consume the model's
+      // correction budget merely because its predecessor proved no work could
+      // start. The fresh provider attestation above is the only authority that
+      // may extend this one pre-work boundary.
+      const preWorkspaceHold = !previous.providerWorkspaceId && !previous.providerSessionId;
+      const maxAttempts = Math.max(Number(row.maxAttempts ?? 12), preWorkspaceHold ? nextAttempt : 0);
+      if (nextAttempt > 48 || (!preWorkspaceHold && !hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12))) continue;
       await patchJobWithRuntime(ctx, row, {
         ...invalidateDeliveryLease(row),
         status: "pending",
         stage: "queued",
         progress: "Secure worker ready · continuing automatically",
         attempt: nextAttempt,
+        maxAttempts,
         startedAt: undefined,
         heartbeatAt: now,
         progressAt: now,
