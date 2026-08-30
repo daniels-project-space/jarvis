@@ -4036,7 +4036,7 @@ async function exactProviderEffectClaim(
   if (
     !job
     || job.status !== "running"
-    || job.dispatchPhase !== "specialist"
+    || !["specialist", "integration"].includes(String(job.dispatchPhase))
     || (job.attempt ?? 1) !== a.expectedAttempt
     || job.workerRunId !== a.workerRunId.slice(0, 120)
   ) return null;
@@ -4052,12 +4052,13 @@ async function exactProviderEffectClaim(
     || attempt.status !== "running"
     || attempt.workerRunId !== job.workerRunId
     || attempt.dispatchId !== job.dispatchId
+    || attempt.dispatchPhase !== job.dispatchPhase
     || attempt.dispatchReceiptId !== job.dispatchReceiptId
     || attempt.dispatchReceiptDigest !== job.dispatchReceiptDigest
     || attempt.dispatchPayloadDigest !== job.dispatchPayloadDigest
     || !receipt
     || receipt.attempt !== a.expectedAttempt
-    || receipt.phase !== "specialist"
+    || receipt.phase !== job.dispatchPhase
   ) return null;
   return { job, runtime, attempt };
 }
@@ -4773,8 +4774,24 @@ export const bindWorkspaceSource = mutation({
     const attempt = await attemptFor(ctx, args.jobId, args.expectedAttempt);
     const checkoutHeadSha = args.checkoutHeadSha ?? args.sourceHeadSha;
     if (!GIT_OID.test(checkoutHeadSha)) return false;
-    if (attempt?.parentAttempt !== undefined && (!GIT_OID.test(String(attempt.parentCheckpointHeadSha ?? ""))
-      || attempt.parentCheckpointHeadSha !== checkoutHeadSha)) return false;
+    if (attempt?.parentAttempt !== undefined) {
+      const checkpointContinuation = GIT_OID.test(String(attempt.parentCheckpointHeadSha ?? ""))
+        && attempt.parentCheckpointHeadSha === checkoutHeadSha;
+      const parent = await attemptFor(ctx, args.jobId, attempt.parentAttempt);
+      // If the prior worker stopped before the write-once Codex turn receipt,
+      // there is no mutable workspace state to preserve. A continuation may
+      // safely hydrate the same immutable admitted source again. Once Codex
+      // was authorized, however, only an exact checkpoint head can cross the
+      // attempt boundary.
+      const cleanPreCodexRetry = !attempt.parentCheckpointHeadSha
+        && checkoutHeadSha === args.sourceHeadSha
+        && parent?.sourceHeadSha === args.sourceHeadSha
+        && parent.workspaceBaseSha === args.sourceHeadSha
+        && !parent.codexTurnReceiptId
+        && !parent.checkpointHeadSha
+        && ["checkpointed", "error"].includes(String(parent.status));
+      if (!checkpointContinuation && !cleanPreCodexRetry) return false;
+    }
     if (row.sourceHeadSha !== args.sourceHeadSha || row.sourceBranch !== args.sourceBranch) return false;
     if (attempt) await ctx.db.patch(attempt._id, { sourceHeadSha: args.sourceHeadSha, workspaceBaseSha: checkoutHeadSha, lastEventAt: Date.now() });
     await appendAttemptEvidence(ctx, row, "workspace_source_bound", `Sandbox source bound to ${args.sourceBranch}@${args.sourceHeadSha}`, {

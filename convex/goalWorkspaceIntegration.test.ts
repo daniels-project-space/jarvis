@@ -311,6 +311,30 @@ async function claimedFirstIntegration(prefix: string) {
 }
 
 describe("real Convex multi-agent workspace and integration races", () => {
+  it("leases a Goal architecture provider effect under its exact integration dispatch", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-30T19:30:00Z"));
+    const f = await goalAwaitingPlan();
+    const [planner] = await dispatch(f.t, 1, "goal-architecture-provider-lease");
+    expect(planner.reservation).toMatchObject({ dispatchPhase: "integration" });
+    expect(planner.claim).toMatchObject({
+      dispatchPhase: "integration",
+      workerRunId: "goal-architecture-provider-lease-run-0",
+    });
+    expect(await f.t.mutation(api.jobs.beginProviderEffectLease, {
+      jobId: planner.reservation.jobId,
+      expectedAttempt: 1,
+      workerRunId: "goal-architecture-provider-lease-run-0",
+      workerToken: TOKEN,
+    })).toEqual({ leaseUntil: Date.now() + 18 * 60_000 });
+    expect(await f.t.mutation(api.jobs.endProviderEffectLease, {
+      jobId: planner.reservation.jobId,
+      expectedAttempt: 1,
+      workerRunId: "goal-architecture-provider-lease-run-0",
+      workerToken: TOKEN,
+    })).toBe(true);
+  });
+
   it("materializes one necessary specialist with a verifier-visible crew contract", async () => {
     const f = await goalAwaitingPlan(4);
     const plan = {
@@ -1114,6 +1138,47 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const integration = (await f.t.run(async (ctx) => ctx.db.query("integrationAttempts").collect()))
       .find((row) => row.jobId === job._id);
     expect(integration).toMatchObject({ workAttempt: 2, reviewedBaseSha: BASE, reviewedHeadSha: "c".repeat(40) });
+  });
+
+  it("rehydrates the exact admitted source when the parent stopped before any Codex turn", async () => {
+    const f = await plannedGoal();
+    const [first] = await dispatch(f.t, 1, "pre-codex-retry-first");
+    const job = f.jobs.find((row) => String(row._id) === String(first.reservation.jobId))!;
+    const firstAuthority = await jobExecutionAuthority(f.t, job._id, 1);
+    expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
+      jobId: job._id,
+      expectedAttempt: 1,
+      authorityDigest: firstAuthority.authorityDigest,
+      workerRunId: String(first.claim!.workerRunId),
+      sourceBranch: String(job.sourceBranch),
+      sourceHeadSha: BASE,
+      checkoutHeadSha: BASE,
+      workerToken: TOKEN,
+    })).toBe(true);
+    expect(await f.t.mutation(api.jobs.checkpointAndRequeue, {
+      jobId: job._id,
+      expectedAttempt: 1,
+      authorityDigest: firstAuthority.authorityDigest,
+      workerRunId: String(first.claim!.workerRunId),
+      checkpoint: "transport response was lost before Codex started",
+      result: "no specialist process started",
+      branch: job.workerBranch,
+      workerToken: TOKEN,
+    })).toMatchObject({ requeued: true });
+
+    const continuations = await dispatch(f.t, 8, "pre-codex-retry-second");
+    const second = continuations.find((entry) => String(entry.reservation.jobId) === String(job._id))!;
+    const secondAuthority = await jobExecutionAuthority(f.t, job._id, 2);
+    expect(await f.t.mutation(api.jobs.bindWorkspaceSource, {
+      jobId: job._id,
+      expectedAttempt: 2,
+      authorityDigest: secondAuthority.authorityDigest,
+      workerRunId: String(second.claim!.workerRunId),
+      sourceBranch: String(job.sourceBranch),
+      sourceHeadSha: BASE,
+      checkoutHeadSha: BASE,
+      workerToken: TOKEN,
+    })).toBe(true);
   });
 
   it("canonicalizes distinct cancelled receipts under mission control without accepting caller digests", async () => {

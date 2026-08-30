@@ -2276,10 +2276,20 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               reviewBaseSha = sourceHeadSha;
               await sh("git", ["-C", dir, "config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv);
               await sh("git", ["-C", dir, "config", "user.name", `${profile.name} via JARVIS`], hostChildEnv);
-              const bound = await convexMutation("jobs:bindWorkspaceSource", {
+              const sourceBinding = {
                 jobId: job.jobId, expectedAttempt, workerRunId: String(job.workerRunId), authorityDigest,
                 sourceBranch: checkoutSourceBranch, sourceHeadSha, checkoutHeadSha: baseSha,
-              }).catch(() => false);
+              };
+              let bound: unknown;
+              try {
+                bound = await convexMutation("jobs:bindWorkspaceSource", sourceBinding);
+              } catch {
+                // This mutation is an exact idempotent confirmation. If its
+                // response was lost after commit, one byte-equivalent retry
+                // recovers the durable true result instead of wasting a work
+                // attempt that never reached Codex.
+                bound = await convexMutation("jobs:bindWorkspaceSource", sourceBinding).catch(() => false);
+              }
               if (!bound) {
                 cloneFailed = true;
                 cloneFailureReason = "The exact admitted checkout could not be confirmed before execution.";

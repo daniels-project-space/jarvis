@@ -1403,6 +1403,39 @@ describe("production Trigger worker authority harness", () => {
     expect(replayBridge.trace.filter((call) => call.path === "jobs:markVerifiedForDelivery")).toHaveLength(0);
   });
 
+  it("replays an exact source binding after its committed response is lost", async () => {
+    configureFakeControllerAuthority();
+    process.env.JARVIS_CLOUD_WORKSPACE_TEMPLATE = "node22";
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-source-bind-response-loss",
+    );
+    let loseSourceBindResponse = true;
+    const bridge = bridgeProductionRunnerToConvex(t, undefined, async (call) => {
+      if (call.path === "jobs:bindWorkspaceSource" && loseSourceBindResponse) {
+        loseSourceBindResponse = false;
+        throw new Error("simulated response loss after durable source binding");
+      }
+    });
+    const dependencies = injectedRunnerDependencies();
+
+    expect(await invokeHarness(
+      reservation,
+      "source-bind-response-loss-run",
+      dependencies,
+    )).toEqual({ processed: 1 });
+    expect(bridge.trace.filter((call) => call.path === "jobs:bindWorkspaceSource"))
+      .toHaveLength(2);
+    const attempt = await t.run(async (ctx) => ctx.db.query("workAttempts")
+      .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1))
+      .first());
+    expect(attempt).toMatchObject({
+      workspaceBaseSha: SOURCE_SHA,
+      codexTurnReceiptPhase: "completed",
+    });
+  });
+
   it("does not start any injected transport when the immutable claim is stale", async () => {
     configureFakeControllerAuthority();
     const t = convexTest(schema, modules);
