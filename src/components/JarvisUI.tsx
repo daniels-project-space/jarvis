@@ -4128,7 +4128,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       setPanelMin(false);
       setInstantPanel(localPanel);
       showCaption({ who: "jarvis", text: fileWorkspaceIntent.query ? `Showing files for “${fileWorkspaceIntent.query}”.` : "Your file workspace is open.", phase: "ready" });
-      void setPanel(localPanel).catch(() => setInstantPanel(null));
+      // The workspace is a local, owner-authorized surface and must remain
+      // usable while the remote ChatGPT/session repair path is unavailable.
+      // Persisting the panel is best-effort; clearing the optimistic panel on
+      // an auth/network failure made Jarvis acknowledge this command and then
+      // immediately hide the workspace it had just opened.
+      void setPanel(localPanel).catch(() => {});
       void logTurn({ threadId: threadRef.current, role: "user", text: t })
         .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: "Opened the file workspace.", model: "instant-ui" }))
         .catch(() => {});
