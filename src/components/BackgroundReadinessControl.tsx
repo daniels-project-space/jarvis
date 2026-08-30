@@ -77,7 +77,7 @@ export function BackgroundReadinessControl() {
 
   const start = async () => {
     if (submitting || status === "starting" || status === "queued" || status === "running") return;
-    if (!window.confirm("Run the background readiness check? It only verifies the Codex worker session. It does not create work, open a workspace, or run a model.")) return;
+    if (!window.confirm("Run the background readiness check? It verifies the Codex session and the current workspace proof. It does not create work, open a workspace, or run a model.")) return;
     setSubmitting(true);
     setStatus("starting");
     pollCount.current = 0;
@@ -103,7 +103,7 @@ export function BackgroundReadinessControl() {
 
   const resume = async () => {
     if (submitting || status !== "ready" || workers !== "paused") return;
-    if (!window.confirm("The worker session is ready. Resume Jarvis's chat dispatcher, goal coordinator, insight engine, and autonomous worker queues?")) return;
+    if (!window.confirm("The worker session and workspace proof are ready. Resume Jarvis's chat dispatcher, goal coordinator, insight engine, and autonomous worker queues?")) return;
     setSubmitting(true);
     try {
       const res = await viewerFetchWithTimeout("/api/background-readiness", {

@@ -65,6 +65,13 @@ workspaces. Only then does it write the deployment-bound signed receipt that
 Goal Mode requires. It is safe to leave `JARVIS_CLOUD_PROVIDER_PROBE` unset
 until the host is ready.
 
+After **Verify release** reports attested, **Background readiness** verifies
+that the published receipt belongs to the exact Trigger deployment currently
+executing, that the pinned adapter is installed, and that the Codex subscription
+session is usable. This second check performs no provider lifecycle call, opens
+no workspace, and runs no model. Autonomous queues cannot be resumed from this
+control unless both the workspace proof and subscription session pass.
+
 ## Runner API v1
 
 The Trigger adapter implements `jarvis-self-hosted-runner-api` **1.0.0**.

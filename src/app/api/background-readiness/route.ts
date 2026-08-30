@@ -135,8 +135,10 @@ function clearTicket(res: NextResponse): NextResponse {
 function completedStatus(output: unknown): PublicStatus {
   if (!output || typeof output !== "object" || Array.isArray(output)) return "unavailable";
   const report = output as Record<string, unknown>;
-  if (report.ready === true && report.controllerSession === "clear") return "ready";
-  if (report.ready === false && report.controllerSession === "repair_required") return "attention";
+  if (report.ready === true && report.controllerSession === "clear" && report.workspace === "ready") return "ready";
+  if (report.ready === false && (
+    report.controllerSession === "repair_required" || report.workspace === "unavailable"
+  )) return "attention";
   return "unavailable";
 }
 

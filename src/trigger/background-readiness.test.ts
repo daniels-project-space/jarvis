@@ -32,6 +32,7 @@ function dependencies(overrides: Partial<BackgroundReadinessDependencies> = {}):
     })),
     verifyCodexSubscriptionPreflight: vi.fn<BackgroundReadinessDependencies["verifyCodexSubscriptionPreflight"]>(() => ({})),
     cleanupSubscriptionHome: vi.fn(),
+    verifyCloudWorkspace: vi.fn(async () => undefined),
     ...overrides,
   };
 }
@@ -50,11 +51,16 @@ describe("background agent readiness probe", () => {
   it("checks a real worker prerequisite chain without dispatching a job or model", async () => {
     const d = dependencies();
 
-    await expect(runBackgroundReadinessProbe(d)).resolves.toEqual({
+    await expect(runBackgroundReadinessProbe(d, { triggerDeploymentVersion: "20260830.3" })).resolves.toEqual({
       ready: true,
       controllerSession: "clear",
+      workspace: "ready",
       codex: { binary: "available", subscription: "acquired", preflight: "passed" },
     });
+    expect(d.verifyCloudWorkspace).toHaveBeenCalledWith(
+      d.environment,
+      { triggerDeploymentVersion: "20260830.3" },
+    );
     expect(d.fetch).toHaveBeenCalledOnce();
     expect(d.fetch).toHaveBeenCalledWith(
       "https://jarvis-readiness.test/api/query",
@@ -93,6 +99,26 @@ describe("background agent readiness probe", () => {
     expect(d.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
     expect(d.prepareSubscriptionEnv).not.toHaveBeenCalled();
     expect(d.fetch).toHaveBeenCalledOnce();
+  });
+
+  it("never reports ready or acquires a model session for a stale workspace release proof", async () => {
+    const d = dependencies({
+      verifyCloudWorkspace: vi.fn(async () => {
+        throw new Error("provider proof names an old Trigger deployment");
+      }),
+    });
+
+    await expect(runBackgroundReadinessProbe(d, {
+      triggerDeploymentVersion: "20260830.3",
+    })).resolves.toEqual({
+      ready: false,
+      controllerSession: "clear",
+      blocker: "cloud_workspace_unavailable",
+      workspace: "unavailable",
+      codex: { binary: "not_checked", subscription: "not_checked", preflight: "not_checked" },
+    });
+    expect(d.resolveSubscriptionAgentBin).not.toHaveBeenCalled();
+    expect(d.prepareSubscriptionEnv).not.toHaveBeenCalled();
   });
 
   it("fails closed before session acquisition when the control-plane read is unavailable", async () => {

@@ -724,7 +724,7 @@ function OptionsPanel({
             </Row>
           )}
           {owner && (
-            <Row label="Background readiness" hint="Manual no-spend check · no workspace or model run">
+            <Row label="Background readiness" hint="Session + current workspace proof · no workspace or model run">
               <BackgroundReadinessControl />
             </Row>
           )}

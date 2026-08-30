@@ -13,6 +13,8 @@ import {
   verifyCodexSubscriptionPreflight,
 } from "./subscription-runtime";
 import { backgroundSubscriptionValidityMs } from "./subscription-validity";
+import { configuredCloudWorkspaceProviderForCurrentTriggerDeployment } from "./cloud-workspace-providers";
+import type { CloudProviderRuntimeAttestation } from "./cloud-provider-probe-attestation";
 
 /**
  * A short window proves the broker can provide a fresh consumer snapshot
@@ -28,12 +30,14 @@ export type BackgroundReadinessBlocker =
   | "subscription_unavailable"
   | "codex_preflight_failed"
   | "consumer_cleanup_failed"
+  | "cloud_workspace_unavailable"
   | CodexSessionUnavailableCode;
 
 export type BackgroundReadinessReport = {
   ready: boolean;
   controllerSession: "clear" | "repair_required" | "unknown";
   blocker?: BackgroundReadinessBlocker;
+  workspace: "ready" | "unavailable" | "not_checked";
   codex: {
     binary: "available" | "unavailable" | "not_checked";
     subscription: "acquired" | "unavailable" | "not_checked";
@@ -53,6 +57,10 @@ export type BackgroundReadinessDependencies = {
   prepareSubscriptionEnv: typeof prepareSubscriptionEnv;
   verifyCodexSubscriptionPreflight: typeof verifyCodexSubscriptionPreflight;
   cleanupSubscriptionHome: typeof cleanupSubscriptionHome;
+  verifyCloudWorkspace: (
+    environment: Readonly<NodeJS.ProcessEnv>,
+    runtime: CloudProviderRuntimeAttestation,
+  ) => Promise<void>;
 };
 
 function productionDependencies(): BackgroundReadinessDependencies {
@@ -63,6 +71,9 @@ function productionDependencies(): BackgroundReadinessDependencies {
     prepareSubscriptionEnv,
     verifyCodexSubscriptionPreflight,
     cleanupSubscriptionHome,
+    verifyCloudWorkspace: async (environment, runtime) => {
+      await configuredCloudWorkspaceProviderForCurrentTriggerDeployment(environment, runtime);
+    },
   };
 }
 
@@ -71,6 +82,7 @@ function unknownControllerReport(blocker: BackgroundReadinessBlocker): Backgroun
     ready: false,
     controllerSession: "unknown",
     blocker,
+    workspace: "not_checked",
     codex: { binary: "not_checked", subscription: "not_checked", preflight: "not_checked" },
   };
 }
@@ -121,6 +133,7 @@ function reportForSessionHold(code: CodexSessionUnavailableCode): BackgroundRead
     ready: false,
     controllerSession: "repair_required",
     blocker: code,
+    workspace: "not_checked",
     codex: { binary: "not_checked", subscription: "not_checked", preflight: "not_checked" },
   };
 }
@@ -132,6 +145,7 @@ function reportForSessionHold(code: CodexSessionUnavailableCode): BackgroundRead
  */
 export async function runBackgroundReadinessProbe(
   dependencies: BackgroundReadinessDependencies = productionDependencies(),
+  runtime: CloudProviderRuntimeAttestation = { triggerDeploymentVersion: undefined },
 ): Promise<BackgroundReadinessReport> {
   if (!dependencies.environment.JARVIS_WORKER_TOKEN) {
     return unknownControllerReport("worker_token_unavailable");
@@ -149,12 +163,30 @@ export async function runBackgroundReadinessProbe(
   }
   const controllerSession = controller.state;
 
+  try {
+    // This is a local/control-plane verification only: it validates the exact
+    // current Trigger deployment receipt, pinned provider SDK and configured
+    // adapter without creating a workspace or making a provider lifecycle
+    // call. A session-only check must never authorize autonomous queues that
+    // have no executable workspace behind them.
+    await dependencies.verifyCloudWorkspace(dependencies.environment, runtime);
+  } catch {
+    return {
+      ready: false,
+      controllerSession,
+      blocker: "cloud_workspace_unavailable",
+      workspace: "unavailable",
+      codex: { binary: "not_checked", subscription: "not_checked", preflight: "not_checked" },
+    };
+  }
+
   const bin = dependencies.resolveSubscriptionAgentBin("codex");
   if (!bin) {
     return {
       ready: false,
       controllerSession,
       blocker: "codex_binary_unavailable",
+      workspace: "ready",
       codex: { binary: "unavailable", subscription: "not_checked", preflight: "not_checked" },
     };
   }
@@ -171,6 +203,7 @@ export async function runBackgroundReadinessProbe(
       ready: false,
       controllerSession,
       blocker: "subscription_unavailable",
+      workspace: "ready",
       codex: { binary: "available", subscription: "unavailable", preflight: "not_checked" },
     };
   }
@@ -178,6 +211,7 @@ export async function runBackgroundReadinessProbe(
     ready: false,
     controllerSession,
     blocker: "subscription_unavailable",
+    workspace: "ready",
     codex: { binary: "available", subscription: "unavailable", preflight: "not_checked" },
   };
   try {
@@ -186,6 +220,7 @@ export async function runBackgroundReadinessProbe(
         ready: false,
         controllerSession,
         blocker: codexSessionUnavailableCode(prepared.error) ?? "subscription_unavailable",
+        workspace: "ready",
         codex: { binary: "available", subscription: "unavailable", preflight: "not_checked" },
       };
     } else {
@@ -196,11 +231,13 @@ export async function runBackgroundReadinessProbe(
             ready: false,
             controllerSession,
             blocker: "codex_preflight_failed",
+            workspace: "ready",
             codex: { binary: "available", subscription: "acquired", preflight: "failed" },
           }
           : {
             ready: true,
             controllerSession,
+            workspace: "ready",
             codex: { binary: "available", subscription: "acquired", preflight: "passed" },
           };
       } catch {
@@ -208,6 +245,7 @@ export async function runBackgroundReadinessProbe(
           ready: false,
           controllerSession,
           blocker: "codex_preflight_failed",
+          workspace: "ready",
           codex: { binary: "available", subscription: "acquired", preflight: "failed" },
         };
       }
@@ -220,6 +258,7 @@ export async function runBackgroundReadinessProbe(
         ready: false,
         controllerSession,
         blocker: "consumer_cleanup_failed",
+        workspace: "ready",
         codex: { binary: "available", subscription: prepared.error ? "unavailable" : "acquired", preflight: "not_checked" },
       };
     }
@@ -234,5 +273,8 @@ export const backgroundReadiness = task({
   machine: "micro",
   retry: { maxAttempts: 1 },
   maxDuration: 45,
-  run: async () => await runBackgroundReadinessProbe(),
+  run: async (_payload, { ctx }) => await runBackgroundReadinessProbe(
+    productionDependencies(),
+    { triggerDeploymentVersion: ctx.deployment?.version },
+  ),
 });

@@ -155,7 +155,7 @@ describe("background readiness control API", () => {
     const { cookie } = await startTicket();
     mock.retrieve.mockResolvedValueOnce({
       status: "COMPLETED",
-      output: { ready: true, controllerSession: "clear" },
+      output: { ready: true, controllerSession: "clear", workspace: "ready" },
     });
     const paused = new Set(["jarvis-background-agents", "jarvis-chat-dispatcher"]);
     mock.queueRetrieve.mockImplementation(async (target: { name: string }) => ({
@@ -186,6 +186,34 @@ describe("background readiness control API", () => {
     }));
 
     expect(res.status).toBe(409);
+    expect(mock.queueResume).not.toHaveBeenCalled();
+  });
+
+  it("treats a stale or unavailable workspace proof as attention and never resumes queues", async () => {
+    const { cookie } = await startTicket();
+    mock.retrieve.mockResolvedValueOnce({
+      status: "COMPLETED",
+      output: {
+        ready: false,
+        controllerSession: "clear",
+        blocker: "cloud_workspace_unavailable",
+        workspace: "unavailable",
+      },
+    });
+
+    const status = await GET(request("GET", { cookie }));
+    expect(await status.json()).toEqual({
+      ok: true,
+      status: "attention",
+      workers: "ready",
+      queued: 0,
+    });
+
+    const resume = await POST(request("POST", {
+      cookie,
+      body: { action: "resume", confirm: BACKGROUND_WORKERS_RESUME_CONFIRMATION },
+    }));
+    expect(resume.status).toBe(409);
     expect(mock.queueResume).not.toHaveBeenCalled();
   });
 });
