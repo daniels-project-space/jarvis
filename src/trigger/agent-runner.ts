@@ -1703,6 +1703,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           authorityDigest,
           workerRunId: options.reservation.workerRunId,
         });
+      const touchActiveHeartbeat = async () => await convexMutation(
+        deliveryFence ? "jobs:touchDeliveryHeartbeat" : "jobs:touchHeartbeat",
+        deliveryFence
+          ? { jobId: job.jobId, expectedAttempt, ...deliveryFence }
+          : { jobId: job.jobId, expectedAttempt, workerRunId: claimedWorkerRunId },
+      ).catch(() => false);
       const reportPreparationStage = async (stage: string, progress: string, percent: number) => {
         options.onProgress?.({
           jobId: String(job.jobId),
@@ -1712,12 +1718,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           stage,
           percent,
         });
-        const live = await convexMutation(
-          deliveryFence ? "jobs:touchDeliveryHeartbeat" : "jobs:touchHeartbeat",
-          deliveryFence
-            ? { jobId: job.jobId, expectedAttempt, ...deliveryFence }
-            : { jobId: job.jobId, expectedAttempt, workerRunId: claimedWorkerRunId },
-        ).catch(() => false);
+        const live = await touchActiveHeartbeat();
         const recorded = live && await convexMutation("jobs:updateProgress", {
           jobId: job.jobId,
           expectedAttempt,
@@ -2488,6 +2489,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               } as const;
               const [durableStage, progress, percent] = stages[stage];
               await reportPreparationStage(durableStage, progress, percent);
+            },
+            onHeartbeat: async () => {
+              // Provider creates, source uploads, and locked dependency
+              // hydration can be quiet for minutes. Keep the exact current
+              // attempt live without manufacturing causal progress.
+              await touchActiveHeartbeat();
             },
           });
           providerWorkspace = preparedWorkspace.workspace;

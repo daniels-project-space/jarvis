@@ -1235,7 +1235,7 @@ describe("production Trigger worker authority harness", () => {
       expect.objectContaining({ reasoningEffort: "max" }),
     );
     expect(specialistDependencies.prepareCloudWorkspaceExecution).toHaveBeenCalledWith(
-      expect.objectContaining({ template: "node22" }),
+      expect.objectContaining({ template: "node22", onHeartbeat: expect.any(Function) }),
     );
     expect(specialistBridge.trace.filter((call) =>
       call.path === "jobs:bindCloudWorkspace" || call.path === "jobs:cloudCheckpointForReplay",

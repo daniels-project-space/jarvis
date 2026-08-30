@@ -91,6 +91,7 @@ export async function prepareCloudWorkspaceExecution(input: {
   bindWorkspace?: (workspace: CloudWorkspace) => Promise<boolean>;
   assertCurrent?: (phase: string) => Promise<boolean>;
   onStage?: (stage: CloudWorkspacePreparationStage | "source_upload" | "dependency_hydration") => Promise<void>;
+  onHeartbeat?: (stage: CloudWorkspacePreparationStage | "source_upload" | "dependency_hydration") => Promise<void>;
 }): Promise<{ provider: CloudWorkspaceProvider; workspace: CloudWorkspace; archive: CredentiallessArchive }> {
   // Provider configuration and capabilities are resolved before the trusted
   // controller runs git or any other host process. This ordering is the
@@ -112,15 +113,41 @@ export async function prepareCloudWorkspaceExecution(input: {
     }
     await input.onStage?.(stage);
   };
+  const withHeartbeat = async <T,>(
+    stage: CloudWorkspacePreparationStage | "source_upload" | "dependency_hydration",
+    work: () => Promise<T>,
+  ): Promise<T> => {
+    if (!input.onHeartbeat) return await work();
+    let pending = Promise.resolve();
+    const timer = setInterval(() => {
+      // Serialize pulses so a slow control-plane response cannot create a
+      // heartbeat stampede. Authority is rechecked after every provider
+      // effect below; this pulse only prevents a live, unchanged worker from
+      // being mistaken for a stalled one during a quiet provider operation.
+      pending = pending
+        .catch(() => undefined)
+        .then(async () => await input.onHeartbeat?.(stage));
+    }, 30_000);
+    timer.unref?.();
+    try {
+      return await work();
+    } finally {
+      clearInterval(timer);
+      // Never leave a pulse running after the exact provider effect settles.
+      // A failed pulse cannot authorize anything and the post-effect
+      // assertCurrent fence remains authoritative.
+      await pending.catch(() => undefined);
+    }
+  };
   if (provider.name !== "vercel") await observeProviderStage("provider_create");
-  const workspace = await provider.createWorkspace({
+  const workspace = await withHeartbeat("provider_create", async () => await provider.createWorkspace({
     attemptKey: input.attemptKey,
     template: input.template,
     runtime: input.runtime,
     lockfileDigest: input.lockfileDigest,
     limits,
     onStage: observeProviderStage,
-  });
+  }));
   if (input.assertCurrent && !await input.assertCurrent("workspace_binding")) {
     await provider.terminate(workspace, "orphan").catch(() => undefined);
     throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected workspace binding", "deferred");
@@ -134,7 +161,7 @@ export async function prepareCloudWorkspaceExecution(input: {
     if (input.assertCurrent && !await input.assertCurrent("source_upload")) {
       throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected source upload", "deferred");
     }
-    await provider.uploadCredentiallessArchive(workspace, archive);
+    await withHeartbeat("source_upload", async () => await provider.uploadCredentiallessArchive(workspace, archive));
     // Dependency hydration is a provider-specific, controller-owned phase.
     // It must finish and relock egress before the caller can reach Codex.
     if (provider.hydrateDependencies) {
@@ -142,7 +169,7 @@ export async function prepareCloudWorkspaceExecution(input: {
       if (input.assertCurrent && !await input.assertCurrent("dependency_hydration")) {
         throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected dependency hydration", "deferred");
       }
-      await provider.hydrateDependencies(workspace);
+      await withHeartbeat("dependency_hydration", async () => await provider.hydrateDependencies!(workspace));
       if (input.assertCurrent && !await input.assertCurrent("dependency_relocked")) {
         throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected dependency relock", "deferred");
       }

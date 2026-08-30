@@ -199,6 +199,45 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(provider.calls).toContain("terminate:terminal");
   });
 
+  it("keeps a quiet dependency hydration alive without inventing a new progress stage", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = new FakeCloudWorkspaceProvider();
+      let releaseHydration!: () => void;
+      let hydrationStarted!: () => void;
+      const started = new Promise<void>((resolve) => { hydrationStarted = resolve; });
+      const hydration = new Promise<void>((resolve) => { releaseHydration = resolve; });
+      const dependencyProvider = provider as typeof provider & { hydrateDependencies: () => Promise<void> };
+      dependencyProvider.hydrateDependencies = async () => {
+        hydrationStarted();
+        await hydration;
+      };
+      const stages: string[] = [];
+      const heartbeats: string[] = [];
+      const pending = prepareCloudWorkspaceExecution({
+        providerFactory: () => provider,
+        hydrateArchive: async () => archive([{ name: "package-lock.json", data: new TextEncoder().encode("{}") }]),
+        attemptKey: "quiet-dependency:1",
+        template: "node",
+        runtime: "node-22",
+        lockfileDigest: LOCK,
+        onStage: async (stage) => { stages.push(stage); },
+        onHeartbeat: async (stage) => { heartbeats.push(stage); },
+      });
+
+      await started;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(heartbeats).toEqual(["dependency_hydration", "dependency_hydration"]);
+      expect(stages).toEqual(["provider_create", "source_upload", "dependency_hydration"]);
+
+      releaseHydration();
+      await pending;
+      expect(provider.calls).not.toContain("terminate:terminal");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("never projects controller secrets or caller env into sandbox execution", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const workspace = await provider.createWorkspace({ attemptKey: "job:1", template: "node", runtime: "node-22", lockfileDigest: "b".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS });
