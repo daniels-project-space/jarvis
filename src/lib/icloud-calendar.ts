@@ -2,7 +2,7 @@ import "server-only";
 
 import { randomUUID } from "node:crypto";
 import { XMLParser } from "fast-xml-parser";
-import { parseIcsVevents } from "./ics";
+import { parseIcsOccurrences } from "./ics";
 import { getServiceSecrets } from "./vault";
 
 const DAV = "DAV:";
@@ -312,8 +312,15 @@ async function resolveCalendar(requested?: string): Promise<ICloudCalendar> {
 // VEVENT parsing itself lives in ./ics (shared with src/lib/gmail.ts, Feature
 // 4b, for .ics/text-calendar Gmail attachments) — this just adds the
 // iCloud/CalDAV-specific wrapper fields.
-function parseIcsEvents(source: string, eventUrl: string, calendarName: string, etag?: string): ICloudEvent[] {
-  return parseIcsVevents(source).map((event) => ({
+function parseIcsEvents(
+  source: string,
+  eventUrl: string,
+  calendarName: string,
+  rangeStart: number,
+  rangeEnd: number,
+  etag?: string,
+): ICloudEvent[] {
+  return parseIcsOccurrences(source, rangeStart, rangeEnd).map((event) => ({
     ...event,
     eventUrl,
     etag,
@@ -355,7 +362,14 @@ export async function listICloudEvents(start: number, end: number, requestedCale
         const data = text(property(row, "calendar-data"));
         const resource = href(row.href);
         if (!data || !resource) continue;
-        events.push(...parseIcsEvents(data, trustedICloudCalDavUrl(resource, calendar.url), calendar.name, text(property(row, "getetag")) || undefined));
+        events.push(...parseIcsEvents(
+          data,
+          trustedICloudCalDavUrl(resource, calendar.url),
+          calendar.name,
+          start,
+          end,
+          text(property(row, "getetag")) || undefined,
+        ));
       }
       return events;
     }),

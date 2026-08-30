@@ -1,5 +1,7 @@
 import "server-only";
 
+import ICAL from "ical.js";
+
 // Shared ICS/VEVENT parsing primitives.
 //
 // This logic originally lived only in icloud-calendar.ts (private, unexported
@@ -119,4 +121,69 @@ export function parseIcsVevents(source: string): ParsedIcsEvent[] {
     if (field && ["UID", "SUMMARY", "DTSTART", "DTEND", "LOCATION", "DESCRIPTION"].includes(field.name)) fields[field.name] ??= field;
   }
   return events;
+}
+
+const MAX_RECURRENCE_ITERATIONS = 100_000;
+
+function intersectsRange(event: ParsedIcsEvent, rangeStart: number, rangeEnd: number): boolean {
+  const effectiveEnd = Math.max(event.start + 1, event.end ?? event.start + 1);
+  return effectiveEnd > rangeStart && event.start < rangeEnd;
+}
+
+/**
+ * Expands a CalDAV resource into only the concrete occurrences intersecting a
+ * requested time range. CalDAV may return a recurring master whose DTSTART is
+ * years outside the REPORT window; returning that master directly produces a
+ * stale card instead of the occurrence the server matched.
+ *
+ * ICAL.js handles RRULE, RDATE, EXDATE, recurrence exceptions, and embedded
+ * VTIMEZONE definitions. The bounded iterator prevents a malformed, extremely
+ * old high-frequency rule from monopolising a foreground Calendar request.
+ */
+export function parseIcsOccurrences(source: string, rangeStart: number, rangeEnd: number): ParsedIcsEvent[] {
+  if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) return [];
+
+  const calendar = new ICAL.Component(ICAL.parse(source));
+  const components = calendar.name === "vevent" ? [calendar] : calendar.getAllSubcomponents("vevent");
+  const occurrences: ParsedIcsEvent[] = [];
+
+  for (const component of components) {
+    if (component.hasProperty("recurrence-id")) continue;
+    const event = new ICAL.Event(component, { strictExceptions: true });
+    const iterator = event.iterator();
+    let iterations = 0;
+    for (let next = iterator.next(); next; next = iterator.next()) {
+      iterations += 1;
+      if (iterations > MAX_RECURRENCE_ITERATIONS) {
+        throw new Error("iCloud recurrence expansion exceeded its safety limit.");
+      }
+
+      const details = event.getOccurrenceDetails(next);
+      const item = details.item;
+      const reachedRangeEnd = next.toJSDate().getTime() >= rangeEnd;
+      const status = item.component.getFirstPropertyValue("status");
+      if (typeof status === "string" && status.toUpperCase() === "CANCELLED") {
+        if (reachedRangeEnd) break;
+        continue;
+      }
+
+      const occurrence: ParsedIcsEvent = {
+        uid: item.uid ?? event.uid ?? "",
+        title: item.summary || "(untitled)",
+        start: details.startDate.toJSDate().getTime(),
+        end: details.endDate.toJSDate().getTime(),
+        allDay: details.startDate.isDate,
+        location: item.location || undefined,
+        notes: item.description || undefined,
+      };
+      if (intersectsRange(occurrence, rangeStart, rangeEnd)) occurrences.push(occurrence);
+
+      // Recurrence IDs are ordered. Exceptions whose original recurrence ID
+      // lies inside the query are resolved above via getOccurrenceDetails().
+      if (reachedRangeEnd) break;
+      if (!event.isRecurring()) break;
+    }
+  }
+
+  return occurrences.sort((left, right) => left.start - right.start || left.title.localeCompare(right.title));
 }
