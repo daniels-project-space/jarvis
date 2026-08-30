@@ -81,6 +81,31 @@ describe("guest foreground boundary", () => {
     expect(mock.convexQuery).toHaveBeenCalledWith("chatQueue:runnerLease", { guestId: guest.guestId });
   });
 
+  it("fails visibly before durable admission while production reply workers are billing-paused", async () => {
+    const previous = process.env.JARVIS_FOREGROUND_HOLD_REASON;
+    process.env.JARVIS_FOREGROUND_HOLD_REASON = "trigger_billing_limit";
+    mock.controlActor.mockResolvedValue({ kind: "owner", authTokenHash: "owner-scope" });
+    try {
+      const response = await chatPost(request("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "Can you hear me?", requestId: "held-turn" }),
+      }));
+
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({
+        code: "FOREGROUND_WORKERS_BILLING_PAUSED",
+        retryable: true,
+        actionUrl: expect.stringContaining("/settings/billing-limits"),
+      });
+      expect(mock.convexMutation).not.toHaveBeenCalled();
+      expect(mock.trigger).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.JARVIS_FOREGROUND_HOLD_REASON;
+      else process.env.JARVIS_FOREGROUND_HOLD_REASON = previous;
+    }
+  });
+
   it("rejects speculative research receipts at the guest foreground boundary", async () => {
     const response = await chatPost(request("/api/chat", {
       method: "POST",

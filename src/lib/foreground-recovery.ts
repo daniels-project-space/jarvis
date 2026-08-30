@@ -29,6 +29,13 @@ export type ForegroundRecoverySignal =
   | "requeued"
   | "failed";
 
+export function foregroundSubmissionFailureMessage(code?: string): string {
+  if (code === "FOREGROUND_WORKERS_BILLING_PAUSED") {
+    return "Jarvis heard you. Reply workers are paused at the service billing limit, so nothing was falsely started. Your request is preserved here for retry.";
+  }
+  return "Jarvis heard you, but the conversation line failed before it confirmed. Retry keeps the same request ID.";
+}
+
 export function foregroundRecoveryBudgetAfterSignal(
   attempts: number,
   signal: ForegroundRecoverySignal,

@@ -128,6 +128,7 @@ import {
   FOREGROUND_AUTO_RECOVERY_MS,
   foregroundRecoveryBudgetAfterSignal,
   foregroundRecoveryWatchdogDisposition,
+  foregroundSubmissionFailureMessage,
   foregroundTurnPhase,
   latestRecoverableForegroundTurn,
   mergeRecoveredAssistant,
@@ -2246,6 +2247,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     options: Pick<SubmitOptions, "requestId" | "researchReceipt" | "voiceTrace">;
   } | null>(null);
   const [submissionRetryReady, setSubmissionRetryReady] = useState(false);
+  const [submissionFailureMessage, setSubmissionFailureMessage] = useState<string | null>(null);
+  const [submissionRepairUrl, setSubmissionRepairUrl] = useState<string | null>(null);
   const lastSubmittedParentId = useRef<string | undefined>(undefined);
   const durableRecoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const durableAutoRecoveries = useRef(0);
@@ -3520,9 +3523,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     durableSubmissionInFlight.current = true;
     failedSubmissionRef.current = null;
     setSubmissionRetryReady(false);
+    setSubmissionFailureMessage(null);
+    setSubmissionRepairUrl(null);
     durableStartedAt.current = performance.now();
     setSending(true);
     showCaption({ who: "you", text: visibleText });
+    let submissionFailureNotice: string | null = null;
     try {
       const request = {
         method: "POST",
@@ -3543,9 +3549,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       } catch {
         response = await viewerFetchWithTimeout("/api/chat", request, 15_000);
       }
-      if (!response.ok) throw new Error(`conversation queue rejected (${response.status})`);
-      const result = await response.json() as { messageId?: string; researchPrefetchAccepted?: boolean };
-      if (!result.messageId) throw new Error("conversation queue returned no turn identity");
+      const result = await response.json().catch(() => null) as {
+        messageId?: string;
+        researchPrefetchAccepted?: boolean;
+        code?: string;
+        actionUrl?: string;
+      } | null;
+      if (!response.ok) {
+        submissionFailureNotice = foregroundSubmissionFailureMessage(result?.code);
+        setSubmissionFailureMessage(submissionFailureNotice);
+        setSubmissionRepairUrl(
+          typeof result?.actionUrl === "string" && result.actionUrl.startsWith("https://cloud.trigger.dev/")
+            ? result.actionUrl
+            : null,
+        );
+        throw new Error(`conversation queue rejected (${response.status}:${result?.code ?? "unknown"})`);
+      }
+      if (!result?.messageId) throw new Error("conversation queue returned no turn identity");
       if (options.researchReceipt) {
         document.documentElement.dataset.jarvisResearchPrefetch = result.researchPrefetchAccepted
           ? "promoted"
@@ -3595,9 +3615,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       };
       setSubmissionRetryReady(true);
       document.documentElement.dataset.jarvisConversationFailure = String(error).slice(0, 160);
+      const failureMessage = submissionFailureNotice ?? foregroundSubmissionFailureMessage();
       showCaption({
         who: "jarvis",
-        text: "I heard you, but the conversation line failed before it confirmed. Tap retry send—your request ID is preserved.",
+        text: failureMessage,
         phase: "ready",
       });
       setSending(false);
@@ -3608,6 +3629,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     const retry = failedSubmissionRef.current;
     if (!retry || durableSubmissionInFlight.current || activeDurableTurn.current) return;
     setSubmissionRetryReady(false);
+    setSubmissionFailureMessage(null);
+    setSubmissionRepairUrl(null);
     void queueDurableTurn(
       retry.text,
       retry.visibleText,
@@ -5431,7 +5454,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     recovery: durableRecovery,
   });
   const foregroundRecoveryMessage = submissionRetryReady
-    ? "Send was not confirmed. Retry keeps the same request ID."
+    ? (submissionFailureMessage ?? foregroundSubmissionFailureMessage())
     : durableRecovery === "waiting"
       ? "Still working on this reply."
       : durableRecovery === "cancelling"
@@ -5700,6 +5723,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             <div className="flex items-center justify-between gap-2 border-t border-amber/15 px-3 py-1.5 text-[11px] text-slate">
               <span>{foregroundRecoveryMessage}</span>
               <div className="flex items-center gap-2">
+                {submissionRetryReady && submissionRepairUrl && (
+                  <a
+                    href={submissionRepairUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-amber underline decoration-amber/40 underline-offset-2"
+                  >
+                    fix service
+                  </a>
+                )}
                 {!submissionRetryReady && !durableRetryReady && (
                   <button
                     type="button"
@@ -6149,6 +6182,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             <div className="flex items-center justify-between gap-3 border-t border-amber/15 bg-amber/[0.04] px-3 py-2 text-xs text-slate">
               <span>{foregroundRecoveryMessage}</span>
               <div className="flex shrink-0 items-center gap-2">
+                {submissionRetryReady && submissionRepairUrl && (
+                  <a
+                    href={submissionRepairUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-amber underline decoration-amber/40 underline-offset-2"
+                  >
+                    fix service
+                  </a>
+                )}
                 {!submissionRetryReady && !durableRetryReady && (
                   <button
                     type="button"
@@ -6339,6 +6382,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           {foregroundRecoveryVisible && (
             <div className="mx-auto mb-1 flex w-fit items-center gap-2 rounded-full border border-amber/20 bg-black/75 px-3 py-1 text-[11px] text-slate backdrop-blur">
               <span>{foregroundRecoveryMessage}</span>
+              {submissionRetryReady && submissionRepairUrl && (
+                <a
+                  href={submissionRepairUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-amber underline decoration-amber/40 underline-offset-2"
+                >
+                  fix service
+                </a>
+              )}
               {!submissionRetryReady && !durableRetryReady && (
                 <button
                   type="button"

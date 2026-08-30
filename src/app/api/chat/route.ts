@@ -63,6 +63,22 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   if (!text && !fileIds.length) return Response.json({ error: "empty" }, { status: 400 });
   if (!text) text = "Please analyze the attached files.";
 
+  // Trigger accepts new runs even while an environment is billing-paused.
+  // Without this explicit operational hold, the browser receives a successful
+  // queue receipt and waits forever for a worker that cannot start. Keep the
+  // request client-side for an exact-ID retry instead of creating another
+  // durable turn while production is known to be suspended.
+  if (process.env.JARVIS_FOREGROUND_HOLD_REASON === "trigger_billing_limit") {
+    return Response.json({
+      error: "Reply workers are paused at the Trigger billing limit.",
+      code: "FOREGROUND_WORKERS_BILLING_PAUSED",
+      retryable: true,
+      ...(actor.kind === "guest"
+        ? {}
+        : { actionUrl: "https://cloud.trigger.dev/orgs/daniels-project-space-be0b/settings/billing-limits" }),
+    }, { status: 503 });
+  }
+
   const adminHash = actorAdminHash(actor);
   const researchPrefetch = researchReceipt && adminHash && requestId
     ? promoteSpeculativeResearchReceipt(

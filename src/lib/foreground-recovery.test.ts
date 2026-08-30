@@ -3,6 +3,7 @@ import {
   authoritativeCancellationReceipt,
   foregroundRecoveryBudgetAfterSignal,
   foregroundRecoveryWatchdogDisposition,
+  foregroundSubmissionFailureMessage,
   foregroundTurnPhase,
   latestRecoverableForegroundTurn,
   mergeRecoveredAssistant,
@@ -10,6 +11,16 @@ import {
 } from "./foreground-recovery";
 
 const userId = "user-1";
+
+describe("foregroundSubmissionFailureMessage", () => {
+  it("distinguishes a suspended worker service from ChatGPT authentication repair", () => {
+    expect(foregroundSubmissionFailureMessage("FOREGROUND_WORKERS_BILLING_PAUSED"))
+      .toContain("service billing limit");
+    expect(foregroundSubmissionFailureMessage("FOREGROUND_WORKERS_BILLING_PAUSED"))
+      .toContain("request is preserved");
+    expect(foregroundSubmissionFailureMessage()).toContain("same request ID");
+  });
+});
 
 describe("foregroundTurnPhase", () => {
   it("tracks a turn by parent identity instead of a later unrelated reply", () => {
