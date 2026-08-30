@@ -3,8 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CODEX_AUTH_ENROLLMENT_CONFIRMATION,
-  CODEX_DEVICE_AUTH_URI,
-  openCodexDeviceAuthWindow,
+  openCodexAuthGuideWindow,
 } from "@/lib/codex-auth-control";
 import { viewerFetch } from "@/lib/viewer-request";
 
@@ -15,6 +14,7 @@ type AuthState =
   | "waiting"
   | "connected"
   | "attention"
+  | "paused"
   | "unavailable";
 type AuthStatus = Readonly<{
   ok: boolean;
@@ -36,6 +36,7 @@ function validStatus(value: unknown): value is AuthStatus {
       "waiting",
       "connected",
       "attention",
+      "paused",
       "unavailable",
     ].includes(String(state))
   );
@@ -43,15 +44,18 @@ function validStatus(value: unknown): value is AuthStatus {
 
 export function CodexAuthControl({
   compact = false,
+  guideMode = false,
+  pollIdle = false,
   onConnected,
 }: {
   compact?: boolean;
+  guideMode?: boolean;
+  pollIdle?: boolean;
   onConnected?: () => void;
 }) {
   const [status, setStatus] = useState<AuthStatus>({ ok: true, state: "idle" });
   const [busy, setBusy] = useState(false);
   const loginWindow = useRef<Window | null>(null);
-  const openedCode = useRef<string | null>(null);
 
   const readStatus = useCallback(async () => {
     const response = await viewerFetch("/api/codex-auth", {
@@ -63,17 +67,6 @@ export function CodexAuthControl({
         ? body
         : { ok: false, state: "unavailable" };
     setStatus(next);
-    if (
-      next.state === "waiting" &&
-      next.verificationUri &&
-      next.userCode &&
-      openedCode.current !== next.userCode
-    ) {
-      openedCode.current = next.userCode;
-      if (loginWindow.current && !loginWindow.current.closed) {
-        loginWindow.current.location.href = next.verificationUri;
-      }
-    }
     if (next.state === "connected") {
       setBusy(false);
       onConnected?.();
@@ -82,25 +75,34 @@ export function CodexAuthControl({
   }, [onConnected]);
 
   useEffect(() => {
-    void readStatus();
+    const timer = window.setTimeout(() => void readStatus(), 0);
+    return () => window.clearTimeout(timer);
   }, [readStatus]);
 
   useEffect(() => {
-    if (!["queued", "starting", "waiting"].includes(status.state)) return;
+    if (
+      !["queued", "starting", "waiting"].includes(status.state)
+      && !(pollIdle && ["idle", "paused"].includes(status.state))
+    ) return;
     const timer = window.setTimeout(
       () => void readStatus(),
       status.state === "waiting" ? 1_500 : 900,
     );
     return () => window.clearTimeout(timer);
-  }, [readStatus, status.state]);
+  }, [pollIdle, readStatus, status.state]);
 
   const reconnect = async () => {
     setBusy(true);
-    openedCode.current = null;
-    loginWindow.current = openCodexDeviceAuthWindow(
-      (url, target, features) => window.open(url, target, features),
-    );
-    if (loginWindow.current) loginWindow.current.opener = null;
+    if (!guideMode) {
+      loginWindow.current = openCodexAuthGuideWindow(
+        (url, target, features) => window.open(url, target, features),
+      );
+      if (loginWindow.current) loginWindow.current.opener = null;
+    }
+    if (status.state === "paused") {
+      setBusy(false);
+      return;
+    }
     try {
       const response = await viewerFetch("/api/codex-auth", {
         method: "POST",
@@ -111,8 +113,6 @@ export function CodexAuthControl({
       if (!response.ok || !validStatus(body)) throw new Error("unavailable");
       setStatus(body);
     } catch {
-      loginWindow.current?.close();
-      loginWindow.current = null;
       setStatus({ ok: false, state: "unavailable" });
       setBusy(false);
     }
@@ -125,6 +125,8 @@ export function CodexAuthControl({
       ? "ChatGPT connected"
       : status.state === "waiting"
         ? "Finish sign-in"
+        : status.state === "paused"
+          ? "Open sign-in help"
         : active
           ? "Preparing sign-in…"
           : "Reconnect ChatGPT";
@@ -175,6 +177,12 @@ export function CodexAuthControl({
         <p className="text-[11px] leading-relaxed text-amber-100">
           Sign-in could not finish. Try again; your existing work stays safely
           queued.
+        </p>
+      )}
+      {!compact && status.state === "paused" && (
+        <p className="text-[11px] leading-relaxed text-amber-100">
+          The ChatGPT sign-in worker is paused by Trigger’s production billing
+          limit. Unpause it, then return here; this screen will keep checking.
         </p>
       )}
     </div>

@@ -7,15 +7,17 @@ export const CODEX_AUTH_ENROLLMENT_CONFIRMATION =
 export const CODEX_DEVICE_AUTH_URI =
   "https://auth.openai.com/codex/device" as const;
 
-export function openCodexDeviceAuthWindow(
+export const CODEX_AUTH_GUIDE_PATH = "/auth/chatgpt" as const;
+
+export function openCodexAuthGuideWindow(
   openWindow: (
-    url: typeof CODEX_DEVICE_AUTH_URI,
+    url: typeof CODEX_AUTH_GUIDE_PATH,
     target: string,
     features: string,
   ) => Window | null,
 ): Window | null {
   return openWindow(
-    CODEX_DEVICE_AUTH_URI,
+    CODEX_AUTH_GUIDE_PATH,
     "jarvis-chatgpt-auth",
     "popup,width=560,height=720",
   );

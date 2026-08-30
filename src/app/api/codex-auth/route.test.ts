@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 const mock = vi.hoisted(() => ({
@@ -53,6 +53,10 @@ async function start() {
 }
 
 describe("owner ChatGPT reconnect control", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mock.sameOrigin.mockReturnValue(true);
@@ -80,6 +84,20 @@ describe("owner ChatGPT reconnect control", () => {
     const cookie = response.headers.get("set-cookie") ?? "";
     expect(cookie).toContain("HttpOnly");
     expect(cookie).not.toContain("private-enrollment-run");
+  });
+
+  it("reports the production billing pause without queuing an inert enrollment", async () => {
+    vi.stubEnv("JARVIS_FOREGROUND_HOLD_REASON", "trigger_billing_limit");
+    const getResponse = await GET(request("GET"));
+    expect(getResponse.status).toBe(503);
+    expect(await getResponse.json()).toEqual({ ok: false, state: "paused" });
+
+    const postResponse = await POST(request("POST", {
+      body: { confirm: CODEX_AUTH_ENROLLMENT_CONFIRMATION },
+    }));
+    expect(postResponse.status).toBe(503);
+    expect(await postResponse.json()).toEqual({ ok: false, state: "paused" });
+    expect(mock.trigger).not.toHaveBeenCalled();
   });
 
   it("cancels an abandoned enrollment before retry and through the owner cancel route", async () => {

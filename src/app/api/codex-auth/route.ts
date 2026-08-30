@@ -33,6 +33,7 @@ type PublicState =
   | "waiting"
   | "connected"
   | "attention"
+  | "paused"
   | "unavailable";
 type PublicBody = {
   ok: boolean;
@@ -198,6 +199,9 @@ async function cancelActiveEnrollments(): Promise<void> {
 export async function GET(req: NextRequest): Promise<NextResponse> {
   const actor = await owner(req);
   if (!actor) return response({ ok: false, state: "unavailable" }, 403);
+  if (process.env.JARVIS_FOREGROUND_HOLD_REASON === "trigger_billing_limit") {
+    return clearTicket(response({ ok: false, state: "paused" }, 503));
+  }
   const ticket = decodeTicket(
     req.cookies.get(TICKET_COOKIE)?.value,
     actor.authTokenHash,
@@ -214,6 +218,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 export async function POST(req: NextRequest): Promise<NextResponse> {
   const actor = await owner(req);
   if (!actor) return response({ ok: false, state: "unavailable" }, 403);
+  if (process.env.JARVIS_FOREGROUND_HOLD_REASON === "trigger_billing_limit") {
+    return response({ ok: false, state: "paused" }, 503);
+  }
   const length = Number(req.headers.get("content-length") ?? 0);
   if (Number.isFinite(length) && length > MAX_BODY_BYTES)
     return response({ ok: false, state: "unavailable" }, 413);
