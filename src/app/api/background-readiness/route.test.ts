@@ -101,7 +101,7 @@ describe("background readiness control API", () => {
     expect(cookie).not.toContain("run_private_identifier");
   });
 
-  it("returns only a finite redacted completed status, never task diagnostics", async () => {
+  it("returns only a finite redacted recovery category, never task diagnostics", async () => {
     const { cookie } = await startTicket();
     mock.retrieve.mockResolvedValueOnce({
       status: "COMPLETED",
@@ -117,7 +117,13 @@ describe("background readiness control API", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("private, no-store");
     const body = await res.json();
-    expect(body).toEqual({ ok: true, status: "attention", workers: "ready", queued: 0 });
+    expect(body).toEqual({
+      ok: true,
+      status: "attention",
+      detail: "chatgpt_connection",
+      workers: "ready",
+      queued: 0,
+    });
     expect(JSON.stringify(body)).not.toContain("sensitive_controller_diagnostic");
     expect(JSON.stringify(body)).not.toContain("run_private_identifier");
   });
@@ -205,6 +211,7 @@ describe("background readiness control API", () => {
     expect(await status.json()).toEqual({
       ok: true,
       status: "attention",
+      detail: "cloud_worker_proof",
       workers: "ready",
       queued: 0,
     });

@@ -23,6 +23,13 @@ type Ticket = {
 
 type PublicStatus = "idle" | "queued" | "running" | "ready" | "attention" | "unavailable";
 type PublicWorkerStatus = "ready" | "paused" | "backlogged" | "unavailable";
+type PublicReadinessDetail =
+  | "chatgpt_connection"
+  | "cloud_worker_proof"
+  | "worker_configuration"
+  | "worker_runtime"
+  | "temporary_cleanup"
+  | "unknown";
 type QueueTarget = { type: "task" | "custom"; name: string };
 type QueueObservation = { paused: boolean; queued: number };
 
@@ -38,6 +45,7 @@ const AUTONOMOUS_WORKER_QUEUES = [
 function response(body: {
   ok: boolean;
   status: PublicStatus;
+  detail?: PublicReadinessDetail;
   workers?: PublicWorkerStatus;
   queued?: number;
 }, status = 200): NextResponse {
@@ -132,32 +140,66 @@ function clearTicket(res: NextResponse): NextResponse {
   return res;
 }
 
-function completedStatus(output: unknown): PublicStatus {
-  if (!output || typeof output !== "object" || Array.isArray(output)) return "unavailable";
-  const report = output as Record<string, unknown>;
-  if (report.ready === true && report.controllerSession === "clear" && report.workspace === "ready") return "ready";
-  if (report.ready === false && (
-    report.controllerSession === "repair_required" || report.workspace === "unavailable"
-  )) return "attention";
-  return "unavailable";
+type PublicRunState = { status: PublicStatus; detail?: PublicReadinessDetail };
+
+function attentionDetail(report: Record<string, unknown>): PublicReadinessDetail {
+  if (report.workspace === "unavailable" || report.blocker === "cloud_workspace_unavailable") {
+    return "cloud_worker_proof";
+  }
+  if (
+    report.controllerSession === "repair_required"
+    || report.blocker === "subscription_unavailable"
+    || report.blocker === "codex_preflight_failed"
+    || report.blocker === "configuration_missing"
+    || report.blocker === "source_rejected"
+    || report.blocker === "credential_broker_unavailable"
+    || report.blocker === "session_store_unavailable"
+    || report.blocker === "snapshot_corrupt"
+    || report.blocker === "snapshot_stale"
+    || report.blocker === "writer_timeout"
+    || report.blocker === "writer_fence_lost"
+    || report.blocker === "rotation_uncertain"
+    || report.blocker === "rotation_failed"
+    || report.blocker === "refresh_token_reused"
+  ) {
+    return "chatgpt_connection";
+  }
+  if (report.blocker === "codex_binary_unavailable") return "worker_runtime";
+  if (report.blocker === "worker_token_unavailable" || report.blocker === "controller_session_status_unavailable") {
+    return "worker_configuration";
+  }
+  if (report.blocker === "consumer_cleanup_failed") return "temporary_cleanup";
+  return "unknown";
 }
 
-function runStatus(run: unknown): PublicStatus {
-  if (!run || typeof run !== "object" || Array.isArray(run)) return "unavailable";
+function completedState(output: unknown): PublicRunState {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return { status: "unavailable" };
+  const report = output as Record<string, unknown>;
+  if (report.ready === true && report.controllerSession === "clear" && report.workspace === "ready") {
+    return { status: "ready" };
+  }
+  if (report.ready === false && (
+    report.controllerSession === "repair_required" || report.workspace === "unavailable"
+  )) return { status: "attention", detail: attentionDetail(report) };
+  return { status: "unavailable" };
+}
+
+function runState(run: unknown): PublicRunState {
+  if (!run || typeof run !== "object" || Array.isArray(run)) return { status: "unavailable" };
   const record = run as Record<string, unknown>;
   switch (record.status) {
     case "PENDING_VERSION":
     case "QUEUED":
     case "DEQUEUED":
-      return "queued";
+      return { status: "queued" };
     case "EXECUTING":
     case "WAITING":
     case "DELAYED":
-      return "running";
+      return { status: "running" };
     case "COMPLETED":
-      return completedStatus(record.output);
+      return completedState(record.output);
     default:
-      return "unavailable";
+      return { status: "unavailable" };
   }
 }
 
@@ -173,7 +215,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
   try {
     const run = await runs.retrieve<typeof backgroundReadiness>(ticket.runId);
-    return response({ ok: true, status: runStatus(run), ...workers });
+    return response({ ok: true, ...runState(run), ...workers });
   } catch {
     // Trigger errors can contain provider response bodies. Never surface them
     // through the owner UI; a fresh manual confirmation remains available.
@@ -200,7 +242,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (!ticket) return response({ ok: false, status: "attention" }, 409);
     try {
       const run = await runs.retrieve<typeof backgroundReadiness>(ticket.runId);
-      if (runStatus(run) !== "ready") return response({ ok: false, status: "attention" }, 409);
+      if (runState(run).status !== "ready") return response({ ok: false, status: "attention" }, 409);
       const observation = await resumePausedQueues(AUTONOMOUS_WORKER_QUEUES);
       return response({
         ok: true,

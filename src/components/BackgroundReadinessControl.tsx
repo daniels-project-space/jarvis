@@ -12,6 +12,7 @@ const STATUS_POLL_MS = 2_000;
 
 type ReadinessStatus = "idle" | "starting" | "queued" | "running" | "ready" | "attention" | "unavailable";
 type WorkerStatus = "ready" | "paused" | "backlogged" | "unavailable";
+type ReadinessDetail = "chatgpt_connection" | "cloud_worker_proof" | "worker_configuration" | "worker_runtime" | "temporary_cleanup" | "unknown";
 
 const LABELS: Record<ReadinessStatus, string> = {
   idle: "not run",
@@ -23,14 +24,33 @@ const LABELS: Record<ReadinessStatus, string> = {
   unavailable: "unavailable · no work launched",
 };
 
+const DETAIL_LABELS: Record<ReadinessDetail, string> = {
+  chatgpt_connection: "Reconnect ChatGPT, then run again",
+  cloud_worker_proof: "Verify cloud worker release first",
+  worker_configuration: "Worker setup is incomplete",
+  worker_runtime: "Worker runtime needs repair",
+  temporary_cleanup: "Cleanup failed · run again shortly",
+  unknown: "Readiness needs attention",
+};
+
 function isReadinessStatus(value: unknown): value is Exclude<ReadinessStatus, "starting"> {
   return value === "idle" || value === "queued" || value === "running" || value === "ready" || value === "attention" || value === "unavailable";
+}
+
+function isReadinessDetail(value: unknown): value is ReadinessDetail {
+  return value === "chatgpt_connection"
+    || value === "cloud_worker_proof"
+    || value === "worker_configuration"
+    || value === "worker_runtime"
+    || value === "temporary_cleanup"
+    || value === "unknown";
 }
 
 export function BackgroundReadinessControl() {
   const [status, setStatus] = useState<ReadinessStatus>("idle");
   const [workers, setWorkers] = useState<WorkerStatus>("unavailable");
   const [queued, setQueued] = useState(0);
+  const [detail, setDetail] = useState<ReadinessDetail | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const pollCount = useRef(0);
 
@@ -42,12 +62,15 @@ export function BackgroundReadinessControl() {
         status?: unknown;
         workers?: unknown;
         queued?: unknown;
+        detail?: unknown;
       } | null;
       if (!res.ok || payload?.ok !== true || !isReadinessStatus(payload.status)) {
         setStatus("unavailable");
+        setDetail(null);
         return;
       }
       setStatus(payload.status);
+      setDetail(payload.status === "attention" && isReadinessDetail(payload.detail) ? payload.detail : null);
       if (payload.workers === "ready" || payload.workers === "paused" || payload.workers === "backlogged" || payload.workers === "unavailable") {
         setWorkers(payload.workers);
       }
@@ -56,6 +79,7 @@ export function BackgroundReadinessControl() {
       }
     } catch {
       setStatus("unavailable");
+      setDetail(null);
     }
   }, []);
 
@@ -80,6 +104,7 @@ export function BackgroundReadinessControl() {
     if (!window.confirm("Run the background readiness check? It verifies the Codex session and the current workspace proof. It does not create work, open a workspace, or run a model.")) return;
     setSubmitting(true);
     setStatus("starting");
+    setDetail(null);
     pollCount.current = 0;
     try {
       const res = await viewerFetchWithTimeout("/api/background-readiness", {
@@ -90,12 +115,14 @@ export function BackgroundReadinessControl() {
       const payload = await res.json().catch(() => null) as { ok?: unknown; status?: unknown } | null;
       if (!res.ok || payload?.ok !== true || payload.status !== "queued") {
         setStatus("unavailable");
+        setDetail(null);
         return;
       }
       setStatus("queued");
       await refresh();
     } catch {
       setStatus("unavailable");
+      setDetail(null);
     } finally {
       setSubmitting(false);
     }
@@ -132,6 +159,7 @@ export function BackgroundReadinessControl() {
     : status === "attention" || status === "unavailable" || workers === "paused" || workers === "unavailable"
       ? "border-amber-300/30 bg-amber-300/10 text-amber-100"
       : "border-white/10 bg-black/20 text-slate";
+  const statusLabel = status === "attention" && detail ? DETAIL_LABELS[detail] : LABELS[status];
 
   return (
     <div className="flex max-w-[168px] flex-col items-end gap-1.5">
@@ -144,7 +172,7 @@ export function BackgroundReadinessControl() {
         {busy ? "checking…" : canResume ? "resume workers" : "run check"}
       </button>
       <span aria-live="polite" className={`rounded-lg border px-2 py-1 text-right text-[9px] ${tone}`}>
-        {LABELS[status]}
+        {statusLabel}
       </span>
       <span className="text-right text-[9px] text-slate" aria-live="polite">
         {workers === "paused"
