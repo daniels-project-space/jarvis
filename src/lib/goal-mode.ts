@@ -8,7 +8,14 @@ import { validateWorkDag } from "./workspace-protocol";
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
 export const GOAL_PLAN_RESULT_MAX_CHARS = 8_000;
+export const WORK_RESULT_MAX_CHARS = 4_000;
 export const GOAL_VALIDATOR_TASK_MAX_CHARS = 40_000;
+
+export function workResultMaxChars(goalStage: unknown) {
+  return goalStage === "planning"
+    ? GOAL_PLAN_RESULT_MAX_CHARS
+    : WORK_RESULT_MAX_CHARS;
+}
 
 // A model segment is already 15 minutes for Luna/Terra and 25 minutes for Sol.
 // These are automatic continuation budgets, not total mission limits: every

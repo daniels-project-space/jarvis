@@ -8,7 +8,7 @@ import { buildContinuationCheckpoint } from "../src/lib/work-checkpoint";
 import { normalizeWorkModelTier } from "../src/lib/work-models";
 import { canonicalizeRepository } from "../src/lib/workflow-contract";
 import { isCodexSessionUnavailableCode } from "../src/lib/codex-session-status";
-import { goalJobMatchesMissionPhase } from "../src/lib/goal-mode";
+import { goalJobMatchesMissionPhase, workResultMaxChars } from "../src/lib/goal-mode";
 import { attemptWorkspaceKey } from "../src/lib/workspace-protocol";
 import {
   controlIntegrationForJob,
@@ -3206,7 +3206,7 @@ export const finalize = mutation({
         || review.diffSha256 !== a.reviewDiffSha256 || review.signature !== a.reviewReceiptSignature
         || a.reviewReceiptKeyId !== review.keyId || delivery?.reviewKeyId !== review.keyId) return false;
     }
-    const normalizedResult = String(a.result ?? "").slice(0, 4_000);
+    const normalizedResult = String(a.result ?? "").slice(0, workResultMaxChars(row.goalStage));
     const normalizedNote = String(a.verificationNote ?? "").slice(0, 1_000);
     if (a.status === "done" && (
       a.resultDigest !== await sha256Hex(normalizedResult)
@@ -5819,7 +5819,7 @@ export const markVerifiedForDelivery = mutation({
     if (!a.reviewReceiptJson || !isSha256Digest(a.reviewReceiptSignature) || !isSha256Digest(a.reviewDiffSha256)
       || !/^[a-zA-Z0-9._-]{1,64}$/.test(String(a.reviewReceiptKeyId ?? ""))) return false;
     if (a.reviewReceiptJson.length > REVIEW_RECEIPT_MAX_CHARS) return false;
-    const result = a.result.slice(0, 4_000);
+    const result = a.result.slice(0, workResultMaxChars(row.goalStage));
     const verificationNote = a.verificationNote.slice(0, 1_000);
     if (a.resultDigest !== await sha256Hex(result) || a.evidenceDigest !== await sha256Hex(verificationNote)) return false;
     let receipt: any;

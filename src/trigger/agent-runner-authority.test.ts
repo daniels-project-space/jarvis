@@ -7,6 +7,7 @@ import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import schema from "../../convex/schema";
 import { testMissionAdmission } from "../../convex/testSourceAdmission";
+import { GOAL_PLAN_MARKER, GOAL_PLAN_RESULT_MAX_CHARS, parseGoalPlan } from "../lib/goal-mode";
 import { workGroupAuthority } from "../lib/work-scheduler";
 import { WORK_ORDER_MACHINE_TEMPLATE } from "../lib/work-order-revision";
 import { canonicalWorkspaceCheckpoint } from "../lib/workspace-checkpoint";
@@ -233,6 +234,7 @@ async function reservedWritableJob(
     task?: string;
     model?: "luna" | "terra" | "sol";
     readonly?: boolean;
+    goalStage?: "planning" | "building" | "validating" | "refining";
   }> = {},
 ) {
   const mission = await testMissionAdmission(t, { key, workerToken: WORKER, repository: REPO });
@@ -242,6 +244,7 @@ async function reservedWritableJob(
     readonly: options.readonly ?? false,
     reasoningEffort,
     ...(options.model ? { model: options.model } : {}),
+    ...(options.goalStage ? { goalStage: options.goalStage } : {}),
     missionId: String(mission.missionId),
     label: "identical mutable runner label",
     workerToken: WORKER,
@@ -250,6 +253,66 @@ async function reservedWritableJob(
   const reservation = batch.reservations[0];
   if (!reservation) throw new Error("runner authority fixture was not reserved");
   return { jobId, reservation };
+}
+
+function longGoalPlanningResult() {
+  const detail = "Inspect the authoritative source, preserve exact lineage, measure the current baseline, and attach independently reproducible evidence before recommending the smallest durable change. ".repeat(4);
+  const workstreams = ["catalog", "checkout", "retention", "measurement"].map((id, index) => ({
+    id,
+    label: `${index + 1}. ${id} specialist`,
+    task: `${detail}Own only the ${id} boundary and report exact provider or repository evidence.`,
+    agentId: ["atlas", "paul", "maya", "sentry"][index],
+    repo: REPO,
+    readonly: true,
+    dependsOn: index === 0 ? [] : [workstreamsDependency(index)],
+    acceptanceCriteria: [
+      `${id} baseline is measured from the authoritative source rather than inferred from a proxy.`,
+      `${id} findings name the exact artifact, query, test, or provider response that proves them.`,
+    ],
+    deliverable: {
+      kind: "research_brief",
+      description: `A bounded ${id} decision brief with durable evidence and an explicit next action.`,
+      requiredEvidence: ["Exact source lineage", "Reproducible measurement", "Named residual risks"],
+    },
+    guardrails: ["Do not publish, spend, delete, or change protected production settings."],
+    mcp: ["context7"],
+  }));
+  const result = `${GOAL_PLAN_MARKER}${JSON.stringify({
+    summary: "Measure four connected product constraints, then sequence only the work that can improve the verified outcome.",
+    route: "existing_project",
+    primaryRepo: REPO,
+    assumptions: ["Every recommendation remains provisional until its named evidence source is read."],
+    outcome: {
+      objective: "Improve the real product outcome while preserving the current production and delivery safety boundaries.",
+      metric: "verified successful owner journeys backed by exact source evidence",
+      baseline: "The current production revision is measured before any change and every failing journey is recorded.",
+      target: "Every accepted owner journey succeeds and the governing evidence is durably linked to the completed work.",
+      measurementWindow: "One complete post-delivery validation window",
+      evidenceSources: ["Production browser journeys", "Provider records", "Repository and deployment lineage"],
+      stopConditions: ["The measurable target is met", "No accepted critical gap or protected decision remains"],
+    },
+    crew: {
+      process: "hierarchical",
+      manager: "jarvis",
+      delegationRules: ["Assign only independent bounded work with explicit acceptance evidence."],
+      humanEscalation: ["Escalate only protected decisions after all safe evidence gathering is complete."],
+      reportingCadence: "Event-driven durable checkpoints without idle polling",
+    },
+    workstreams,
+    validation: {
+      criteria: ["All workstream evidence reconciles to the original measurable outcome."],
+      tests: ["Run the exact affected automated suites and production journey checks."],
+      liveChecks: ["Re-read the authoritative provider and deployment state after delivery."],
+    },
+  })}`;
+  if (result.length <= 4_000 || result.length > GOAL_PLAN_RESULT_MAX_CHARS) {
+    throw new Error(`long goal fixture must exercise the 4,000-8,000 character contract; got ${result.length}`);
+  }
+  return result;
+}
+
+function workstreamsDependency(index: number) {
+  return ["catalog", "checkout", "retention", "measurement"][index - 1];
 }
 
 async function invokeProductionWorker(payload: Record<string, unknown>, runId: string) {
@@ -1283,6 +1346,80 @@ describe("production Trigger worker authority harness", () => {
       verificationVerdict: "pass",
       sourceBranch: "main",
     });
+  });
+
+  it("preserves a complete repository-backed Goal plan beyond the ordinary 4,000-character result limit", async () => {
+    configureFakeControllerAuthority();
+    const planningResult = longGoalPlanningResult();
+    expect(parseGoalPlan(planningResult, 8).workstreams).toHaveLength(4);
+
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-long-goal-plan-result",
+      "ultra",
+      {
+        task: "Return the complete measurable Goal plan contract without changing the admitted repository.",
+        model: "terra",
+        readonly: true,
+        goalStage: "planning",
+      },
+    );
+    const runProcess = vi.fn(async (input: any) => {
+      await input.turnReceipt.beforeRequest();
+      input.turnReceipt.requestWritten();
+      await input.turnReceipt.accepted();
+      await input.turnReceipt.completed();
+      return {
+        text: planningResult,
+        timedOut: false,
+        stopped: null,
+        checkpointLog: "complete long Goal plan emitted",
+        commands: [],
+      };
+    });
+    const specialistBridge = bridgeProductionRunnerToConvex(t);
+    const specialistDependencies = injectedRunnerDependencies({ runProcess });
+
+    expect(await invokeHarness(
+      reservation,
+      "long-goal-plan-specialist-run",
+      specialistDependencies,
+    )).toEqual({ processed: 1 });
+    expect(specialistBridge.trace.filter((call) => call.path === "jobs:markVerifiedForDelivery"))
+      .toHaveLength(1);
+    const reviewed = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(reviewed).toMatchObject({ status: "pending", goalStage: "planning" });
+    expect(String(reviewed?.result)).toContain(planningResult);
+    expect(parseGoalPlan(String(reviewed?.result), 8).workstreams).toHaveLength(4);
+
+    const controllerBatch = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      workerToken: WORKER,
+    });
+    const controllerReservation = controllerBatch.reservations[0];
+    expect(controllerReservation).toBeTruthy();
+    const controllerBridge = bridgeProductionRunnerToConvex(t);
+    const controllerDependencies = injectedRunnerDependencies();
+    expect(await invokeHarness(
+      controllerReservation,
+      "long-goal-plan-controller-run",
+      controllerDependencies,
+    )).toEqual({ processed: 1 });
+    expect(controllerDependencies.runCloudWorkspaceAgent).not.toHaveBeenCalled();
+    expect(controllerBridge.trace.filter((call) => call.path === "jobs:checkpointAndRequeue"))
+      .toHaveLength(0);
+
+    const finished = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(finished).toMatchObject({
+      status: "done",
+      attempt: 1,
+      goalStage: "planning",
+      verificationVerdict: "pass",
+    });
+    expect(String(finished?.result).length).toBeGreaterThan(4_000);
+    expect(String(finished?.result).length).toBeLessThanOrEqual(GOAL_PLAN_RESULT_MAX_CHARS);
+    expect(parseGoalPlan(String(finished?.result), 8).workstreams).toHaveLength(4);
   });
 
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {

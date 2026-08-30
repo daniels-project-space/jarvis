@@ -44,9 +44,9 @@ import {
   controllerSessionAutonomousWorkStatus,
 } from "../lib/codex-session-status";
 import {
-  GOAL_PLAN_RESULT_MAX_CHARS,
   parseGoalPlan,
   parseGoalValidation,
+  workResultMaxChars,
   type GoalPlan,
 } from "../lib/goal-mode";
 import { startAppFactoryGoal, syncExternalGoalRevisions, syncExternalGoalRuns } from "./goal-runtime";
@@ -234,12 +234,17 @@ async function plainPrompt(bin: string, env: NodeJS.ProcessEnv, prompt: string, 
 }
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
-const normalizeCompletion = (result: string, verificationNote: string) => ({
-  result: String(result).slice(0, 4_000),
+const normalizeCompletion = (result: string, verificationNote: string, resultMaxChars = 4_000) => ({
+  result: String(result).slice(0, resultMaxChars),
   verificationNote: String(verificationNote).slice(0, 1_000),
 });
-const completionEvidence = (result: string, verificationNote: string, gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding }) => {
-  const normalized = normalizeCompletion(result, verificationNote);
+const completionEvidence = (
+  result: string,
+  verificationNote: string,
+  gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding },
+  resultMaxChars = 4_000,
+) => {
+  const normalized = normalizeCompletion(result, verificationNote, resultMaxChars);
   // This recomputes SHA-256 from the exact post-truncation strings sent to
   // Convex. A caller cannot reuse a digest computed for a longer/tampered body.
   return {
@@ -1273,6 +1278,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     }
     const processed = 1;
     const expectedAttempt = Number(job.attempt ?? 1);
+    const resultMaxChars = workResultMaxChars(job.goalStage);
     const authorityDigest = typeof job.authorityDigest === "string" ? job.authorityDigest : "";
     const claimedWorkerRunId = options.reservation.workerRunId.slice(0, 120);
     const authorizeBoundary = async (phase: AgentRunnerAuthorityPhase) => {
@@ -1809,7 +1815,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           await deliveryMutation("jobs:checkpointAndRequeue", {
             jobId: job.jobId, expectedAttempt,
             checkpoint: `Verified repository delivery is held because ${repositoryReadiness.reason}.`,
-            result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
+            result: String(job.result ?? "").slice(0, resultMaxChars), branch: resumeBranch, delayMs: 30_000,
           }).catch(() => null);
           return;
         }
@@ -1817,7 +1823,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           await deliveryMutation("jobs:checkpointAndRequeue", {
             jobId: job.jobId, expectedAttempt,
             checkpoint: "Verified repository delivery is held because the controller repository capability is unavailable.",
-            result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
+            result: String(job.result ?? "").slice(0, resultMaxChars), branch: resumeBranch, delayMs: 30_000,
           }).catch(() => null);
           return;
         }
@@ -1873,7 +1879,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             await deliveryMutation("jobs:checkpointAndRequeue", {
               jobId: job.jobId, expectedAttempt,
               checkpoint: "Verified delivery is held: the immutable controller review receipt could not be loaded and HMAC-verified. Do not rerun the specialist.",
-              result: String(job.result ?? "").slice(0, 4_000), branch: resumeBranch, delayMs: 30_000,
+              result: String(job.result ?? "").slice(0, resultMaxChars), branch: resumeBranch, delayMs: 30_000,
             }).catch(() => null);
             return;
           }
@@ -2112,7 +2118,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               jobId: job.jobId,
               expectedAttempt,
               checkpoint: `Supervisor verification is already complete. Resume controller delivery only; do not rerun the specialist.\n\n${delivery.note}`,
-              result: String(job.result ?? "").slice(0, 4_000),
+              result: String(job.result ?? "").slice(0, resultMaxChars),
               branch: resumeBranch,
               delayMs: 30_000,
             }).catch(() => null);
@@ -2143,7 +2149,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               : readOnlyDelivery
                 ? "Delivery: read-only controller receipt finalized without a GitHub mutation."
               : `Delivery: verified branch ${resumeBranch} is on the default branch${pullRequestUrl ? ` via ${pullRequestUrl}` : ""}${mergeSha ? ` at ${mergeSha}` : ""}.`,
-          ].filter(Boolean).join("\n\n").slice(0, 4_000);
+          ].filter(Boolean).join("\n\n").slice(0, resultMaxChars);
           const finalized = await deliveryMutation("jobs:finalize", {
             jobId: job.jobId,
             expectedAttempt,
@@ -2152,7 +2158,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             pullRequestUrl: pullRequestUrl || undefined,
             verificationVerdict: "pass",
             verificationNote: String(job.verificationNote ?? "Supervisor check passed before delivery continuation"),
-            ...completionEvidence(deliveryResult, String(job.verificationNote ?? "Supervisor check passed before delivery continuation"), continuationReview),
+            ...completionEvidence(
+              deliveryResult,
+              String(job.verificationNote ?? "Supervisor check passed before delivery continuation"),
+              continuationReview,
+              resultMaxChars,
+            ),
           });
           if (!finalized) return;
           if (job.incidentId) {
@@ -3143,7 +3154,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: `Goal evidence is complete, but the controller could not bind its immutable Git receipt: ${receipt.note}`,
                 checkpointHeadSha: checkpointHeadSha || undefined,
-                result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
+                result: result.slice(0, resultMaxChars), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
               }).catch(() => null);
               return;
             }
@@ -3153,22 +3164,28 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: "Repository completion is held: the trusted controller receipt authority is unavailable. Do not rerun the specialist.",
                 checkpointHeadSha: checkpointHeadSha || undefined,
-                result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
+                result: result.slice(0, resultMaxChars), branch: branch ?? undefined, delayMs: failureBackoffMs(expectedAttempt),
               }).catch(() => null);
               return;
             }
             goalReview = { envelope: signingAuthority.issue(receipt.receipt), binding: receipt.binding };
+            const persistedResult = result.slice(0, resultMaxChars);
             const persisted = await deliveryMutation("jobs:markVerifiedForDelivery", {
-              jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId), result: result.slice(0, 4_000),
+              jobId: job.jobId, expectedAttempt, specialistRunId: String(job.workerRunId), result: persistedResult,
               verificationNote: `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
-              ...completionEvidence(result.slice(0, 4_000), `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`, goalReview),
+              ...completionEvidence(
+                persistedResult,
+                `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
+                goalReview,
+                resultMaxChars,
+              ),
             }).catch(() => false);
             if (!persisted) {
               await checkpointMutation({
                 jobId: job.jobId, expectedAttempt,
                 checkpoint: "Goal completion is held because its controller review receipt could not be persisted. Do not rerun the specialist.",
                 checkpointHeadSha: checkpointHeadSha || undefined,
-                result: result.slice(0, 4_000), branch: branch ?? undefined, delayMs: 30_000,
+                result: result.slice(0, resultMaxChars), branch: branch ?? undefined, delayMs: 30_000,
               }).catch(() => null);
               return;
             }
@@ -3183,14 +3200,16 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             jobId: job.jobId,
             expectedAttempt,
             status: "done",
-            result: `${result}${goalDeliveryNote}`.slice(
-              0,
-              job.goalStage === "planning" ? GOAL_PLAN_RESULT_MAX_CHARS : 4_000,
-            ),
+            result: `${result}${goalDeliveryNote}`.slice(0, resultMaxChars),
             pullRequestUrl: goalPullRequestUrl,
             verificationVerdict: "pass",
             verificationNote: `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
-            ...completionEvidence(`${result}${goalDeliveryNote}`.slice(0, job.goalStage === "planning" ? GOAL_PLAN_RESULT_MAX_CHARS : 4_000), `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`, goalReview),
+            ...completionEvidence(
+              `${result}${goalDeliveryNote}`.slice(0, resultMaxChars),
+              `${job.goalStage === "planning" ? "Goal plan" : "Deep validation"} machine contract is structurally valid`,
+              goalReview,
+              resultMaxChars,
+            ),
           });
           if (finalized) await drainGoalAdvances();
           return;
