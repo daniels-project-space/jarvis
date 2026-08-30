@@ -438,6 +438,8 @@ export type CodexTurnInput = {
   invocationContext?: ToolInvocationContext;
   toolHostContext?: CodexDynamicToolHostContext;
   outputSchema?: JsonObject;
+  /** Display name for seeded history; capability selection is independent. */
+  speaker?: "Daniel" | "Guest";
   onDelta: (delta: string) => void;
   /** Cancels an admitted turn and interrupts the exact app-server turn id. */
   signal?: AbortSignal;
@@ -632,7 +634,7 @@ export class CodexAppServer {
       throw new Error("Codex conversation turn was cancelled");
     }
 
-    const speaker = input.allowTools === false ? "Guest" : "Daniel";
+    const speaker = input.speaker ?? (input.allowTools === false ? "Guest" : "Daniel");
     const history = isNewThread && input.history.length
       ? `Recent conversation:\n${input.history.map((item) => `${item.role === "user" ? speaker : "Jarvis"}: ${item.text}`).join("\n")}\n\n`
       : "";

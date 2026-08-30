@@ -3,7 +3,7 @@ const TOOL_BELT_REGISTRY = {
     "dispatch_agent", "show", "show_ranking", "rank_focus", "video_control", "hide", "web_search", "weather",
     "timer", "briefing", "remind_at", "todo_add", "todo_done", "todo_list", "calendar_view",
     "icloud_calendar_create",
-    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image", "show_uploaded_file", "open_uploaded_transcript", "review_uploaded_file",
+    "open_app", "host_ui", "mac_shortcut", "current_time", "calculate", "orb_mood", "show_uploaded_image", "show_uploaded_file", "open_uploaded_transcript", "review_uploaded_file", "organize_uploaded_file",
     // Errands Daniel starts by voice ("email Rakuten and ask about…"), so they
     // belong in core: a tool absent from every belt is unreachable in the
     // realtime lane no matter how good its description is.

@@ -1280,6 +1280,21 @@ export const TOOL_DEFS = [
       required: ["file_id", "review_state"],
     },
   },
+  {
+    name: "organize_uploaded_file",
+    description:
+      "Rename, move, or tag one exact file attached to Daniel's current message. Use only when he explicitly asks to organise that attached file. This changes owner-visible workspace metadata only; it never moves private R2 bytes, edits content, or deletes anything. Pass only fields Daniel requested and the exact attached file_id.",
+    parameters: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "the exact id of a file attached to the current user message" },
+        name: { type: "string", description: "new visible filename, only when explicitly requested" },
+        folder_path: { type: "string", description: "new workspace folder path such as Business/Acme" },
+        tags: { type: "array", items: { type: "string" }, description: "complete replacement tag list, only when explicitly requested" },
+      },
+      required: ["file_id"],
+    },
+  },
   // Gmail supports search, reading, subscription discovery, and draft creation.
   // Destructive inbox actions are intentionally not tool definitions: a model-
   // supplied `confirmed: true` is not an owner approval receipt.
@@ -5115,6 +5130,30 @@ async function reviewUploadedFile(args: any, invocationContext?: ToolInvocationC
   return "Cleared the review marker on the exact attached file. Nothing was deleted.";
 }
 
+async function organizeUploadedFile(args: any, invocationContext?: ToolInvocationContext): Promise<string> {
+  const fileId = String(args.file_id ?? "").trim();
+  if (!fileId) return "TOOL DID NOTHING: no file_id passed.";
+  const messageId = invocationContext?.userMessageId;
+  if (!messageId) return "TOOL DID NOTHING: file organization needs trusted current-message provenance.";
+  const name = typeof args.name === "string" ? args.name.trim() : undefined;
+  const folderPath = typeof args.folder_path === "string" ? args.folder_path.trim() : undefined;
+  const tags = Array.isArray(args.tags) && args.tags.every((tag: unknown) => typeof tag === "string")
+    ? args.tags.map((tag: string) => tag.trim()).filter(Boolean)
+    : undefined;
+  if (name === undefined && folderPath === undefined && tags === undefined) {
+    return "TOOL DID NOTHING: pass a requested name, folder_path, or tags change.";
+  }
+  const updated = await convexMutation("files:updateWorkspaceMetadataForMessage", {
+    messageId,
+    fileId,
+    ...(name !== undefined ? { name } : {}),
+    ...(folderPath !== undefined ? { folderPath } : {}),
+    ...(tags !== undefined ? { tags } : {}),
+  }).catch(() => null) as { name?: string; relativePath?: string; tags?: string[] } | null;
+  if (!updated) return "TOOL DID NOTHING: the selected file is not attached to this message or the metadata change was rejected.";
+  return `Organised the exact attached file as “${String(updated.relativePath ?? updated.name ?? "file").slice(0, 180)}”${updated.tags?.length ? ` with tags ${updated.tags.join(", ")}` : ""}. Its private bytes, content, citations, and chat links were left untouched.`;
+}
+
 export async function executeTool(
   name: string,
   args: any,
@@ -6080,6 +6119,8 @@ export async function executeTool(
       return await showUploadedFile(args);
     case "review_uploaded_file":
       return await reviewUploadedFile(args, invocationContext);
+    case "organize_uploaded_file":
+      return await organizeUploadedFile(args, invocationContext);
     case "gmail_search": {
       const query = typeof args.query === "string" ? args.query : undefined;
       const maxResults = Number(args.max_results) || 20;

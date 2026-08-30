@@ -124,9 +124,41 @@ function publicFile(row: any) {
     sheetNames: row.sheetNames,
     errorCode: row.errorCode,
     reviewState: row.reviewState ?? "unreviewed",
+    tags: Array.isArray(row.tags) ? row.tags : [],
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+const WORKSPACE_DOCUMENT_MAX_CHARS = 120_000;
+const WORKSPACE_TEXT_MIME = /^(?:text\/|application\/(?:json|xml|yaml|x-yaml|javascript|typescript|x-httpd-php))/i;
+
+function workspaceFileName(value: string): string {
+  const name = value.trim().replace(/[\\/\u0000-\u001f\u007f]/g, "_").replace(/\s+/g, " ").slice(0, 180);
+  if (!name || name === "." || name === "..") {
+    throw new ConvexError({ code: "INVALID_FILE_NAME", message: "File name is invalid" });
+  }
+  return name;
+}
+
+function workspaceFolderPath(value: string): string {
+  const parts = value.replace(/\\/g, "/").split("/").map((part) => part.trim()).filter(Boolean);
+  if (parts.length > 12 || parts.some((part) => part === "." || part === ".." || /[\u0000-\u001f\u007f]/.test(part))) {
+    throw new ConvexError({ code: "INVALID_FOLDER_PATH", message: "Folder path is invalid" });
+  }
+  const path = parts.join("/").slice(0, 480);
+  if (parts.join("/") !== path) throw new ConvexError({ code: "INVALID_FOLDER_PATH", message: "Folder path is too long" });
+  return path;
+}
+
+function workspaceTags(values: string[]): string[] {
+  const tags = [...new Set(values.map((tag) => tag.trim().replace(/\s+/g, " ").slice(0, 32)).filter(Boolean))];
+  if (tags.length > 12) throw new ConvexError({ code: "INVALID_FILE_TAGS", message: "A file can have at most 12 tags" });
+  return tags;
+}
+
+function workspaceSearchText(file: any, name: string, relativePath: string, tags: string[]): string {
+  return [name, relativePath, tags.join(" "), String(file.summary ?? "")].filter(Boolean).join(" ").slice(0, 8_000);
 }
 
 function cleanupKeysForFile(file: any): string[] {
@@ -612,11 +644,20 @@ export const quickSearchLibrary = query({
     const search = args.search.trim().slice(0, 160);
     if (search.length < 2) return [];
     const limit = Math.min(12, Math.max(1, Math.floor(args.limit ?? 8)));
-    const rows = await ctx.db
-      .query("files")
-      .withSearchIndex("search_metadata", (q) => q.search("searchText", search).eq("libraryVisible", true))
-      .take(limit);
-    return rows.map(publicFile);
+    const [metadataRows, documentMatches, chunkMatches] = await Promise.all([
+      ctx.db.query("files").withSearchIndex("search_metadata", (q) => q.search("searchText", search).eq("libraryVisible", true)).take(limit),
+      ctx.db.query("fileDocuments").withSearchIndex("search_content", (q) => q.search("content", search)).take(limit),
+      ctx.db.query("fileChunks").withSearchIndex("search_text", (q) => q.search("text", search)).take(limit),
+    ]);
+    const contentRows = await Promise.all([...documentMatches, ...chunkMatches].map((match) => ctx.db.get(match.fileId)));
+    const seen = new Set<string>();
+    return [...metadataRows, ...contentRows].flatMap((row) => {
+      if (!row || row.libraryVisible !== true || row.status === "deleted" || row.status === "deleting") return [];
+      const id = String(row._id);
+      if (seen.has(id)) return [];
+      seen.add(id);
+      return [publicFile(row)];
+    }).slice(0, limit);
   },
 });
 
@@ -712,6 +753,94 @@ export const setReviewState = mutation({
   },
 });
 
+export const updateWorkspaceMetadata = mutation({
+  args: {
+    fileId: v.id("files"),
+    name: v.optional(v.string()),
+    folderPath: v.optional(v.string()),
+    tags: v.optional(v.array(v.string())),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const file = await ctx.db.get(args.fileId);
+    if (!file || file.status === "deleted" || file.status === "deleting") return null;
+    const name = args.name === undefined ? String(file.originalName) : workspaceFileName(args.name);
+    const currentPath = String(file.relativePath ?? file.originalName).replace(/\\/g, "/");
+    const currentFolder = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
+    const folderPath = args.folderPath === undefined ? workspaceFolderPath(currentFolder) : workspaceFolderPath(args.folderPath);
+    const tags = args.tags === undefined
+      ? (Array.isArray(file.tags) ? workspaceTags(file.tags.map(String)) : [])
+      : workspaceTags(args.tags);
+    const relativePath = folderPath ? `${folderPath}/${name}` : name;
+    const now = Date.now();
+    const patch = {
+      originalName: name,
+      relativePath,
+      tags,
+      searchText: workspaceSearchText(file, name, relativePath, tags),
+      updatedAt: now,
+    };
+    await ctx.db.patch(file._id, patch);
+    return publicFile({ ...file, ...patch });
+  },
+});
+
+export const getWorkspaceDocument = query({
+  args: { fileId: v.id("files"), ...actorAuthArgs },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const file = await ctx.db.get(args.fileId);
+    if (!file || file.status === "deleted" || file.status === "deleting") return null;
+    const mimeType = String(file.detectedMimeType ?? file.mimeType);
+    if (!WORKSPACE_TEXT_MIME.test(mimeType)) return { editable: false as const, file: publicFile(file) };
+    const draft = await ctx.db.query("fileDocuments").withIndex("by_file", (q) => q.eq("fileId", file._id)).unique();
+    if (draft) {
+      return { editable: true as const, file: publicFile(file), content: draft.content, version: draft.version, edited: true as const };
+    }
+    const chunks = await ctx.db.query("fileChunks").withIndex("by_file_ordinal", (q) => q.eq("fileId", file._id)).take(256);
+    const content = chunks.map((chunk) => String(chunk.text)).join("\n\n").slice(0, WORKSPACE_DOCUMENT_MAX_CHARS);
+    return { editable: true as const, file: publicFile(file), content, version: 0, edited: false as const };
+  },
+});
+
+export const saveWorkspaceDocument = mutation({
+  args: {
+    fileId: v.id("files"),
+    content: v.string(),
+    baseVersion: v.number(),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const file = await ctx.db.get(args.fileId);
+    if (!file || file.status === "deleted" || file.status === "deleting") return null;
+    const mimeType = String(file.detectedMimeType ?? file.mimeType);
+    if (!WORKSPACE_TEXT_MIME.test(mimeType)) {
+      throw new ConvexError({ code: "FILE_NOT_EDITABLE", message: "Only text documents can be edited" });
+    }
+    if (!Number.isSafeInteger(args.baseVersion) || args.baseVersion < 0 || args.content.length > WORKSPACE_DOCUMENT_MAX_CHARS) {
+      throw new ConvexError({ code: "INVALID_FILE_DOCUMENT", message: "Document edit is invalid or too large" });
+    }
+    const current = await ctx.db.query("fileDocuments").withIndex("by_file", (q) => q.eq("fileId", file._id)).unique();
+    const currentVersion = current?.version ?? 0;
+    if (currentVersion !== args.baseVersion) {
+      throw new ConvexError({ code: "FILE_EDIT_CONFLICT", message: "This document changed in another session" });
+    }
+    const now = Date.now();
+    const version = currentVersion + 1;
+    if (current) await ctx.db.patch(current._id, { content: args.content, version, updatedAt: now });
+    else await ctx.db.insert("fileDocuments", { fileId: file._id, content: args.content, version, createdAt: now, updatedAt: now });
+    const summary = args.content.trim().replace(/\s+/g, " ").slice(0, 280) || file.summary;
+    await ctx.db.patch(file._id, {
+      summary,
+      searchText: workspaceSearchText({ ...file, summary }, String(file.originalName), String(file.relativePath), Array.isArray(file.tags) ? file.tags.map(String) : []),
+      updatedAt: now,
+    });
+    return { ok: true as const, fileId: String(file._id), version, updatedAt: now };
+  },
+});
+
 // Tool calls must be bound to the exact user message that attached the file.
 // This is still metadata-only: no R2 operation or thread/message link changes.
 export const setReviewStateForMessage = mutation({
@@ -741,6 +870,40 @@ export const setReviewStateForMessage = mutation({
     const now = Date.now();
     await ctx.db.patch(file._id, { reviewState: args.reviewState, updatedAt: now });
     return publicFile({ ...file, reviewState: args.reviewState, updatedAt: now });
+  },
+});
+
+export const updateWorkspaceMetadataForMessage = mutation({
+  args: {
+    messageId: v.id("chatMessages"),
+    fileId: v.id("files"),
+    name: v.optional(v.string()),
+    folderPath: v.optional(v.string()),
+    tags: v.optional(v.array(v.string())),
+    ...actorAuthArgs,
+  },
+  handler: async (ctx, args) => {
+    await requireActor(ctx, args);
+    const message = await ctx.db.get(args.messageId);
+    if (!message || message.role !== "user") {
+      throw new ConvexError({ code: "INVALID_FILE_MESSAGE", message: "File organization requires a user message" });
+    }
+    const attachment = await ctx.db.query("messageFiles").withIndex("by_message_file", (q) => q.eq("messageId", message._id).eq("fileId", args.fileId)).first();
+    if (!attachment) throw new ConvexError({ code: "FILE_NOT_ATTACHED", message: "That file is not attached to this message" });
+    const file = await ctx.db.get(args.fileId);
+    if (!file || file.status === "deleted" || file.status === "deleting") {
+      throw new ConvexError({ code: "FILE_NOT_ORGANIZABLE", message: "Attached file is unavailable" });
+    }
+    const name = args.name === undefined ? String(file.originalName) : workspaceFileName(args.name);
+    const currentPath = String(file.relativePath ?? file.originalName).replace(/\\/g, "/");
+    const currentFolder = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
+    const folderPath = args.folderPath === undefined ? workspaceFolderPath(currentFolder) : workspaceFolderPath(args.folderPath);
+    const tags = args.tags === undefined ? (Array.isArray(file.tags) ? workspaceTags(file.tags.map(String)) : []) : workspaceTags(args.tags);
+    const relativePath = folderPath ? `${folderPath}/${name}` : name;
+    const now = Date.now();
+    const patch = { originalName: name, relativePath, tags, searchText: workspaceSearchText(file, name, relativePath, tags), updatedAt: now };
+    await ctx.db.patch(file._id, patch);
+    return publicFile({ ...file, ...patch });
   },
 });
 
@@ -1242,6 +1405,19 @@ export const searchAttachedFiles = query({
       if (!file || !FILE_READY_STATUSES.has(String(file.status))) {
         throw new ConvexError({ code: "FILE_NOT_READY", message: "Attached file is not ready" });
       }
+      const draft = await ctx.db.query("fileDocuments").withIndex("by_file", (q) => q.eq("fileId", file._id)).unique();
+      if (draft) {
+        const draftChunks = String(draft.content).match(/[\s\S]{1,2200}/g) ?? [];
+        for (let ordinal = afterOrdinal + 1; ordinal < draftChunks.length && results.length < limit; ordinal += 1) {
+          const excerpt = draftChunks[ordinal].slice(0, remainingChars);
+          if (!excerpt) break;
+          results.push({ fileId: String(file._id), name: String(file.originalName), ordinal, text: excerpt });
+          remainingChars -= excerpt.length;
+          if (remainingChars <= 0) break;
+        }
+        const nextOrdinal = results.at(-1)?.ordinal ?? afterOrdinal;
+        return { mode: "read" as const, fileId: String(file._id), results, nextOrdinal, hasMore: nextOrdinal + 1 < draftChunks.length };
+      }
       const chunks = await ctx.db
         .query("fileChunks")
         .withIndex("by_file_ordinal", (q) => q.eq("fileId", file._id).gt("ordinal", afterOrdinal))
@@ -1277,6 +1453,18 @@ export const searchAttachedFiles = query({
       if (results.length >= limit || remainingChars <= 0) break;
       const file = await ctx.db.get(link.fileId);
       if (!file || !FILE_READY_STATUSES.has(String(file.status))) continue;
+      const draft = await ctx.db.query("fileDocuments").withIndex("by_file", (q) => q.eq("fileId", file._id)).unique();
+      if (draft) {
+        const lower = String(draft.content).toLowerCase();
+        const index = lower.indexOf(text.toLowerCase());
+        if (index >= 0) {
+          const start = Math.max(0, index - 320);
+          const excerpt = String(draft.content).slice(start, start + Math.min(1_200, remainingChars));
+          results.push({ fileId: String(file._id), name: String(file.originalName), ordinal: Math.floor(start / 2_200), text: excerpt });
+          remainingChars -= excerpt.length;
+        }
+        continue;
+      }
       const matches = await ctx.db
         .query("fileChunks")
         .withSearchIndex("search_text", (q) => q.search("text", text).eq("fileKey", String(file._id)))
@@ -1351,6 +1539,7 @@ export const authorizeFileTool = query({
       [/^web_search$/, /\b(?:search|find|look up|research)\b.{0,36}\b(?:web|online|internet)\b|\b(?:web|online|internet)\b.{0,24}\bsearch\b/],
       [/^read_url$/, /\b(?:read|open|inspect|analy[sz]e|summari[sz]e)\b.{0,30}\b(?:url|link|website|web page)\b/],
       [/^open_uploaded_transcript$/, /\b(?:open|show|display|read|view)\b.{0,36}\b(?:transcript|captions?|audio|video|recording|voice(?:\s+note)?)\b|\b(?:transcript|captions?|audio|video|recording|voice(?:\s+note)?)\b.{0,36}\b(?:open|show|display|read|view)\b/],
+      [/^organize_uploaded_file$/, /\b(?:rename|move|organize|organise|tag)\b.{0,64}\b(?:this|that|the|attached|uploaded)?\s*(?:file|document|upload|image|photo|folder|tags?)\b|\b(?:file|document|upload|image|photo)\b.{0,64}\b(?:rename|move|organize|organise|tag)\b/],
       [/^(?:youtube_search|youtube_transcript)$/, /\b(?:search|find|read|get|show)\b.{0,36}\b(?:youtube|video transcript|transcript)\b/],
       [/^flight_search$/, /\b(?:search|find|show|look up)\b.{0,30}\bflights?\b/],
       [/^memory_search$/, /\b(?:search|find|recall|look up)\b.{0,30}\b(?:memory|memories|what you remember)\b/],
@@ -1503,14 +1692,15 @@ export const finishDelete = mutation({
       activeIngestCleanupRetryAfter(file, now),
       await activeTurnFileLeaseRetryAfter(ctx, file._id, now),
     ) !== null) return false;
-    const [chunks, threadLinks] = await Promise.all([
+    const [chunks, threadLinks, documents] = await Promise.all([
       ctx.db.query("fileChunks").withIndex("by_file_ordinal", (q) => q.eq("fileId", file._id)).collect(),
       ctx.db.query("threadFiles").withIndex("by_file", (q) => q.eq("fileId", file._id)).collect(),
+      ctx.db.query("fileDocuments").withIndex("by_file", (q) => q.eq("fileId", file._id)).collect(),
     ]);
     // Keep messageFiles as immutable provenance. Their small manifest remains
     // visible after bytes are deleted, while ready-file validation prevents
     // any deleted content from re-entering a model turn.
-    for (const row of [...chunks, ...threadLinks]) await ctx.db.delete(row._id);
+    for (const row of [...chunks, ...threadLinks, ...documents]) await ctx.db.delete(row._id);
     await ctx.db.patch(file._id, {
       status: "deleted",
       deletePreviousStatus: undefined,

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
-import { CAPABILITIES, INFRA_MAP, PERSONA, REMEMBER } from "../lib/persona";
+import { INFRA_MAP, PERSONA, REMEMBER, VOICE_CAPABILITIES } from "../lib/persona";
 import { visualInitiativeDirective } from "../lib/visual-initiative";
 import { shouldCaptureDurableMemory } from "../lib/current-state";
 import { memoryConfidence } from "../lib/memory-governance";
@@ -281,7 +281,11 @@ function createPrivateAttachmentFence(
 
 function conversationPreamble() {
   return PERSONA +
-    `\n\n${CAPABILITIES}\n\n${INFRA_MAP}\n\n${REMEMBER}\n\n` +
+    // Foreground chat has the same small spoken contract whether its input was
+    // typed or transcribed. Dynamic tool schemas remain authoritative; the
+    // compact map preserves every action/safety class without replaying the
+    // twelve-thousand-character encyclopaedia on each cold conversation.
+    `\n\n${VOICE_CAPABILITIES}\n\n${INFRA_MAP}\n\n${REMEMBER}\n\n` +
     JARVIS_TOOL_INSTRUCTIONS + " " +
     `When Daniel's request implies a supported visual or live-data capability, execute the most specific safe tool before the final reply; never claim that you cannot show a map, chart, weather, search result, briefing, planner, or document when its tool is available. Then keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
 }
@@ -299,8 +303,8 @@ function conversationPreamble() {
 function lunaFastPreamble() {
   return PERSONA +
     `\n\n${REMEMBER}\n\n` +
-    JARVIS_TOOL_INSTRUCTIONS + " " +
-    `Keep the default spoken reply to one concise sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
+    `This lane is only for an exact greeting, thanks, or acknowledgement. No tools are available or needed. ` +
+    `Answer immediately in one warm, natural sentence. Never narrate context, memory, shell commands, or tool plumbing.`;
 }
 
 async function runTurn(
@@ -336,15 +340,17 @@ async function runTurn(
         (visualDirective ? `\n\n${visualDirective}` : ""),
     );
     let sawDelta = false;
+    const fastLane = shouldUseLunaFastLane(userText, model);
     const result = await server.runTurn({
       conversationId,
       userText,
       history,
       contextBlock: freshContext,
       imageInputs,
-      preamble: shouldUseLunaFastLane(userText, model) ? lunaFastPreamble() : conversationPreamble(),
+      preamble: fastLane ? lunaFastPreamble() : conversationPreamble(),
       modelTier: model,
-      allowTools: true,
+      allowTools: !fastLane,
+      speaker: "Daniel",
       invocationContext,
       ...(toolHostContext ? { toolHostContext } : {}),
       signal: cancellationAbort.signal,

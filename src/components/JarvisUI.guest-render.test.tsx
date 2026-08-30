@@ -63,6 +63,9 @@ describe("guest Home application render", () => {
     expect(voiceActionPresentation({ live: "off", recording: false, speaking: false })).toMatchObject({
       action: "toggle-live", ariaLabel: "Start Jarvis live listening", label: "voice",
     });
+    expect(voiceActionPresentation({ live: "off", recording: false, speaking: false, wakeReady: true })).toMatchObject({
+      action: "toggle-live", label: "wake-only", glyph: "◇",
+    });
     expect(voiceActionPresentation({ live: "connecting", recording: false, speaking: false })).toMatchObject({
       action: "toggle-live", ariaLabel: "Cancel Jarvis voice connection", label: "connecting",
     });

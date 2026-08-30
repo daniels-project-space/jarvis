@@ -82,3 +82,62 @@ describe("review_uploaded_file tool", () => {
     )).resolves.toContain("not attached to this message");
   });
 });
+
+describe("organize_uploaded_file tool", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mock.convexMutation.mockResolvedValue({
+      fileId: "file-1",
+      name: "invoice.pdf",
+      relativePath: "Business/Acme/invoice.pdf",
+      tags: ["finance", "acme"],
+    });
+  });
+
+  it("changes only exact current-message workspace metadata", async () => {
+    const definition = TOOL_DEFS.find((tool) => tool.name === "organize_uploaded_file");
+    expect(definition?.parameters).toMatchObject({
+      required: ["file_id"],
+      properties: {
+        folder_path: { type: "string" },
+        tags: { type: "array" },
+      },
+    });
+
+    await expect(executeTool(
+      "organize_uploaded_file",
+      {
+        file_id: "file-1",
+        name: "invoice.pdf",
+        folder_path: "Business/Acme",
+        tags: ["finance", "acme"],
+      },
+      { invocationContext: { userMessageId: "message-1" } },
+    )).resolves.toContain("Business/Acme/invoice.pdf");
+
+    expect(mock.convexMutation).toHaveBeenCalledWith("files:updateWorkspaceMetadataForMessage", {
+      messageId: "message-1",
+      fileId: "file-1",
+      name: "invoice.pdf",
+      folderPath: "Business/Acme",
+      tags: ["finance", "acme"],
+    });
+  });
+
+  it("fails closed without message provenance, requested changes, or attachment admission", async () => {
+    await expect(executeTool("organize_uploaded_file", {
+      file_id: "file-1",
+      folder_path: "Business/Acme",
+    })).resolves.toContain("trusted current-message provenance");
+
+    await expect(executeTool("organize_uploaded_file", {
+      file_id: "file-1",
+    }, { invocationContext: { userMessageId: "message-1" } })).resolves.toContain("pass a requested");
+
+    mock.convexMutation.mockResolvedValueOnce(null);
+    await expect(executeTool("organize_uploaded_file", {
+      file_id: "unrelated-file",
+      tags: ["private"],
+    }, { invocationContext: { userMessageId: "message-1" } })).resolves.toContain("not attached to this message");
+  });
+});

@@ -8,6 +8,7 @@ import { useJarvisQuery } from "@/lib/secure-convex";
 import { clientMutation } from "@/lib/client-mutation";
 import {
   forgetMicrophoneGrant,
+  primeMicrophone,
   readJarvisPermissions,
   rememberMicrophoneGrant,
   watchMicrophonePermission,
@@ -95,6 +96,8 @@ import { isForegroundBusy } from "@/lib/foreground-state";
 import { FleetCommandCenter, type FleetOpenRequest } from "./CompactWorkBar";
 import { WorkMapBubble } from "./WorkMapBubble";
 import { OrbQuickSearch } from "./OrbQuickSearch";
+import { FileWorkspace } from "./FileWorkspace";
+import { parseFileWorkspaceIntent } from "@/lib/file-workspace";
 import { shouldHideWorkMap, type WorkMapTodoItem } from "@/lib/work-map";
 import { PROJECT_REGISTRY } from "@/lib/project-registry";
 import { readyPrivateFilePanel } from "@/lib/private-file-panel";
@@ -568,7 +571,7 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, locOn, onLocation, onClose, onToggleLive, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice, controllerSessionReadiness, owner,
+  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, wake, locOn, onLocation, onClose, onToggleWake, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice, controllerSessionReadiness, owner,
 }: {
   prefs: JarvisPrefs;
   setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
@@ -576,10 +579,11 @@ function OptionsPanel({
   permissionBusy: boolean;
   onEnableMicrophone: () => void;
   live: string;
+  wake: boolean;
   locOn: boolean;
   onLocation: () => void;
   onClose: () => void;
-  onToggleLive: () => void;
+  onToggleWake: () => void;
   onMood: (m: string) => void;
   onClearMood: () => void;
   onOpenLibrary: () => void;
@@ -599,8 +603,6 @@ function OptionsPanel({
       <div className="shrink-0">{children}</div>
     </div>
   );
-  const permissionText = (value: JarvisPermissionState["microphone"]) =>
-    value === "granted" ? "ready" : value === "denied" ? "blocked" : value === "unsupported" ? "unavailable" : "not enabled";
   // Connection state is personal context. It follows the same viewer/session
   // gate as the rest of the options panel; the encrypted credential itself is
   // only ever available to trusted server/worker code.
@@ -726,16 +728,6 @@ function OptionsPanel({
           <Row label="Voice" hint="private neural speech · free no-silence fallback">
             <span className="rounded-lg border border-cyan/25 bg-cyan/[0.07] px-2.5 py-1 text-[11px] text-cyan">Jarvis · private neural</span>
           </Row>
-          <Row label="Live microphone" hint={`microphone ${permissionText(permissions.microphone)} · remembered by this browser`}>
-            <button
-              type="button"
-              disabled={permissionBusy || permissions.microphone === "granted"}
-              onClick={onEnableMicrophone}
-              className={`rounded-lg px-3 py-1 text-[11px] transition disabled:opacity-70 ${permissions.microphone === "granted" ? "bg-emerald-400/10 text-emerald-300 ring-1 ring-emerald-400/30" : "border border-cyan/30 text-cyan hover:bg-cyan/10"}`}
-            >
-              {permissionBusy ? "enabling…" : permissions.microphone === "granted" ? "ready ✓" : permissions.microphone === "denied" ? "browser settings" : "enable once"}
-            </button>
-          </Row>
           <Row label="Speaking voice" hint="Free streamed en-GB-RyanNeural">
             <span className="rounded-lg border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-ice">Jarvis</span>
           </Row>
@@ -794,12 +786,17 @@ function OptionsPanel({
               {novitaPatchProposer.label}
             </span>
           </Row>
-          <Row label="Live conversation" hint={live !== "off" ? "on now" : "listen → answer → listen, with no self-echo"}>
-            <button onClick={onToggleLive} className={`rounded-lg px-3 py-1 text-[11px] transition ${live !== "off" ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}>
-              {live === "connecting" ? "…" : live !== "off" ? "stop" : "start"}
+          <Row label="Voice activation" hint={wake ? "wake-only · nothing is submitted until you say Jarvis" : permissions.microphone === "denied" ? "blocked in browser settings" : "off · enable once to listen for Jarvis locally"}>
+            <button
+              type="button"
+              disabled={permissionBusy}
+              onClick={permissions.microphone === "granted" ? onToggleWake : onEnableMicrophone}
+              className={`rounded-lg px-3 py-1 text-[11px] transition disabled:opacity-60 ${wake ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}
+            >
+              {permissionBusy ? "enabling…" : wake ? "wake-only" : permissions.microphone === "denied" ? "browser settings" : "enable"}
             </button>
           </Row>
-          <Row label="Live by default" hint="asks once on first use, then starts automatically with this browser's saved permission">
+          <Row label="Continuous voice" hint={live !== "off" ? "on now · tap the one voice control to stop" : "optional hands-free follow-up mode · off by default"}>
             <button onClick={() => setPref("liveDefault", !prefs.liveDefault)} className={`h-5 w-9 rounded-full p-0.5 transition ${prefs.liveDefault ? "bg-cyan/60" : "bg-white/15"}`}>
               <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.liveDefault ? "translate-x-4" : ""}`} />
             </button>
@@ -1409,6 +1406,8 @@ export function Viewport({
         <TravelLibraryView />
       ) : route.renderer === "fleet" ? (
         <GoalModeLauncherView />
+      ) : route.renderer === "files" ? (
+        <FileWorkspace value={panel.value} />
       ) : route.renderer === "board" ? (
         <BoardView value={panel.value} />
       ) : route.renderer === "scene" ? (
@@ -1595,6 +1594,7 @@ export function voiceActionPresentation(args: {
   live: "off" | "connecting" | "live";
   recording: boolean;
   speaking: boolean;
+  wakeReady?: boolean;
 }): VoiceActionPresentation {
   if (args.speaking) {
     return { action: "interrupt", ariaLabel: "Interrupt Jarvis", title: "Stop Jarvis speaking", label: "hush", glyph: "■", tone: "interrupt" };
@@ -1608,7 +1608,9 @@ export function voiceActionPresentation(args: {
   if (args.recording) {
     return { action: "finish-recording", ariaLabel: "Finish recording your voice message", title: "Finish recording", label: "done", glyph: "■", tone: "recording" };
   }
-  return { action: "toggle-live", ariaLabel: "Start Jarvis live listening", title: "Start live voice", label: "voice", glyph: "●", tone: "idle" };
+  return args.wakeReady
+    ? { action: "toggle-live", ariaLabel: "Jarvis wake-only is ready. Start listening now", title: "Wake-only · say Jarvis, or tap to speak now", label: "wake-only", glyph: "◇", tone: "idle" }
+    : { action: "toggle-live", ariaLabel: "Start Jarvis live listening", title: "Start live voice", label: "voice", glyph: "●", tone: "idle" };
 }
 
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
@@ -2031,7 +2033,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const openMapDocuments = useCallback(() => {
     setPanelFull(false);
     setPanelMin(false);
-    void setPanel({ type: "creations", value: JSON.stringify({ category: "documents" }), title: "Documents" });
+    void setPanel({ type: "files", value: "workspace", title: "Files" });
   }, [setPanel]);
   const openMapTodos = useCallback((items: WorkMapTodoItem[]) => {
     setPanelFull(false);
@@ -2087,10 +2089,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     if (result.source !== "file") return;
     const panel = readyPrivateFilePanel(result.payload as { fileId: string; name?: string; relativePath?: string; mimeType?: string; status?: string });
-    if (!panel) return;
     setPanelFull(false);
     setPanelMin(false);
-    void setPanel(panel);
+    void setPanel(panel ?? { type: "files", value: JSON.stringify({ query: result.title }), title: "Files" });
   }, [setPanel]);
   // Viewport minimize: keep talking and the panel folds into a pill; the orb
   // comes back. Fresh panel content pops it open again.
@@ -2307,7 +2308,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [authRepairRecovered, setAuthRepairRecovered] = useState(false);
   const [googleOAuthNotice, setGoogleOAuthNotice] = useState<GoogleOAuthReturnNotice | null>(null);
   const setMoodMut = (args: Record<string, unknown>) => privateMutation("ui:setMood", args);
-  const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: true });
+  const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: false });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
   const liveAutoStarted = useRef(false);
@@ -2335,7 +2336,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     localStorage.removeItem("jarvis_kokoro_voice");
     setPrefs({
       reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
-      liveDefault: localStorage.getItem("jarvis_live_default") !== "0",
+      // Wake-only is the privacy-safe default. Continuous capture is an
+      // explicit opt-in and never starts just because an older browser has
+      // already granted microphone permission.
+      liveDefault: localStorage.getItem("jarvis_live_default") === "1",
     });
     // Greeting synthesis is never run on mount. It competes with wake-word
     // recognition and makes an assistant speak before Daniel has asked.
@@ -2564,9 +2568,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Standby wake word: "hey jarvis" / "jarvis" starts live mode, Siri-style.
   const wakePreferenceKey = embedded ? "jarvis_embed_wake" : "jarvis_wake";
   const wakeOwnedByHost = () => embedded && window.parent !== window;
-  const wakeIsEnabled = () => embedded
-    ? localStorage.getItem(wakePreferenceKey) !== "0"
-    : localStorage.getItem(wakePreferenceKey) === "1";
+  const wakeIsEnabled = () => localStorage.getItem(wakePreferenceKey) !== "0";
   const standbyIsEligible = () => wakeIsEnabled() || chatModeRef.current === "off";
   const clearStandbyHeartbeat = () => {
     if (standbyHeartbeatRef.current) clearInterval(standbyHeartbeatRef.current);
@@ -4117,6 +4119,21 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       // If the parent cannot fulfil a fast path, let the full model inspect its
       // inventory and choose a grounded fallback rather than claiming success.
     }
+    const fileWorkspaceIntent = guest || fileIds.length ? null : parseFileWorkspaceIntent(t);
+    if (fileWorkspaceIntent) {
+      const value = JSON.stringify(fileWorkspaceIntent);
+      const localPanel = { type: "files", value, title: "Files", updatedAt: Date.now() };
+      document.documentElement.dataset.jarvisFirstTokenMs = "0";
+      setPanelFull(false);
+      setPanelMin(false);
+      setInstantPanel(localPanel);
+      showCaption({ who: "jarvis", text: fileWorkspaceIntent.query ? `Showing files for “${fileWorkspaceIntent.query}”.` : "Your file workspace is open.", phase: "ready" });
+      void setPanel(localPanel).catch(() => setInstantPanel(null));
+      void logTurn({ threadId: threadRef.current, role: "user", text: t })
+        .then(() => logTurn({ threadId: threadRef.current, role: "assistant", text: "Opened the file workspace.", model: "instant-ui" }))
+        .catch(() => {});
+      return;
+    }
     // A playing video shrinks to picture-in-picture (keeps playing). A genuine
     // follow-up keeps the current visual; a topic switch clears it immediately
     // instead of leaving a stale chart/widget behind while the next turn runs.
@@ -4655,17 +4672,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     setPermissionBusy(true);
     unlockSpeechPlayback();
-    liveAutoStarted.current = true;
-    const started = await toggleLive(true).catch(() => false).finally(() => setPermissionBusy(false));
-    const current = await readJarvisPermissions().catch(() => permissions);
+    const permission = await primeMicrophone().catch(() => "prompt" as const);
+    setPermissionBusy(false);
+    const current = await readJarvisPermissions().catch(() => ({ ...permissions, microphone: permission }));
     setPermissions(current);
-    if (started) {
-      setPref("liveDefault", true);
-      liveAutoStarted.current = true;
-    } else {
-      liveAutoStarted.current = false;
+    if (current.microphone === "granted") {
+      localStorage.setItem(wakePreferenceKey, "1");
+      setPref("liveDefault", false);
+      rearmWake();
+      return;
     }
-    if (!started && current.microphone === "denied") {
+    if (current.microphone === "denied") {
       alert("Microphone access is blocked. Open this site's browser settings and allow it once.");
     }
   }
@@ -5503,7 +5520,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     || durableRecovery === "cancelling"
     || (durableRecovery === "retry-ready" && !durableRetryReady);
   const voiceRecoveryVisible = ttsRuntimeStatus === "blocked" || voiceReplayReady;
-  const voiceAction = voiceActionPresentation({ live, recording, speaking });
+  const voiceAction = voiceActionPresentation({ live, recording, speaking, wakeReady: wake });
   const runVoiceAction = () => {
     if (voiceAction.action === "interrupt") {
       stopTalking();
@@ -5876,10 +5893,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           permissionBusy={permissionBusy}
           onEnableMicrophone={() => void enableMicrophone()}
           live={live}
+          wake={wake}
           locOn={locOn}
           onLocation={toggleLocation}
           onClose={() => setOptionsOpen(false)}
-          onToggleLive={() => void toggleLive()}
+          onToggleWake={toggleWake}
           onMood={(m) => void setMoodMut({ mood: m, manual: true })}
           onClearMood={() => void setMoodMut({ mood: "calm", manual: false, source: "cleared" })}
           onOpenLibrary={() => {

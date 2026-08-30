@@ -16,6 +16,14 @@ type PrivateFileRow = {
   r2Key: string;
 };
 
+type WorkspaceDocument = {
+  editable: boolean;
+  content?: string;
+  version?: number;
+  edited?: boolean;
+  file?: Record<string, unknown>;
+};
+
 function disposition(name: string, download: boolean): string {
   const safe = name.replace(/[\r\n"]/g, "_").slice(0, 160) || "file";
   return `${download ? "attachment" : "inline"}; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(safe)}`;
@@ -46,6 +54,15 @@ export async function GET(req: NextRequest, context: { params: Promise<{ id: str
   if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
   if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
   const { id: fileId } = await context.params;
+  if (req.nextUrl.searchParams.get("workspace") === "1") {
+    const document = await controlQuery("files:getWorkspaceDocument", {
+      fileId,
+      ...controlCredentials(actor),
+    }).catch(() => null) as WorkspaceDocument | null;
+    return document
+      ? Response.json(document, { headers: { "cache-control": "private, no-store" } })
+      : Response.json({ error: "file not found" }, { status: 404 });
+  }
   const file = await controlQuery("files:getForOwner", { fileId, ...controlCredentials(actor) }).catch(() => null) as PrivateFileRow | null;
   if (!file || ["reserved", "deleting", "deleted"].includes(file.status)) {
     return Response.json({ error: "file not found" }, { status: 404 });
@@ -79,17 +96,58 @@ export async function PATCH(req: NextRequest, context: { params: Promise<{ id: s
   const actor = await controlActor(req);
   if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
   if (!isOwnerActor(actor)) return Response.json({ error: "owner enrollment required" }, { status: 403 });
-  const body = await req.json().catch(() => null) as { reviewState?: unknown } | null;
+  const body = await req.json().catch(() => null) as {
+    reviewState?: unknown;
+    name?: unknown;
+    folderPath?: unknown;
+    tags?: unknown;
+    content?: unknown;
+    baseVersion?: unknown;
+  } | null;
+  if (!body) return Response.json({ error: "file update is required" }, { status: 400 });
+  const { id: fileId } = await context.params;
+  const credentials = controlCredentials(actor);
+  if (typeof body.content === "string") {
+    if (!Number.isSafeInteger(body.baseVersion) || Number(body.baseVersion) < 0) {
+      return Response.json({ error: "document version is required" }, { status: 400 });
+    }
+    const saved = await controlMutation("files:saveWorkspaceDocument", {
+      fileId,
+      content: body.content,
+      baseVersion: Number(body.baseVersion),
+      ...credentials,
+    }).catch(() => null) as { ok?: boolean; version?: number } | null;
+    return saved?.ok
+      ? Response.json(saved, { headers: { "cache-control": "private, no-store" } })
+      : Response.json({ error: "document changed or could not be saved" }, { status: 409 });
+  }
+  const hasMetadata = body.name !== undefined || body.folderPath !== undefined || body.tags !== undefined;
+  if (hasMetadata) {
+    if (body.name !== undefined && typeof body.name !== "string") return Response.json({ error: "file name is invalid" }, { status: 400 });
+    if (body.folderPath !== undefined && typeof body.folderPath !== "string") return Response.json({ error: "folder path is invalid" }, { status: 400 });
+    if (body.tags !== undefined && (!Array.isArray(body.tags) || body.tags.some((tag) => typeof tag !== "string"))) {
+      return Response.json({ error: "file tags are invalid" }, { status: 400 });
+    }
+    const updated = await controlMutation("files:updateWorkspaceMetadata", {
+      fileId,
+      ...(typeof body.name === "string" ? { name: body.name } : {}),
+      ...(typeof body.folderPath === "string" ? { folderPath: body.folderPath } : {}),
+      ...(Array.isArray(body.tags) ? { tags: body.tags } : {}),
+      ...credentials,
+    }).catch(() => null) as { fileId?: string } | null;
+    return updated
+      ? Response.json({ ok: true, file: updated }, { headers: { "cache-control": "private, no-store" } })
+      : Response.json({ error: "file metadata could not be updated" }, { status: 409 });
+  }
   const candidateState = typeof body?.reviewState === "string" ? body.reviewState : "";
   if (!REVIEW_STATES.has(candidateState as ReviewState)) {
     return Response.json({ error: "review state must be unreviewed, favorite, or review_remove" }, { status: 400 });
   }
-  const { id: fileId } = await context.params;
   const reviewState = candidateState as ReviewState;
   const reviewed = await controlMutation("files:setReviewState", {
     fileId,
     reviewState,
-    ...controlCredentials(actor),
+    ...credentials,
   }).catch(() => null) as { fileId?: string; reviewState?: ReviewState } | null;
   if (!reviewed || reviewed.reviewState !== reviewState) {
     return Response.json({ error: "file is not available for review" }, { status: 409 });

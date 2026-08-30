@@ -34,6 +34,9 @@ const contentTypes: Record<string, string> = {
   "/work-map": "text/html; charset=utf-8",
   "/work-map.js": "text/javascript; charset=utf-8",
   "/work-map.css": "text/css; charset=utf-8",
+  "/file-workspace": "text/html; charset=utf-8",
+  "/file-workspace.js": "text/javascript; charset=utf-8",
+  "/file-workspace.css": "text/css; charset=utf-8",
   "/compact-work": "text/html; charset=utf-8",
   "/compact-work.js": "text/javascript; charset=utf-8",
   "/compact-work.css": "text/css; charset=utf-8",
@@ -182,6 +185,22 @@ const workMapFixtureHtml = [
   "</html>",
 ].join("\n");
 
+const fileWorkspaceFixtureHtml = [
+  "<!doctype html>",
+  "<html lang=\"en\">",
+  "  <head>",
+  "    <meta charset=\"utf-8\" />",
+  "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+  "    <title>Jarvis file workspace fixture</title>",
+  "    <link rel=\"stylesheet\" href=\"/file-workspace.css\" />",
+  "  </head>",
+  "  <body>",
+  "    <div id=\"root\"></div>",
+  "    <script src=\"/file-workspace.js\" defer></script>",
+  "  </body>",
+  "</html>",
+].join("\n");
+
 const compactWorkFixtureHtml = [
   "<!doctype html>",
   "<html lang=\"en\">",
@@ -303,6 +322,7 @@ async function main() {
     "offline-map": join(projectRoot, "e2e/fixtures/apple-maps-offline.browser.tsx"),
     "city-itinerary": join(projectRoot, "e2e/fixtures/trip-city-itinerary-scope.browser.tsx"),
     "work-map": join(projectRoot, "e2e/fixtures/work-map-bubble.browser.tsx"),
+    "file-workspace": join(projectRoot, "e2e/fixtures/file-workspace.browser.tsx"),
     "compact-work": join(projectRoot, "e2e/fixtures/compact-work.browser.tsx"),
     "orb-mood": join(projectRoot, "e2e/fixtures/orb-mood.browser.tsx"),
   },
@@ -331,6 +351,7 @@ async function main() {
   const offlineMapJsPath = join(outputDir, "offline-map.js");
   const cityItineraryJsPath = join(outputDir, "city-itinerary.js");
   const workMapJsPath = join(outputDir, "work-map.js");
+  const fileWorkspaceJsPath = join(outputDir, "file-workspace.js");
   const compactWorkJsPath = join(outputDir, "compact-work.js");
   const orbMoodJsPath = join(outputDir, "orb-mood.js");
   const teamAvatarPath = join(projectRoot, "public/agents/jarvis-team-v1.webp");
@@ -348,6 +369,7 @@ async function main() {
     access(offlineMapJsPath),
     access(cityItineraryJsPath),
     access(workMapJsPath),
+    access(fileWorkspaceJsPath),
     access(compactWorkJsPath),
     access(orbMoodJsPath),
     access(teamAvatarPath),
@@ -482,6 +504,11 @@ async function main() {
     response.end(workMapFixtureHtml);
     return;
   }
+  if (pathname === "/file-workspace") {
+    response.writeHead(200);
+    response.end(fileWorkspaceFixtureHtml);
+    return;
+  }
   if (pathname === "/compact-work") {
     response.writeHead(200);
     response.end(compactWorkFixtureHtml);
@@ -493,6 +520,11 @@ async function main() {
     return;
   }
   if (pathname === "/work-map.css") {
+    response.writeHead(200);
+    response.end(workMapCss);
+    return;
+  }
+  if (pathname === "/file-workspace.css") {
     response.writeHead(200);
     response.end(workMapCss);
     return;
@@ -541,6 +573,7 @@ async function main() {
     "/caption.js": captionJsPath,
     "/caption.css": captionCssPath,
     "/work-map.js": workMapJsPath,
+    "/file-workspace.js": fileWorkspaceJsPath,
     "/compact-work.js": compactWorkJsPath,
     "/orb-mood.js": orbMoodJsPath,
     "/location.js": locationJsPath,

@@ -400,6 +400,9 @@ export default defineSchema({
       v.literal("favorite"),
       v.literal("review_remove"),
     )),
+    // Owner-managed workspace metadata. R2 object identities stay immutable;
+    // moving or renaming a file changes only this visible hierarchy.
+    tags: v.optional(v.array(v.string())),
     deletePreviousStatus: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
@@ -410,6 +413,19 @@ export default defineSchema({
     .index("by_sha256", ["sha256"])
     .index("by_updatedAt", ["updatedAt"])
     .searchIndex("search_metadata", { searchField: "searchText", filterFields: ["status", "libraryVisible", "reviewState"] }),
+
+  // Editable text/markdown is versioned separately from immutable uploaded
+  // bytes and extracted chunks. Existing chunk ids remain stable for saved
+  // citations while Jarvis and the workspace can prefer the current draft.
+  fileDocuments: defineTable({
+    fileId: v.id("files"),
+    content: v.string(),
+    version: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_file", ["fileId"])
+    .searchIndex("search_content", { searchField: "content" }),
 
   // One browser reservation covers a bounded multi-file or folder upload.
   // requestId and its returned fileIds make retries idempotent before any R2

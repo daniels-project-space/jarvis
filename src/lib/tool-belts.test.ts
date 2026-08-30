@@ -196,6 +196,8 @@ describe("tool belt registry", () => {
     }
     expect(TOOL_BELTS.core.has("review_uploaded_file")).toBe(true);
     expect(SUBSCRIPTION_TOOL_NAMES.has("review_uploaded_file")).toBe(true);
+    expect(TOOL_BELTS.core.has("organize_uploaded_file")).toBe(true);
+    expect(SUBSCRIPTION_TOOL_NAMES.has("organize_uploaded_file")).toBe(true);
   });
 
   it("keeps offline-map preparation in the discoverable owner travel lane", () => {

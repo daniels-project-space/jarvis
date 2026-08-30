@@ -106,6 +106,39 @@ describe("private file controls", () => {
     expect(mock.trigger).toHaveBeenCalledWith("jarvis-file-cleanup", { fileId: "file-1" });
   });
 
+  it("returns an owner-only editable draft without reading the private object route", async () => {
+    mock.controlQuery.mockResolvedValueOnce({ editable: true, content: "draft", version: 2, edited: true });
+    const response = await GET(
+      new NextRequest("https://jarvis.example/api/files/file-1?workspace=1"),
+      { params: Promise.resolve({ id: "file-1" }) },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ editable: true, content: "draft", version: 2 });
+    expect(mock.controlQuery).toHaveBeenCalledWith("files:getWorkspaceDocument", { fileId: "file-1", authTokenHash: "owner-hash" });
+    expect(mock.privateR2Get).not.toHaveBeenCalled();
+  });
+
+  it("updates hierarchy metadata and saves optimistic text versions through separate mutations", async () => {
+    mock.controlMutation.mockResolvedValueOnce({ fileId: "file-1", name: "plan.md", relativePath: "Acme/plan.md", tags: ["launch"] });
+    const metadata = await PATCH(new NextRequest("https://jarvis.example/api/files/file-1", {
+      method: "PATCH",
+      headers: { origin: "https://jarvis.example", "content-type": "application/json" },
+      body: JSON.stringify({ name: "plan.md", folderPath: "Acme", tags: ["launch"] }),
+    }), { params: Promise.resolve({ id: "file-1" }) });
+    expect(metadata.status).toBe(200);
+    expect(mock.controlMutation).toHaveBeenLastCalledWith("files:updateWorkspaceMetadata", expect.objectContaining({ fileId: "file-1", folderPath: "Acme", tags: ["launch"] }));
+
+    mock.controlMutation.mockResolvedValueOnce({ ok: true, fileId: "file-1", version: 3 });
+    const document = await PATCH(new NextRequest("https://jarvis.example/api/files/file-1", {
+      method: "PATCH",
+      headers: { origin: "https://jarvis.example", "content-type": "application/json" },
+      body: JSON.stringify({ content: "new draft", baseVersion: 2 }),
+    }), { params: Promise.resolve({ id: "file-1" }) });
+    expect(document.status).toBe(200);
+    expect(await document.json()).toMatchObject({ ok: true, version: 3 });
+    expect(mock.controlMutation).toHaveBeenLastCalledWith("files:saveWorkspaceDocument", expect.objectContaining({ fileId: "file-1", baseVersion: 2, content: "new draft" }));
+  });
+
   it.each(["favorite", "review_remove", "unreviewed"] as const)("writes %s as a reversible review label without scheduling private storage work", async (reviewState) => {
     mock.controlMutation.mockResolvedValueOnce({ fileId: "file-1", reviewState });
     const request = new NextRequest("https://jarvis.example/api/files/file-1", {

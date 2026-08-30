@@ -22,6 +22,15 @@ function deferred<T>() {
 }
 
 describe("live voice bootstrap policy", () => {
+  it("defaults to local wake-only instead of continuous capture", () => {
+    const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
+    expect(source).toContain('liveDefault: localStorage.getItem("jarvis_live_default") === "1"');
+    expect(source).toContain('const wakeIsEnabled = () => localStorage.getItem(wakePreferenceKey) !== "0"');
+    expect(source).toContain('localStorage.setItem(wakePreferenceKey, "1")');
+    expect(source).toContain('setPref("liveDefault", false)');
+    expect(shouldAutoStartLiveVoice({ embedded: false, visible: true, liveDefault: false, permission: "granted", attempted: false, manuallyStopped: false })).toBe(false);
+  });
+
   it.each(["prompt", "granted"] as const)("starts the main site when microphone permission is %s", (permission) => {
     expect(shouldAutoStartLiveVoice({
       embedded: false,

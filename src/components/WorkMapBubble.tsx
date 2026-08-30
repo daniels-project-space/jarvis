@@ -89,6 +89,7 @@ export function WorkMapBubble({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(initialOpen);
+  const [showAll, setShowAll] = useState(initialOpen);
   const [expandedCategoryId, setExpandedCategoryId] = useState<string | null>(null);
   const [expandedBranchId, setExpandedBranchId] = useState<string | null>(null);
   const [todos, setTodos] = useState<WorkMapTodoSummary>({ state: "loading", openTodoCount: null, items: [] });
@@ -113,10 +114,14 @@ export function WorkMapBubble({
     setOpen(false);
     setExpandedCategoryId(null);
     setExpandedBranchId(null);
+    setShowAll(false);
     onOpenChangeAction?.(false);
     if (restoreFocus) restoreTriggerFocus();
   }, [onOpenChangeAction, restoreTriggerFocus]);
-  const openMap = () => {
+  const openMap = (all = true, categoryId?: string) => {
+    setShowAll(all);
+    setExpandedCategoryId(categoryId ?? null);
+    setExpandedBranchId(null);
     setOpen(true);
     onOpenChangeAction?.(true);
   };
@@ -175,22 +180,24 @@ export function WorkMapBubble({
     // Project and domain branches intentionally show the same job in two useful
     // contexts, so the trigger must count durable jobs rather than map leaves.
     const activeCount = workMapActiveJobCount(snapshot);
-    return (
-      <button
-        ref={triggerRef}
-        type="button"
-        data-work-map-trigger
-        aria-expanded="false"
-        aria-label={`Open Jarvis work map${activeCount ? `, ${activeCount} active worker ${activeCount === 1 ? "task" : "tasks"}` : ""}`}
-        onClick={openMap}
-        className="work-map-trigger glass absolute left-1/2 top-[68%] z-30 inline-flex h-8 w-8 -translate-x-1/2 items-center justify-center rounded-full !border-cyan/25 bg-[#071019]/88 shadow-[0_8px_24px_rgba(0,0,0,.3)] transition hover:-translate-y-px hover:!border-cyan/55 motion-reduce:hover:translate-y-0 motion-reduce:transition-none sm:left-auto sm:right-[calc(50%-184px)] sm:top-[61%] sm:translate-x-0"
-      >
-        <span className={`work-map-trigger-dot ${activeCount ? "work-map-pulse" : ""}`} aria-hidden="true" />
-        <span className="h-1 w-1 rounded-full bg-cyan/65" aria-hidden="true" />
-        <span className="h-1 w-1 rounded-full bg-cyan/35" aria-hidden="true" />
-      </button>
-    );
+    return <section data-work-map-context aria-label="Contextual Jarvis work map" className="pointer-events-none absolute left-1/2 top-1/2 z-30 h-[min(370px,62vh)] w-[min(600px,96vw)] -translate-x-1/2 -translate-y-1/2">
+      <svg aria-hidden="true" viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 h-full w-full opacity-45">
+        {orbitCategories.map((category, index) => { const point = workMapPosition(index, orbitCategories.length); return <line key={category.id} className={categoryWorking(category) ? "work-map-live-line" : "work-map-line"} x1="50" y1="50" x2={point.x} y2={point.y} />; })}
+      </svg>
+      <button ref={triggerRef} type="button" data-work-map-trigger aria-expanded="false" aria-label={`Open Jarvis work map and reveal all${activeCount ? `, ${activeCount} active worker ${activeCount === 1 ? "task" : "tasks"}` : ""}`} onClick={() => openMap(true)} className="pointer-events-auto absolute left-1/2 top-1/2 h-28 w-28 -translate-x-1/2 -translate-y-1/2 rounded-full bg-transparent outline-none ring-cyan/30 focus-visible:ring-1"><span className="sr-only">Reveal all work</span></button>
+      {orbitCategories.map((category, index) => {
+        const point = workMapPosition(index, orbitCategories.length);
+        const active = categoryWorking(category);
+        return <button key={category.id} type="button" data-work-map-category={category.id} onClick={() => openMap(false, category.id)} style={{ left: `${point.x}%`, top: `${point.y}%` }} className="work-map-context-dot group pointer-events-auto absolute flex -translate-x-1/2 -translate-y-1/2 items-center gap-1.5 rounded-full border border-cyan/25 bg-[#07131e]/80 p-1.5 text-left shadow-[0_8px_30px_rgba(0,0,0,.3)] backdrop-blur transition-all duration-300 hover:scale-105 hover:border-cyan/55 hover:bg-[#091927]/95 focus-visible:scale-105 focus-visible:border-cyan/55">
+          <span className={`work-map-state-dot shrink-0 ${active ? "work-map-pulse" : ""}`} aria-hidden="true" />
+          <span className="max-w-0 overflow-hidden whitespace-nowrap font-mono text-[7px] uppercase tracking-[.12em] text-cyan opacity-0 transition-all duration-300 group-hover:max-w-24 group-hover:pr-1 group-hover:opacity-100 group-focus-visible:max-w-24 group-focus-visible:pr-1 group-focus-visible:opacity-100">{category.label}</span>
+          <span className="sr-only">Open {category.label}</span>
+        </button>;
+      })}
+    </section>;
   }
+
+  const visibleCategories = showAll ? categories : orbitCategories;
 
   const tileBranches = expandedCategory?.branches.slice(0, 2) ?? [];
   const visibleCount = expandedCategory ? tileBranches.reduce((count, branch) => count + (branch.children.length || 1), 0) : 0;
@@ -203,8 +210,8 @@ export function WorkMapBubble({
       className={`work-map-surface pointer-events-auto absolute left-1/2 top-1/2 z-30 h-[min(420px,68vh)] w-[min(680px,calc(100%-12px))] -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-[28px] bg-[radial-gradient(ellipse_at_50%_50%,rgba(6,16,24,.12),rgba(6,16,24,.05)_46%,transparent_78%)] motion-reduce:transition-none sm:w-[min(680px,calc(100%-28px))] ${reduceMotion ? "work-map-static" : ""}`}
     >
       <svg aria-hidden="true" viewBox="0 0 100 100" preserveAspectRatio="none" className="pointer-events-none absolute inset-0 h-full w-full overflow-visible">
-        {orbitCategories.map((category, index) => {
-          const point = workMapPosition(index, orbitCategories.length);
+        {visibleCategories.map((category, index) => {
+          const point = workMapPosition(index, visibleCategories.length);
           const active = categoryWorking(category);
           return <g key={category.id}>
             <line className={active ? "work-map-live-line" : "work-map-line"} x1="50" y1="50" x2={point.x} y2={point.y} />
@@ -213,17 +220,14 @@ export function WorkMapBubble({
         })}
       </svg>
 
-      <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 grid h-[86px] w-[86px] -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border border-cyan/35 bg-cyan/[0.02] text-center shadow-[0_0_42px_rgba(34,211,238,.13)]">
-        <div className="grid grid-cols-3 gap-1.5" aria-hidden="true"><span className="h-1 w-1 rounded-full bg-cyan/80" /><span className="h-1 w-1 rounded-full bg-cyan/45" /><span className="h-1 w-1 rounded-full bg-cyan/65" /></div>
-      </div>
-
-      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-end px-3 py-3">
+      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-end gap-2 px-3 py-3">
+        <button type="button" onClick={() => { setShowAll((value) => !value); setExpandedCategoryId(null); setExpandedBranchId(null); }} className="rounded-full border border-white/10 px-2.5 py-1 font-mono text-[7px] uppercase tracking-[.12em] text-slate transition hover:border-cyan/35 hover:text-cyan">{showAll ? "relevant only" : "show all"}</button>
         <button ref={closeButtonRef} type="button" onClick={() => close()} className="grid h-7 w-7 place-items-center rounded-full border border-white/10 font-mono text-[11px] text-slate transition hover:border-cyan/45 hover:text-cyan" aria-label="Close contextual Jarvis work map">×</button>
       </header>
 
       <div className="absolute inset-0 z-10" aria-live="off">
-        {orbitCategories.map((category, index) => {
-          const point = workMapPosition(index, orbitCategories.length);
+        {visibleCategories.map((category, index) => {
+          const point = workMapPosition(index, visibleCategories.length);
           const selected = expandedCategoryId === category.id;
           const active = categoryWorking(category);
           return <button
@@ -237,11 +241,12 @@ export function WorkMapBubble({
               setExpandedBranchId(null);
             }}
             style={{ left: `${point.x}%`, top: `${point.y}%` }}
-            className={`work-map-category absolute grid h-5 w-5 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border transition-[background,border-color,box-shadow,transform] duration-300 motion-reduce:transition-none ${
-              selected ? "scale-125 border-cyan/80 bg-cyan/30 shadow-[0_0_22px_rgba(34,211,238,.42)]" : "border-cyan/40 bg-[#08131d]/95 hover:scale-125 hover:border-cyan/80 hover:bg-cyan/20"
+            className={`work-map-category group absolute flex min-h-5 -translate-x-1/2 -translate-y-1/2 items-center gap-1.5 rounded-full border px-1.5 py-1 transition-[background,border-color,box-shadow,transform] duration-300 motion-reduce:transition-none ${
+              selected ? "scale-110 border-cyan/80 bg-[#0b2230] shadow-[0_0_22px_rgba(34,211,238,.32)]" : "border-cyan/40 bg-[#08131d]/95 hover:scale-110 hover:border-cyan/80 hover:bg-[#0a1c28]"
             }`}
           >
             <span className={`work-map-state-dot ${active ? "work-map-pulse" : ""}`} aria-hidden="true" />
+            <span className={`whitespace-nowrap font-mono text-[7px] uppercase tracking-[.1em] transition-all ${selected ? "max-w-28 text-cyan opacity-100" : "max-w-0 overflow-hidden text-slate opacity-0 group-hover:max-w-28 group-hover:opacity-100 group-focus-visible:max-w-28 group-focus-visible:opacity-100"}`}>{category.label}<span className="ml-1 text-cyan/50">{category.workCount || "·"}</span></span>
             <span className="sr-only">Open {category.label}</span>
           </button>;
         })}

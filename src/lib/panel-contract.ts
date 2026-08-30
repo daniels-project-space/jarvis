@@ -11,6 +11,7 @@ export type PanelRenderer =
   | "creations"
   | "travel"
   | "fleet"
+  | "files"
   | "board"
   | "scene"
   | "private_video"
@@ -71,6 +72,7 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
                   : panel.type === "creations" ? "creations"
                     : panel.type === "travel" ? "travel"
                       : panel.type === "fleet" ? "fleet"
+                        : panel.type === "files" ? "files"
                           : panel.type === "board" ? "board"
                           : panel.type === "scene" ? "scene"
                             : panel.type === "private_video" && isPrivateFilePanelUrl(panel.value) ? "private_video"
@@ -116,6 +118,7 @@ export function resolvePanelRoute(panel: PanelInput): PanelRoute {
     case "travel": presentation = "workspace"; size = "h-full w-full"; break;
     case "trip": presentation = "workspace"; size = "h-full w-full"; break;
     case "fleet": presentation = "workspace"; size = "h-full w-full"; break;
+    case "files": presentation = "workspace"; size = "h-full w-full"; break;
     case "pdf":
     case "private_pdf": presentation = "workspace"; size = "h-full w-full"; break;
     case "site":

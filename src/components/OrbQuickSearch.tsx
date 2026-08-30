@@ -36,6 +36,7 @@ export function OrbQuickSearch({
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(false);
   const [hovered, setHovered] = useState(false);
+  const [scope, setScope] = useState<"all" | "file" | "project" | "work" | "creation">("all");
   const search = query.trim();
   const files = useJarvisQuery(
     api.files.quickSearchLibrary,
@@ -53,6 +54,7 @@ export function OrbQuickSearch({
     [creations, files, projects, search, snapshot],
   );
   const visible = active && search.length >= 2;
+  const visibleResults = scope === "all" ? results : results.filter((result) => result.source === scope);
   const expanded = active || hovered || query.length > 0;
 
   useEffect(() => {
@@ -77,16 +79,16 @@ export function OrbQuickSearch({
       data-orb-quick-search
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      className={`pointer-events-auto absolute left-1/2 top-2 z-40 -translate-x-1/2 transition-[width] duration-200 ${expanded ? "w-[min(244px,calc(100%-72px))]" : "w-9"}`}
+      className={`pointer-events-auto absolute left-1/2 top-1 z-40 -translate-x-1/2 transition-[width] duration-200 ${expanded ? "w-[min(210px,calc(100%-88px))]" : "w-7"}`}
     >
-      <div className={`flex h-9 items-center overflow-hidden rounded-full border bg-[#07131e]/70 px-[10px] shadow-[0_8px_22px_rgba(0,0,0,.22)] backdrop-blur-xl transition ${visible ? "border-cyan/55" : expanded ? "border-cyan/25" : "border-white/[.07] hover:border-cyan/30"}`}>
+      <div className={`flex h-7 items-center overflow-hidden rounded-full border bg-[#07131e]/55 px-[7px] shadow-[0_6px_18px_rgba(0,0,0,.18)] backdrop-blur-xl transition ${visible ? "border-cyan/45" : expanded ? "border-cyan/20" : "border-white/[.06] opacity-65 hover:border-cyan/30 hover:opacity-100"}`}>
         <button
           type="button"
           onClick={() => inputRef.current?.focus()}
           aria-label="Search Jarvis work and files"
-          className="grid h-4 w-4 shrink-0 place-items-center text-cyan/65 transition hover:text-cyan"
+          className="grid h-3 w-3 shrink-0 place-items-center text-cyan/55 transition hover:text-cyan"
         >
-          <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="10.8" cy="10.8" r="6.4" /><path d="m16 16 4 4" /></svg>
+          <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="10.8" cy="10.8" r="6.4" /><path d="m16 16 4 4" /></svg>
         </button>
         <input
           ref={inputRef}
@@ -106,21 +108,22 @@ export function OrbQuickSearch({
           aria-controls="orb-quick-search-results"
           placeholder="Search everything"
           tabIndex={expanded ? 0 : -1}
-          className={`min-w-0 bg-transparent text-[10px] text-ice outline-none placeholder:text-slate/60 transition-all duration-200 ${expanded ? "ml-2 flex-1 opacity-100" : "pointer-events-none w-0 opacity-0"}`}
+          className={`min-w-0 bg-transparent text-[9px] text-ice outline-none placeholder:text-slate/55 transition-all duration-200 ${expanded ? "ml-2 flex-1 opacity-100" : "pointer-events-none w-0 opacity-0"}`}
         />
       </div>
       {visible && (
-        <div id="orb-quick-search-results" role="listbox" aria-label="Quick search results" className="mt-2 overflow-hidden rounded-2xl border border-white/10 bg-[#07131e]/[.98] p-1.5 shadow-[0_18px_52px_rgba(0,0,0,.48)] backdrop-blur-xl">
-          {results.length ? results.map((result) => (
+        <div id="orb-quick-search-results" role="listbox" aria-label="Quick search results" className="relative left-1/2 mt-1.5 w-[min(360px,calc(100vw-24px))] -translate-x-1/2 overflow-hidden rounded-2xl border border-white/10 bg-[#07131e]/[.98] p-1.5 shadow-[0_18px_52px_rgba(0,0,0,.48)] backdrop-blur-xl">
+          <div className="mb-1 flex gap-1 overflow-x-auto px-1 py-1" aria-label="Search result type">{([['all','all'],['file','files'],['project','projects'],['work','work'],['creation','saved']] as const).map(([id,label]) => <button key={id} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => setScope(id)} className={`rounded-full px-2 py-1 font-mono text-[7px] uppercase tracking-[.08em] ${scope === id ? "bg-cyan/12 text-cyan ring-1 ring-cyan/25" : "text-slate hover:text-ice"}`}>{label}</button>)}</div>
+          {visibleResults.length ? visibleResults.map((result) => (
             <div key={result.id} role="option" aria-selected={false} aria-label={`${searchSourceLabel(result.source)}: ${result.title}`} className="group flex min-w-0 items-center gap-2 rounded-xl px-2 py-2 transition hover:bg-cyan/[.07]">
               <span aria-hidden="true" className={`h-1.5 w-1.5 shrink-0 rounded-full ${result.source === "work" ? "bg-amber" : result.source === "project" ? "bg-cyan" : "bg-slate"}`} />
               <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => onOpenAction(result)} className="min-w-0 flex-1 text-left">
                 <span className="block truncate text-[10px] text-ice">{result.title}</span>
                 <span className="mt-0.5 block truncate font-mono text-[7px] uppercase tracking-[.09em] text-slate">{searchSourceLabel(result.source)} · {result.detail}</span>
               </button>
-              {result.canShow && (
-                <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => onShowAction(result)} className="shrink-0 rounded-lg border border-white/10 px-1.5 py-1 font-mono text-[7px] uppercase tracking-[.08em] text-slate opacity-0 transition hover:border-cyan/45 hover:text-cyan group-hover:opacity-100 focus:opacity-100" aria-label={`Show ${result.title} here`}>
-                  show
+              {(result.canShow || result.source === "file") && (
+                <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => onShowAction(result)} className="shrink-0 rounded-lg border border-white/10 px-1.5 py-1 font-mono text-[7px] uppercase tracking-[.08em] text-slate opacity-0 transition hover:border-cyan/45 hover:text-cyan group-hover:opacity-100 focus:opacity-100" aria-label={`${result.canShow ? "Show" : "Manage"} ${result.title} here`}>
+                  {result.canShow ? "show" : "manage"}
                 </button>
               )}
               <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => onOpenAction(result)} className="shrink-0 rounded-lg px-1.5 py-1 font-mono text-[7px] uppercase tracking-[.08em] text-cyan/75 transition hover:bg-cyan/[.1] hover:text-cyan" aria-label={`Open ${result.title}`}>

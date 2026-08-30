@@ -90,6 +90,7 @@ test.describe("work map bubble fixture", () => {
       await page.setViewportSize({ width, height });
       await page.goto("/work-map?reduced=1", { waitUntil: "networkidle" });
       await expect(page.locator("html")).toHaveClass(/jarvis-reduce-motion/);
+      await expect(page.locator("[data-work-map-context] button[data-work-map-category]")).toHaveCount(3);
       await openWorkMapFromKeyboard(page);
 
       const layout = await page.locator("[data-work-map]").evaluate((surface) => {
@@ -120,8 +121,8 @@ test.describe("work map bubble fixture", () => {
         };
       });
 
-      expect(layout.categories).toHaveLength(3);
-      expect(new Set(layout.categories.map((category) => category.id)).size).toBe(3);
+      expect(layout.categories).toHaveLength(6);
+      expect(new Set(layout.categories.map((category) => category.id)).size).toBe(6);
       expect(layout.map.left + layout.map.width / 2).toBeCloseTo(width / 2, 1);
       expect(layout.map.top + layout.map.height / 2).toBeCloseTo(height / 2, 1);
       expect(layout.pulseAnimations).not.toHaveLength(0);

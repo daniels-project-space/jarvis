@@ -418,6 +418,21 @@ body {
 }
 .work-map-trigger-dot { background: rgba(34, 211, 238, .8); }
 .work-map-worker-dot { width: .34rem; height: .34rem; }
+.work-map-context-dot {
+  animation: work-map-orbit-breathe 4.8s ease-in-out infinite;
+  will-change: transform;
+}
+.work-map-context-dot:nth-of-type(2n) { animation-delay: -1.7s; }
+.work-map-context-dot:nth-of-type(3n) { animation-delay: -3.1s; }
+.work-map-surface { animation: work-map-materialize .28s cubic-bezier(.22,1,.36,1) both; }
+@keyframes work-map-orbit-breathe {
+  0%, 100% { margin-top: 0; filter: brightness(.86); }
+  50% { margin-top: -3px; filter: brightness(1.12); }
+}
+@keyframes work-map-materialize {
+  from { opacity: 0; transform: translate(-50%, -48%) scale(.96); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
 .work-map-pulse {
   background: rgb(52, 211, 153);
   box-shadow: 0 0 0 1px rgba(209, 250, 229, .56), 0 0 12px rgba(52, 211, 153, .82);
@@ -438,7 +453,7 @@ body {
   .scene-funnel, .scene-line, .scene-donut, .scene-gauge, .scene-candle,
   .scene-gallery, .scene-focus, .scene-live-dot, .scene-signal-glow,
   .work-live-pulse, .work-progress-update, .work-progress-glint::after,
-  .work-map-pulse {
+  .work-map-pulse, .work-map-context-dot, .work-map-surface {
     animation: none !important;
     opacity: 1;
     clip-path: none;
@@ -484,7 +499,9 @@ html.jarvis-reduce-motion .work-progress-arrow {
 }
 html.jarvis-reduce-motion .work-map-pulse,
 html.jarvis-reduce-motion .work-map-trigger,
-html.jarvis-reduce-motion .work-map-category {
+html.jarvis-reduce-motion .work-map-category,
+html.jarvis-reduce-motion .work-map-context-dot,
+html.jarvis-reduce-motion .work-map-surface {
   animation: none !important;
   transition-duration: .01ms !important;
 }
