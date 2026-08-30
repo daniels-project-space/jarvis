@@ -10,6 +10,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { metadata, task } from "@trigger.dev/sdk/v3";
 import { CODEX_DEVICE_AUTH_URI } from "../lib/codex-auth-control";
+import { callForegroundConvex } from "./foreground-convex-call";
 import { parseChatgptSubscriptionAuthText } from "./subscription-auth";
 import { productionSubscriptionSessionController } from "./subscription-session-r2";
 
@@ -127,7 +128,7 @@ export async function enrollCodexDeviceSession(
       authJson: string,
     ) => Promise<{ version: number; tokenExpiresAt: number }>;
   } = {},
-): Promise<{ status: "connected"; tokenExpiresAt: number }> {
+): Promise<{ status: "connected"; sessionVersion: number; tokenExpiresAt: number }> {
   const environment = options.environment ?? process.env;
   const configuredBin = options.bin ?? environment.CODEX_BIN?.trim();
   const bin = configuredBin || packagedCodexBinary();
@@ -226,12 +227,61 @@ export async function enrollCodexDeviceSession(
       : await (
           await productionSubscriptionSessionController(bin, environment)
         ).reseed(auth);
-    return { status: "connected", tokenExpiresAt: published.tokenExpiresAt };
+    return {
+      status: "connected",
+      sessionVersion: published.version,
+      tokenExpiresAt: published.tokenExpiresAt,
+    };
   } finally {
     // The enrolled refresh token is committed only into the encrypted session
     // store. The temporary Codex home is removed even after timeout/failure.
     rmSync(home, { recursive: true, force: true });
   }
+}
+
+type ConfirmRepairCall = typeof callForegroundConvex;
+
+/**
+ * Publish only the credential-free reseed receipt after the encrypted session
+ * controller has committed it. If this write cannot be confirmed, enrollment
+ * stays failed instead of showing a false connected state in Settings.
+ */
+export async function confirmControllerSessionRepair(
+  result: { sessionVersion: number; tokenExpiresAt: number },
+  options: {
+    environment?: Readonly<Record<string, string | undefined>>;
+    call?: ConfirmRepairCall;
+  } = {},
+) {
+  const environment = options.environment ?? process.env;
+  const convexUrl = environment.CONVEX_URL?.trim()
+    || environment.NEXT_PUBLIC_CONVEX_URL?.trim();
+  const workerToken = environment.JARVIS_WORKER_TOKEN?.trim();
+  if (!convexUrl || !workerToken) {
+    throw new Error("Controller-session repair confirmation is not configured");
+  }
+  const call = options.call ?? callForegroundConvex;
+  const confirmed = await call(
+    convexUrl,
+    workerToken,
+    "mutation",
+    "controllerSession:confirmRepair",
+    {
+      sessionVersion: result.sessionVersion,
+      tokenExpiresAt: result.tokenExpiresAt,
+    },
+  );
+  if (!confirmed || typeof confirmed !== "object" || Array.isArray(confirmed)) {
+    throw new Error("Controller-session repair confirmation was rejected");
+  }
+  const receipt = confirmed as Record<string, unknown>;
+  if (
+    receipt.sessionVersion !== result.sessionVersion
+    || receipt.tokenExpiresAt !== result.tokenExpiresAt
+    || !Number.isSafeInteger(receipt.generation)
+    || Number(receipt.generation) < 1
+  ) throw new Error("Controller-session repair confirmation did not match the reseed");
+  return { generation: Number(receipt.generation) };
 }
 
 export const codexAuthEnrollment = task({
@@ -249,6 +299,7 @@ export const codexAuthEnrollment = task({
           await metadata.flush();
         },
       });
+      await confirmControllerSessionRepair(result);
       metadata.set("authEnrollment", {
         status: "connected",
         tokenExpiresAt: result.tokenExpiresAt,

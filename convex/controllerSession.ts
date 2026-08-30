@@ -1,6 +1,6 @@
 import { v } from "convex/values";
-import { query } from "./_generated/server";
-import { requireViewer, viewerAuthArgs } from "./controlAuth";
+import { mutation, query } from "./_generated/server";
+import { requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import {
   codexSessionUnavailableCode,
   isCodexSessionUnavailableCode,
@@ -9,11 +9,19 @@ import {
 
 const REPAIR_HOLD_LIMIT = 8;
 const LEGACY_HOLD_LIMIT = 32;
+const REPAIR_KEY = "managed-codex-session";
 
 type RuntimeRow = Record<string, unknown>;
 
-function holdCode(row: RuntimeRow): CodexSessionUnavailableCode | null {
+function holdCode(
+  row: RuntimeRow,
+  currentRepairGeneration: number,
+): CodexSessionUnavailableCode | null {
   if (row.status !== "needs_input" || row.active === false) return null;
+  const holdGeneration = typeof row.controllerSessionRepairGeneration === "number"
+    ? row.controllerSessionRepairGeneration
+    : 0;
+  if (holdGeneration < currentRepairGeneration) return null;
   // New worker holds carry a machine-readable code. Keep the text fallback
   // while already-held production jobs age out; it recognizes the same finite
   // signal and never treats a task or checkpoint as a session status source.
@@ -25,15 +33,88 @@ function holdCode(row: RuntimeRow): CodexSessionUnavailableCode | null {
   return codexSessionUnavailableCode(row.progress);
 }
 
-export function controllerSessionStatusFromRows(rows: readonly RuntimeRow[]) {
+export function controllerSessionStatusFromRows(
+  rows: readonly RuntimeRow[],
+  currentRepairGeneration = 0,
+) {
   for (const row of rows) {
-    const code = holdCode(row);
+    const code = holdCode(row, currentRepairGeneration);
     if (code) return { state: "repair_required" as const, code };
   }
   // This is intentionally not a credential probe: "clear" means that no
   // unresolved durable work has reported a terminal controller-session hold.
   return { state: "clear" as const };
 }
+
+export async function currentControllerSessionRepairGeneration(ctx: { db: any }) {
+  const repair = await ctx.db
+    .query("controllerSessionRepairs")
+    .withIndex("by_key", (q: any) => q.eq("key", REPAIR_KEY))
+    .unique();
+  return typeof repair?.generation === "number" ? repair.generation : 0;
+}
+
+/**
+ * Called only after the trusted enrollment task has durably reseeded the
+ * encrypted controller session. It records no credential material. Exact
+ * retries are idempotent; older or contradictory versions fail closed.
+ */
+export const confirmRepair = mutation({
+  args: {
+    workerToken: v.string(),
+    sessionVersion: v.number(),
+    tokenExpiresAt: v.number(),
+  },
+  returns: v.any(),
+  handler: async (ctx, args) => {
+    requireWorker(args.workerToken);
+    const now = Date.now();
+    if (
+      !Number.isSafeInteger(args.sessionVersion)
+      || args.sessionVersion < 1
+      || !Number.isSafeInteger(args.tokenExpiresAt)
+      || args.tokenExpiresAt <= now + 60_000
+    ) throw new Error("Invalid controller-session repair receipt");
+    const existing = await ctx.db
+      .query("controllerSessionRepairs")
+      .withIndex("by_key", (q: any) => q.eq("key", REPAIR_KEY))
+      .unique();
+    if (existing) {
+      if (args.sessionVersion < existing.sessionVersion) return false;
+      if (args.sessionVersion === existing.sessionVersion) {
+        if (args.tokenExpiresAt !== existing.tokenExpiresAt) return false;
+        return {
+          generation: existing.generation,
+          sessionVersion: existing.sessionVersion,
+          tokenExpiresAt: existing.tokenExpiresAt,
+          repairedAt: existing.repairedAt,
+        };
+      }
+      const next = {
+        generation: existing.generation + 1,
+        sessionVersion: args.sessionVersion,
+        tokenExpiresAt: args.tokenExpiresAt,
+        repairedAt: now,
+      };
+      await ctx.db.patch(existing._id, next);
+      return next;
+    }
+    const first = {
+      key: REPAIR_KEY,
+      generation: 1,
+      sessionVersion: args.sessionVersion,
+      tokenExpiresAt: args.tokenExpiresAt,
+      repairedAt: now,
+    };
+    await ctx.db.insert("controllerSessionRepairs", first);
+    return {
+      generation: first.generation,
+      sessionVersion: first.sessionVersion,
+      tokenExpiresAt: first.tokenExpiresAt,
+      repairedAt: first.repairedAt,
+    };
+  },
+});
 
 /**
  * Owner-visible, bounded session safety state. It reads only durable job
@@ -45,7 +126,7 @@ export const status = query({
   returns: v.any(),
   handler: async (ctx, args) => {
     await requireViewer(ctx, args);
-    const [typedRows, legacyRows] = await Promise.all([
+    const [typedRows, legacyRows, repairGeneration] = await Promise.all([
       ctx.db.query("jobRuntime")
         .withIndex("by_controller_session_repair", (q) => q
           .eq("controllerSessionRepairRequired", true)
@@ -58,7 +139,11 @@ export const status = query({
           .eq("status", "needs_input"))
         .order("desc")
         .take(LEGACY_HOLD_LIMIT),
+      currentControllerSessionRepairGeneration(ctx),
     ]);
-    return controllerSessionStatusFromRows([...typedRows, ...legacyRows]);
+    return controllerSessionStatusFromRows(
+      [...typedRows, ...legacyRows],
+      repairGeneration,
+    );
   },
 });

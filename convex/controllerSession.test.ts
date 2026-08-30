@@ -1,5 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { convexTest } from "convex-test";
+import { api } from "./_generated/api";
+import schema from "./schema";
 import { controllerSessionStatusFromRows } from "./controllerSession";
+
+declare global {
+  interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
+}
+
+const modules = import.meta.glob("./**/*.ts");
+const WORKER = "controller-session-repair-test-worker";
+
+beforeEach(() => {
+  process.env.JARVIS_WORKER_TOKEN = WORKER;
+});
+
+afterEach(() => {
+  delete process.env.JARVIS_WORKER_TOKEN;
+});
 
 describe("controller session control-plane status", () => {
   it("surfaces only a real needs-input controller hold", () => {
@@ -44,5 +62,63 @@ describe("controller session control-plane status", () => {
         progress: "Jarvis needs repair. JARVIS_CODEX_SESSION_UNAVAILABLE[rotation_uncertain]: re-enrol the managed session",
       },
     ])).toEqual({ state: "repair_required", code: "rotation_uncertain" });
+  });
+
+  it("supersedes only older repair generations and preserves a new failure", () => {
+    const oldHold = {
+      status: "needs_input",
+      active: true,
+      controllerSessionRepairRequired: true,
+      controllerSessionHoldCode: "rotation_uncertain",
+    };
+    expect(controllerSessionStatusFromRows([oldHold], 1)).toEqual({ state: "clear" });
+    expect(controllerSessionStatusFromRows([{
+      ...oldHold,
+      controllerSessionRepairGeneration: 1,
+    }], 1)).toEqual({ state: "repair_required", code: "rotation_uncertain" });
+  });
+
+  it("records only monotonic, credential-free repair receipts", async () => {
+    const t = convexTest(schema, modules);
+    const tokenExpiresAt = Date.now() + 4 * 60 * 60_000;
+    const first = await t.mutation(api.controllerSession.confirmRepair, {
+      workerToken: WORKER,
+      sessionVersion: 7,
+      tokenExpiresAt,
+    });
+    expect(first).toMatchObject({ generation: 1, sessionVersion: 7, tokenExpiresAt });
+    await expect(t.mutation(api.controllerSession.confirmRepair, {
+      workerToken: WORKER,
+      sessionVersion: 7,
+      tokenExpiresAt,
+    })).resolves.toEqual(first);
+    await expect(t.mutation(api.controllerSession.confirmRepair, {
+      workerToken: WORKER,
+      sessionVersion: 6,
+      tokenExpiresAt,
+    })).resolves.toBe(false);
+    const second = await t.mutation(api.controllerSession.confirmRepair, {
+      workerToken: WORKER,
+      sessionVersion: 8,
+      tokenExpiresAt: tokenExpiresAt + 60_000,
+    });
+    expect(second).toMatchObject({ generation: 2, sessionVersion: 8 });
+    const rows = await t.run((ctx) => ctx.db.query("controllerSessionRepairs").collect());
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual(expect.objectContaining({
+      key: "managed-codex-session",
+      generation: 2,
+      sessionVersion: 8,
+      tokenExpiresAt: tokenExpiresAt + 60_000,
+    }));
+    expect(Object.keys(rows[0]).sort()).toEqual([
+      "_creationTime",
+      "_id",
+      "generation",
+      "key",
+      "repairedAt",
+      "sessionVersion",
+      "tokenExpiresAt",
+    ]);
   });
 });

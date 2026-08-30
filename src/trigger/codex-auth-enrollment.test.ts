@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   CODEX_DEVICE_AUTH_URI,
+  confirmControllerSessionRepair,
   packagedCodexBinary,
   parseCodexDevicePrompt,
 } from "./codex-auth-enrollment";
+import { vi } from "vitest";
 
 describe("Codex device enrollment", () => {
   it("resolves the pinned installed Codex package without relying on PATH", () => {
@@ -41,5 +43,48 @@ describe("Codex device enrollment", () => {
       parseCodexDevicePrompt(`${CODEX_DEVICE_AUTH_URI}\nnot-a-code`, 1_000),
     ).toBeNull();
     expect(parseCodexDevicePrompt("AB12-CDE34", 1_000)).toBeNull();
+  });
+
+  it("confirms the exact credential-free reseed receipt before reporting connected", async () => {
+    const call = vi.fn(async () => ({
+      generation: 3,
+      sessionVersion: 12,
+      tokenExpiresAt: 9_000_000,
+      repairedAt: 1,
+    }));
+    await expect(confirmControllerSessionRepair(
+      { sessionVersion: 12, tokenExpiresAt: 9_000_000 },
+      {
+        environment: {
+          CONVEX_URL: "https://convex.example",
+          JARVIS_WORKER_TOKEN: "worker-secret",
+        },
+        call,
+      },
+    )).resolves.toEqual({ generation: 3 });
+    expect(call).toHaveBeenCalledWith(
+      "https://convex.example",
+      "worker-secret",
+      "mutation",
+      "controllerSession:confirmRepair",
+      { sessionVersion: 12, tokenExpiresAt: 9_000_000 },
+    );
+  });
+
+  it("fails closed when the repair receipt does not match the committed session", async () => {
+    await expect(confirmControllerSessionRepair(
+      { sessionVersion: 12, tokenExpiresAt: 9_000_000 },
+      {
+        environment: {
+          CONVEX_URL: "https://convex.example",
+          JARVIS_WORKER_TOKEN: "worker-secret",
+        },
+        call: vi.fn(async () => ({
+          generation: 3,
+          sessionVersion: 11,
+          tokenExpiresAt: 9_000_000,
+        })),
+      },
+    )).rejects.toThrow("did not match");
   });
 });

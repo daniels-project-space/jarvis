@@ -1502,10 +1502,23 @@ describe("production Trigger worker authority harness", () => {
       retry: await ctx.db.query("workAttempts")
         .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 2)).first(),
     }));
-    expect(state.job).toMatchObject({ status: "needs_input", attempt: 1 });
+    expect(state.job).toMatchObject({
+      status: "needs_input",
+      attempt: 1,
+      controllerSessionRepairGeneration: 0,
+    });
     expect(state.attempt).toMatchObject({ status: "needs_input" });
     expect(state.retry).toBeNull();
     expect(state.attention?.detail).toContain("rotation_uncertain");
+    await expect(t.query(api.controllerSession.status, { workerToken: WORKER }))
+      .resolves.toMatchObject({ state: "repair_required", code: "rotation_uncertain" });
+    await t.mutation(api.controllerSession.confirmRepair, {
+      workerToken: WORKER,
+      sessionVersion: 2,
+      tokenExpiresAt: Date.now() + 4 * 60 * 60_000,
+    });
+    await expect(t.query(api.controllerSession.status, { workerToken: WORKER }))
+      .resolves.toEqual({ state: "clear" });
   });
 
   it("bounds a hung active workspace cleanup after a controller-session hold", async () => {

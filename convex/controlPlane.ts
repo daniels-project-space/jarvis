@@ -124,6 +124,9 @@ export function projectJobRuntime(job: any) {
     cloudWorkspaceBlockCode: typeof job.cloudWorkspaceBlockCode === "string" ? job.cloudWorkspaceBlockCode.slice(0, 80) : undefined,
     controllerSessionHoldCode: typeof job.controllerSessionHoldCode === "string" ? job.controllerSessionHoldCode.slice(0, 80) : undefined,
     controllerSessionRepairRequired: job.controllerSessionRepairRequired === true ? true : undefined,
+    controllerSessionRepairGeneration: typeof job.controllerSessionRepairGeneration === "number"
+      ? job.controllerSessionRepairGeneration
+      : undefined,
     readonly: typeof job.readonly === "boolean" ? job.readonly : undefined,
     parentJobId: typeof job.parentJobId === "string" ? job.parentJobId.slice(0, 120) : undefined,
     dependsOn: Array.isArray(job.dependsOn) ? job.dependsOn.slice(0, 16).map((id: unknown) => String(id).slice(0, 120)) : undefined,

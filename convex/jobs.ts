@@ -50,6 +50,7 @@ import {
   upsertJobRuntime,
   upsertMissionRuntime,
 } from "./controlPlane";
+import { currentControllerSessionRepairGeneration } from "./controllerSession";
 import {
   BACKGROUND_CONCURRENCY_LIMIT,
   DISPATCH_CANDIDATE_WINDOW_MAX,
@@ -5280,6 +5281,9 @@ export const requestInput = mutation({
     if (a.controllerSessionHoldCode !== undefined && !isCodexSessionUnavailableCode(a.controllerSessionHoldCode)) {
       throw new Error("Invalid controller-session hold code");
     }
+    const controllerSessionRepairGeneration = a.controllerSessionHoldCode !== undefined
+      ? await currentControllerSessionRepairGeneration(ctx)
+      : undefined;
     const attempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
     if (!attempt || attempt.status !== "running") return false;
     if (isSupervisorOwnedJob(row)) {
@@ -5305,6 +5309,7 @@ export const requestInput = mutation({
       checkpoint: a.checkpoint?.slice(0, 6000) ?? row.checkpoint,
       controllerSessionHoldCode: a.controllerSessionHoldCode,
       controllerSessionRepairRequired: a.controllerSessionHoldCode !== undefined ? true : undefined,
+      controllerSessionRepairGeneration,
       heartbeatAt: now,
     });
     if (

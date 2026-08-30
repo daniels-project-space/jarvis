@@ -200,6 +200,19 @@ export default defineSchema({
     .index("by_key", ["key"])
     .index("by_expiry", ["expiresAt"]),
 
+  // Monotonic, credential-free evidence that the trusted enrollment worker
+  // committed a newer controller-managed ChatGPT session. Job holds bind to
+  // the current generation, so a successful repair supersedes older holds
+  // without deleting their durable audit history. A later failure binds to
+  // the new generation and immediately blocks autonomous work again.
+  controllerSessionRepairs: defineTable({
+    key: v.string(),
+    generation: v.number(),
+    sessionVersion: v.number(),
+    tokenExpiresAt: v.number(),
+    repairedAt: v.number(),
+  }).index("by_key", ["key"]),
+
   // Performance counters only: no transcript, source URLs, device fingerprint,
   // or wall-clock activity history is retained with a voice turn.
   voiceTurnMetrics: defineTable({
@@ -840,6 +853,7 @@ export default defineSchema({
     // known-safe, finite error code; session credentials never enter Convex.
     controllerSessionHoldCode: v.optional(v.string()),
     controllerSessionRepairRequired: v.optional(v.boolean()),
+    controllerSessionRepairGeneration: v.optional(v.number()),
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
@@ -1009,6 +1023,7 @@ export default defineSchema({
     cloudWorkspaceBlockCode: v.optional(v.string()),
     controllerSessionHoldCode: v.optional(v.string()),
     controllerSessionRepairRequired: v.optional(v.boolean()),
+    controllerSessionRepairGeneration: v.optional(v.number()),
     readonly: v.optional(v.boolean()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),
