@@ -494,6 +494,90 @@ describe("real Convex multi-agent workspace and integration races", () => {
     })).resolves.toMatchObject({ advanced: true, status: "done" });
   });
 
+  it("retires controller authority before a rejected validator contract gets a fresh specialist attempt", async () => {
+    const f = await goalAwaitingPlan(1);
+    const fence = {
+      advanceLeaseOwner: "validator-rejection-owner",
+      advanceLeaseToken: "validator-rejection-token",
+      advanceLeaseVersion: 4,
+    };
+    const { mission, validator } = await f.t.run(async (ctx) => {
+      const mission: any = await ctx.db.get(f.missionId);
+      const validator: any = await ctx.db.get(mission.planningJobId as any);
+      if (!validator) throw new Error("goal fixture lost its planner job");
+      const staleController = {
+        status: "done",
+        goalStage: "validating",
+        attempt: 1,
+        dispatchGeneration: 7,
+        dispatchPhase: "integration",
+        workerRunId: "stale-validator-controller",
+        workerRuntime: "trigger",
+        providerRunState: "terminated",
+        providerObservedAt: Date.now(),
+        providerEffectLeaseUntil: Date.now() + 60_000,
+        deliveryLeaseVersion: 9,
+        deliveryLeaseOwner: "stale-delivery-owner",
+        deliveryLeaseToken: "stale-delivery-token",
+        deliveryLeaseUntil: Date.now() + 60_000,
+        deliveryRunId: "stale-validator-controller",
+        deliveryGeneration: 3,
+        integrationState: "not_applicable",
+        reviewReceiptJson: "stale-review",
+        reviewReceiptSignature: "stale-signature",
+        reviewReceiptDigest: "stale-digest",
+        verificationVerdict: "pass",
+        verificationNote: "stale pass",
+        verifiedAt: Date.now(),
+        deliveryStatus: "branch",
+        pullRequestUrl: "https://example.invalid/stale",
+        mergeCommitSha: "f".repeat(40),
+        mergedAt: Date.now(),
+        completedAt: Date.now(),
+      };
+      await patchJobWithRuntime(ctx, validator, staleController);
+      await ctx.db.patch(f.missionId, {
+        status: "running",
+        phase: "validating",
+        validatorJobId: String(validator._id),
+        advanceAttempt: 2,
+        ...fence,
+        advanceLeaseUntil: Date.now() + 10 * 60_000,
+      });
+      return { mission: await ctx.db.get(f.missionId), validator: await ctx.db.get(validator._id) };
+    });
+    expect(mission).not.toBeNull();
+    expect(validator).toMatchObject({ status: "done", dispatchPhase: "integration", verificationVerdict: "pass" });
+    const validatorJobId = validator!._id as any;
+
+    expect(await f.t.mutation(api.goalMode.rejectAdvance, {
+      id: f.missionId,
+      jobId: validatorJobId,
+      expectedAdvanceAttempt: 2,
+      ...fence,
+      error: "Goal completion requires the accepted measurable outcome and every stop condition to be evidenced",
+      workerToken: TOKEN,
+    })).toEqual({ requeued: true, stale: false });
+
+    const corrected: any = await f.t.run(async (ctx) => ctx.db.get(validatorJobId));
+    expect(corrected).toMatchObject({
+      status: "pending",
+      stage: "checkpointed",
+      attempt: 2,
+      deliveryLeaseVersion: 10,
+    });
+    for (const field of [
+      "dispatchGeneration", "dispatchPhase", "workerRunId", "workerRuntime",
+      "providerRunState", "providerObservedAt", "providerEffectLeaseUntil",
+      "deliveryLeaseOwner", "deliveryLeaseToken", "deliveryLeaseUntil", "deliveryRunId",
+      "deliveryGeneration", "integrationState", "reviewReceiptJson", "reviewReceiptSignature",
+      "reviewReceiptDigest", "verificationVerdict", "verificationNote", "verifiedAt",
+      "deliveryStatus", "pullRequestUrl", "mergeCommitSha", "mergedAt", "result",
+    ]) {
+      expect(corrected[field], field).toBeUndefined();
+    }
+  });
+
   it("projects all 320 action-scope decisions identically into Goal Mode producers", async () => {
     expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
     for (const [index, task] of GENERATED_GATED_ACTION_MATRIX.entries()) {

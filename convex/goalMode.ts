@@ -64,6 +64,48 @@ type AdvanceLeaseFence = {
   advanceLeaseVersion?: number;
 };
 
+// A rejected planner/validator contract requires a new specialist generation,
+// never a continuation of the immutable controller receipt that delivered the
+// rejected result. Keep source/checkpoint lineage, but retire every dispatch,
+// provider, review, delivery, and integration authority projected on the job.
+function freshGoalSpecialistAttemptPatch(job: any) {
+  return {
+    dispatchId: undefined,
+    dispatchGeneration: undefined,
+    dispatchPhase: undefined,
+    dispatchReceiptId: undefined,
+    dispatchReceiptDigest: undefined,
+    dispatchPayloadDigest: undefined,
+    dispatchLeaseUntil: undefined,
+    dispatchReason: undefined,
+    workerRunId: undefined,
+    workerRuntime: undefined,
+    providerRunState: undefined,
+    providerObservedAt: undefined,
+    providerEffectLeaseUntil: undefined,
+    deliveryLeaseVersion: Math.max(0, Number(job.deliveryLeaseVersion ?? 0)) + 1,
+    deliveryLeaseOwner: undefined,
+    deliveryLeaseToken: undefined,
+    deliveryLeaseUntil: undefined,
+    deliveryRunId: undefined,
+    activeDeliveryAttemptId: undefined,
+    deliveryGeneration: undefined,
+    integrationAttemptId: undefined,
+    integrationState: undefined,
+    reviewReceiptJson: undefined,
+    reviewReceiptSignature: undefined,
+    reviewReceiptId: undefined,
+    reviewReceiptDigest: undefined,
+    verificationVerdict: undefined,
+    verificationNote: undefined,
+    verifiedAt: undefined,
+    deliveryStatus: undefined,
+    pullRequestUrl: undefined,
+    mergeCommitSha: undefined,
+    mergedAt: undefined,
+  };
+}
+
 /**
  * Goal planning is substantial architecture work, so Terra/ultra is the
  * normal quality default. The shared router may use Sol/max only for an
@@ -1564,6 +1606,7 @@ export const rejectAdvance = mutation({
       return { requeued: false, stale: false };
     }
     await patchJobWithRuntime(ctx, job, {
+      ...freshGoalSpecialistAttemptPatch(job),
       status: "pending",
       stage: "checkpointed",
       progress: `Structured contract rejected; correction attempt ${nextAttempt} queued`,
@@ -1572,9 +1615,7 @@ export const rejectAdvance = mutation({
       nextRunAt: now + 5_000,
       completedAt: undefined,
       startedAt: undefined,
-      verificationVerdict: undefined,
-      verificationNote: undefined,
-      verifiedAt: undefined,
+      result: undefined,
     });
     await ensureWorkAttempt(ctx, job, nextAttempt, "pending", now, { parentAttempt: Number(job.attempt ?? 1) });
     await patchMissionWithRuntime(ctx, mission, { advanceLeaseUntil: undefined, updatedAt: now });
@@ -2368,6 +2409,7 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false, exte
     }
   }
   await patchJobWithRuntime(ctx, job, {
+    ...freshGoalSpecialistAttemptPatch(job),
     status: awaitingApproval ? "awaiting_approval" : "pending",
     stage: awaitingApproval ? "approval" : "queued",
     progress: awaitingApproval ? "Goal Mode retry waiting for approval" : "Goal Mode recovery queued",
@@ -2386,9 +2428,6 @@ async function resetGoalJob(ctx: any, job: any, now: number, force = false, exte
     startedAt: undefined,
     heartbeatAt: now,
     nextRunAt: awaitingApproval ? undefined : now,
-    verificationVerdict: undefined,
-    verificationNote: undefined,
-    verifiedAt: undefined,
   });
   await ensureWorkAttempt(ctx, job, nextAttempt, awaitingApproval ? "awaiting_approval" : "pending", now, {
     parentAttempt: Number(job.attempt ?? 1),
