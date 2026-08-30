@@ -4,11 +4,14 @@ import { NextRequest } from "next/server";
 const mock = vi.hoisted(() => ({
   controlActor: vi.fn(),
   isSameOriginRequest: vi.fn(),
+  queueRetrieve: vi.fn(),
+  queueResume: vi.fn(),
   retrieve: vi.fn(),
   trigger: vi.fn(),
 }));
 
 vi.mock("@trigger.dev/sdk/v3", () => ({
+  queues: { retrieve: mock.queueRetrieve, resume: mock.queueResume },
   runs: { retrieve: mock.retrieve },
   tasks: { trigger: mock.trigger },
 }));
@@ -18,7 +21,10 @@ vi.mock("@/lib/request-auth", () => ({
   isOwnerActor: (actor: { kind?: string }) => actor.kind === "owner",
 }));
 
-import { BACKGROUND_READINESS_CONFIRMATION } from "@/lib/background-readiness-contract";
+import {
+  BACKGROUND_READINESS_CONFIRMATION,
+  BACKGROUND_WORKERS_RESUME_CONFIRMATION,
+} from "@/lib/background-readiness-contract";
 import { GET, POST } from "./route";
 
 const owner = { kind: "owner", authTokenHash: "session-only-owner-hash" };
@@ -52,6 +58,8 @@ describe("background readiness control API", () => {
     vi.clearAllMocks();
     mock.isSameOriginRequest.mockReturnValue(true);
     mock.controlActor.mockResolvedValue(owner);
+    mock.queueRetrieve.mockResolvedValue({ paused: false, queued: 0 });
+    mock.queueResume.mockResolvedValue({ paused: false, queued: 0 });
   });
 
   it("requires same-origin owner authentication and an exact explicit confirmation before triggering", async () => {
@@ -76,7 +84,7 @@ describe("background readiness control API", () => {
     mock.controlActor.mockResolvedValueOnce({ kind: "owner", authTokenHash: "different-owner-session" });
 
     const res = await GET(request("GET", { cookie }));
-    expect(await res.json()).toEqual({ ok: true, status: "idle" });
+    expect(await res.json()).toEqual({ ok: true, status: "idle", workers: "ready", queued: 0 });
     expect(mock.retrieve).not.toHaveBeenCalled();
   });
 
@@ -109,7 +117,7 @@ describe("background readiness control API", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("private, no-store");
     const body = await res.json();
-    expect(body).toEqual({ ok: true, status: "attention" });
+    expect(body).toEqual({ ok: true, status: "attention", workers: "ready", queued: 0 });
     expect(JSON.stringify(body)).not.toContain("sensitive_controller_diagnostic");
     expect(JSON.stringify(body)).not.toContain("run_private_identifier");
   });
@@ -123,5 +131,61 @@ describe("background readiness control API", () => {
     const body = await res.json();
     expect(body).toEqual({ ok: false, status: "unavailable" });
     expect(JSON.stringify(body)).not.toContain("TRIGGER_SECRET_KEY");
+  });
+
+  it("repairs only the no-work readiness queue before starting verification", async () => {
+    let readinessPaused = true;
+    mock.queueRetrieve.mockImplementation(async (target: { name: string }) => ({
+      paused: target.name === "jarvis-background-readiness" && readinessPaused,
+      queued: 0,
+    }));
+    mock.queueResume.mockImplementation(async (target: { name: string }) => {
+      if (target.name === "jarvis-background-readiness") readinessPaused = false;
+      return { paused: false, queued: 0 };
+    });
+
+    await startTicket();
+
+    expect(mock.queueResume).toHaveBeenCalledTimes(1);
+    expect(mock.queueResume).toHaveBeenCalledWith({ type: "task", name: "jarvis-background-readiness" });
+    expect(mock.queueResume.mock.invocationCallOrder[0]).toBeLessThan(mock.trigger.mock.invocationCallOrder[0]);
+  });
+
+  it("resumes exact autonomous queues only after a ready owner-bound proof", async () => {
+    const { cookie } = await startTicket();
+    mock.retrieve.mockResolvedValueOnce({
+      status: "COMPLETED",
+      output: { ready: true, controllerSession: "clear" },
+    });
+    const paused = new Set(["jarvis-background-agents", "jarvis-chat-dispatcher"]);
+    mock.queueRetrieve.mockImplementation(async (target: { name: string }) => ({
+      paused: paused.has(target.name),
+      queued: target.name === "jarvis-chat-dispatcher" ? 12 : 0,
+    }));
+    mock.queueResume.mockImplementation(async (target: { name: string }) => {
+      paused.delete(target.name);
+      return { paused: false, queued: target.name === "jarvis-chat-dispatcher" ? 12 : 0 };
+    });
+
+    const res = await POST(request("POST", {
+      cookie,
+      body: { action: "resume", confirm: BACKGROUND_WORKERS_RESUME_CONFIRMATION },
+    }));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, status: "ready", workers: "backlogged", queued: 12 });
+    expect(mock.queueResume.mock.calls).toEqual([
+      [{ type: "task", name: "jarvis-chat-dispatcher" }],
+      [{ type: "custom", name: "jarvis-background-agents" }],
+    ]);
+  });
+
+  it("refuses to resume workers without a current successful readiness proof", async () => {
+    const res = await POST(request("POST", {
+      body: { action: "resume", confirm: BACKGROUND_WORKERS_RESUME_CONFIRMATION },
+    }));
+
+    expect(res.status).toBe(409);
+    expect(mock.queueResume).not.toHaveBeenCalled();
   });
 });
