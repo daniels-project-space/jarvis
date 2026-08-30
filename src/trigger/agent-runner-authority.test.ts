@@ -1242,6 +1242,23 @@ describe("production Trigger worker authority harness", () => {
     expect(specialistDependencies.runCloudWorkspaceAgent).toHaveBeenCalledWith(
       expect.objectContaining({ reasoningEffort: "max" }),
     );
+    const codexReceiptIndex = specialistBridge.trace.findIndex(
+      (call) => call.path === "jobs:prepareCloudCodexTurn",
+    );
+    const codexLeaseBeginIndex = specialistBridge.trace.findIndex(
+      (call) => call.path === "jobs:beginProviderEffectLease",
+    );
+    const codexRequestIndex = specialistBridge.trace.findIndex(
+      (call) => call.path === "jobs:recordCloudCodexTurnPhase"
+        && call.args.phase === "request_intent",
+    );
+    const codexLeaseEndIndex = specialistBridge.trace.findIndex(
+      (call) => call.path === "jobs:endProviderEffectLease",
+    );
+    expect(codexReceiptIndex).toBeGreaterThanOrEqual(0);
+    expect(codexLeaseBeginIndex).toBeGreaterThan(codexReceiptIndex);
+    expect(codexRequestIndex).toBeGreaterThan(codexLeaseBeginIndex);
+    expect(codexLeaseEndIndex).toBeGreaterThan(codexRequestIndex);
     expect(specialistDependencies.prepareCloudWorkspaceExecution).toHaveBeenCalledWith(
       expect.objectContaining({ template: "node22", onHeartbeat: expect.any(Function) }),
     );
@@ -1270,6 +1287,7 @@ describe("production Trigger worker authority harness", () => {
       reviewReceiptId: sealed.reviews[0]?._id,
       reviewReceiptDigest: sealed.reviews[0]?.receiptDigest,
     });
+    expect(sealed.job).not.toHaveProperty("providerEffectLeaseUntil");
     expect(sealed.attempt).toMatchObject({
       workerRunId: "specialist-authority-run",
       checkpointDigest: CHECKPOINT_SHA,

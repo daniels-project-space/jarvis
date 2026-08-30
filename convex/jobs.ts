@@ -85,11 +85,12 @@ import {
 } from "../src/lib/supervisor-fleet-manifest";
 
 const STALE_RUNNER_MS = 5 * 60 * 1000;
-// Provider workspace operations have a hard 15-minute controller deadline.
-// Mint a little server-owned margin for cleanup/response delivery so the
+// Provider workspace operations have a hard 15-minute controller deadline,
+// while the longest admitted background Codex segment is 25 minutes. Mint a
+// little server-owned margin beyond that longest provider effect so the
 // five-minute stale heartbeat reaper cannot consume an exact live attempt
 // while a provider SDK call prevents the Trigger event loop from pulsing.
-const PROVIDER_EFFECT_LEASE_MS = 18 * 60 * 1000;
+const PROVIDER_EFFECT_LEASE_MS = 28 * 60 * 1000;
 // A configuration hold can resolve automatically after a verified provider
 // deploy, but old intent must not be resurrected indefinitely.  Before this
 // horizon it remains a silent, resumable system hold; afterwards it receives

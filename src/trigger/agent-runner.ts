@@ -2746,25 +2746,58 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt authority rejected at Codex process boundary", "rejected");
           }
           dependencies.onAuthorityBoundary("codex_process", processAuthority);
-          return await runCloudWorkspaceAgent({
-            bin,
-            controllerScratch,
-            controllerEnv: boundary.agentEnv,
-            provider: cloudProvider!,
-            workspace: providerWorkspace!,
-            prompt,
-            model,
-            toolScope: job.toolScope,
-            reasoningEffort,
-            onProgress: reportProgress,
-            executionState: async () => {
-              if (workerDeadlineReached()) return "stalled";
-              const state = await executionStatus();
-              return state === "superseded" ? "cancelled" : state;
-            },
-            timeoutMs: segmentTimeoutMs(model),
-            turnReceipt: boundary.turnReceipt,
-          });
+          let codexEffectLeaseActive = false;
+          try {
+            // A provider command can monopolize the Trigger event loop, so the
+            // one-minute JS heartbeat is only an accelerator. Fence the actual
+            // Codex turn durably as well as workspace preparation; otherwise
+            // the five-minute reaper can start attempt N+1 while attempt N is
+            // still writing through the provider. Delivery jobs have their
+            // own exact delivery lease and are intentionally excluded here.
+            if (!deliveryFence) {
+              const lease = await providerEffectLeaseMutation("jobs:beginProviderEffectLease").catch(() => null);
+              if (!lease || typeof lease !== "object" || !Number.isFinite(Number((lease as { leaseUntil?: unknown }).leaseUntil))) {
+                throw new CloudWorkspaceError(
+                  cloudProvider.name,
+                  "stale_attempt",
+                  "attempt fence rejected the Codex provider effect",
+                  "deferred",
+                );
+              }
+              codexEffectLeaseActive = true;
+            }
+            return await runCloudWorkspaceAgent({
+              bin,
+              controllerScratch,
+              controllerEnv: boundary.agentEnv,
+              provider: cloudProvider!,
+              workspace: providerWorkspace!,
+              prompt,
+              model,
+              toolScope: job.toolScope,
+              reasoningEffort,
+              onProgress: reportProgress,
+              executionState: async () => {
+                if (workerDeadlineReached()) return "stalled";
+                const state = await executionStatus();
+                return state === "superseded" ? "cancelled" : state;
+              },
+              timeoutMs: segmentTimeoutMs(model),
+              turnReceipt: boundary.turnReceipt,
+            });
+          } finally {
+            if (codexEffectLeaseActive) {
+              const cleared = await providerEffectLeaseMutation("jobs:endProviderEffectLease").catch(() => false);
+              if (cleared !== true) {
+                throw new CloudWorkspaceError(
+                  cloudProvider.name,
+                  "stale_attempt",
+                  "Codex provider effect completed without a confirmed durable lease release",
+                  "deferred",
+                );
+              }
+            }
+          }
         };
         const holdUnsafeTurn = async (error: unknown): Promise<boolean> => {
           if (!(error instanceof CloudCodexReplayUnsafeError)) return false;

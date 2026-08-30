@@ -527,7 +527,7 @@ describe("real Convex specialist/controller race matrix", () => {
       workerRunId: "specialist-run",
       workerToken: WORKER,
     });
-    expect(lease).toEqual({ leaseUntil: Date.now() + 18 * 60_000 });
+    expect(lease).toEqual({ leaseUntil: Date.now() + 28 * 60_000 });
     expect(await f.t.run(async (ctx) => {
       const job = await ctx.db.query("jobs")
         .filter((q) => q.eq(q.field("_id"), f.jobId))

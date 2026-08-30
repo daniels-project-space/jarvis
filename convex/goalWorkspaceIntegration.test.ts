@@ -326,7 +326,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       expectedAttempt: 1,
       workerRunId: "goal-architecture-provider-lease-run-0",
       workerToken: TOKEN,
-    })).toEqual({ leaseUntil: Date.now() + 18 * 60_000 });
+    })).toEqual({ leaseUntil: Date.now() + 28 * 60_000 });
     expect(await f.t.mutation(api.jobs.endProviderEffectLease, {
       jobId: planner.reservation.jobId,
       expectedAttempt: 1,
