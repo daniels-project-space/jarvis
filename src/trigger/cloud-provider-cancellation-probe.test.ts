@@ -35,6 +35,12 @@ describe("independently observed provider cancellation", () => {
     expect(() => issueAfterExactRemoteCancellation(evidence, issue)).toThrow(/not independently observed/);
     expect(issue).not.toHaveBeenCalled();
     expect(remote.exec).toHaveBeenCalledTimes(3);
+    const cleanup = remote.exec.mock.calls[2]?.[0];
+    expect(cleanup.command).toContain("process.kill(-pid");
+    expect(cleanup.command).not.toContain("readdirSync");
+    const observer = remote.exec.mock.calls[1]?.[0];
+    expect(observer.command).toContain("processGroupAlive");
+    expect(observer.command).not.toContain("cmdline");
   });
 
   it.each([

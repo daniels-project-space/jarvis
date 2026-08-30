@@ -104,5 +104,7 @@ describe("rootless Podman self-host runner", () => {
     expect(kill?.args.some((value) => value.endsWith(".lease"))).toBe(true);
     expect(kill?.args.some((value) => value.endsWith(".started"))).toBe(true);
     expect(kill?.args.some((value) => value.endsWith(".pid"))).toBe(true);
+    expect(kill?.args.some((value) => value.includes('/bin/kill -KILL -- "-$pid"'))).toBe(true);
+    expect(kill?.args.some((value) => value.includes('/bin/kill -0 -- "-$pid"'))).toBe(true);
   });
 });

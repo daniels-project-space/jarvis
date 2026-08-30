@@ -126,9 +126,21 @@ while [ "$i" -lt 40 ]; do
   if [ -f "$3" ]; then
     pid=$(cat "$3")
     case "$pid" in (*[!0-9]*|'') exit 43;; esac
-    kill -KILL -- "-$pid" 2>/dev/null || true
-    rm -f "$2" "$3"
-    exit 0
+    # dash's kill builtin does not consistently accept the double-dash,
+    # negative-process-group form.
+    # Use procps' external implementation and do not report cancellation until
+    # the independently created session/process group is actually gone.
+    /bin/kill -KILL -- "-$pid" 2>/dev/null || true
+    j=0
+    while [ "$j" -lt 100 ]; do
+      if ! /bin/kill -0 -- "-$pid" 2>/dev/null; then
+        rm -f "$2" "$3"
+        exit 0
+      fi
+      j=$((j+1))
+      sleep 0.02
+    done
+    exit 45
   fi
   [ -f "$2" ] || exit 0
   i=$((i+1))

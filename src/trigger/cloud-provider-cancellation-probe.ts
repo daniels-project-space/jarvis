@@ -95,18 +95,19 @@ export async function probeExactRemoteCancellation(
   ].join("");
   const observer = [
     "const fs=require('node:fs');",
-    "const [pidPath,markerPath,token]=process.argv.slice(1);",
+    "const [pidPath,markerPath]=process.argv.slice(1);",
     "let pid=0;try{pid=Number(fs.readFileSync(pidPath,'utf8').trim());}catch{}",
     "let pidAlive=false;try{process.kill(pid,0);pidAlive=pid>0;}catch{}",
-    "let tokenAlive=false;for(const entry of fs.readdirSync('/proc')){if(!/^\\d+$/.test(entry)||Number(entry)===process.pid)continue;try{if(fs.readFileSync(`/proc/${entry}/cmdline`,'utf8').includes(token)){tokenAlive=true;break;}}catch{}}",
-    "const observed={pidGone:!pidAlive,processGone:!tokenAlive,markerAbsent:!fs.existsSync(markerPath)};",
+    "let processGroupAlive=false;for(const entry of fs.readdirSync('/proc')){if(!/^\\d+$/.test(entry))continue;try{const stat=fs.readFileSync(`/proc/${entry}/stat`,'utf8');const end=stat.lastIndexOf(')');const fields=stat.slice(end+1).trim().split(/\\s+/);if(Number(fields[2])===pid){processGroupAlive=true;break;}}catch{}}",
+    "const observed={pidGone:!pidAlive,processGone:!processGroupAlive,markerAbsent:!fs.existsSync(markerPath)};",
     "process.stdout.write(JSON.stringify(observed));",
     "if(!observed.pidGone||!observed.processGone||!observed.markerAbsent)process.exitCode=23;",
   ].join("");
   const cleanup = [
     "const fs=require('node:fs');",
-    "const [directory,token]=process.argv.slice(1);",
-    "for(const entry of fs.readdirSync('/proc')){if(!/^\\d+$/.test(entry)||Number(entry)===process.pid)continue;try{if(fs.readFileSync(`/proc/${entry}/cmdline`,'utf8').includes(token))process.kill(Number(entry),'SIGKILL');}catch{}}",
+    "const [directory]=process.argv.slice(1);",
+    "let pid=0;try{pid=Number(fs.readFileSync(`${directory}/process.pid`,'utf8').trim());}catch{}",
+    "if(pid>0){try{process.kill(-pid,'SIGKILL');}catch{try{process.kill(pid,'SIGKILL');}catch{}}}",
     "fs.rmSync(directory,{recursive:true,force:true});",
     "try{fs.rmdirSync('.jarvis-provider-probe');}catch{}",
   ].join("");
@@ -147,7 +148,9 @@ export async function probeExactRemoteCancellation(
     }
     await wait(markerDelayMs + observationMarginMs);
     const result = await within(remote.exec({
-      command: nodeCommand(observer, [pidPath, markerPath, processToken]),
+      // Observe the exact setsid-created process group. Searching command-line
+      // text for the token also matches this observer's own shell transport.
+      command: nodeCommand(observer, [pidPath, markerPath]),
       timeoutMs: 5_000,
       maxOutputBytes: 4_000,
     }), 7_000, "independent remote cancellation observation");
@@ -160,7 +163,10 @@ export async function probeExactRemoteCancellation(
   } finally {
     abort.abort();
     const cleanupResult = await within(remote.exec({
-      command: nodeCommand(cleanup, [directory, processToken]),
+      // Clean the exact process group recorded by the probe. Searching for the
+      // token would also match this cleanup command's own shell ancestors and
+      // can kill the cleanup transport instead of the orphan.
+      command: nodeCommand(cleanup, [directory]),
       timeoutMs: 5_000,
       maxOutputBytes: 4_000,
     }), 7_000, "remote cancellation probe cleanup");
