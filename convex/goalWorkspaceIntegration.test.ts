@@ -706,6 +706,67 @@ describe("real Convex multi-agent workspace and integration races", () => {
     }
   });
 
+  it("keeps every refinement read-only when the accepted mission has no write authority", async () => {
+    const refining = await goalAwaitingPlan();
+    const plan = {
+      summary: "Read-only lifecycle evidence mission",
+      route: "existing_project",
+      primaryRepo: REPO,
+      assumptions: [],
+      workstreams: [{
+        id: "lifecycle-evidence",
+        label: "Lifecycle evidence",
+        task: "Inspect the worker lifecycle and run only read-only validation checks.",
+        agentId: "atlas",
+        repo: REPO,
+        readonly: true,
+        dependsOn: [],
+        acceptanceCriteria: ["Lifecycle evidence is recorded without repository mutation"],
+        mcp: [],
+      }],
+      validation: { criteria: ["Evidence is complete"], tests: [], liveChecks: [] },
+    };
+    expect(await recordPlanFixture(refining.t, {
+      id: refining.missionId,
+      expectedAdvanceAttempt: 1,
+      plan,
+      workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, jobs: 1 });
+    await refining.t.run(async (ctx) => {
+      await ctx.db.patch(refining.missionId, { phase: "validating", advanceAttempt: 1 });
+    });
+    expect(await refining.t.mutation(api.goalMode.recordValidation, {
+      id: refining.missionId,
+      expectedAdvanceAttempt: 1,
+      validation: {
+        verdict: "refine",
+        summary: "One more evidence-only check is required",
+        evidence: [],
+        gaps: ["Exact race assertion output is missing"],
+        refinements: [{
+          id: "run-race-checks",
+          label: "Run race checks",
+          task: "Run the selected existing race tests and report their assertion-level output without changing source.",
+          // Even a malformed validator cannot broaden the accepted mission.
+          readonly: false,
+          acceptanceCriteria: ["Selected existing tests pass without source mutation"],
+        }],
+      },
+      workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, status: "refining", jobs: 1 });
+    const [job] = await refining.t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(refining.missionId)))
+      .collect()).filter((row) => row.goalStage === "refining"));
+    expect(job).toMatchObject({
+      readonly: true,
+      risk: "low",
+      deliveryMode: "read_only",
+      approvalRequired: false,
+      model: "terra",
+      reasoningEffort: "xhigh",
+    });
+  });
+
   it("defines one terminal-release truth table for every outcome path", () => {
     const effect = (observation?: "applied" | "not_applied" | "unknown", providerHeadSha?: string) => ({
       effectId: "final", effectKind: "update_ref", expectedBaseSha: BASE,

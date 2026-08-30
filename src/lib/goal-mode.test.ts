@@ -244,9 +244,9 @@ describe("Goal Mode contracts", () => {
       summary: "One live gap remains",
       evidence: ["build passed"],
       gaps: ["mobile flow fails"],
-      refinements: [{ label: "Mobile repair", task: "Repair the broken mobile flow and verify it with a real browser run." }],
+      refinements: [{ label: "Mobile repair", task: "Repair the broken mobile flow and verify it with a real browser run.", readonly: true }],
     })}`);
-    expect(value.refinements).toHaveLength(1);
+    expect(value.refinements).toEqual([expect.objectContaining({ readonly: true })]);
   });
 
   it("keeps deep validator evidence and its machine contract inside the durable task budget", () => {

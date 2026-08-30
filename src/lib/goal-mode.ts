@@ -149,6 +149,7 @@ export type GoalRefinement = {
   id: string;
   label: string;
   task: string;
+  readonly: boolean;
   acceptanceCriteria: string[];
 };
 
@@ -602,6 +603,7 @@ export function parseGoalValidation(text: string): GoalValidation {
       id: slug(row.id, `refine-${index + 1}`),
       label: clampText(row.label, 80) || `Refinement ${index + 1}`,
       task,
+      readonly: row.readonly === true,
       acceptanceCriteria: strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500).length
         ? strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500)
         : ["Close the validator's stated gap and re-run the relevant checks"],
@@ -695,7 +697,7 @@ export function validatorTask(args: {
     SAFE_SANDBOX_EXECUTION_RULES,
     "Inspect the actual branch and current code. Run proportionate deep tests, typecheck/build, end-to-end or browser checks, and exact provider/deployment checks where the goal requires them. A command exit code alone is not proof. Do not merge or deploy yourself; a pass hands the branch to the automatic delivery controller. Do not publish publicly, spend, message or perform destructive actions. If a gap is fixable in the existing scope, return refine with 1-3 precise Terra repair sessions. Use blocked only for a genuine Daniel/external decision after independent work is exhausted. Use pass only when the measured target—not merely each task, code change, deployment, traffic, or revenue proxy—is evidenced for the declared window and every stop condition is satisfied. When it passes, the crew stops; do not invent follow-on work.",
     "End with exactly one compact JSON object after GOAL_VALIDATION_JSON: using:",
-    '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"outcomeAchieved":false,"outcomeEvidence":["authoritative measured evidence"],"stopConditionsSatisfied":["exact satisfied condition"],"observedOutcome":{"metric":"...","baseline":"...","observed":"...","target":"...","measurementWindow":"..."},"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',
+    '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"outcomeAchieved":false,"outcomeEvidence":["authoritative measured evidence"],"stopConditionsSatisfied":["exact satisfied condition"],"observedOutcome":{"metric":"...","baseline":"...","observed":"...","target":"...","measurementWindow":"..."},"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","readonly":false,"acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',
     "The JSON is a machine contract. Keep it under 3,500 characters.",
   ].filter(Boolean).join("\n\n");
   if (prompt.length <= GOAL_VALIDATOR_TASK_MAX_CHARS) return prompt;

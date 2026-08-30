@@ -1735,8 +1735,20 @@ export const renewAdvance = mutation({
 
 async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefinement[], wave: number) {
   const integrationBranch = mission.integrationBranch || mission.sharedBranch || missionBranch(mission, mission.primaryRepo);
+  const acceptedPlan = mission.plan && typeof mission.plan === "object"
+    ? mission.plan as GoalPlan
+    : null;
+  // A validator may request more evidence, but it cannot silently broaden an
+  // accepted all-read-only mission into branches, checkpoints, merge receipts
+  // or write authority. This also keeps verification-only waves on the cheap
+  // immutable completion path.
+  const acceptedReadOnlyBoundary = Boolean(
+    acceptedPlan?.workstreams?.length
+      && acceptedPlan.workstreams.every((stream) => stream.readonly),
+  );
   const ids: string[] = [];
   for (const refinement of refinements.slice(0, 3)) {
+    const readonly = acceptedReadOnlyBoundary || refinement.readonly;
     const id = await insertGoalJob(ctx, {
       task: [
         refinement.task,
@@ -1747,13 +1759,13 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
       missionId: String(mission._id),
       label: refinement.label,
       repo: mission.primaryRepo,
-      readonly: false,
+      readonly,
       model: "terra",
       reasoningEffort: "high",
       mcp: ["context7"],
       originThreadId: mission.originThreadId,
       agentId: "paul",
-      risk: "high",
+      risk: readonly ? "low" : "high",
       priority: 96,
       acceptanceCriteria: refinement.acceptanceCriteria,
       modelReason: "Goal Mode uses a bounded Terra/high repair wave before another deep validation",
