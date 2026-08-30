@@ -18,6 +18,8 @@ import {
   type WorkspaceLimits,
 } from "./cloud-workspace";
 
+export const CLOUD_WORKSPACE_HEARTBEAT_TIMEOUT_MS = 10_000;
+
 function boundedProcess(
   command: string,
   args: string[],
@@ -91,7 +93,10 @@ export async function prepareCloudWorkspaceExecution(input: {
   bindWorkspace?: (workspace: CloudWorkspace) => Promise<boolean>;
   assertCurrent?: (phase: string) => Promise<boolean>;
   onStage?: (stage: CloudWorkspacePreparationStage | "source_upload" | "dependency_hydration") => Promise<void>;
-  onHeartbeat?: (stage: CloudWorkspacePreparationStage | "source_upload" | "dependency_hydration") => Promise<void>;
+  onHeartbeat?: (
+    stage: CloudWorkspacePreparationStage | "source_upload" | "dependency_hydration",
+    signal: AbortSignal,
+  ) => Promise<void>;
 }): Promise<{ provider: CloudWorkspaceProvider; workspace: CloudWorkspace; archive: CredentiallessArchive }> {
   // Provider configuration and capabilities are resolved before the trusted
   // controller runs git or any other host process. This ordering is the
@@ -126,7 +131,22 @@ export async function prepareCloudWorkspaceExecution(input: {
       // being mistaken for a stalled one during a quiet provider operation.
       pending = pending
         .catch(() => undefined)
-        .then(async () => await input.onHeartbeat?.(stage));
+        .then(async () => {
+          const controller = new AbortController();
+          const timeout = setTimeout(
+            () => controller.abort(),
+            CLOUD_WORKSPACE_HEARTBEAT_TIMEOUT_MS,
+          );
+          try {
+            await input.onHeartbeat?.(stage, controller.signal);
+          } finally {
+            clearTimeout(timeout);
+          }
+        })
+        // Observe a timed-out pulse immediately. Waiting for the next interval
+        // to attach a handler creates an unhandled-rejection window and can
+        // make the task runtime treat a recoverable heartbeat miss as fatal.
+        .catch(() => undefined);
     }, 30_000);
     timer.unref?.();
     try {

@@ -253,7 +253,7 @@ const completionEvidence = (result: string, verificationNote: string, gitReview?
   reviewReceiptJson: gitReview ? JSON.stringify(gitReview.envelope.receipt) : undefined,
   };
 };
-async function convexMutation(path: string, args: unknown) {
+async function convexMutation(path: string, args: unknown, signal?: AbortSignal) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
   const protectedArgs = { ...((args ?? {}) as Record<string, unknown>), workerToken };
@@ -261,6 +261,7 @@ async function convexMutation(path: string, args: unknown) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
+    signal,
   });
   const payload = await response.json();
   if (!response.ok || payload?.status === "error") {
@@ -1703,11 +1704,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           authorityDigest,
           workerRunId: options.reservation.workerRunId,
         });
-      const touchActiveHeartbeat = async () => await convexMutation(
+      const touchActiveHeartbeat = async (signal?: AbortSignal) => await convexMutation(
         deliveryFence ? "jobs:touchDeliveryHeartbeat" : "jobs:touchHeartbeat",
         deliveryFence
           ? { jobId: job.jobId, expectedAttempt, ...deliveryFence }
           : { jobId: job.jobId, expectedAttempt, workerRunId: claimedWorkerRunId },
+        signal,
       ).catch(() => false);
       const reportPreparationStage = async (stage: string, progress: string, percent: number) => {
         options.onProgress?.({
@@ -2490,11 +2492,11 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               const [durableStage, progress, percent] = stages[stage];
               await reportPreparationStage(durableStage, progress, percent);
             },
-            onHeartbeat: async () => {
+            onHeartbeat: async (_stage, signal) => {
               // Provider creates, source uploads, and locked dependency
               // hydration can be quiet for minutes. Keep the exact current
               // attempt live without manufacturing causal progress.
-              await touchActiveHeartbeat();
+              await touchActiveHeartbeat(signal);
             },
           });
           providerWorkspace = preparedWorkspace.workspace;

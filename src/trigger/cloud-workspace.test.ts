@@ -18,7 +18,13 @@ import {
 } from "./cloud-workspace";
 import { FakeCloudWorkspaceProvider } from "./cloud-workspace-fake";
 import { CloudWorkspaceToolBridge, cloudRepositoryToolsForScope } from "./cloud-workspace-tools";
-import { persistPortableCheckpoint, prepareCloudWorkspaceExecution, replayCloudWorkspaceExecution, terminateOrphanedCloudWorkspaces } from "./cloud-workspace-controller";
+import {
+  CLOUD_WORKSPACE_HEARTBEAT_TIMEOUT_MS,
+  persistPortableCheckpoint,
+  prepareCloudWorkspaceExecution,
+  replayCloudWorkspaceExecution,
+  terminateOrphanedCloudWorkspaces,
+} from "./cloud-workspace-controller";
 import {
   CLOUD_WORKSPACE_CAPABILITY_MATRIX,
   configuredCloudWorkspaceCleanupProvider,
@@ -222,11 +228,25 @@ describe("fail-closed cloud workspace boundary", () => {
         runtime: "node-22",
         lockfileDigest: LOCK,
         onStage: async (stage) => { stages.push(stage); },
-        onHeartbeat: async (stage) => { heartbeats.push(stage); },
+        onHeartbeat: async (stage, signal) => {
+          heartbeats.push(stage);
+          // A single stalled control-plane request must not suppress every
+          // later pulse. The controller bounds it and retries on the next
+          // cadence without overlapping heartbeat requests.
+          if (heartbeats.length === 1) {
+            await new Promise<void>((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => reject(new Error("heartbeat timeout")),
+                { once: true },
+              );
+            });
+          }
+        },
       });
 
       await started;
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(60_000 + CLOUD_WORKSPACE_HEARTBEAT_TIMEOUT_MS);
       expect(heartbeats).toEqual(["dependency_hydration", "dependency_hydration"]);
       expect(stages).toEqual(["provider_create", "source_upload", "dependency_hydration"]);
 

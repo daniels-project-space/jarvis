@@ -103,7 +103,7 @@ const WORKER = "production-runner-authority-worker";
 const REPO = "daniels-project-space/jarvis";
 type HarnessConvex = TestConvex<typeof schema>;
 
-type MutationTrace = { path: string; args: Record<string, unknown> };
+type MutationTrace = { path: string; args: Record<string, unknown>; signal?: AbortSignal };
 
 function bridgeProductionRunnerToConvex(
   t: HarnessConvex,
@@ -113,8 +113,9 @@ function bridgeProductionRunnerToConvex(
   const trace: MutationTrace[] = [];
   const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body ?? "{}")) as MutationTrace;
-    trace.push({ path: body.path, args: body.args });
-    await beforeCall?.(body);
+    const call = { path: body.path, args: body.args, signal: init?.signal ?? undefined };
+    trace.push(call);
+    await beforeCall?.(call);
     let value: unknown;
     switch (body.path) {
       case "jobs:activateHeartbeatProtocolV2":
@@ -387,6 +388,7 @@ function injectedRunnerDependencies(options: {
     }),
     prepareCloudWorkspaceExecution: vi.fn(async (input: any) => {
       if (!await input.bindWorkspace(workspace)) throw new Error("fake workspace binding rejected");
+      await input.onHeartbeat?.("dependency_hydration", new AbortController().signal);
       return { provider, workspace, archive: await input.hydrateArchive() };
     }) as any,
     runCloudWorkspaceAgent: runProcess as any,
@@ -1237,6 +1239,11 @@ describe("production Trigger worker authority harness", () => {
     expect(specialistDependencies.prepareCloudWorkspaceExecution).toHaveBeenCalledWith(
       expect.objectContaining({ template: "node22", onHeartbeat: expect.any(Function) }),
     );
+    const preparationHeartbeats = specialistBridge.trace.filter(
+      (call) => call.path === "jobs:touchHeartbeat",
+    );
+    expect(preparationHeartbeats).not.toHaveLength(0);
+    expect(preparationHeartbeats.some((call) => call.signal instanceof AbortSignal)).toBe(true);
     expect(specialistBridge.trace.filter((call) =>
       call.path === "jobs:bindCloudWorkspace" || call.path === "jobs:cloudCheckpointForReplay",
     ).every((call) => call.args.template === WORK_ORDER_MACHINE_TEMPLATE)).toBe(true);
