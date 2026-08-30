@@ -1243,6 +1243,11 @@ describe("production Trigger worker authority harness", () => {
     )).toEqual({ processed: 1 });
     expect(dependencies.persistPortableCheckpoint).not.toHaveBeenCalled();
     expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:recordCloudCheckpoint");
+    expect(dependencies.runCommand).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["checkout", "-B", "main", SOURCE_SHA]),
+      expect.any(Object),
+    );
     const state = await t.run(async (ctx) => ({
       job: await ctx.db.get(jobId),
       attempt: await ctx.db.query("workAttempts")

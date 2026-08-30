@@ -2880,8 +2880,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               : fetched;
           }
           if (basePresent.code !== 0) throw new Error("trusted controller could not prove the exact patch base");
-          const checkedOut = branch
-            ? await sh("git", ["-C", controllerCheckoutPath, "checkout", "-B", branch, baseSha], hostChildEnv)
+          const reviewCheckoutBranch = branch
+            || (immutableReadOnlyResult ? checkoutSourceBranch : null);
+          const checkedOut = reviewCheckoutBranch
+            ? await sh("git", ["-C", controllerCheckoutPath, "checkout", "-B", reviewCheckoutBranch, baseSha], hostChildEnv)
             : await sh("git", ["-C", controllerCheckoutPath, "checkout", "--detach", baseSha], hostChildEnv);
           if (checkedOut.code !== 0) throw new Error("trusted controller could not restore the exact worker branch base");
           await sh("git", ["-C", controllerCheckoutPath, "remote", "set-url", "origin", url], hostChildEnv);
