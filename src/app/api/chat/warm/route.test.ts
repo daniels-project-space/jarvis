@@ -29,6 +29,7 @@ describe("foreground voice prewarm route", () => {
     vi.clearAllMocks();
     vi.spyOn(Date, "now").mockReturnValue(1_800_000);
     delete process.env.JARVIS_FOREGROUND_HOLD_REASON;
+    delete process.env.JARVIS_SELF_HOSTED_FOREGROUND;
     mock.controlActor.mockResolvedValue({ kind: "owner", authTokenHash: "owner-hash" });
     mock.convexQuery.mockResolvedValue(null);
     mock.trigger.mockResolvedValue({ id: "run-prewarm" });
@@ -74,6 +75,35 @@ describe("foreground voice prewarm route", () => {
 
     await expect(response.json()).resolves.toMatchObject({ started: true, warm: false });
     expect(mock.trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it("recognizes only an authoritative self-hosted lease and never starts Trigger", async () => {
+    process.env.JARVIS_FOREGROUND_HOLD_REASON = "trigger_billing_limit";
+    process.env.JARVIS_SELF_HOSTED_FOREGROUND = "live";
+    mock.convexQuery.mockResolvedValue({
+      runnerId: "selfhost:daniel-studio:primary:run-1",
+      updatedAt: Date.now() - 1_000,
+    });
+
+    const response = await POST(request() as never);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true, warm: true, started: false });
+    expect(mock.trigger).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when self-host mode is selected without its live lease", async () => {
+    process.env.JARVIS_SELF_HOSTED_FOREGROUND = "live";
+    mock.convexQuery.mockResolvedValue({
+      runnerId: "trigger:primary:run-1",
+      updatedAt: Date.now() - 1_000,
+    });
+
+    const response = await POST(request() as never);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ code: "SELF_HOSTED_FOREGROUND_OFFLINE" });
+    expect(mock.trigger).not.toHaveBeenCalled();
   });
 
   it("fails closed for unauthenticated, guest, billing-held, and failed starts", async () => {

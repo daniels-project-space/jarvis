@@ -1,30 +1,18 @@
 import "server-only";
 import { currentAdminSession } from "./control-context";
-import { classifyContextProfile, compileContext, requiresHubSnapshot } from "./context-compiler";
 import { resolveConvexUrl } from "./convex-url";
-import { PORTFOLIO_NORTH_STAR, PROJECT_REGISTRY } from "./project-registry";
-import { HUB_CONTEXT_URL, hubContextRequestArgs } from "./hub-context";
+export {
+  boundedSnapshot,
+  buildContext,
+  CONTEXT_INPUT_DEADLINE_MS,
+  CONTEXT_LAST_KNOWN_GOOD_MS,
+} from "./foreground-context";
 
 // Server-side context bundle for the brain: memory, business intel, hub
 // (to-dos/calendar/wealth), cloud stack, running agents, fresh findings.
 // Used by the subscription conversation worker on every turn.
 
 const CONVEX_URL = resolveConvexUrl(process.env.NEXT_PUBLIC_CONVEX_URL, process.env.CONVEX_URL);
-let hubCache: { value: any; expiresAt: number } | null = null;
-let hubRequest: Promise<any> | null = null;
-// `brainContext:snapshot` includes memory-search results for the current user
-// text. A fallback therefore must be scoped to that exact search input: a
-// stalled new question must not inherit the prior question's relevant-memory
-// hits merely because both ran in the same warm foreground process.
-let brainLastKnownGood: { value: any; capturedAt: number; queryKey: string } | null = null;
-let hubLastKnownGood: { value: any; capturedAt: number } | null = null;
-
-// These snapshots enrich a foreground answer; they are never allowed to hold
-// the conversational lane hostage. The measured normal path is sub-second,
-// so a small deadline is enough to preserve freshness without turning a
-// provider stall into an indefinite model delay.
-export const CONTEXT_INPUT_DEADLINE_MS = 850;
-export const CONTEXT_LAST_KNOWN_GOOD_MS = 5 * 60_000;
 
 async function q(base: string, path: string, args: unknown = {}, signal?: AbortSignal): Promise<any> {
   try {
@@ -68,62 +56,6 @@ export async function convexMutation(path: string, args: unknown): Promise<any> 
 
 export const convexQuery = (path: string, args: unknown = {}) => q(CONVEX_URL, path, args);
 
-async function hubSnapshot(signal?: AbortSignal) {
-  const args = hubContextRequestArgs();
-  // Project Hub accepts only its dedicated `jarvis-context` capability. Do
-  // not fall back to VAULT_ACCESS_TOKEN: its scope is intentionally broader.
-  if (!args) return null;
-  if (hubCache && hubCache.expiresAt > Date.now()) return hubCache.value;
-  if (hubRequest) return hubRequest;
-  hubRequest = q(HUB_CONTEXT_URL, "jarvisContext:snapshot", args, signal).then((value) => {
-    // The remote-work hub is expensive relative to a conversational turn and
-    // does not change token-by-token. A short shared cache removes a whole
-    // network dependency from rapid follow-ups while keeping work data fresh.
-    hubCache = { value, expiresAt: Date.now() + (value ? 20_000 : 3_000) };
-    return value;
-  }).finally(() => {
-    hubRequest = null;
-  });
-  return hubRequest;
-}
-
-export async function boundedSnapshot(
-  read: (signal: AbortSignal) => Promise<any>,
-  getLastKnownGood: () => { value: any; capturedAt: number } | null,
-  setLastKnownGood: (snapshot: { value: any; capturedAt: number }) => void,
-): Promise<any> {
-  const controller = new AbortController();
-  let timedOut = false;
-  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
-  // The transport may be a shared Hub request owned by another caller. Race at
-  // this caller boundary as well as aborting the transport we own, so joining
-  // a stalled request can never extend this foreground turn past 850ms.
-  const deadline = new Promise<null>((resolve) => {
-    deadlineTimer = setTimeout(() => {
-      timedOut = true;
-      controller.abort("context deadline");
-      resolve(null);
-    }, CONTEXT_INPUT_DEADLINE_MS);
-  });
-  const result = Promise.resolve()
-    .then(() => read(controller.signal))
-    // Keep observing a late shared rejection after this caller has returned.
-    .catch(() => null);
-  try {
-    const value = await Promise.race([result, deadline]);
-    if (!timedOut && value !== null && value !== undefined) {
-      setLastKnownGood({ value, capturedAt: Date.now() });
-      return value;
-    }
-  } finally {
-    if (deadlineTimer) clearTimeout(deadlineTimer);
-  }
-  const previous = getLastKnownGood();
-  return previous && Date.now() - previous.capturedAt <= CONTEXT_LAST_KNOWN_GOOD_MS
-    ? previous.value
-    : null;
-}
-
 // Self-healing hook: anything server-side that breaks files an incident; the
 // healer (agent-runner) turns open incidents into root-cause repair agents.
 export async function reportIncident(source: string, signature: string, message: string, app?: string, authTokenHash?: string) {
@@ -132,55 +64,6 @@ export async function reportIncident(source: string, signature: string, message:
   } catch {
     /* never let telemetry break the caller */
   }
-}
-
-export async function buildContext(
-  userText?: string,
-): Promise<string> {
-  // A pure greeting/acknowledgement must not wait on two optional remote
-  // snapshots. It has no live-state dependency, and compileContext already
-  // emits the same explicit reflex instruction without any fetched evidence.
-  if (classifyContextProfile(userText) === "reflex") {
-    return compileContext({
-      userText,
-      northStar: PORTFOLIO_NORTH_STAR,
-      brain: null,
-      hub: null,
-      projectRegistry: PROJECT_REGISTRY,
-    });
-  }
-  // Keep the key identical to the bounded query payload. It retains the
-  // no-wait last-known-good path for a retry while preventing text-specific
-  // retrieval grounding from crossing into a distinct turn.
-  const brainQueryText = userText?.slice(0, 240) || undefined;
-  const brainQueryKey = brainQueryText ?? "";
-  const [brain, hub] = await Promise.all([
-    boundedSnapshot(
-      (signal) => q(CONVEX_URL, "brainContext:snapshot", { userText: brainQueryText }, signal),
-      () => brainLastKnownGood?.queryKey === brainQueryKey ? brainLastKnownGood : null,
-      (snapshot) => { brainLastKnownGood = { ...snapshot, queryKey: brainQueryKey }; },
-    ),
-    // Hub data is only eligible for the existing calendar/to-do or wealth
-    // compiler branches. Avoid making every unrelated substantive turn wait
-    // on (or disclose its text-adjacent timing to) that cross-app snapshot.
-    requiresHubSnapshot(userText)
-      ? boundedSnapshot(
-        (signal) => hubSnapshot(signal),
-        () => hubLastKnownGood,
-        (snapshot) => { hubLastKnownGood = snapshot; },
-      )
-      : Promise.resolve(null),
-  ]);
-  // Keep the expensive state snapshot durable and reusable, but compile only
-  // the evidence needed for this exact turn. Passing the entire snapshot made
-  // simple spoken replies pay for unrelated portfolio and work history.
-  return compileContext({
-    userText,
-    northStar: PORTFOLIO_NORTH_STAR,
-    brain,
-    hub,
-    projectRegistry: PROJECT_REGISTRY,
-  });
 }
 
 // A deliberately small context retained for bounded utility callers. The rich

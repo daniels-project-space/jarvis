@@ -1,7 +1,12 @@
 import type { NextRequest } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
-import { convexMutation, reportIncident } from "@/lib/context";
+import { convexMutation, convexQuery, reportIncident } from "@/lib/context";
 import { actorAdminHash, controlActor, controlCredentials } from "@/lib/request-auth";
+import {
+  foregroundDispatchFailure,
+  foregroundDispatchMode,
+  type ForegroundRunnerLease,
+} from "@/lib/foreground-runner-mode";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -22,6 +27,22 @@ export async function POST(req: NextRequest) {
   if (!messageId) return Response.json({ error: "messageId is required" }, { status: 400 });
 
   const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
+  const shouldReadLease = process.env.JARVIS_SELF_HOSTED_FOREGROUND === "live"
+    || process.env.JARVIS_FOREGROUND_HOLD_REASON !== "trigger_billing_limit";
+  const lease = shouldReadLease
+    ? await convexQuery("chatQueue:runnerLease", credentials).catch(() => null) as ForegroundRunnerLease
+    : null;
+  const dispatchMode = foregroundDispatchMode(process.env, lease);
+  const dispatchFailure = foregroundDispatchFailure(dispatchMode);
+  if (dispatchFailure) {
+    return Response.json({
+      ok: false,
+      error: dispatchFailure.message,
+      code: dispatchFailure.code,
+      retryable: true,
+    }, { status: 503 });
+  }
+
   const recovery = await convexMutation("chatQueue:requestRecovery", {
     messageId,
     threadId,
@@ -52,7 +73,7 @@ export async function POST(req: NextRequest) {
   }
 
   let handle: { id: string } | null = null;
-  if (recovery.status === "pending" || recovery.status === "requeued") {
+  if ((recovery.status === "pending" || recovery.status === "requeued") && dispatchMode !== "selfhost") {
     handle = await tasks.trigger(
       "jarvis-chat-turn",
       {
@@ -74,7 +95,7 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  if ((recovery.status === "pending" || recovery.status === "requeued") && !handle) {
+  if ((recovery.status === "pending" || recovery.status === "requeued") && dispatchMode !== "selfhost" && !handle) {
     return Response.json({
       ok: false,
       error: "recovery wake-up unavailable",
@@ -90,6 +111,6 @@ export async function POST(req: NextRequest) {
     attemptCount: recovery.attemptCount,
     dispatchEpoch: recovery.dispatchEpoch,
     assistant: recovery.status === "completed" ? recovery.assistant : undefined,
-    immediate: Boolean(handle) || recovery.status === "active" || recovery.status === "completed",
+    immediate: dispatchMode === "selfhost" || Boolean(handle) || recovery.status === "active" || recovery.status === "completed",
   });
 }

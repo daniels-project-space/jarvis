@@ -6,6 +6,11 @@ import {
   controlCredentials,
   isOwnerActor,
 } from "@/lib/request-auth";
+import {
+  foregroundDispatchFailure,
+  foregroundDispatchMode,
+  type ForegroundRunnerLease,
+} from "@/lib/foreground-runner-mode";
 
 export const runtime = "nodejs";
 export const maxDuration = 15;
@@ -27,18 +32,31 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: "owner enrollment required" }, { status: 403 });
   }
 
-  if (process.env.JARVIS_FOREGROUND_HOLD_REASON === "trigger_billing_limit") {
+  const shouldReadLease = process.env.JARVIS_SELF_HOSTED_FOREGROUND === "live"
+    || process.env.JARVIS_FOREGROUND_HOLD_REASON !== "trigger_billing_limit";
+  const lease = shouldReadLease
+    ? await convexQuery(
+        "chatQueue:runnerLease",
+        controlCredentials(actor),
+      ).catch(() => null) as ForegroundRunnerLease
+    : null;
+  const dispatchMode = foregroundDispatchMode(process.env, lease);
+  const dispatchFailure = foregroundDispatchFailure(dispatchMode);
+  if (dispatchFailure) {
     return Response.json({
       ok: false,
       warm: false,
-      code: "FOREGROUND_WORKERS_BILLING_PAUSED",
+      code: dispatchFailure.code,
     }, { status: 503, headers: { "cache-control": "private, no-store" } });
   }
 
-  const lease = await convexQuery(
-    "chatQueue:runnerLease",
-    controlCredentials(actor),
-  ).catch(() => null) as { updatedAt?: unknown } | null;
+  if (dispatchMode === "selfhost") {
+    return Response.json(
+      { ok: true, warm: true, started: false },
+      { headers: { "cache-control": "private, no-store" } },
+    );
+  }
+
   const leaseAgeMs = Date.now() - Number(lease?.updatedAt);
   const warm = Number.isFinite(leaseAgeMs) && leaseAgeMs >= 0 && leaseAgeMs < 25_000;
   if (warm) {

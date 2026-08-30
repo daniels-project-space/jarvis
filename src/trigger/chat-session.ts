@@ -10,7 +10,7 @@ import { shouldCaptureDurableMemory } from "../lib/current-state";
 import { memoryConfidence } from "../lib/memory-governance";
 import { visibleTurnText } from "../lib/host-context";
 import { stripAssistantApprovals } from "../lib/sanitize";
-import { buildContext } from "../lib/context";
+import { buildContext } from "../lib/foreground-context";
 import { isSpeculativeResearchApplicable } from "../lib/speculative-research";
 import {
   buildBoundedFileContext,
@@ -86,6 +86,48 @@ const CONVEX_URL =
 // it. The finite safety reserve leaves Trigger time to cancel and clean up.
 const RUN_BUDGET_MS = FOREGROUND_MAX_DURATION_SECONDS * 1_000 - FOREGROUND_PROCESS_EXIT_RESERVE_MS;
 const HANDOFF_AFTER_MS = RUN_BUDGET_MS - FOREGROUND_HANDOFF_OVERLAP_MS;
+
+type ForegroundMemoryPayload = {
+  userText: string;
+  assistantText: string;
+  sourceMessageId?: string;
+};
+
+type ForegroundMetadataValue = Parameters<typeof metadata.set>[1];
+
+export type ForegroundQueueRuntime = {
+  kind: "trigger" | "selfhost";
+  instanceId?: string;
+  idleTimeoutMs?: number;
+  subscriptionRoot?: string;
+  shutdownSignal?: AbortSignal;
+  recordMetadata: (
+    key: "subscriptionSession" | "foregroundTiming",
+    value: ForegroundMetadataValue,
+  ) => Promise<void>;
+  dispatchRunner: (
+    taskId: "jarvis-chat-turn" | "jarvis-chat-handoff",
+    payload: ForegroundTurnPayload,
+    idempotencyKey: string,
+  ) => Promise<unknown>;
+  captureMemory: (payload: ForegroundMemoryPayload) => Promise<void>;
+};
+
+const triggerForegroundRuntime: ForegroundQueueRuntime = {
+  kind: "trigger",
+  recordMetadata: async (key, value) => {
+    metadata.set(key, value);
+    await metadata.flush();
+  },
+  dispatchRunner: async (taskId, payload, idempotencyKey) => await tasks.trigger(
+    taskId,
+    payload,
+    { idempotencyKey },
+  ),
+  captureMemory: async (payload) => {
+    await tasks.trigger("jarvis-chat-memory", payload);
+  },
+};
 
 async function convexCall(kind: "query" | "mutation", path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
@@ -464,9 +506,40 @@ async function extractAndSave(
   return n;
 }
 
-async function processChatQueue(
+export async function captureForegroundMemory(
+  payload: ForegroundMemoryPayload,
+  options: { subscriptionRoot?: string } = {},
+) {
+  const provider: AgentProvider = "codex";
+  const prepared = await prepareSubscriptionEnv(provider, {
+    scope: "memory",
+    minimumValidityMs: MEMORY_SUBSCRIPTION_VALIDITY_MS,
+    root: options.subscriptionRoot,
+  });
+  try {
+    const bin = resolveSubscriptionAgentBin(provider);
+    if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
+    const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
+    if (preflight.error) return { saved: 0, error: preflight.error };
+    return {
+      saved: await extractAndSave(
+        provider,
+        bin,
+        prepared.env,
+        payload.userText,
+        payload.assistantText,
+        payload.sourceMessageId,
+      ),
+    };
+  } finally {
+    cleanupSubscriptionHome(prepared.env);
+  }
+}
+
+export async function processChatQueue(
   payload: ForegroundTurnPayload = {},
   lane: ForegroundLane = "primary",
+  runtime: ForegroundQueueRuntime = triggerForegroundRuntime,
 ) {
   let targetMessageId = payload.messageId;
   const source = payload.source ?? "conversation";
@@ -491,6 +564,7 @@ async function processChatQueue(
   const prepared = await prepareSubscriptionEnv(provider, {
     scope: `foreground-${lane}`,
     minimumValidityMs: FOREGROUND_SESSION_RENEWAL_RESERVE_MS,
+    root: runtime.subscriptionRoot,
   });
   if (prepared.error) return await failForegroundStartup(prepared.error);
   const bin = resolveSubscriptionAgentBin(provider);
@@ -503,7 +577,10 @@ async function processChatQueue(
     cleanupSubscriptionHome(prepared.env);
     return await failForegroundStartup(preflight.error);
   }
-  const runnerId = randomUUID();
+  const runtimeInstance = runtime.kind === "selfhost"
+    ? (runtime.instanceId ?? "private")
+    : lane;
+  const runnerId = `${runtime.kind}:${runtimeInstance}:${lane}:${randomUUID()}`;
   const bridge = new AgentToolBridge(dispatchToken, {
     ownerToolReceiptSecret: workerToken,
     searchAttachedFiles: async (messageId, request) => await convexCall("query", "files:searchAttachedFiles", {
@@ -532,16 +609,19 @@ async function processChatQueue(
       initial: prepared,
       scope: `foreground-${lane}`,
       createServer,
-      prepare: (input) => prepareSubscriptionEnv(provider, input),
+      prepare: (input) => prepareSubscriptionEnv(provider, {
+        ...input,
+        root: runtime.subscriptionRoot,
+      }),
       preflight: (candidateEnv) => verifyCodexSubscriptionPreflight(bin, candidateEnv).error,
       cleanup: cleanupSubscriptionHome,
       onRenewalError: (signal) => {
-        metadata.set("subscriptionSession", { status: "renewal_failed", signal });
-        void metadata.flush().catch(() => undefined);
+        void runtime.recordMetadata("subscriptionSession", { status: "renewal_failed", signal })
+          .catch(() => undefined);
       },
       onRenewalReady: () => {
-        metadata.set("subscriptionSession", { status: "ready" });
-        void metadata.flush().catch(() => undefined);
+        void runtime.recordMetadata("subscriptionSession", { status: "ready" })
+          .catch(() => undefined);
       },
     });
   } catch (error) {
@@ -591,16 +671,26 @@ async function processChatQueue(
       }
     });
   }, 10_000);
+  const stopForRuntimeShutdown = () => {
+    leaseActive = false;
+    abortForegroundLeaseWork(
+      leaseAbort,
+      activeTurnAbort,
+      new Error("foreground runtime shutting down"),
+    );
+  };
+  runtime.shutdownSignal?.addEventListener("abort", stopForRuntimeShutdown, { once: true });
+  if (runtime.shutdownSignal?.aborted) stopForRuntimeShutdown();
   let handoffStarted = false;
   let handoffPromise: Promise<unknown> | null = null;
   const startHandoff = () => {
     if (handoffStarted) return;
     handoffStarted = true;
     const successorTask = taskForForegroundLane(successorLane(lane));
-    handoffPromise = tasks.trigger(
+    handoffPromise = runtime.dispatchRunner(
       successorTask,
       { source: "warm-handoff" },
-      { idempotencyKey: `jarvis-warm-${lane}-${runnerId}` },
+      `jarvis-warm-${lane}-${runnerId}`,
     ).catch(() => null);
   };
   const handoffTimer = setTimeout(startHandoff, HANDOFF_AFTER_MS);
@@ -630,7 +720,7 @@ async function processChatQueue(
       if (remaining <= 0 || !(await waitForPending(
         client,
         workerToken,
-        Math.min(remaining, FOREGROUND_IDLE_TIMEOUT_MS),
+        Math.min(remaining, runtime.idleTimeoutMs ?? FOREGROUND_IDLE_TIMEOUT_MS),
         leaseAbort.signal,
       ))) break;
       continue;
@@ -851,14 +941,16 @@ async function processChatQueue(
       const deliveredAt = Date.now();
       // Memory capture is a separate background task. It must never hold the
       // warm conversational worker hostage after Daniel already has a reply.
-      if (turn.finalText.trim() && shouldCaptureDurableMemory(visibleUserText)) void tasks.trigger("jarvis-chat-memory", {
-        userText: visibleUserText,
-        // An approval marker is a live, owner-only bearer receipt rather than
-        // durable memory. The chat card is rendered from the stored turn; the
-        // memory worker never needs the token or its sealed proposal.
-        assistantText: stripAssistantApprovals(turn.finalText),
-        sourceMessageId: targetMessageId ? String(targetMessageId) : undefined,
-      }).catch(() => {});
+      if (turn.finalText.trim() && shouldCaptureDurableMemory(visibleUserText)) {
+        void runtime.captureMemory({
+          userText: visibleUserText,
+          // An approval marker is a live, owner-only bearer receipt rather than
+          // durable memory. The chat card is rendered from the stored turn; the
+          // memory worker never needs the token or its sealed proposal.
+          assistantText: stripAssistantApprovals(turn.finalText),
+          sourceMessageId: targetMessageId ? String(targetMessageId) : undefined,
+        }).catch(() => undefined);
+      }
       timings.push({
         claimMs: claimedAt - claimStarted,
         contextMs: contextReadyAt - contextStarted,
@@ -874,8 +966,10 @@ async function processChatQueue(
       // Realtime metadata is deliberately per delivered turn, never per token.
       // It contains only durations and lets the active run be monitored before
       // its eventual four-hour cleanup path executes.
-      metadata.set("foregroundTiming", buildForegroundTiming(timings, Date.now() - started, lane));
-      await metadata.flush();
+      await runtime.recordMetadata(
+        "foregroundTiming",
+        buildForegroundTiming(timings, Date.now() - started, lane),
+      );
     } catch (error: unknown) {
       await convexMutation("chatQueue:finalize", {
         messageId: claim.assistantId,
@@ -898,10 +992,13 @@ async function processChatQueue(
     // A final structured snapshot records the bounded timing state even when
     // the worker exits through its cleanup path rather than a delivered turn.
     try {
-      metadata.set("foregroundTiming", buildForegroundTiming(timings, Date.now() - started, lane));
-      await metadata.flush();
+      await runtime.recordMetadata(
+        "foregroundTiming",
+        buildForegroundTiming(timings, Date.now() - started, lane),
+      );
     } finally {
       leaseClosing = true;
+      runtime.shutdownSignal?.removeEventListener("abort", stopForRuntimeShutdown);
       abortForegroundLeaseWork(
         leaseAbort,
         activeTurnAbort,
@@ -928,15 +1025,15 @@ async function processChatQueue(
         // Admission raced the realtime listener's final timeout. The atomic
         // retirement receipt transfers responsibility to one replacement wake;
         // this path is exceptional and adds no task to ordinary warm turns.
-        await tasks.trigger(
+        await runtime.dispatchRunner(
           taskForForegroundLane(lane),
           {
             messageId: retirement.pendingMessageId,
             threadId: retirement.pendingThreadId,
-            dispatchEpoch: retirement.pendingDispatchEpoch,
+            dispatchEpoch: Number(retirement.pendingDispatchEpoch),
             source: "runner-retirement",
           },
-          { idempotencyKey: `jarvis-retire-${retirement.pendingMessageId}` },
+          `jarvis-retire-${retirement.pendingMessageId}`,
         ).catch(() => null);
       }
       await session.close();
@@ -950,23 +1047,8 @@ export const chatMemory = task({
   queue: { name: "jarvis-memory", concurrencyLimit: 2 },
   machine: "small-1x",
   maxDuration: 180,
-  run: async (payload: { userText: string; assistantText: string; sourceMessageId?: string }) => {
-    const provider: AgentProvider = "codex";
-    const prepared = await prepareSubscriptionEnv(provider, {
-      scope: "memory",
-      minimumValidityMs: MEMORY_SUBSCRIPTION_VALIDITY_MS,
-    });
-    try {
-      const bin = resolveSubscriptionAgentBin(provider);
-      if (prepared.error || !bin) return { saved: 0, error: prepared.error ?? "Codex binary unavailable" };
-      const preflight = verifyCodexSubscriptionPreflight(bin, prepared.env);
-      if (preflight.error) return { saved: 0, error: preflight.error };
-      return { saved: await extractAndSave(provider, bin, prepared.env, payload.userText, payload.assistantText, payload.sourceMessageId) };
-    } finally {
-      cleanupSubscriptionHome(prepared.env);
-    }
-  },
-});;
+  run: async (payload: ForegroundMemoryPayload) => await captureForegroundMemory(payload),
+});
 
 // Initial and recovery turns enter the primary lane. Its owner prewarms the
 // alternate lane only at the four-hour handoff boundary.

@@ -61,6 +61,8 @@ function request(path: string, init: RequestInit = {}) {
 describe("guest foreground boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.JARVIS_FOREGROUND_HOLD_REASON;
+    delete process.env.JARVIS_SELF_HOSTED_FOREGROUND;
     mock.controlActor.mockResolvedValue(guest);
     mock.convexMutation.mockResolvedValue("message-1");
     mock.convexQuery.mockResolvedValue(null);
@@ -104,6 +106,30 @@ describe("guest foreground boundary", () => {
       if (previous === undefined) delete process.env.JARVIS_FOREGROUND_HOLD_REASON;
       else process.env.JARVIS_FOREGROUND_HOLD_REASON = previous;
     }
+  });
+
+  it("admits through a fresh private runner without spending a Trigger task", async () => {
+    process.env.JARVIS_FOREGROUND_HOLD_REASON = "trigger_billing_limit";
+    process.env.JARVIS_SELF_HOSTED_FOREGROUND = "live";
+    mock.controlActor.mockResolvedValue({ kind: "owner", authTokenHash: "owner-scope" });
+    mock.controlCredentials.mockReturnValue({ adminHash: "owner-scope" });
+    mock.convexQuery.mockResolvedValue({
+      runnerId: "selfhost:daniel-studio:primary:run-1",
+      updatedAt: Date.now(),
+    });
+
+    const response = await chatPost(request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "Can you hear me now?", requestId: "private-turn" }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(mock.convexMutation).toHaveBeenCalledWith(
+      "chatQueue:sendMessageWithRunnerLease",
+      expect.objectContaining({ adminHash: "owner-scope", text: "Can you hear me now?" }),
+    );
+    expect(mock.trigger).not.toHaveBeenCalled();
   });
 
   it("rejects speculative research receipts at the guest foreground boundary", async () => {
@@ -237,6 +263,30 @@ describe("guest foreground boundary", () => {
       threadId: "main",
       guestId: guest.guestId,
     });
+  });
+
+  it("requeues recovery for a live private runner without Trigger", async () => {
+    process.env.JARVIS_SELF_HOSTED_FOREGROUND = "live";
+    mock.convexQuery.mockResolvedValue({
+      runnerId: "selfhost:daniel-studio:primary:run-1",
+      updatedAt: Date.now(),
+    });
+    mock.convexMutation.mockResolvedValue({
+      status: "requeued",
+      messageId: "message-1",
+      attemptCount: 1,
+      dispatchEpoch: 2,
+    });
+
+    const response = await recoverChatPost(request("/api/chat/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messageId: "message-1", threadId: "main" }),
+    }));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ ok: true, recovery: "requeued", immediate: true });
+    expect(mock.trigger).not.toHaveBeenCalled();
   });
 
   it("keeps an authoritative cancellation fence inside the guest partition", async () => {

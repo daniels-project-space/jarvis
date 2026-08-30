@@ -6,6 +6,11 @@ import { CHAT_FILE_LIMITS } from "@/lib/chat-files";
 import { visibleTurnText } from "@/lib/host-context";
 import { promoteSpeculativeResearchReceipt } from "@/lib/speculative-research-receipt.server";
 import { SPECULATIVE_RESEARCH_LIMITS } from "@/lib/speculative-research";
+import {
+  foregroundDispatchFailure,
+  foregroundDispatchMode,
+  type ForegroundRunnerLease,
+} from "@/lib/foreground-runner-mode";
 
 // Conversation transport only. The durable answer is produced by a trusted
 // Trigger worker running Codex with Daniel's subscription; neither the browser
@@ -63,17 +68,23 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
   if (!text && !fileIds.length) return Response.json({ error: "empty" }, { status: 400 });
   if (!text) text = "Please analyze the attached files.";
 
+  const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
+  const selfHostedLease = process.env.JARVIS_SELF_HOSTED_FOREGROUND === "live"
+    ? await convexQuery("chatQueue:runnerLease", credentials).catch(() => null) as ForegroundRunnerLease
+    : null;
+  const dispatchMode = foregroundDispatchMode(process.env, selfHostedLease);
+  const dispatchFailure = foregroundDispatchFailure(dispatchMode);
   // Trigger accepts new runs even while an environment is billing-paused.
   // Without this explicit operational hold, the browser receives a successful
-  // queue receipt and waits forever for a worker that cannot start. Keep the
-  // request client-side for an exact-ID retry instead of creating another
-  // durable turn while production is known to be suspended.
-  if (process.env.JARVIS_FOREGROUND_HOLD_REASON === "trigger_billing_limit") {
+  // queue receipt and waits forever for a worker that cannot start. A selected
+  // self-hosted runner is also fail-closed: only its exact live Convex lease can
+  // admit a turn, and there is no silent fallback to paid Trigger execution.
+  if (dispatchFailure) {
     return Response.json({
-      error: "Reply workers are paused at the Trigger billing limit.",
-      code: "FOREGROUND_WORKERS_BILLING_PAUSED",
+      error: dispatchFailure.message,
+      code: dispatchFailure.code,
       retryable: true,
-      ...(actor.kind === "guest"
+      ...(dispatchMode !== "billing_paused" || actor.kind === "guest"
         ? {}
         : { actionUrl: "https://cloud.trigger.dev/orgs/daniels-project-space-be0b/settings/billing-limits" }),
     }, { status: 503 });
@@ -90,7 +101,6 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
       )
     : null;
 
-  const credentials = actor.kind === "guest" ? { guestId: actor.guestId } : controlCredentials(actor);
   let messageId: unknown;
   let warm: boolean | undefined;
   try {
@@ -130,12 +140,14 @@ async function handlePost(req: NextRequest, actor: ControlActor) {
       },
     );
   }
-  if (warm === undefined) {
+  if (dispatchMode === "selfhost") {
+    warm = true;
+  } else if (warm === undefined) {
     const lease = await convexQuery("chatQueue:runnerLease", credentials)
       .catch(() => null) as { updatedAt?: number } | null;
     warm = Boolean(lease?.updatedAt && Date.now() - lease.updatedAt < 25_000);
   }
-  const handle = warm ? null : await tasks
+  const handle = dispatchMode === "selfhost" || warm ? null : await tasks
     .trigger(
       "jarvis-chat-turn",
       { source: "conversation", threadId, messageId: String(messageId), dispatchEpoch: 0 },
