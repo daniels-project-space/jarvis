@@ -510,6 +510,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
         status: "done",
         goalStage: "validating",
         attempt: 1,
+        percent: 99,
         dispatchGeneration: 7,
         dispatchPhase: "integration",
         workerRunId: "stale-validator-controller",
@@ -565,6 +566,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
       status: "pending",
       stage: "checkpointed",
       attempt: 2,
+      percent: 0,
       deliveryLeaseVersion: 10,
     });
     for (const field of [

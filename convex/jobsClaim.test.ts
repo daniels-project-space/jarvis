@@ -316,6 +316,14 @@ describe("real Convex specialist/controller race matrix", () => {
       workerRunId: "expiry-race-run",
       workerToken: WORKER,
     });
+    expect(await f.t.mutation(api.jobs.updateProgress, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      progress: "Prior attempt reached its final validation step",
+      stage: "validating",
+      percent: 99,
+      workerToken: WORKER,
+    })).toBe(true);
     const failures = await Promise.all([
       f.t.mutation(api.jobs.checkpointAndRequeue, {
         jobId: f.jobId, expectedAttempt: 1, authorityDigest: claim.authorityDigest,
@@ -328,6 +336,10 @@ describe("real Convex specialist/controller race matrix", () => {
     ]);
     expect(failures.filter((failure) => failure.requeued)).toHaveLength(1);
     expect(failures.filter((failure) => failure.stale)).toHaveLength(1);
+    expect(await f.t.run(async (ctx) => ctx.db
+      .query("jobRuntime")
+      .withIndex("by_job", (q) => q.eq("jobId", f.jobId))
+      .unique())).toMatchObject({ attempt: 2, status: "pending", percent: 0 });
 
     const continuation = (await f.t.mutation(api.jobs.reserveDispatchBatch, {
       limit: 1, reason: "next-closed-generation", workerToken: WORKER,
@@ -337,9 +349,24 @@ describe("real Convex specialist/controller race matrix", () => {
       dispatchGeneration: 2,
       dispatchPhase: "specialist",
     });
+    expect(await f.t.run(async (ctx) => ctx.db
+      .query("jobRuntime")
+      .withIndex("by_job", (q) => q.eq("jobId", f.jobId))
+      .unique())).toMatchObject({ attempt: 2, status: "dispatching", percent: 1 });
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: continuation.dispatchId,
+      ...triggerClaimAuthority(continuation),
+      workerRunId: "fresh-attempt-run",
+      workerToken: WORKER,
+    })).toMatchObject({ attempt: 2, workerRunId: "fresh-attempt-run" });
+    expect(await f.t.run(async (ctx) => ctx.db
+      .query("jobRuntime")
+      .withIndex("by_job", (q) => q.eq("jobId", f.jobId))
+      .unique())).toMatchObject({ attempt: 2, status: "running", percent: 2 });
     expect((await rows(f.t)).dispatches.map((receipt) => [receipt.generation, receipt.status])).toEqual([
       [1, "closed"],
-      [2, "reserved"],
+      [2, "claimed"],
     ]);
   });
 

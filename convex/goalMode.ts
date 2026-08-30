@@ -71,6 +71,10 @@ type AdvanceLeaseFence = {
 // provider, review, delivery, and integration authority projected on the job.
 function freshGoalSpecialistAttemptPatch(job: any) {
   return {
+    // Progress is scoped to the fresh specialist generation. Keeping the
+    // rejected attempt's terminal percentage makes a queued correction look
+    // finished before it has even acquired a workspace.
+    percent: 0,
     dispatchId: undefined,
     dispatchGeneration: undefined,
     dispatchPhase: undefined,

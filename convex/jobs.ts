@@ -1673,6 +1673,10 @@ export const reserveDispatchBatch = mutation({
         status: "dispatching",
         stage: "dispatching",
         progress: "cloud worker reserved",
+        // `percent` is the current specialist attempt, not a lifetime high
+        // water mark. A correction/recovery may follow a prior 99% attempt;
+        // carrying that value makes a brand-new workspace look complete.
+        percent: deliveryContinuation ? Math.max(1, j.percent ?? 0) : 1,
         dispatchId,
         dispatchGeneration: dispatchReceipt.generation,
         dispatchPhase: dispatchReceipt.phase,
@@ -1713,7 +1717,7 @@ export const reserveDispatchBatch = mutation({
         triggerMachineReason: triggerMachine.reason,
       });
       await appendAttemptEvidence(ctx, j, "dispatched", `Independent Trigger worker reserved${a.reason ? ` · ${a.reason.slice(0, 120)}` : ""}`, {
-        stage: "dispatching", percent: Math.max(1, j.percent ?? 0), evidenceKind: "dispatch", eventKey: `dispatch:${attemptNumber}:${dispatchId}`,
+        stage: "dispatching", percent: deliveryContinuation ? Math.max(1, j.percent ?? 0) : 1, evidenceKind: "dispatch", eventKey: `dispatch:${attemptNumber}:${dispatchId}`,
       });
       const reservation = reservationFromDispatchReceipt(dispatchReceipt, j);
       if (reservation) reservations.push(reservation);
@@ -2690,6 +2694,9 @@ export const reserveSupervisorControlDispatchBatchV1 = mutation({
         status: "dispatching",
         stage: "dispatching",
         progress: "cloud worker reserved",
+        percent: envelope.phase === "delivery"
+          ? Math.max(1, planned.job.percent ?? 0)
+          : 1,
         dispatchId: envelope.dispatchId,
         dispatchGeneration: planned.nextDispatchGeneration,
         dispatchPhase: envelope.phase,
@@ -2720,7 +2727,9 @@ export const reserveSupervisorControlDispatchBatchV1 = mutation({
         "Independent Trigger worker reserved by exact supervisor resume",
         {
           stage: "dispatching",
-          percent: Math.max(1, planned.job.percent ?? 0),
+          percent: envelope.phase === "delivery"
+            ? Math.max(1, planned.job.percent ?? 0)
+            : 1,
           evidenceKind: "dispatch",
           eventKey:
             `dispatch:${planned.member.attempt}:${envelope.dispatchId}`,
@@ -2973,7 +2982,7 @@ export const claimDispatched = mutation({
       status: "running",
       stage: "starting",
       progress: "starting secure workspace",
-      percent: Math.max(2, j.percent ?? 0),
+      percent: 2,
       startedAt: now,
       heartbeatAt: now,
       progressAt: now,
@@ -3032,7 +3041,7 @@ export const claimDispatched = mutation({
     });
     await appendAttemptEvidence(ctx, j, "started", `Attempt ${j.attempt ?? 1} started`, {
       stage: "starting",
-      percent: Math.max(2, j.percent ?? 0),
+      percent: 2,
       evidenceKind: "attempt_launch",
       data: { workspace: workspaceKey, workspaceLineage, workerBranch: j.workerBranch, session: a.workerRunId.slice(0, 120) },
     });
@@ -3897,6 +3906,7 @@ export const reapStale = mutation({
           ...invalidateDeliveryLease(j),
           status: "pending",
           stage: "queued",
+          percent: 0,
           startedAt: undefined,
           heartbeatAt: now,
           nextRunAt: now + Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, nextAttempt - 2)),
@@ -4231,6 +4241,7 @@ export const checkpointAndRequeue = mutation({
         await patchJobWithRuntime(ctx, row, {
           ...invalidateDeliveryLease(row),
           status: "pending", stage: "checkpointed", attempt: nextAttempt,
+          percent: 0,
           checkpoint: a.checkpoint.slice(0, 6000), result: a.result, branch: a.branch ?? row.branch,
           startedAt: undefined, heartbeatAt: now, nextRunAt: now, dispatchId: undefined,
           dispatchLeaseUntil: undefined, workerRunId: undefined,
@@ -4354,6 +4365,7 @@ export const checkpointAndRequeue = mutation({
       ...invalidateDeliveryLease(row),
       status,
       stage: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
+      percent: status === "pending" && !deliveryContinuation ? 0 : row.percent,
       checkpoint: a.checkpoint.slice(0, 6000),
       result: a.result,
       branch: a.branch ?? row.branch,
@@ -4515,6 +4527,7 @@ export const expediteCloudWorkspaceCapacityWait = mutation({
       status: "pending",
       stage: "checkpointed",
       progress: "provider capacity retry ready",
+      percent: 0,
       nextRunAt: now,
       heartbeatAt: now,
       progressAt: now,
@@ -4991,6 +5004,7 @@ export const resumeCloudWorkspaceBlocks = mutation({
         status: "pending",
         stage: "queued",
         progress: "Secure worker ready · continuing automatically",
+        percent: 0,
         attempt: nextAttempt,
         maxAttempts,
         startedAt: undefined,
@@ -5573,6 +5587,7 @@ export const provideInput = mutation({
       status: "pending",
       stage: "queued",
       progress: "Daniel answered — continuation queued",
+      percent: 0,
       checkpoint: `${row.checkpoint ?? ""}\n\nDaniel's answer: ${a.answer.slice(0, 2000)}`.trim(),
       attempt: nextAttempt,
       heartbeatAt: now,
@@ -6181,6 +6196,7 @@ export const control = mutation({
         status: "pending",
         stage: "queued",
         progress: row.status === "stalled" ? "stalled attempt resumed — fresh workspace queued" : "resumed — queued",
+        percent: 0,
         attempt: nextAttempt,
         startedAt: undefined,
         heartbeatAt: now,
@@ -6277,6 +6293,7 @@ export const control = mutation({
         ...invalidateDeliveryLease(row),
         status: renewApproval ? "awaiting_approval" : "pending",
         stage: renewApproval ? "approval" : "queued",
+        percent: 0,
         completedAt: undefined,
         startedAt: undefined,
         heartbeatAt: now,
@@ -6374,6 +6391,7 @@ export const control = mutation({
         approvalStatus: approval.required ? "pending" : undefined,
         stage: approval.required ? "approval" : "queued",
         attempt: nextAttempt,
+        percent: 0,
         steerRevision,
         checkpoint: `${row.checkpoint ?? ""}\n\nDaniel steering instruction:\n${steer}`.trim().slice(-6_000),
         progress: approval.required
