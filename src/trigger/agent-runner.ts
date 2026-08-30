@@ -3506,6 +3506,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         await sendPush("JARVIS", spoken.slice(0, 140), "/");
       } catch (e: any) {
         const message = redactSensitiveText(String(e?.message ?? e), env);
+        const cloudFailure = e instanceof CloudWorkspaceError ? e : null;
         // The session controller intentionally emits this exact, secret-free
         // operator signal when its ChatGPT session cannot be used safely
         // (notably after an uncertain refresh-token rotation). Retrying that
@@ -3536,6 +3537,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           checkpoint: `Runner exception on attempt ${job.attempt ?? 1}: ${message.slice(0, 1200)}. Retry from the original task with a different approach.`,
           result: message.slice(0, 4000),
           branch: job.branch ?? undefined,
+          // The server grants this only when the exact attempt has neither a
+          // provider identity nor a prepared Codex turn. A worker cannot use
+          // the flag to replenish an attempt after meaningful work began.
+          systemHoldCode: cloudFailure?.code === "provider_capacity" && !providerWorkspace
+            ? "provider_capacity"
+            : undefined,
           delayMs: failureBackoffMs(Number(job.attempt ?? 1)),
         }).catch(() => null);
         if (job.incidentId)

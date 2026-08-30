@@ -23,6 +23,7 @@ export type CloudWorkspaceFailureCode =
   | "stale_attempt"
   | "cancelled"
   | "timeout"
+  | "provider_capacity"
   | "resource_limit"
   | "unsafe_archive"
   | "unsafe_patch"

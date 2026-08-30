@@ -2326,6 +2326,139 @@ describe("production Trigger worker authority harness", () => {
     expect(state.job).not.toHaveProperty("providerEffectLeaseUntil");
   });
 
+  it("treats a pre-work provider capacity hold as a short budget-free continuation", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-provider-capacity-hold");
+    await t.run(async (ctx) => {
+      const runtime: any = await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", jobId))
+        .unique();
+      await ctx.db.patch(jobId, { maxAttempts: 1 });
+      await ctx.db.patch(runtime._id, { maxAttempts: 1 });
+    });
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+    (dependencies.prepareCloudWorkspaceExecution as any).mockRejectedValue(
+      new CloudWorkspaceError(
+        "vercel",
+        "provider_capacity",
+        "Vercel Sandbox controller active-attempt cap is reached",
+        "deferred",
+      ),
+    );
+
+    const before = Date.now();
+    expect(await invokeHarness(reservation, "provider-capacity-hold-run", dependencies))
+      .toEqual({ processed: 1 });
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempts: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId))
+        .collect(),
+    }));
+    expect(state.job).toMatchObject({
+      status: "pending",
+      attempt: 2,
+      maxAttempts: 2,
+      providerRunState: "capacity_wait",
+      cloudWorkspaceBlockCode: "provider_capacity",
+    });
+    expect(Number(state.job?.nextRunAt)).toBeGreaterThanOrEqual(before + 59_000);
+    expect(Number(state.job?.nextRunAt)).toBeLessThanOrEqual(Date.now() + 61_000);
+    expect(state.attempts.find((attempt) => attempt.attempt === 1)).toMatchObject({
+      status: "checkpointed",
+      workerRunId: "provider-capacity-hold-run",
+    });
+    expect(state.attempts.find((attempt) => attempt.attempt === 1)).not.toHaveProperty("providerWorkspaceId");
+    expect(state.attempts.find((attempt) => attempt.attempt === 1)).not.toHaveProperty("codexTurnReceiptId");
+    expect(state.attempts.find((attempt) => attempt.attempt === 2)).toMatchObject({ status: "pending" });
+    expect(bridge.trace.find((call) => call.path === "jobs:checkpointAndRequeue")?.args)
+      .toMatchObject({ systemHoldCode: "provider_capacity" });
+    expect((dependencies.runCloudWorkspaceAgent as any)).not.toHaveBeenCalled();
+    expect((dependencies.prepareSubscriptionEnv as any)).not.toHaveBeenCalled();
+  });
+
+  it("cannot replenish correction budget after a provider or Codex boundary exists", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-spoofed-capacity-hold");
+    await t.mutation(api.jobs.claimDispatched, {
+      ...workerPayload(reservation),
+      workerRunId: "spoofed-capacity-run",
+      workerToken: WORKER,
+    });
+    await t.run(async (ctx) => {
+      const runtime: any = await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", jobId))
+        .unique();
+      const attempt: any = await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1))
+        .unique();
+      await ctx.db.patch(jobId, { maxAttempts: 1 });
+      await ctx.db.patch(runtime._id, { maxAttempts: 1 });
+      await ctx.db.patch(attempt._id, {
+        providerWorkspaceId: "workspace-already-created",
+        providerSessionId: "session-already-created",
+        codexTurnReceiptId: "codex-already-prepared",
+      });
+    });
+
+    expect(await t.mutation(api.jobs.checkpointAndRequeue, {
+      jobId,
+      expectedAttempt: 1,
+      authorityDigest: String(reservation.authorityDigest),
+      workerRunId: "spoofed-capacity-run",
+      workerToken: WORKER,
+      checkpoint: "A caller falsely claimed provider capacity before work.",
+      systemHoldCode: "provider_capacity",
+    })).toMatchObject({ requeued: false, exhausted: true, stale: false });
+    expect(await t.run(async (ctx) => ctx.db.get(jobId))).toMatchObject({
+      status: "error",
+      attempt: 2,
+      maxAttempts: 1,
+    });
+  });
+
+  it("pulls an exact legacy capacity continuation forward without workspace or Codex effects", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(t, "runner-legacy-capacity-wait");
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+    (dependencies.prepareCloudWorkspaceExecution as any).mockRejectedValue(
+      new Error("Vercel Sandbox controller active-attempt cap is reached"),
+    );
+
+    expect(await invokeHarness(reservation, "legacy-capacity-run", dependencies))
+      .toEqual({ processed: 1 });
+    const delayed = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(delayed).toMatchObject({ status: "pending", attempt: 2, maxAttempts: 12 });
+    expect(Number(delayed?.nextRunAt)).toBeGreaterThan(Date.now());
+    expect(await t.mutation(api.jobs.expediteCloudWorkspaceCapacityWait, {
+      jobId,
+      workerToken: WORKER,
+    })).toBe(true);
+    const resumed = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(resumed).toMatchObject({
+      status: "pending",
+      attempt: 2,
+      maxAttempts: 13,
+      providerRunState: "capacity_wait",
+      cloudWorkspaceBlockCode: "provider_capacity",
+      progress: "provider capacity retry ready",
+    });
+    expect(Number(resumed?.nextRunAt)).toBeLessThanOrEqual(Date.now());
+    expect(await t.mutation(api.jobs.expediteCloudWorkspaceCapacityWait, {
+      jobId,
+      workerToken: WORKER,
+    })).toBe(true);
+    // Classified replays are idempotent and never extend the budget twice.
+    expect(await t.run(async (ctx) => ctx.db.get(jobId))).toMatchObject({ maxAttempts: 13 });
+    expect(bridge.trace.find((call) => call.path === "jobs:checkpointAndRequeue")?.args)
+      .not.toHaveProperty("systemHoldCode");
+  });
+
   it.each([
     "sandbox file read acquisition",
     "sandbox file read iteration",

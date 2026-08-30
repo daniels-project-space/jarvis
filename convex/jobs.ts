@@ -4191,6 +4191,7 @@ export const checkpointAndRequeue = mutation({
     result: v.optional(v.string()),
     branch: v.optional(v.string()),
     delayMs: v.optional(v.number()),
+    systemHoldCode: v.optional(v.literal("provider_capacity")),
     nextStatus: v.optional(v.union(v.literal("pending"), v.literal("paused"), v.literal("cancelled"))),
     deliveryAttemptId: v.optional(v.id("deliveryAttempts")),
     sourceWorkAttempt: v.optional(v.number()),
@@ -4281,19 +4282,36 @@ export const checkpointAndRequeue = mutation({
     const deliveryContinuation = requestedStatus === "pending"
       && row.verificationVerdict === "pass"
       && Boolean(row.reviewReceiptId);
+    const activeAttempt = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    // Capacity is an infrastructure admission hold, not a model correction.
+    // Derive eligibility from durable state: no provider identity and no
+    // prepared Codex turn may exist. The caller's enum only selects this
+    // stricter branch; it is never trusted as proof by itself.
+    const providerCapacityHold = requestedStatus === "pending"
+      && a.systemHoldCode === "provider_capacity"
+      && !deliveryContinuation
+      && activeAttempt?.status === "running"
+      && !activeAttempt.providerWorkspaceId
+      && !activeAttempt.providerSessionId
+      && !activeAttempt.codexTurnReceiptId;
     const nextAttempt =
       (row.attempt ?? 1)
       + (requestedStatus === "pending" && !deliveryContinuation ? 1 : 0);
-    const requestedDelayMs = Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
+    const requestedDelayMs = providerCapacityHold
+      ? 60_000
+      : Math.max(0, Math.min(6 * 60 * 60 * 1000, a.delayMs ?? 0));
     const retryOrdinal = deliveryContinuation && delivery
       ? Number(delivery.cumulativeRetries ?? delivery.retries ?? 0) + 1
       : 0;
     const delayMs = deliveryContinuation
       ? Math.max(requestedDelayMs, Math.min(30 * 60_000, 30_000 * 2 ** Math.max(0, retryOrdinal - 1)))
       : requestedDelayMs;
+    const capacityMaxAttempts = providerCapacityHold
+      ? Math.min(48, Math.max(Number(row.maxAttempts ?? 12) + 1, nextAttempt))
+      : Number(row.maxAttempts ?? 12);
     const exhausted =
       requestedStatus === "pending" &&
-      (nextAttempt > (row.maxAttempts ?? 12)
+      (nextAttempt > capacityMaxAttempts
         || Date.now() - row.createdAt > 14 * 86_400_000);
     const status = exhausted ? "error" : requestedStatus;
     // There is no next attempt when the continuation budget is exhausted.
@@ -4340,6 +4358,7 @@ export const checkpointAndRequeue = mutation({
       result: a.result,
       branch: a.branch ?? row.branch,
       attempt,
+      maxAttempts: capacityMaxAttempts,
       // Allocate the next controller generation once here. reserveDispatch
       // only dispatches it, so retries cannot double-increment.
       deliveryGeneration: deliveryContinuation ? Number(row.deliveryGeneration ?? 1) + 1 : row.deliveryGeneration,
@@ -4366,11 +4385,13 @@ export const checkpointAndRequeue = mutation({
       completedAt: requestedStatus === "cancelled" || exhausted ? Date.now() : undefined,
       progress: exhausted
         ? "continuation budget exhausted"
+        : providerCapacityHold
+          ? `provider capacity busy · continuation ${attempt} eligible in 1m`
         : requestedStatus === "pending"
           ? `checkpoint saved · continuation ${attempt}${delayMs ? ` eligible in ${Math.max(1, Math.ceil(delayMs / 60_000))}m` : " queued"}`
           : `checkpoint saved · ${requestedStatus}`,
     });
-    const attemptRecord = await attemptFor(ctx, a.jobId, a.expectedAttempt);
+    const attemptRecord = activeAttempt;
     if (attemptRecord) await ctx.db.patch(attemptRecord._id, {
       status: exhausted ? "error" : requestedStatus === "pending" ? "checkpointed" : requestedStatus,
       checkpointHeadSha: a.checkpointHeadSha && GIT_OID.test(a.checkpointHeadSha) ? a.checkpointHeadSha : attemptRecord.checkpointHeadSha,
@@ -4383,9 +4404,11 @@ export const checkpointAndRequeue = mutation({
       a.deliveryRunId ?? a.workerRunId,
       requestedStatus === "pending" ? "durable continuation queued" : `job ${requestedStatus}`,
     );
-    await appendAttemptEvidence(ctx, row, exhausted ? "continuation_exhausted" : requestedStatus === "pending" ? "checkpoint" : requestedStatus,
+    await appendAttemptEvidence(ctx, row, exhausted ? "continuation_exhausted" : providerCapacityHold ? "provider_capacity_wait" : requestedStatus === "pending" ? "checkpoint" : requestedStatus,
       exhausted
         ? "Continuation budget exhausted"
+        : providerCapacityHold
+          ? `Provider capacity was busy before workspace creation; attempt ${attempt} queued without consuming model correction budget`
         : requestedStatus === "pending"
           ? `Checkpoint saved; attempt ${attempt}${delayMs ? ` eligible in ${Math.max(1, Math.ceil(delayMs / 60_000))}m` : " queued"}`
           : `Checkpoint saved; job ${requestedStatus}`,
@@ -4398,6 +4421,13 @@ export const checkpointAndRequeue = mutation({
       });
       await appendAttemptEvidence(ctx, row, "queued", `Continuation attempt ${attempt} queued`, {
         stage: "queued", evidenceKind: "intent", eventKey: `intent:${attempt}`, attempt,
+      });
+    }
+    if (providerCapacityHold && status === "pending") {
+      await patchJobWithRuntime(ctx, row, {
+        providerRunState: "capacity_wait",
+        providerObservedAt: Date.now(),
+        cloudWorkspaceBlockCode: "provider_capacity",
       });
     }
     if (deliveryContinuation && delivery) {
@@ -4452,6 +4482,51 @@ export const checkpointAndRequeue = mutation({
       }
     }
     return { requeued: status === "pending", exhausted, stale: false };
+  },
+});
+
+/** Pull forward a capacity continuation produced by the pre-classification
+ * runner. This accepts only the exact historical controller message and
+ * proves that neither the failed nor current attempt reached a provider or
+ * Codex boundary. It is safe to retain as an operator/maintenance repair. */
+export const expediteCloudWorkspaceCapacityWait = mutation({
+  args: { jobId: v.id("jobs"), workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const row: any = await ctx.db.get(a.jobId);
+    if (!row || row.status !== "pending" || !Number.isSafeInteger(row.attempt)
+      || row.attempt < 2 || row.dispatchId || row.workerRunId) return false;
+    const current = await attemptFor(ctx, row._id, row.attempt);
+    const previous = await attemptFor(ctx, row._id, row.attempt - 1);
+    if (!current || current.status !== "pending" || !previous || previous.status !== "checkpointed"
+      || current.providerWorkspaceId || current.providerSessionId || current.codexTurnReceiptId
+      || previous.providerWorkspaceId || previous.providerSessionId || previous.codexTurnReceiptId) return false;
+    const classified = row.cloudWorkspaceBlockCode === "provider_capacity";
+    const legacy = !row.cloudWorkspaceBlockCode
+      && /^Runner exception on attempt [1-9][0-9]*: Vercel Sandbox controller active-attempt cap is reached\./.test(
+        String(row.checkpoint ?? ""),
+      );
+    if (!classified && !legacy) return false;
+    const now = Date.now();
+    const maxAttempts = legacy
+      ? Math.min(48, Math.max(Number(row.maxAttempts ?? 12) + 1, Number(row.attempt)))
+      : Number(row.maxAttempts ?? 12);
+    await patchJobWithRuntime(ctx, row, {
+      status: "pending",
+      stage: "checkpointed",
+      progress: "provider capacity retry ready",
+      nextRunAt: now,
+      heartbeatAt: now,
+      progressAt: now,
+      maxAttempts,
+      providerRunState: "capacity_wait",
+      providerObservedAt: now,
+      cloudWorkspaceBlockCode: "provider_capacity",
+    });
+    await appendAttemptEvidence(ctx, row, "provider_capacity_recovered", "Provider capacity continuation made eligible without consuming model correction budget", {
+      stage: "queued", evidenceKind: "recovery", eventKey: `provider-capacity-recovered:${row.attempt}`, attempt: row.attempt,
+    });
+    return true;
   },
 });
 

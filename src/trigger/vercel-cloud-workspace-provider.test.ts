@@ -659,10 +659,10 @@ describe("VercelCloudWorkspaceProvider", () => {
     const { VERCEL_ACTIVE_SANDBOX_CAP, VercelCloudWorkspaceProvider } = await import("./cloud-workspace-providers");
     observed.listed = Array.from({ length: VERCEL_ACTIVE_SANDBOX_CAP }, () => ({ status: "running" }));
     const provider = new VercelCloudWorkspaceProvider("controller-token", "team_1", "prj_1");
-    await expect(provider.createWorkspace({ attemptKey: "job:cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
+    await expect(provider.createWorkspace({ attemptKey: "job:cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "provider_capacity", disposition: "deferred" });
     expect(observed.create).toBeUndefined();
     observed.listed = Array.from({ length: VERCEL_ACTIVE_SANDBOX_CAP }, () => ({ status: "snapshotting" }));
-    await expect(provider.createWorkspace({ attemptKey: "job:snapshot-cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "resource_limit" });
+    await expect(provider.createWorkspace({ attemptKey: "job:snapshot-cap", template: "node22", runtime: "node-22", lockfileDigest: "a".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS })).rejects.toMatchObject({ code: "provider_capacity", disposition: "deferred" });
     expect(observed.create).toBeUndefined();
   });
 

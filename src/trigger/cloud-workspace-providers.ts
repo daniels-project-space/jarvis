@@ -934,7 +934,7 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
       throw new CloudWorkspaceError(this.name, "provider_unavailable", "prior exact sandbox attempt was reconciled; retry creation after durable requeue", "deferred");
     }
     if (active >= VERCEL_ACTIVE_SANDBOX_CAP) {
-      throw new CloudWorkspaceError(this.name, "resource_limit", "Vercel Sandbox controller active-attempt cap is reached", "deferred");
+      throw new CloudWorkspaceError(this.name, "provider_capacity", "Vercel Sandbox controller active-attempt cap is reached", "deferred");
     }
     await input.onStage?.("provider_create");
     let sandbox: VercelSandbox;
