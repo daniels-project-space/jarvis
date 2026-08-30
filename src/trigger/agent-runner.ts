@@ -2836,12 +2836,36 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         await durableProgress;
         let result = run.text;
-        const portable = await persistAndRecordCloudCheckpoint();
+        const immutableReadOnlyResult = job.readonly === true
+          && Array.isArray(job.toolScope)
+          && job.toolScope.every((tool: unknown) =>
+            tool === "repository_read_file" || tool === "repository_list_files")
+          && !run.timedOut
+          && run.stopped === null
+          && result !== "(no output)"
+          && !/^error:/i.test(result);
+        // A successfully completed job with only immutable read/list
+        // capabilities has no mutable workspace state to preserve or export.
+        // Finalize its durable model receipt directly instead of letting an
+        // unrelated Git checkpoint failure discard the completed result. Any
+        // writable, timed-out, stopped, or failed turn still requires the full
+        // portable checkpoint and patch boundary below.
+        const portable = immutableReadOnlyResult
+          ? null
+          : await persistAndRecordCloudCheckpoint();
         if (repo) {
-          if (!await assertCurrentWorkspace("patch_export")) {
-            throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected patch export", "deferred");
-          }
-          const patch = await cloudProvider.exportPatch(providerWorkspace, baseSha, DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes);
+          const patch = immutableReadOnlyResult
+            ? null
+            : await (async () => {
+                if (!await assertCurrentWorkspace("patch_export")) {
+                  throw new CloudWorkspaceError(cloudProvider.name, "stale_attempt", "attempt fence rejected patch export", "deferred");
+                }
+                return await cloudProvider.exportPatch(
+                  providerWorkspace,
+                  baseSha,
+                  DEFAULT_WORKSPACE_LIMITS.maxArchiveBytes,
+                );
+              })();
           if (!controllerCheckoutPath || !token) throw new Error("trusted controller checkout authority is unavailable after specialist exit");
           const url = githubRepoUrl(repo);
           const gitEnv = githubGitEnv(hostChildEnv, token);
@@ -2864,9 +2888,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           await sh("git", ["-C", controllerCheckoutPath, "config", "user.email", "jarvis@daniels-project-space.dev"], hostChildEnv);
           await sh("git", ["-C", controllerCheckoutPath, "config", "user.name", `${profile.name} via JARVIS`], hostChildEnv);
           repoDir = controllerCheckoutPath;
-          await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, hostChildEnv);
+          if (patch) {
+            await applyValidatedPatchToControllerCheckout(repoDir, baseSha, patch, hostChildEnv);
+          }
         }
-        result = `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`;
+        result = portable
+          ? `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; R2 checkpoint ${portable.digest} (${portable.byteCount} bytes).`
+          : `${result}\n\nCloud boundary: ${cloudProvider.name} workspace ${providerWorkspace.providerWorkspaceId}; immutable read-only result finalized without a mutable checkpoint.`;
 
         const checkpointText = buildContinuationCheckpoint({
           attempt: expectedAttempt,

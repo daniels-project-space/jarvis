@@ -229,13 +229,17 @@ async function reservedWritableJob(
   t: HarnessConvex,
   key: string,
   reasoningEffort?: string,
-  options: Readonly<{ task?: string; model?: "luna" | "terra" | "sol" }> = {},
+  options: Readonly<{
+    task?: string;
+    model?: "luna" | "terra" | "sol";
+    readonly?: boolean;
+  }> = {},
 ) {
   const mission = await testMissionAdmission(t, { key, workerToken: WORKER, repository: REPO });
   const jobId = await t.mutation(api.jobs.enqueueV2, {
     task: options.task ?? "Implement the exact production runner authority fixture and stop before any untrusted checkout.",
     repo: REPO,
-    readonly: false,
+    readonly: options.readonly ?? false,
     reasoningEffort,
     ...(options.model ? { model: options.model } : {}),
     missionId: String(mission.missionId),
@@ -1214,6 +1218,43 @@ describe("production Trigger worker authority harness", () => {
     // untrusted specialist/Novita response cannot promote itself to delivery.
     expect(trace.map((item) => item.effect)).toContain("review_receipt");
     expect(bridge.trace.filter((call) => call.path === "jobs:markVerifiedForDelivery")).toHaveLength(1);
+  });
+
+  it("finalizes a successful immutable read-only result without exporting mutable provider state", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-immutable-readonly-result",
+      "ultra",
+      {
+        task: "Inspect the admitted repository and return bounded evidence without changing it.",
+        model: "terra",
+        readonly: true,
+      },
+    );
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies();
+
+    expect(await invokeHarness(
+      reservation,
+      "immutable-readonly-result-run",
+      dependencies,
+    )).toEqual({ processed: 1 });
+    expect(dependencies.persistPortableCheckpoint).not.toHaveBeenCalled();
+    expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:recordCloudCheckpoint");
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempt: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId).eq("attempt", 1))
+        .unique(),
+    }));
+    expect(state.job).toMatchObject({ attempt: 1 });
+    expect(state.job?.result).toContain("immutable read-only result finalized without a mutable checkpoint");
+    expect(state.attempt).toMatchObject({
+      attempt: 1,
+      codexTurnReceiptPhase: "completed",
+    });
   });
 
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {

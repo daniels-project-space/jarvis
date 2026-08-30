@@ -5824,12 +5824,24 @@ export const markVerifiedForDelivery = mutation({
     if (a.resultDigest !== await sha256Hex(result) || a.evidenceDigest !== await sha256Hex(verificationNote)) return false;
     let receipt: any;
     try { receipt = JSON.parse(a.reviewReceiptJson); } catch { return false; }
+    const assignedReviewBranch = String(row.workerBranch ?? row.branch ?? "");
+    const readonlySourceBranch = row.readonly && !assignedReviewBranch
+      ? String(row.sourceBranch ?? "")
+      : "";
+    const receiptBranch = String(receipt?.branch ?? "");
+    const reviewBranchMatches = receiptBranch === assignedReviewBranch
+      || (
+        row.readonly
+        && !assignedReviewBranch
+        && (receiptBranch === readonlySourceBranch || receiptBranch === "")
+      );
+    const reviewedBranch = receiptBranch;
     if (
       receipt?.jobId !== String(a.jobId)
       || Number(receipt?.attempt) !== a.expectedAttempt
       || receipt?.workOrderRevisionDigest !== executionAuthority.workOrderRevisionDigest
       || receipt?.repository !== row.repo
-      || receipt?.branch !== String(row.workerBranch ?? row.branch ?? "")
+      || !reviewBranchMatches
       || receipt?.diffSha256 !== a.reviewDiffSha256
       || !/^[0-9a-f]{40,64}$/i.test(String(receipt?.baseSha ?? ""))
       || !/^[0-9a-f]{40,64}$/i.test(String(receipt?.baseTreeSha ?? ""))
@@ -5862,7 +5874,7 @@ export const markVerifiedForDelivery = mutation({
       canonicalProjectId: executionAuthority.canonicalProjectId,
       signature: a.reviewReceiptSignature, diffSha256: a.reviewDiffSha256,
       keyId: a.reviewReceiptKeyId,
-      workerBranch: String(row.workerBranch ?? row.branch),
+      workerBranch: reviewedBranch,
       sourceBranch: row.sourceBranch,
       workspaceLineage: row.workspaceLineage,
       retryLineage: row.retryLineage,
