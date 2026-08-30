@@ -171,6 +171,14 @@ async function sha256Hex(value: string) {
 }
 
 async function acceptedPlan(value: GoalPlan, maxNodes: number) {
+  if (!value?.outcome || !value?.crew
+    || value.crew.process !== "hierarchical" || value.crew.manager !== "jarvis"
+    || !Array.isArray(value.workstreams) || value.workstreams.some((stream) =>
+      !stream?.deliverable || !Array.isArray(stream.deliverable.requiredEvidence)
+      || stream.deliverable.requiredEvidence.length < 1
+      || !Array.isArray(stream.guardrails) || stream.guardrails.length < 1)) {
+    throw new Error("New GoalPlan admission requires a measurable outcome, hierarchical crew, deliverables, evidence, and guardrails");
+  }
   const canonical = canonicalGoalPlan(value, maxNodes);
   return { plan: canonical, digest: await sha256Hex(canonicalGoalPlanJson(canonical, maxNodes)) };
 }
@@ -555,7 +563,7 @@ export const createV2 = mutation({
     const now = Date.now();
     const goal = args.goal.trim().slice(0, 500);
     if (goal.length < 12) throw new Error("Goal Mode needs a concrete outcome");
-    const maxBuildSessions = Math.max(2, Math.min(8, Math.floor(args.maxBuildSessions ?? 6)));
+    const maxBuildSessions = Math.max(1, Math.min(8, Math.floor(args.maxBuildSessions ?? 6)));
     const maxRevisionWaves = Math.max(1, Math.min(4, Math.floor(args.maxRevisionWaves ?? 2)));
     const criteria = (args.acceptanceCriteria ?? []).map((item) => item.trim().slice(0, 500)).filter(Boolean).slice(0, 10);
     const primaryRepo = args.primaryRepo === undefined ? undefined : canonicalizeRepository(args.primaryRepo, { allowShortName: true }) ?? undefined;
@@ -620,7 +628,7 @@ export const createV2 = mutation({
       priority: 100,
       acceptanceCriteria: [
         "Inspect the current ownership boundary and reusable infrastructure",
-        `Return a valid 2-${maxBuildSessions} session GOAL_PLAN_JSON contract`,
+        `Return a valid 1-${maxBuildSessions} necessary-workstream GOAL_PLAN_JSON contract`,
         "Keep consequential actions explicitly gated",
       ],
       modelReason: `Goal Mode's architecture pass is adaptively quality-routed; ${plannerPolicy.modelReason}`.slice(0, 300),
@@ -751,7 +759,7 @@ async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]): Prom
 }
 
 async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Promise<string> {
-  const plan = mission.plan as GoalPlan;
+  const plan = canonicalGoalPlan(mission.plan as GoalPlan, Number(mission.maxBuildSessions ?? GOAL_DAG_MAX_NODES));
   let buildEvidence = jobs
     .filter((job) => job.goalStage === "building" || job.goalStage === "refining")
     .map((job) => ({ label: job.label ?? job.task.slice(0, 80), status: job.status,
@@ -819,7 +827,7 @@ async function validatorTaskForMission(ctx: any, mission: any, jobs: any[]): Pro
 }
 
 async function enqueueValidator(ctx: any, mission: any, jobs: any[]) {
-  const plan = mission.plan as GoalPlan;
+  const plan = canonicalGoalPlan(mission.plan as GoalPlan, Number(mission.maxBuildSessions ?? GOAL_DAG_MAX_NODES));
   // App Factory owns its own repository/build lifecycle. Its final deep session
   // validates the external run and must not be pointed at a made-up Jarvis branch.
   const splitParent = Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length > 0;
@@ -1224,7 +1232,7 @@ export const recordPlanV2 = mutation({
       throw new Error("Accepted GoalPlan requires a fresh stored canonical project admission ledger");
     }
     const planGeneration = 1;
-    if (!Array.isArray(plan.workstreams) || plan.workstreams.length < 2
+    if (!Array.isArray(plan.workstreams) || plan.workstreams.length < 1
       || plan.workstreams.length > Number(mission.maxBuildSessions ?? 6)) {
       throw new Error("Goal plan workstream budget is invalid");
     }
@@ -1249,7 +1257,7 @@ export const recordPlanV2 = mutation({
         advanceLeaseUntil: undefined, updatedAt: now,
       });
       await resolveGoalAttention(ctx, args.id);
-      await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", "Sol plan accepted; App Factory now owns the build lifecycle", "building", 12, {
+      await recordMissionEvent(ctx, String(args.id), "goal_plan_ready", "Deep plan accepted; App Factory now owns the build lifecycle", "building", 12, {
         externalRunId: args.externalRun.id, externalSlug: args.externalRun.slug,
       });
       return { advanced: true, external: true, jobs: 0 };
@@ -1365,12 +1373,31 @@ export const materializePlanBatch = mutation({
       const dependencies = stream.dependsOn.map((dependency) => jobByNode.get(dependency)).filter((id): id is string => Boolean(id));
       if (dependencies.length !== stream.dependsOn.length) throw new Error(`Goal plan workstream ${stream.id} lost an executable dependency`);
       const split = child._id !== mission._id;
+      const crewContract = [
+        "HIERARCHICAL CREW WORK CONTRACT:",
+        `Manager: JARVIS · specialist: ${stream.agentId} · node: ${stream.id}.`,
+        `Shared objective: ${plan.outcome.objective}`,
+        `Primary metric: ${plan.outcome.metric} · baseline: ${plan.outcome.baseline} · target: ${plan.outcome.target} · window: ${plan.outcome.measurementWindow}.`,
+        `Expected ${stream.deliverable.kind}: ${stream.deliverable.description}`,
+        `Required deliverable evidence:\n${stream.deliverable.requiredEvidence.map((item) => `- ${item}`).join("\n")}`,
+        `Guardrails:\n${stream.guardrails.map((item) => `- ${item}`).join("\n")}`,
+        `Crew delegation rules:\n${plan.crew.delegationRules.map((item) => `- ${item}`).join("\n")}`,
+        `Human escalation rules:\n${plan.crew.humanEscalation.map((item) => `- ${item}`).join("\n")}`,
+        `Reporting: ${plan.crew.reportingCadence}.`,
+        "Use verified upstream handoffs when present. Continue safe independent work before escalating. Stop this worker after its deliverable is evidenced; do not create filler work or keep polling.",
+      ].join("\n");
+      const crewAcceptanceCriteria = [
+        ...stream.acceptanceCriteria,
+        `Structured deliverable (${stream.deliverable.kind}): ${stream.deliverable.description}`,
+        `Required evidence: ${stream.deliverable.requiredEvidence.join("; ")}`,
+        `Guardrails: ${stream.guardrails.join("; ")}`,
+      ];
       const task = split ? [
-        stream.task, `Original Goal Mode outcome: ${mission.goal}`,
+        crewContract, stream.task, `Original Goal Mode outcome: ${mission.goal}`,
         `Immutable parent plan: ${mission.planDigest} generation 1; node ${stream.id}.`,
         "Repository inspection may enrich context but cannot change this node id, scope, dependencies, acceptance criteria, or consequence policy.",
       ].join("\n\n") : [
-        stream.task, `Goal Mode outcome: ${mission.goal}`,
+        crewContract, stream.task, `Goal Mode outcome: ${mission.goal}`,
         `Reuse/ownership boundary: ${mission.infrastructureContext ?? "Inspect the current project boundary before editing."}`,
         `This is adaptive implementation session ${cursor + jobByNode.size + 1} of ${ordered.length}. Preserve completed branch work, stay inside this workstream, and leave a compact evidence-rich checkpoint for the final deep validator.`,
       ].join("\n\n");
@@ -1381,7 +1408,7 @@ export const materializePlanBatch = mutation({
         model: selectedPolicy.model, reasoningEffort: selectedPolicy.reasoningEffort, mcp: stream.mcp,
         originThreadId: mission.originThreadId, agentId: stream.agentId,
         risk: stream.readonly ? "low" : "high", priority: 92,
-        acceptanceCriteria: stream.acceptanceCriteria,
+        acceptanceCriteria: crewAcceptanceCriteria,
         modelReason: `${split
           ? "Goal Mode executes the accepted parent DAG node without child replanning"
           : "Goal Mode deterministically routes each accepted DAG node for quality per token"}; ${selectedPolicy.modelReason}`.slice(0, 300),
@@ -1438,7 +1465,7 @@ export const materializePlanBatch = mutation({
     await recordMissionEvent(ctx, String(mission._id), splitRequired ? "goal_split" : "goal_plan_ready",
       splitRequired
         ? `Accepted plan ${mission.planDigest.slice(0, 12)} projected without replanning`
-        : `Sol plan accepted; ${ordered.length} adaptively routed sessions queued`,
+        : `Deep plan accepted; ${ordered.length} adaptively routed sessions queued`,
       splitRequired ? "split" : "building", 12, {
         planDigest: mission.planDigest, planGeneration: 1, nodeCount: ordered.length,
         edgeCount: plan.workstreams.reduce((sum, stream) => sum + stream.dependsOn.length, 0),
@@ -1620,7 +1647,7 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
       task: [
         refinement.task,
         `Goal Mode outcome: ${mission.goal}`,
-        `Final validator gap from wave ${wave - 1}: close only this gap on your isolated worker branch, run the relevant checks, and report exact evidence for controller integration and the next Sol validation.`,
+        `Final validator gap from wave ${wave - 1}: close only this gap on your isolated worker branch, run the relevant checks, and report exact evidence for controller integration and the next deep validation.`,
       ].join("\n\n"),
       policyTask: refinement.task,
       missionId: String(mission._id),
@@ -1635,7 +1662,7 @@ async function enqueueRefinements(ctx: any, mission: any, refinements: GoalRefin
       risk: "high",
       priority: 96,
       acceptanceCriteria: refinement.acceptanceCriteria,
-      modelReason: "Goal Mode uses a bounded Terra/high repair wave before another Sol validation",
+      modelReason: "Goal Mode uses a bounded Terra/high repair wave before another deep validation",
       sourceBranch: integrationBranch,
       integrationBranch,
       maxAttempts: GOAL_AUTOMATIC_ATTEMPT_LIMITS.refining,
@@ -1715,7 +1742,7 @@ async function queueExternalRevision(
     options.eventType,
     options.extendBudget
       ? `Daniel approved App Factory repair wave ${wave}; the durable revision outbox is applying it to the same generated app`
-      : `Sol validation queued repair wave ${wave} for the same App Factory run`,
+      : `Deep validation queued repair wave ${wave} for the same App Factory run`,
     "factory refinement",
     Math.min(94, 84 + wave * 4),
     { wave, gaps: validation.gaps, externalRunId: mission.externalRunId },
@@ -1740,6 +1767,31 @@ export const recordValidation = mutation({
       Number(mission.advanceAttempt ?? 0) !== args.expectedAdvanceAttempt || !ownsAdvanceLease(mission, args)
     ) return { advanced: false, stale: true };
     const validation = args.validation as GoalValidation;
+    const plan = mission.plan
+      ? canonicalGoalPlan(mission.plan as GoalPlan, Number(mission.maxBuildSessions ?? GOAL_DAG_MAX_NODES))
+      : undefined;
+    if (validation.verdict === "pass") {
+      const requiredStops = plan?.outcome?.stopConditions ?? [];
+      const satisfiedStops = Array.isArray(validation.stopConditionsSatisfied)
+        ? new Set(validation.stopConditionsSatisfied.map((value) => String(value).trim()))
+        : new Set<string>();
+      const observed = validation.observedOutcome;
+      const matchesAcceptedOutcome = Boolean(
+        plan?.outcome
+        && observed
+        && observed.metric.trim() === plan.outcome.metric.trim()
+        && observed.target.trim() === plan.outcome.target.trim()
+        && observed.measurementWindow.trim() === plan.outcome.measurementWindow.trim(),
+      );
+      if (validation.outcomeAchieved !== true
+        || !Array.isArray(validation.outcomeEvidence) || validation.outcomeEvidence.length < 2
+        || !observed?.metric || !observed.baseline || !observed.observed || !observed.target
+        || !observed.measurementWindow || !matchesAcceptedOutcome
+        || requiredStops.length < 1
+        || !requiredStops.every((condition) => satisfiedStops.has(condition.trim()))) {
+        throw new Error("Goal completion requires the accepted measurable outcome and every stop condition to be evidenced");
+      }
+    }
     const now = Date.now();
     const history = [...(mission.validationHistory ?? []), validation].slice(-6);
     if (validation.verdict === "pass") {
@@ -1756,8 +1808,11 @@ export const recordValidation = mutation({
         updatedAt: now,
       });
       await resolveGoalAttention(ctx, args.id);
-      await recordMissionEvent(ctx, String(args.id), "goal_complete", "Sol validation passed the complete outcome", "complete", 100, {
+      await recordMissionEvent(ctx, String(args.id), "goal_complete", "Deep validation passed the measured outcome", "complete", 100, {
         evidence: validation.evidence,
+        outcomeEvidence: validation.outcomeEvidence,
+        stopConditionsSatisfied: validation.stopConditionsSatisfied,
+        observedOutcome: validation.observedOutcome,
       });
       if (mission.parentMissionId) await rollupSplitParent(ctx, mission.parentMissionId);
       return { advanced: true, status: "done", summary: validation.summary };
@@ -1765,7 +1820,7 @@ export const recordValidation = mutation({
     if (Array.isArray(mission.splitChildMissionIds) && mission.splitChildMissionIds.length) {
       const reason = validation.verdict === "blocked"
         ? validation.blocker || validation.summary
-        : `Parent Sol validation did not prove the original accepted plan: ${validation.gaps.join("; ") || validation.summary}`;
+        : `Parent deep validation did not prove the original accepted plan: ${validation.gaps.join("; ") || validation.summary}`;
       await patchMissionWithRuntime(ctx, mission, {
         status: "needs_input", phase: "needs Daniel", pausedPhase: "validating",
         validation, validationHistory: history, failureReason: reason.slice(0, 2_000),

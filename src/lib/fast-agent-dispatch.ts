@@ -3,6 +3,12 @@ export type FastAgentDispatch = {
   agentId?: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 };
 
+export type FastGoalCrewDispatch = {
+  goal: string;
+  successMetric?: string;
+  target?: string;
+};
+
 const namedAgents = new Set(["paul", "atlas", "iris", "maya", "chloe", "sentry"]);
 const vagueTask = /^(?:it|that|this|the task|the issue|something|what we discussed)(?:\s+please)?[.!?]*$/i;
 const projectFeatureTask = /(?:\b(?:add(?:ed)?|build|implement(?:ed)?|create(?:d)?|make|fix(?:ed)?|improve(?:d)?|redesign(?:ed)?|change(?:d)?|update(?:d)?)\b.*\b(?:feature|button|control|page|screen|view|workflow|flow|form|filter|search|setting|tab|dashboard|ui|ux|integration|functionality|bug)\b|\b(?:feature|button|control|page|screen|view|workflow|flow|form|filter|search|setting|tab|dashboard|ui|ux|integration|functionality|bug)\b.*\b(?:add(?:ed)?|build|implement(?:ed)?|create(?:d)?|make|fix(?:ed)?|improve(?:d)?|redesign(?:ed)?|change(?:d)?|update(?:d)?)\b)/i;
@@ -29,6 +35,29 @@ export function parseFastAgentDispatch(input: string): FastAgentDispatch | null 
   return {
     task,
     agentId: namedAgents.has(actor) ? actor as FastAgentDispatch["agentId"] : undefined,
+  };
+}
+
+/**
+ * Explicit outcome/team language takes the deterministic Goal Mode lane so a
+ * spoken command does not depend on a foreground model remembering to select
+ * the orchestration tool. This is deliberately narrower than broad ambition:
+ * questions and ordinary feature requests still stay conversational.
+ */
+export function parseFastGoalCrewDispatch(input: string): FastGoalCrewDispatch | null {
+  const goal = input.trim().replace(/\s+/g, " ");
+  if (goal.length < 16 || goal.length > 1_400 || exploratoryHostRequest.test(goal)) return null;
+  const explicitCrew = /\b(?:start|launch|spin\s+up|assemble|create|run)\b[\s\S]{0,60}\b(?:team|crew|goal\s+mode)\b/i.test(goal)
+    || /\b(?:use|start|run)\s+goal\s+mode\b/i.test(goal);
+  const explicitProfitOutcome = /^make\s+(?:my|the|our)\b[\s\S]{2,180}\bprofitable\b/i.test(goal);
+  const explicitCompletionLoop = /\b(?:keep|continue)\s+working\b[\s\S]{0,100}\buntil\b/i.test(goal);
+  if (!explicitCrew && !explicitProfitOutcome && !explicitCompletionLoop) return null;
+  return {
+    goal,
+    ...(explicitProfitOutcome ? {
+      successMetric: "reconciled net contribution profit after attributable costs, refunds, fees, fulfilment, and acquisition expense",
+      target: "positive reconciled net contribution profit sustained for the accepted measurement window",
+    } : {}),
   };
 }
 

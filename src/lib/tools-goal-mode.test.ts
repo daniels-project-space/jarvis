@@ -90,6 +90,37 @@ describe("goal_mode exact source admission", () => {
     expect(definition.parameters.properties.source_branch).toMatchObject({
       type: "string",
     });
+    expect(definition.parameters.properties.success_metric).toMatchObject({ type: "string" });
+    expect(definition.parameters.properties.baseline).toMatchObject({ type: "string" });
+    expect(definition.parameters.properties.target).toMatchObject({ type: "string" });
+    expect(definition.parameters.properties.measurement_window).toMatchObject({ type: "string" });
+  });
+
+  it("turns a spoken business outcome into one measured hierarchical crew mission", async () => {
+    const result = await executeTool("goal_mode", {
+      action: "start",
+      goal: "Make my Snuffelo Shopify website profitable with the smallest necessary specialist team",
+      success_metric: "reconciled net contribution profit after product, fulfilment, refund, fee, and acquisition costs",
+      baseline: "the current store ledger before the crew changes anything",
+      target: "positive reconciled net contribution profit",
+      measurement_window: "one complete post-change attribution window",
+      build_sessions: 4,
+    });
+
+    expect(result).toContain("Goal Mode mission-1 is live");
+    expect(mock.convexMutation).toHaveBeenCalledWith(
+      "goalMode:createV2",
+      expect.objectContaining({
+        maxBuildSessions: 4,
+        acceptanceCriteria: [
+          expect.stringContaining("reconciled net contribution profit"),
+          expect.stringContaining("current store ledger"),
+          expect.stringContaining("positive reconciled net contribution profit"),
+          expect.stringContaining("post-change attribution window"),
+        ],
+      }),
+    );
+    expect(mock.wakeAgentFleet).toHaveBeenCalledWith("goal:mission-1");
   });
 
   it("passes the exact branch into v2 source observation and the durable mission mutation", async () => {

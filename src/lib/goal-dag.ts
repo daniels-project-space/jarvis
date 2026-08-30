@@ -25,6 +25,20 @@ function canonicalWorkstream(value: GoalWorkstream): GoalWorkstream {
     readonly: value.readonly === true,
     dependsOn: list(value.dependsOn, GOAL_DAG_MAX_DEPENDENCIES, 80).sort(),
     acceptanceCriteria: list(value.acceptanceCriteria, 10, 500),
+    deliverable: value.deliverable ? {
+      kind: value.deliverable.kind,
+      description: text(value.deliverable.description, 800),
+      requiredEvidence: list(value.deliverable.requiredEvidence, 8, 500),
+    } : {
+      kind: value.readonly ? "research_brief" : "code_change",
+      description: text(value.task || value.label, 800) || "Complete the accepted scoped workstream",
+      requiredEvidence: list(value.acceptanceCriteria, 8, 500).length
+        ? list(value.acceptanceCriteria, 8, 500)
+        : ["Concrete verification evidence for the accepted workstream"],
+    },
+    guardrails: list(value.guardrails, 8, 500).length
+      ? list(value.guardrails, 8, 500)
+      : ["Preserve the mission's existing consequence and delivery boundaries"],
     mcp: [...new Set((Array.isArray(value.mcp) ? value.mcp : [])
       .filter((item): item is "playwright" | "context7" => item === "playwright" || item === "context7"))].sort(),
   };
@@ -46,11 +60,44 @@ export function canonicalGoalPlan(value: GoalPlan, maxNodes = GOAL_DAG_MAX_NODES
     ? canonicalizeRepository(value.primaryRepo, { allowShortName: true }) ?? undefined
     : undefined;
   if (value.primaryRepo && !primaryRepo) throw new Error("Goal plan primary repository is invalid");
+  const legacyOutcome = {
+    objective: text(value.summary, 800) || "Deliver the accepted Goal Mode outcome",
+    metric: "accepted outcome criteria proven end to end",
+    baseline: "The accepted outcome was not proven before this mission",
+    target: "Every accepted criterion and required live check is evidenced",
+    measurementWindow: "The mission's final validation window",
+    evidenceSources: ["Verified worker receipts and final validation evidence"],
+    stopConditions: ["Every accepted criterion and required live check is evidenced"],
+  };
+  const outcome = value.outcome ?? legacyOutcome;
+  const crew = value.crew ?? {
+    process: "hierarchical" as const,
+    manager: "jarvis" as const,
+    delegationRules: ["Preserve the accepted workstream DAG and use only necessary specialists"],
+    humanEscalation: ["Escalate only protected decisions after safe independent work is exhausted"],
+    reportingCadence: "Event-driven durable checkpoints",
+  };
   return {
     summary: text(value.summary, 1_000),
     route: value.route,
     primaryRepo,
     assumptions: list(value.assumptions, 12, 500).sort(),
+    outcome: {
+      objective: text(outcome.objective, 800),
+      metric: text(outcome.metric, 300),
+      baseline: text(outcome.baseline, 800),
+      target: text(outcome.target, 800),
+      measurementWindow: text(outcome.measurementWindow, 300),
+      evidenceSources: list(outcome.evidenceSources, 8, 500),
+      stopConditions: list(outcome.stopConditions, 8, 500),
+    },
+    crew: {
+      process: "hierarchical",
+      manager: "jarvis",
+      delegationRules: list(crew.delegationRules, 8, 500),
+      humanEscalation: list(crew.humanEscalation, 8, 500),
+      reportingCadence: text(crew.reportingCadence, 300),
+    },
     workstreams,
     validation: {
       criteria: list(value.validation?.criteria, 12, 500),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseFastAgentDispatch, parseProjectFeatureDispatch } from "./fast-agent-dispatch";
+import { parseFastAgentDispatch, parseFastGoalCrewDispatch, parseProjectFeatureDispatch } from "./fast-agent-dispatch";
 
 describe("parseFastAgentDispatch", () => {
   it("routes an explicit named specialist launch without a model turn", () => {
@@ -37,6 +37,28 @@ describe("parseFastAgentDispatch", () => {
     "Ask the team to investigate this",
   ])("keeps contextual or fleet requests with Jarvis: %s", (input) => {
     expect(parseFastAgentDispatch(input)).toBeNull();
+  });
+});
+
+describe("parseFastGoalCrewDispatch", () => {
+  it("turns the spoken profitability outcome into a measured crew start", () => {
+    expect(parseFastGoalCrewDispatch("Make my Snuffelo Shopify website profitable")).toMatchObject({
+      goal: "Make my Snuffelo Shopify website profitable",
+      successMetric: expect.stringContaining("net contribution profit"),
+      target: expect.stringContaining("positive reconciled net contribution profit"),
+    });
+  });
+
+  it("recognizes explicit team and completion-loop commands", () => {
+    expect(parseFastGoalCrewDispatch("Start a team to rigorously improve the store until the measured target is met"))
+      .toMatchObject({ goal: expect.stringContaining("Start a team") });
+    expect(parseFastGoalCrewDispatch("Keep working on the launch until every production journey passes"))
+      .toMatchObject({ goal: expect.stringContaining("until every production journey passes") });
+  });
+
+  it("keeps exploratory questions and ordinary feature work conversational", () => {
+    expect(parseFastGoalCrewDispatch("How should I make my Shopify store profitable?")).toBeNull();
+    expect(parseFastGoalCrewDispatch("Add a compact worker card to Jarvis")).toBeNull();
   });
 });
 

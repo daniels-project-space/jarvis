@@ -160,7 +160,7 @@ export const TOOL_DEFS = [
   {
     name: "goal_mode",
     description:
-      "Start or control one durable long-running outcome after direction and observable success criteria are clear; do not start Goal Mode for an exploratory conversation. Goal Mode uses a deep architecture session, 2-8 dependency-aware build sessions with persistent checkpoints, then deep validation and bounded repair waves, with adaptive model effort at each stage. It routes new apps through App Factory, video work through YouTube Studio AI, existing products into their own repo, and genuinely new infrastructure through Daniel's isolated cloud standard. Use for outcomes that may take hours or days; use orchestrate for a short parallel fleet.",
+      "Start or control one durable long-running outcome after direction and observable success criteria are clear; do not start Goal Mode for an exploratory conversation. JARVIS becomes the hierarchical crew manager, establishes baseline/metric/target/evidence/stop conditions, and creates only the 1-8 specialists actually needed. Each worker receives a structured deliverable, guardrails, verified dependency handoffs, checkpoints and bounded retries; protected decisions surface in Needs you. A deep final audit cannot pass on code, deployment, traffic or revenue proxies when the requested outcome is measurable. Use for outcomes that may take hours or days; use orchestrate for a short independent fleet.",
     parameters: {
       type: "object",
       properties: {
@@ -170,8 +170,12 @@ export const TOOL_DEFS = [
         input: { type: "string", description: "Steering instruction when action=steer; preserves accepted node scope and creates fresh execution generations" },
         repo: { type: "string", description: "Known owner/repo only when the goal explicitly belongs there" },
         source_branch: { type: "string", description: "Exact existing GitHub branch to seal as the v2 mission source; start only" },
-        acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final Sol validator must prove" },
-        build_sessions: { type: "number", description: "Maximum bounded Terra/high implementation sessions, 2-8; default 6" },
+        acceptance_criteria: { type: "array", items: { type: "string" }, description: "Observable goal-level truths the final deep validator must prove" },
+        success_metric: { type: "string", description: "Optional primary outcome metric when Daniel named one" },
+        baseline: { type: "string", description: "Optional current measured state or authoritative source for measuring it" },
+        target: { type: "string", description: "Optional observable threshold that ends the goal" },
+        measurement_window: { type: "string", description: "Optional period over which the target must hold" },
+        build_sessions: { type: "number", description: "Maximum bounded implementation workstreams, 1-8; default 6" },
         revision_waves: { type: "number", description: "Maximum automatic Terra repair waves after final validation, 1-4; default 2" },
       },
       required: ["action"],
@@ -5333,6 +5337,16 @@ export async function executeTool(
         }
       }
       const originThreadId = await activeThread();
+      const outcomeHints = [
+        args.success_metric ? `Primary success metric: ${String(args.success_metric).slice(0, 300)}` : "",
+        args.baseline ? `Baseline or baseline source: ${String(args.baseline).slice(0, 500)}` : "",
+        args.target ? `Target that ends the goal: ${String(args.target).slice(0, 500)}` : "",
+        args.measurement_window ? `Measurement window: ${String(args.measurement_window).slice(0, 300)}` : "",
+      ].filter(Boolean);
+      const acceptanceCriteria = [
+        ...(Array.isArray(args.acceptance_criteria) ? args.acceptance_criteria.map(String).slice(0, 10) : []),
+        ...outcomeHints,
+      ].slice(0, 10);
       const created = await convexMutation(admissionMutationName("goal"), {
         authTokenHash,
         goal,
@@ -5344,7 +5358,7 @@ export async function executeTool(
         originThreadId,
         priority: 98,
         risk: "high",
-        acceptanceCriteria: Array.isArray(args.acceptance_criteria) ? args.acceptance_criteria.map(String).slice(0, 10) : undefined,
+        acceptanceCriteria: acceptanceCriteria.length ? acceptanceCriteria : undefined,
         maxBuildSessions: Number(args.build_sessions) || 6,
         maxRevisionWaves: Number(args.revision_waves) || 2,
       });

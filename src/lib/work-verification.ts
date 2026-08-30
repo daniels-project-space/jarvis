@@ -1,7 +1,7 @@
 export const WORK_VERIFICATION_EVIDENCE_MAX_CHARS = 8_000;
 
 /**
- * Shared standard for both the fast workstream supervisor and the final Sol
+ * Shared standard for both the fast workstream supervisor and the final deep
  * validator. It prevents a green build or a caller-supplied field from being
  * promoted into evidence that an external provider actually supplied data or
  * accepted an operation.
@@ -15,7 +15,7 @@ export const EVIDENCE_INTEGRITY_RULES = [
 
 export function supervisorDeliveryBoundary(goalStage: unknown): string {
   return goalStage === "building" || goalStage === "refining"
-    ? "This is one shared-branch Goal Mode implementation session. Judge its scoped definition of done. Do not return concerns solely because the branch is not merged/deployed or because goal-level provider validation remains: the final Release Proof, Sol validator, and trusted delivery controller own those later boundaries."
+    ? "This is one shared-branch Goal Mode implementation session. Judge its scoped definition of done. Do not return concerns solely because the branch is not merged/deployed or because goal-level provider validation remains: the final Release Proof, deep outcome validator, and trusted delivery controller own those later boundaries."
     : "";
 }
 

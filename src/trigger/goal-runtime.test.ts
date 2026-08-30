@@ -21,6 +21,9 @@ describe("Goal Mode external runtime", () => {
       verdict: "refine",
       summary: "One gap remains",
       evidence: ["build passed"],
+      outcomeAchieved: false,
+      outcomeEvidence: [],
+      stopConditionsSatisfied: [],
       gaps: ["mobile navigation clips"],
       refinements: [{ id: "mobile", label: "Mobile", task: "Repair the mobile navigation and verify the real flow.", acceptanceCriteria: ["No clipping"] }],
     }, 2);

@@ -33,6 +33,40 @@ export type GoalRouteKind = (typeof GOAL_ROUTE_KINDS)[number];
 export type GoalReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type GoalAgentId = "jarvis" | "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
 
+export const GOAL_DELIVERABLE_KINDS = [
+  "code_change",
+  "research_brief",
+  "creative_artifact",
+  "operational_result",
+  "decision_brief",
+] as const;
+
+export type GoalDeliverableKind = (typeof GOAL_DELIVERABLE_KINDS)[number];
+
+export type GoalOutcomeContract = {
+  objective: string;
+  metric: string;
+  baseline: string;
+  target: string;
+  measurementWindow: string;
+  evidenceSources: string[];
+  stopConditions: string[];
+};
+
+export type GoalCrewCharter = {
+  process: "hierarchical";
+  manager: "jarvis";
+  delegationRules: string[];
+  humanEscalation: string[];
+  reportingCadence: string;
+};
+
+export type GoalWorkstreamDeliverable = {
+  kind: GoalDeliverableKind;
+  description: string;
+  requiredEvidence: string[];
+};
+
 export type GoalRoute = {
   kind: GoalRouteKind;
   primaryRepo?: string;
@@ -50,6 +84,8 @@ export type GoalWorkstream = {
   readonly: boolean;
   dependsOn: string[];
   acceptanceCriteria: string[];
+  deliverable: GoalWorkstreamDeliverable;
+  guardrails: string[];
   mcp: Array<"playwright" | "context7">;
 };
 
@@ -87,6 +123,8 @@ export type GoalPlan = {
   route: GoalRouteKind;
   primaryRepo?: string;
   assumptions: string[];
+  outcome: GoalOutcomeContract;
+  crew: GoalCrewCharter;
   workstreams: GoalWorkstream[];
   validation: {
     criteria: string[];
@@ -111,6 +149,16 @@ export type GoalValidation = {
   verdict: "pass" | "refine" | "blocked";
   summary: string;
   evidence: string[];
+  outcomeAchieved: boolean;
+  outcomeEvidence: string[];
+  stopConditionsSatisfied: string[];
+  observedOutcome?: {
+    metric: string;
+    baseline: string;
+    observed: string;
+    target: string;
+    measurementWindow: string;
+  };
   gaps: string[];
   refinements: GoalRefinement[];
   blocker?: string;
@@ -300,7 +348,7 @@ export function routeGoal(goal: string, requestedRepo?: string): GoalRoute {
 
   return {
     kind: "general",
-    reason: "No existing product or new-app pipeline is unambiguously implied; the Sol planner must establish the smallest correct ownership boundary.",
+    reason: "No existing product or new-app pipeline is unambiguously implied; the deep planner must establish the smallest correct ownership boundary.",
     infrastructureContext:
       "Inspect Daniel's current project registry and infrastructure guidance before proposing new code. Prefer an existing product boundary when it genuinely owns the capability; otherwise follow the isolated cloud-project standard.",
   };
@@ -367,9 +415,45 @@ function topologicalWorkstreams(workstreams: GoalWorkstream[]): GoalWorkstream[]
 export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
   const input = parseMarkedObject(text, GOAL_PLAN_MARKER);
   const rawStreams = Array.isArray(input.workstreams) ? input.workstreams : [];
-  const limit = Math.max(2, Math.min(8, Math.floor(maxBuildSessions || 6)));
-  if (rawStreams.length < 2 || rawStreams.length > limit) {
-    throw new Error(`Goal plan must contain 2-${limit} bounded workstreams`);
+  const limit = Math.max(1, Math.min(8, Math.floor(maxBuildSessions || 6)));
+  if (rawStreams.length < 1 || rawStreams.length > limit) {
+    throw new Error(`Goal plan must contain 1-${limit} necessary workstreams`);
+  }
+  const outcomeInput = input.outcome && typeof input.outcome === "object"
+    ? input.outcome as Record<string, unknown>
+    : null;
+  if (!outcomeInput) throw new Error("Goal plan requires a measurable outcome contract");
+  const outcome: GoalOutcomeContract = {
+    objective: clampText(outcomeInput.objective, 800),
+    metric: clampText(outcomeInput.metric, 300),
+    baseline: clampText(outcomeInput.baseline, 800),
+    target: clampText(outcomeInput.target, 800),
+    measurementWindow: clampText(outcomeInput.measurementWindow ?? outcomeInput.measurement_window, 300),
+    evidenceSources: strings(outcomeInput.evidenceSources ?? outcomeInput.evidence_sources, 8, 500),
+    stopConditions: strings(outcomeInput.stopConditions ?? outcomeInput.stop_conditions, 8, 500),
+  };
+  if (outcome.objective.length < 12 || outcome.metric.length < 3
+    || outcome.baseline.length < 8 || outcome.target.length < 8
+    || outcome.measurementWindow.length < 3 || outcome.evidenceSources.length === 0
+    || outcome.stopConditions.length === 0) {
+    throw new Error("Goal outcome must define objective, metric, baseline, target, measurement window, evidence sources, and stop conditions");
+  }
+  const crewInput = input.crew && typeof input.crew === "object"
+    ? input.crew as Record<string, unknown>
+    : null;
+  if (!crewInput || clampText(crewInput.process, 30) !== "hierarchical"
+    || clampText(crewInput.manager, 30) !== "jarvis") {
+    throw new Error("Goal plan requires a hierarchical crew managed by jarvis");
+  }
+  const crew: GoalCrewCharter = {
+    process: "hierarchical",
+    manager: "jarvis",
+    delegationRules: strings(crewInput.delegationRules ?? crewInput.delegation_rules, 8, 500),
+    humanEscalation: strings(crewInput.humanEscalation ?? crewInput.human_escalation, 8, 500),
+    reportingCadence: clampText(crewInput.reportingCadence ?? crewInput.reporting_cadence, 300),
+  };
+  if (!crew.delegationRules.length || !crew.humanEscalation.length || crew.reportingCadence.length < 3) {
+    throw new Error("Goal crew must define delegation, human escalation, and reporting rules");
   }
   const used = new Set<string>();
   const allowedAgents = new Set(["paul", "atlas", "iris", "maya", "chloe", "sentry"]);
@@ -382,6 +466,24 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
     if (task.length < 20) throw new Error(`Goal plan workstream ${id} needs a concrete task`);
     const requestedAgent = clampText(row.agentId ?? row.agent_id, 20).toLowerCase();
     const agentId = (allowedAgents.has(requestedAgent) ? requestedAgent : "paul") as GoalWorkstream["agentId"];
+    const deliverableInput = row.deliverable && typeof row.deliverable === "object"
+      ? row.deliverable as Record<string, unknown>
+      : null;
+    const deliverableKind = clampText(deliverableInput?.kind, 40) as GoalDeliverableKind;
+    const deliverable: GoalWorkstreamDeliverable = {
+      kind: GOAL_DELIVERABLE_KINDS.includes(deliverableKind) ? deliverableKind : "operational_result",
+      description: clampText(deliverableInput?.description, 800),
+      requiredEvidence: strings(
+        deliverableInput?.requiredEvidence ?? deliverableInput?.required_evidence,
+        8,
+        500,
+      ),
+    };
+    const guardrails = strings(row.guardrails, 8, 500);
+    if (!deliverableInput || deliverable.description.length < 12 || !deliverable.requiredEvidence.length) {
+      throw new Error(`Goal plan workstream ${id} requires a structured deliverable and evidence contract`);
+    }
+    if (!guardrails.length) throw new Error(`Goal plan workstream ${id} requires at least one explicit guardrail`);
     return {
       id,
       label: clampText(row.label, 80) || `Workstream ${index + 1}`,
@@ -399,6 +501,8 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
       acceptanceCriteria: strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500).length
         ? strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500)
         : ["Deliver the scoped outcome with concrete verification evidence"],
+      deliverable,
+      guardrails,
       mcp: strings(row.mcp, 2, 20).filter((name): name is "playwright" | "context7" => name === "playwright" || name === "context7"),
     };
   });
@@ -437,6 +541,8 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
       return canonical;
     })(),
     assumptions: strings(input.assumptions, 8, 500),
+    outcome,
+    crew,
     workstreams: topologicalWorkstreams(streams),
     validation: {
       criteria: strings(validation.criteria, 12, 500).length
@@ -456,8 +562,30 @@ export function parseGoalValidation(text: string): GoalValidation {
     throw new Error("Goal validation verdict must be pass, refine or blocked");
   }
   const evidence = strings(input.evidence, 16, 800);
-  if (verdict === "pass" && evidence.length < 2) {
-    throw new Error("A passing goal validation requires at least two concrete pieces of evidence");
+  const outcomeAchieved = input.outcomeAchieved === true || input.outcome_achieved === true;
+  const outcomeEvidence = strings(input.outcomeEvidence ?? input.outcome_evidence, 16, 800);
+  const stopConditionsSatisfied = strings(
+    input.stopConditionsSatisfied ?? input.stop_conditions_satisfied,
+    12,
+    500,
+  );
+  const observedInput = input.observedOutcome && typeof input.observedOutcome === "object"
+    ? input.observedOutcome as Record<string, unknown>
+    : input.observed_outcome && typeof input.observed_outcome === "object"
+      ? input.observed_outcome as Record<string, unknown>
+      : null;
+  const observedOutcome = observedInput ? {
+    metric: clampText(observedInput.metric, 300),
+    baseline: clampText(observedInput.baseline, 800),
+    observed: clampText(observedInput.observed, 800),
+    target: clampText(observedInput.target, 800),
+    measurementWindow: clampText(observedInput.measurementWindow ?? observedInput.measurement_window, 300),
+  } : undefined;
+  if (verdict === "pass" && (evidence.length < 2 || !outcomeAchieved
+    || outcomeEvidence.length < 2 || stopConditionsSatisfied.length === 0
+    || !observedOutcome?.metric || !observedOutcome.baseline || !observedOutcome.observed
+    || !observedOutcome.target || !observedOutcome.measurementWindow)) {
+    throw new Error("A passing goal validation requires measured target evidence and satisfied stop conditions, not task or deployment proxies");
   }
   const refinements = (Array.isArray(input.refinements) ? input.refinements : []).slice(0, 3).map((raw, index) => {
     const row = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
@@ -479,6 +607,10 @@ export function parseGoalValidation(text: string): GoalValidation {
     verdict,
     summary: clampText(input.summary, 1_600) || "Deep validation completed.",
     evidence,
+    outcomeAchieved,
+    outcomeEvidence,
+    stopConditionsSatisfied,
+    observedOutcome,
     gaps: strings(input.gaps, 12, 800),
     refinements,
     blocker: clampText(input.blocker, 1_200) || undefined,
@@ -499,9 +631,11 @@ export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: 
     `Why: ${route.reason}`,
     `Reuse boundary: ${route.infrastructureContext}`,
     acceptanceCriteria.length ? `Daniel's acceptance criteria:\n${acceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
-    `Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. Break the outcome into 2-${maxBuildSessions} bounded sessions. Assign Paul to engineering/integration, Atlas to evidence research, Iris to media/visual quality, Maya to travel/calendar work, and Sentry to reliability/security review. When quality defects are found, fix their generation, render, configuration, or data root cause; detection filters are secondary regression guards and a rejection-only gate does not satisfy the outcome. Express only real ordering requirements as dependsOn edges. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
+    `Act as the hierarchical crew manager. Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. First define one measurable outcome contract: current baseline, primary metric, target, measurement window, authoritative evidence sources, and exact stop conditions. A business goal about profit must measure net contribution after attributable costs, refunds, fees and acquisition expense; sales, traffic, code shipped, or a deployment are not profit.`,
+    `Create only the ${maxBuildSessions === 1 ? "single necessary" : `1-${maxBuildSessions} necessary`} workstream${maxBuildSessions === 1 ? "" : "s"}; never add a ceremonial specialist merely to make a larger crew. Assign Paul to engineering/integration, Atlas to evidence research, Iris to media/visual quality, Maya to travel/calendar work, Chloe to social/content operations, and Sentry to reliability/security review. Give each workstream one structured deliverable, required evidence and explicit guardrails. Express only real ordering requirements as dependsOn edges; verified upstream outputs become the dependent worker's context. Continue reversible independent work before escalating, and ask Daniel only for the smallest genuinely protected decision. Once every stop condition is proved, stop the crew and leave no polling worker running merely to look busy.`,
+    `When quality defects are found, fix their generation, render, configuration, or data root cause; detection filters are secondary regression guards and a rejection-only gate does not satisfy the outcome. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
     "End with exactly one compact JSON object after GOAL_PLAN_JSON:. It must use this shape:",
-    '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|chloe|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
+    '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"outcome":{"objective":"...","metric":"one primary metric","baseline":"current measured state/source","target":"observable threshold","measurementWindow":"...","evidenceSources":["authoritative source"],"stopConditions":["condition that ends work"]},"crew":{"process":"hierarchical","manager":"jarvis","delegationRules":["only necessary specialists"],"humanEscalation":["protected decision only after independent work"],"reportingCadence":"event-driven checkpoints; no idle polling"},"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|chloe|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"deliverable":{"kind":"code_change|research_brief|creative_artifact|operational_result|decision_brief","description":"exact output","requiredEvidence":["proof"]},"guardrails":["explicit boundary"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
     "The JSON is a machine contract. Keep the whole response and JSON concise enough to fit in 7,500 characters.",
   ].filter(Boolean).join("\n\n");
 }
@@ -528,6 +662,16 @@ export function validatorTask(args: {
     `Outcome: ${args.goal.slice(0, 1_000)}`,
     `Revision wave: ${args.revisionWave}`,
     `Plan summary: ${args.plan.summary.slice(0, 1_500)}`,
+    [
+      "MEASURABLE OUTCOME CONTRACT:",
+      `Objective: ${args.plan.outcome.objective}`,
+      `Primary metric: ${args.plan.outcome.metric}`,
+      `Baseline: ${args.plan.outcome.baseline}`,
+      `Target: ${args.plan.outcome.target}`,
+      `Measurement window: ${args.plan.outcome.measurementWindow}`,
+      `Authoritative evidence sources:\n${bullets(args.plan.outcome.evidenceSources, 2_500)}`,
+      `Stop conditions:\n${bullets(args.plan.outcome.stopConditions, 2_500)}`,
+    ].join("\n"),
     args.externalContext ? `External build ownership:\n${args.externalContext.slice(0, 3_000)}` : "",
     `Goal criteria:\n${bullets([...args.acceptanceCriteria, ...args.plan.validation.criteria], 4_000)}`,
     args.plan.validation.tests.length ? `Required tests:\n${bullets(args.plan.validation.tests, 3_000)}` : "",
@@ -542,9 +686,9 @@ export function validatorTask(args: {
       : "",
     EVIDENCE_INTEGRITY_RULES,
     SAFE_SANDBOX_EXECUTION_RULES,
-    "Inspect the actual branch and current code. Run proportionate deep tests, typecheck/build, end-to-end or browser checks, and exact provider/deployment checks where the goal requires them. A command exit code alone is not proof. Do not merge or deploy yourself; a pass hands the branch to the automatic delivery controller. Do not publish publicly, spend, message or perform destructive actions. If a gap is fixable in the existing scope, return refine with 1-3 precise Terra repair sessions. Use blocked only for a genuine Daniel/external decision. Use pass only when the outcome—not merely each task—is evidenced.",
+    "Inspect the actual branch and current code. Run proportionate deep tests, typecheck/build, end-to-end or browser checks, and exact provider/deployment checks where the goal requires them. A command exit code alone is not proof. Do not merge or deploy yourself; a pass hands the branch to the automatic delivery controller. Do not publish publicly, spend, message or perform destructive actions. If a gap is fixable in the existing scope, return refine with 1-3 precise Terra repair sessions. Use blocked only for a genuine Daniel/external decision after independent work is exhausted. Use pass only when the measured target—not merely each task, code change, deployment, traffic, or revenue proxy—is evidenced for the declared window and every stop condition is satisfied. When it passes, the crew stops; do not invent follow-on work.",
     "End with exactly one compact JSON object after GOAL_VALIDATION_JSON: using:",
-    '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',
+    '{"verdict":"pass|refine|blocked","summary":"...","evidence":["exact check/result"],"outcomeAchieved":false,"outcomeEvidence":["authoritative measured evidence"],"stopConditionsSatisfied":["exact satisfied condition"],"observedOutcome":{"metric":"...","baseline":"...","observed":"...","target":"...","measurementWindow":"..."},"gaps":["..."],"refinements":[{"id":"...","label":"...","task":"self-contained repair","acceptanceCriteria":["..."]}],"blocker":"only when blocked"}',
     "The JSON is a machine contract. Keep it under 3,500 characters.",
   ].filter(Boolean).join("\n\n");
   if (prompt.length <= GOAL_VALIDATOR_TASK_MAX_CHARS) return prompt;

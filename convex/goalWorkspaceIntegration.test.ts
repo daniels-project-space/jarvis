@@ -49,6 +49,45 @@ async function createGoalFixture(t: GoalTest, args: any) {
 }
 
 async function recordPlanFixture(t: GoalTest, args: any) {
+  const plan = {
+    summary: "Goal integration fixture",
+    route: "existing_project",
+    assumptions: [],
+    outcome: {
+      objective: "Deliver and verify the exact accepted integration outcome",
+      metric: "verified accepted integration nodes",
+      baseline: "The accepted integration nodes have not yet been delivered",
+      target: "Every accepted integration node is delivered and independently verified",
+      measurementWindow: "The current mission validation window",
+      evidenceSources: ["Signed work receipts and exact integration evidence"],
+      stopConditions: ["Every accepted integration node is verified"],
+    },
+    crew: {
+      process: "hierarchical",
+      manager: "jarvis",
+      delegationRules: ["Create only necessary specialist workstreams"],
+      humanEscalation: ["Escalate only protected decisions after safe work is exhausted"],
+      reportingCadence: "Event-driven durable checkpoints",
+    },
+    validation: { criteria: [], tests: [], liveChecks: [] },
+    ...args.plan,
+    workstreams: (args.plan?.workstreams ?? []).map((stream: any, index: number) => ({
+      label: `Workstream ${index + 1}`,
+      task: `Complete and verify the exact scoped integration workstream ${index + 1}.`,
+      agentId: "paul",
+      readonly: false,
+      acceptanceCriteria: ["The scoped outcome is verified"],
+      mcp: [],
+      deliverable: {
+        kind: "code_change",
+        description: "A scoped verified change with a signed integration handoff",
+        requiredEvidence: ["Exact test and integration receipt evidence"],
+      },
+      guardrails: ["Do not bypass the mission integration controller"],
+      ...stream,
+    })),
+  };
+  args = { ...args, plan };
   const mission: any = await t.run(async (ctx) => ctx.db.get(args.id));
   const admittedScopes = new Set((mission?.projectAdmissions ?? []).map((admission: any) => admission.repository ?? "evidence"));
   const repositories = new Set<string | undefined>();
@@ -272,6 +311,161 @@ async function claimedFirstIntegration(prefix: string) {
 }
 
 describe("real Convex multi-agent workspace and integration races", () => {
+  it("materializes one necessary specialist with a verifier-visible crew contract", async () => {
+    const f = await goalAwaitingPlan(4);
+    const plan = {
+      summary: "Measure the store economics before changing one bounded funnel",
+      route: "existing_project",
+      primaryRepo: REPO,
+      assumptions: [],
+      outcome: {
+        objective: "Reach positive reconciled contribution profit",
+        metric: "reconciled net contribution profit",
+        baseline: "The current store ledger before any crew change",
+        target: "Positive reconciled net contribution profit",
+        measurementWindow: "One complete post-change attribution window",
+        evidenceSources: ["Store orders, refunds, fees, fulfilment, and acquisition-cost ledger"],
+        stopConditions: ["Positive reconciled contribution profit is evidenced"],
+      },
+      crew: {
+        process: "hierarchical",
+        manager: "jarvis",
+        delegationRules: ["Use one specialist until evidence proves another role is necessary"],
+        humanEscalation: ["Escalate protected spend only after safe analysis is exhausted"],
+        reportingCadence: "Event-driven checkpoints only",
+      },
+      workstreams: [{
+        id: "economics",
+        label: "Store economics",
+        task: "Reconcile the existing store economics and identify the single highest-evidence bounded improvement.",
+        agentId: "atlas",
+        repo: REPO,
+        readonly: true,
+        dependsOn: [],
+        acceptanceCriteria: ["The current contribution baseline is reconciled"],
+        deliverable: {
+          kind: "research_brief",
+          description: "A reconciled store-economics baseline and ranked next action",
+          requiredEvidence: ["Source-attributed order, refund, fee, fulfilment, and acquisition-cost totals"],
+        },
+        guardrails: ["Do not change spend, pricing, inventory, or the live storefront"],
+        mcp: [],
+      }],
+      validation: { criteria: ["Profit is measured, not inferred from sales"], tests: [], liveChecks: [] },
+    };
+
+    expect(await recordPlanFixture(f.t, {
+      id: f.missionId, expectedAdvanceAttempt: 1, plan, workerToken: TOKEN,
+    })).toMatchObject({ advanced: true, jobs: 1 });
+    const builders = await f.t.run(async (ctx) => (await ctx.db.query("jobs")
+      .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId))).collect())
+      .filter((job) => job.goalStage === "building"));
+    expect(builders).toHaveLength(1);
+    expect(builders[0]).toMatchObject({ agentId: "atlas", goalWorkstreamId: "economics" });
+    expect(builders[0].task).toMatch(/^HIERARCHICAL CREW WORK CONTRACT:/);
+    expect(builders[0].task).toContain("reconciled net contribution profit");
+    expect(builders[0].acceptanceCriteria).toEqual(expect.arrayContaining([
+      expect.stringContaining("Structured deliverable (research_brief)"),
+      expect.stringContaining("Required evidence:"),
+      expect.stringContaining("Guardrails:"),
+    ]));
+  });
+
+  it("rejects a newly submitted legacy-shaped plan instead of silently inventing its outcome", async () => {
+    const f = await goalAwaitingPlan(2);
+    await expect(f.t.mutation(api.goalMode.recordPlanV2, {
+      id: f.missionId,
+      expectedAdvanceAttempt: 1,
+      plan: {
+        summary: "Legacy-shaped direct submission",
+        route: "existing_project",
+        assumptions: [],
+        workstreams: [{
+          id: "legacy",
+          label: "Legacy",
+          task: "Implement the directly submitted legacy-shaped workstream",
+          agentId: "paul",
+          repo: REPO,
+          readonly: false,
+          dependsOn: [],
+          acceptanceCriteria: ["done"],
+          mcp: [],
+        }],
+        validation: { criteria: ["done"], tests: [], liveChecks: [] },
+      },
+      workerToken: TOKEN,
+    })).rejects.toThrow(/requires a measurable outcome, hierarchical crew, deliverables, evidence, and guardrails/);
+  });
+
+  it("cannot complete a profit mission with a different proxy metric or paraphrased stop condition", async () => {
+    const f = await goalAwaitingPlan(1);
+    const outcome = {
+      objective: "Reach positive reconciled contribution profit",
+      metric: "reconciled net contribution profit",
+      baseline: "Current reconciled store ledger",
+      target: "Positive reconciled net contribution profit",
+      measurementWindow: "One complete attribution window",
+      evidenceSources: ["Store and cost ledgers"],
+      stopConditions: ["Positive reconciled contribution profit is evidenced"],
+    };
+    const plan = {
+      summary: "Measured profit plan",
+      route: "existing_project",
+      assumptions: [],
+      outcome,
+      crew: {
+        process: "hierarchical",
+        manager: "jarvis",
+        delegationRules: ["Use only necessary specialists"],
+        humanEscalation: ["Escalate only protected actions"],
+        reportingCadence: "Event-driven checkpoints",
+      },
+      workstreams: [{
+        id: "economics", label: "Economics", task: "Reconcile exact economics", agentId: "atlas",
+        readonly: true, dependsOn: [], acceptanceCriteria: ["Profit reconciled"],
+        deliverable: { kind: "research_brief", description: "Reconciled economics brief", requiredEvidence: ["Ledger evidence"] },
+        guardrails: ["Read only"], mcp: [],
+      }],
+      validation: { criteria: ["Profit is measured"], tests: [], liveChecks: [] },
+    };
+    await f.t.run(async (ctx) => ctx.db.patch(f.missionId, {
+      plan, status: "running", phase: "validating", advanceAttempt: 1,
+    }));
+    const validation = {
+      verdict: "pass",
+      summary: "The target is proved",
+      evidence: ["store ledger", "cost ledger"],
+      outcomeAchieved: true,
+      outcomeEvidence: ["store ledger", "cost ledger"],
+      stopConditionsSatisfied: outcome.stopConditions,
+      observedOutcome: {
+        metric: outcome.metric,
+        baseline: outcome.baseline,
+        observed: "Positive reconciled profit",
+        target: outcome.target,
+        measurementWindow: outcome.measurementWindow,
+      },
+      gaps: [],
+      refinements: [],
+    };
+    await expect(f.t.mutation(api.goalMode.recordValidation, {
+      id: f.missionId,
+      expectedAdvanceAttempt: 1,
+      validation: {
+        ...validation,
+        observedOutcome: { ...validation.observedOutcome, metric: "gross sales" },
+        stopConditionsSatisfied: ["Sales increased"],
+      },
+      workerToken: TOKEN,
+    })).rejects.toThrow(/measurable outcome and every stop condition/);
+    await expect(f.t.mutation(api.goalMode.recordValidation, {
+      id: f.missionId,
+      expectedAdvanceAttempt: 1,
+      validation,
+      workerToken: TOKEN,
+    })).resolves.toMatchObject({ advanced: true, status: "done" });
+  });
+
   it("projects all 320 action-scope decisions identically into Goal Mode producers", async () => {
     expect(GENERATED_GATED_ACTION_MATRIX).toHaveLength(320);
     for (const [index, task] of GENERATED_GATED_ACTION_MATRIX.entries()) {
@@ -812,14 +1006,26 @@ describe("real Convex multi-agent workspace and integration races", () => {
 
     const [validatorRun] = await dispatch(f.t, 8, "dag-validator");
     expect(validatorRun.claim).toMatchObject({ goalStage: "validating", model: "terra", reasoningEffort: "ultra", readonly: true, repo: null });
-    const validationResult = `GOAL_VALIDATION_JSON:${JSON.stringify({ verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs"], gaps: [], refinements: [] })}`;
+    const passingOutcome = {
+      outcomeAchieved: true,
+      outcomeEvidence: ["four generation-bound handoffs", "exact parent integration receipt"],
+      stopConditionsSatisfied: ["Every accepted integration node is verified"],
+      observedOutcome: {
+        metric: "verified accepted integration nodes",
+        baseline: "No nodes were delivered before the mission",
+        observed: "Every accepted node is integrated with an exact receipt",
+        target: "Every accepted integration node is delivered and independently verified",
+        measurementWindow: "The current mission validation window",
+      },
+    };
+    const validationResult = `GOAL_VALIDATION_JSON:${JSON.stringify({ verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs", "exact parent integration receipt"], ...passingOutcome, gaps: [], refinements: [] })}`;
     const validatorJob: any = await f.t.run(async (ctx) => ctx.db.get(validatorRun.reservation.jobId as any));
     await finalizeReadonly(f.t, validatorJob, validationResult, "Parent Sol validator checked original plan, handoffs, child heads, and live checks.");
     const validationClaim: any = await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN });
     expect(validationClaim).toMatchObject({ kind: "validation", missionId: f.missionId });
     expect(await f.t.mutation(api.goalMode.recordValidation, {
       id: f.missionId, expectedAdvanceAttempt: validationClaim.expectedAdvanceAttempt,
-      validation: { verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs"], gaps: [], refinements: [] },
+      validation: { verdict: "pass", summary: "Original cross-project goal proved", evidence: ["four generation-bound handoffs", "exact parent integration receipt"], ...passingOutcome, gaps: [], refinements: [] },
       workerToken: TOKEN,
     })).toMatchObject({ status: "done" });
   });
@@ -1112,9 +1318,21 @@ describe("real Convex multi-agent workspace and integration races", () => {
     });
     const validationClaim = await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN });
     expect(validationClaim).toMatchObject({ kind: "validation", missionId: f.missionId });
+    const passingOutcome = {
+      outcomeAchieved: true,
+      outcomeEvidence: ["two signed receipts", "pinned validator head"],
+      stopConditionsSatisfied: ["Every accepted integration node is verified"],
+      observedOutcome: {
+        metric: "verified accepted integration nodes",
+        baseline: "No nodes were delivered before the mission",
+        observed: "Every accepted node is integrated with an exact receipt",
+        target: "Every accepted integration node is delivered and independently verified",
+        measurementWindow: "The current mission validation window",
+      },
+    };
     expect(await f.t.mutation(api.goalMode.recordValidation, {
       id: f.missionId, expectedAdvanceAttempt: Number(validationClaim!.expectedAdvanceAttempt),
-      validation: { verdict: "pass", summary: "integrated mission passed", evidence: ["two signed receipts", "pinned validator head"], gaps: [], refinements: [] },
+      validation: { verdict: "pass", summary: "integrated mission passed", evidence: ["two signed receipts", "pinned validator head"], ...passingOutcome, gaps: [], refinements: [] },
       workerToken: TOKEN,
     })).toMatchObject({ advanced: true, status: "done" });
     expect(((await f.t.run(async (ctx) => ctx.db.get(f.missionId))) as any)?.status).toBe("done");

@@ -15,7 +15,37 @@ import {
   selectGoalWorkstreamPolicy,
   summarizeGoalPhase,
   validatorTask,
+  type GoalCrewCharter,
+  type GoalOutcomeContract,
 } from "./goal-mode";
+
+const outcome: GoalOutcomeContract = {
+  objective: "Make the requested product outcome measurably true",
+  metric: "verified successful user journeys",
+  baseline: "Current production journey and provider evidence are measured before changes",
+  target: "Every accepted journey succeeds against the exact production revision",
+  measurementWindow: "One complete post-deployment validation window",
+  evidenceSources: ["Provider response lineage and production browser checks"],
+  stopConditions: ["The target is evidenced and no accepted critical gap remains"],
+};
+
+const crew: GoalCrewCharter = {
+  process: "hierarchical",
+  manager: "jarvis",
+  delegationRules: ["Create only necessary specialist workstreams"],
+  humanEscalation: ["Escalate only protected decisions after safe independent work is exhausted"],
+  reportingCadence: "Event-driven durable checkpoints; no idle polling",
+};
+
+const workstream = (value: Record<string, unknown>) => ({
+  deliverable: {
+    kind: "code_change",
+    description: "A scoped verified change with an evidence-rich handoff",
+    requiredEvidence: ["Exact relevant tests and caller evidence"],
+  },
+  guardrails: ["Do not perform protected external actions"],
+  ...value,
+});
 
 describe("Goal Mode contracts", () => {
   it("keeps automatic continuation budgets stage-bounded and explicitly resumable", () => {
@@ -153,9 +183,11 @@ describe("Goal Mode contracts", () => {
       summary: "Build and verify it",
       route: "existing_project",
       primaryRepo: "daniels-project-space/jarvis",
+      outcome,
+      crew,
       workstreams: [
-        { id: "ui", label: "UI", task: "Connect the complete user interface to the durable backend.", dependsOn: ["core"], acceptanceCriteria: ["UI works"] },
-        { id: "core", label: "Core", task: "Implement the durable state machine and its recovery transitions.", acceptanceCriteria: ["Transitions are tested"] },
+        workstream({ id: "ui", label: "UI", task: "Connect the complete user interface to the durable backend.", dependsOn: ["core"], acceptanceCriteria: ["UI works"] }),
+        workstream({ id: "core", label: "Core", task: "Implement the durable state machine and its recovery transitions.", acceptanceCriteria: ["Transitions are tested"] }),
       ],
       validation: { criteria: ["Works end to end"], tests: ["npm test"], liveChecks: ["production smoke"] },
     })}`);
@@ -178,33 +210,35 @@ describe("Goal Mode contracts", () => {
 
   it("rejects cyclic plans", () => {
     expect(() => parseGoalPlan(`${GOAL_PLAN_MARKER}${JSON.stringify({
+      outcome,
+      crew,
       workstreams: [
-        { id: "a", task: "Implement the first substantial bounded work package.", dependsOn: ["b"] },
-        { id: "b", task: "Implement the second substantial bounded work package.", dependsOn: ["a"] },
+        workstream({ id: "a", task: "Implement the first substantial bounded work package.", dependsOn: ["b"] }),
+        workstream({ id: "b", task: "Implement the second substantial bounded work package.", dependsOn: ["a"] }),
       ],
     })}`)).toThrow(/cycle/);
   });
 
   it.each([
     ["duplicate ids", [
-      { id: "same", task: "Implement the first substantial bounded work package." },
-      { id: "same", task: "Implement the second substantial bounded work package." },
+      workstream({ id: "same", task: "Implement the first substantial bounded work package." }),
+      workstream({ id: "same", task: "Implement the second substantial bounded work package." }),
     ], /duplicate workstream id/],
     ["missing dependency", [
-      { id: "a", task: "Implement the first substantial bounded work package.", dependsOn: ["missing"] },
-      { id: "b", task: "Implement the second substantial bounded work package." },
+      workstream({ id: "a", task: "Implement the first substantial bounded work package.", dependsOn: ["missing"] }),
+      workstream({ id: "b", task: "Implement the second substantial bounded work package." }),
     ], /unknown workstream/],
     ["duplicate edge", [
-      { id: "a", task: "Implement the first substantial bounded work package." },
-      { id: "b", task: "Implement the second substantial bounded work package.", dependsOn: ["a", "a"] },
+      workstream({ id: "a", task: "Implement the first substantial bounded work package." }),
+      workstream({ id: "b", task: "Implement the second substantial bounded work package.", dependsOn: ["a", "a"] }),
     ], /duplicate dependency/],
   ])("rejects %s before dispatch", (_label, workstreams, expected) => {
-    expect(() => parseGoalPlan(`${GOAL_PLAN_MARKER}${JSON.stringify({ workstreams })}`)).toThrow(expected as RegExp);
+    expect(() => parseGoalPlan(`${GOAL_PLAN_MARKER}${JSON.stringify({ outcome, crew, workstreams })}`)).toThrow(expected as RegExp);
   });
 
   it("requires evidence for a pass and repairs for refine", () => {
-    expect(() => parseGoalValidation(`${GOAL_VALIDATION_MARKER}{"verdict":"pass","evidence":["build passed"]}`))
-      .toThrow(/two concrete/);
+    expect(() => parseGoalValidation(`${GOAL_VALIDATION_MARKER}{"verdict":"pass","evidence":["build passed","tests passed"]}`))
+      .toThrow(/measured target evidence/);
     const value = parseGoalValidation(`${GOAL_VALIDATION_MARKER}${JSON.stringify({
       verdict: "refine",
       summary: "One live gap remains",
@@ -226,6 +260,8 @@ describe("Goal Mode contracts", () => {
         summary: "Skeptically validate every protected and public surface. ".repeat(40),
         route: "existing_project",
         assumptions: [],
+        outcome,
+        crew,
         workstreams: [],
         validation: {
           criteria: repeated(12, "criterion"),
@@ -249,6 +285,68 @@ describe("Goal Mode contracts", () => {
     expect(task).toContain("persisted lineage");
     expect(task).toContain(GOAL_VALIDATION_MARKER);
     expect(task).toContain('"verdict":"pass|refine|blocked"');
+  });
+
+  it("creates only the necessary crew and makes profit goals impossible to pass on sales proxies", () => {
+    const planned = parseGoalPlan(`${GOAL_PLAN_MARKER}${JSON.stringify({
+      summary: "Measure the shop, repair the highest-leverage constraint, and prove profit",
+      route: "existing_project",
+      primaryRepo: "daniels-project-space/dropship-ai",
+      assumptions: [],
+      outcome: {
+        objective: "Make the Snuffelo Shopify store measurably more profitable",
+        metric: "net contribution profit after refunds, fees, fulfilment and attributable advertising spend",
+        baseline: "A reconciled pre-change Shopify, payment, fulfilment and advertising cohort",
+        target: "Positive net contribution profit above the reconciled baseline",
+        measurementWindow: "One statistically comparable post-change cohort",
+        evidenceSources: ["Shopify orders and refunds", "Payment fees", "Fulfilment costs", "Advertising spend"],
+        stopConditions: ["The target is met in reconciled source data", "No protected campaign or pricing action is pending"],
+      },
+      crew,
+      workstreams: [workstream({
+        id: "baseline",
+        label: "Atlas · profit baseline",
+        task: "Reconcile the authoritative commerce data and identify the binding profitability constraint.",
+        agentId: "atlas",
+        readonly: true,
+      })],
+      validation: { criteria: ["Net profit improves"], tests: [], liveChecks: ["Reconcile provider totals"] },
+    })}`, 6);
+    expect(planned.workstreams).toHaveLength(1);
+    expect(planned.outcome.metric).toContain("net contribution profit");
+
+    expect(() => parseGoalValidation(`${GOAL_VALIDATION_MARKER}${JSON.stringify({
+      verdict: "pass",
+      summary: "Sales increased",
+      evidence: ["Deployment succeeded", "Shopify revenue increased"],
+      outcomeAchieved: false,
+      outcomeEvidence: ["Revenue increased"],
+      stopConditionsSatisfied: [],
+      observedOutcome: {
+        metric: "revenue",
+        baseline: "£1,000",
+        observed: "£1,200",
+        target: "positive profit",
+        measurementWindow: "one week",
+      },
+    })}`)).toThrow(/measured target evidence/);
+
+    const validation = parseGoalValidation(`${GOAL_VALIDATION_MARKER}${JSON.stringify({
+      verdict: "pass",
+      summary: "The reconciled target is met",
+      evidence: ["Shopify cohort reconciled", "Costs reconciled"],
+      outcomeAchieved: true,
+      outcomeEvidence: ["Provider-sourced net contribution improved from -£40 to £85", "Refunds, fees, fulfilment and ads reconcile to the order cohort"],
+      stopConditionsSatisfied: ["The target is met in reconciled source data", "No protected action remains"],
+      observedOutcome: {
+        metric: "net contribution profit",
+        baseline: "-£40",
+        observed: "£85",
+        target: "positive and above baseline",
+        measurementWindow: "comparable seven-day cohort",
+      },
+    })}`);
+    expect(validation.outcomeAchieved).toBe(true);
   });
 
   it("creates a stable shared goal branch", () => {

@@ -79,7 +79,13 @@ import {
 } from "@/lib/tts";
 import { NarrationLedger, narrationClaim } from "@/lib/narration";
 import { resolveEmbedLayoutMode, resolvePanelRoute } from "@/lib/panel-contract";
-import { parseFastAgentDispatch, parseProjectFeatureDispatch, type FastAgentDispatch } from "@/lib/fast-agent-dispatch";
+import {
+  parseFastAgentDispatch,
+  parseFastGoalCrewDispatch,
+  parseProjectFeatureDispatch,
+  type FastAgentDispatch,
+  type FastGoalCrewDispatch,
+} from "@/lib/fast-agent-dispatch";
 import { resolveVoiceTurnAdmission } from "@/lib/voice-turn-admission";
 import { needsHostContext, visibleTurnText, withHostContext, type JarvisHostContext } from "@/lib/host-context";
 import { resolveHostProjectContext } from "@/lib/host-project-context";
@@ -3933,6 +3939,74 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
+  async function openFastGoalCrew(intent: FastGoalCrewDispatch, requestedText: string, background = false) {
+    const narrationId = `goal-crew:${Date.now()}`;
+    if (controllerSessionReadiness?.state === "repair_required") {
+      const repair = controllerSessionStatusPresentation("repair_required", controllerSessionReadiness.code);
+      const reply = `I haven’t started the crew. ${repair.hint}`;
+      showCaption({ who: "you", text: requestedText });
+      showCaption({ who: "jarvis", text: reply, phase: "ready" });
+      if (!background) await narrateText({ text: reply, claim: narrationClaim(narrationId, reply), captionText: reply });
+      return;
+    }
+    const startingReply = "I’m forming the smallest team that can prove the outcome.";
+    document.documentElement.dataset.jarvisFirstTokenMs = "0";
+    if (!background) setSending(true);
+    showCaption({ who: "you", text: requestedText });
+    showCaption({ who: "jarvis", text: startingReply, phase: "streaming" });
+    if (!background) void narrateText({
+      text: startingReply,
+      claim: narrationClaim(`${narrationId}:starting`, startingReply),
+      captionText: startingReply,
+      final: false,
+    });
+    try {
+      const response = await viewerFetch("/api/tools", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "goal_mode",
+          args: {
+            action: "start",
+            goal: intent.goal,
+            success_metric: intent.successMetric,
+            target: intent.target,
+          },
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      const result = String(body?.result ?? "");
+      if (!response.ok || !result || /^(?:Tool failed|Tool unavailable|Tell me)/i.test(result)) {
+        throw new Error(result || "crew start unavailable");
+      }
+      const live = /\bis live\b/i.test(result);
+      const reply = live
+        ? "The crew is live. I’ll delegate only necessary work and keep the measured outcome on screen."
+        : result.slice(0, 360);
+      if (!background) updateConversationMood(reply);
+      showCaption({ who: "jarvis", text: reply, phase: "ready" });
+      void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
+      void logTurn({ threadId: threadRef.current, role: "assistant", text: reply, model: "instant-goal-dispatch" });
+      if (live && embedded) {
+        dismissEmbeddedAfterHandoff();
+        return;
+      }
+      if (!background) {
+        lastSpokenText.current = { text: reply, ts: Date.now() };
+        await narrateText({ text: reply, claim: narrationClaim(narrationId, reply), captionText: reply });
+      }
+    } catch {
+      if (background) {
+        showCaption({ who: "jarvis", text: "I couldn’t start that crew while the current reply continues." });
+        return;
+      }
+      showCaption({ who: "jarvis", text: "The direct crew start failed. I’m retrying through the durable conversation lane." });
+      await queueDurableTurn(requestedText);
+    } finally {
+      if (!background) setSending(false);
+    }
+  }
+
   const fastChartRequest = useRef(0);
   async function openFastChart(intent: FastChartIntent, requestedText: string) {
     const request = ++fastChartRequest.current;
@@ -4054,14 +4128,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     if (!t && !fileIds.length) return;
     const visibleText = t || "Analyze the attached files.";
-    const explicitFastDispatch = guest || fileIds.length ? null : parseFastAgentDispatch(t);
+    const fastGoalCrew = guest || fileIds.length ? null : parseFastGoalCrewDispatch(t);
+    const explicitFastDispatch = fastGoalCrew ? null : guest || fileIds.length ? null : parseFastAgentDispatch(t);
     const projectFastDispatch = !explicitFastDispatch && embedded && !guest && !fileIds.length
       && resolveHostProjectContext(hostContextRef.current)
       ? parseProjectFeatureDispatch(t)
       : null;
     const fastDispatch = explicitFastDispatch ?? projectFastDispatch;
     const foregroundBusy = Boolean(durableSubmissionInFlight.current || activeDurableTurn.current);
-    const admission = resolveVoiceTurnAdmission({ foregroundBusy, hasFastDispatch: fastDispatch !== null });
+    const admission = resolveVoiceTurnAdmission({ foregroundBusy, hasFastDispatch: fastDispatch !== null || fastGoalCrew !== null });
     // A received specialist handoff is durable background work, not a second
     // foreground model turn. Keep ordinary conversation serialization intact
     // while allowing Daniel to keep using the live loop during the handoff.
@@ -4084,6 +4159,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     lastSent.current = { text: sendFingerprint, ts: Date.now() };
     setInput("");
     const backgroundDispatch = admission === "background-dispatch";
+    if (fastGoalCrew) {
+      updateConversationMood(sanitizedVisibleUserMoodText(visibleText));
+      void openFastGoalCrew(fastGoalCrew, t, backgroundDispatch);
+      return;
+    }
     if (fastDispatch) {
       // Fast handoffs return before the ordinary submit path reaches its
       // local-first mood update. Keep typed, STT, and live requests visually
