@@ -146,8 +146,12 @@ const RULES: readonly CapabilityRule[] = [
     reason: "youtube_video_discovery",
     matches: (value, original) => !YOUTUBE_URL_RE.test(original)
       && !/\byoutube\s+studio\b/i.test(value)
-      && /\b(?:youtube|yt)\b/i.test(value)
-      && /\b(?:find|search|watch|video|videos|creator|channel|clip|playlist|transcript|summari[sz]e)\b/i.test(value),
+      && (
+        (/\b(?:youtube|yt)\b/i.test(value)
+          && /\b(?:find|search|watch|video|videos|creator|channel|clip|playlist|transcript|summari[sz]e)\b/i.test(value))
+        || (!/\b(?:uploaded|attached|private|local|file)\b/i.test(value)
+          && /\b(?:find|search(?:\s+for)?|show\s+me|watch)\b[^\r\n]{0,64}\b(?:videos?|clips?|channels?|playlists?)\b/i.test(value))
+      ),
   },
   {
     belt: "core",

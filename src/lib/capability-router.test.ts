@@ -15,6 +15,7 @@ describe("capability router", () => {
     ["Make a mind map for the launch", "creative", "mind_map"],
     ["Summarise https://youtu.be/abcDEF12345", "creative", "youtube_transcript"],
     ["Find me a YouTube video about camera lighting", "creative", "youtube_search"],
+    ["Show me videos of Lofi Girl", "creative", "youtube_search"],
     ["Favourite this attached image", "core", "review_uploaded_file"],
     ["Mark this uploaded file for removal review", "core", "review_uploaded_file"],
     ["Move this uploaded file into Business/Acme", "core", "organize_uploaded_file"],
@@ -56,6 +57,11 @@ describe("capability router", () => {
 
   it("does not divert YouTube Studio work into public video discovery", () => {
     expect(rankCapabilities("Open YouTube Studio and show the latest upload").candidates.map(({ tool }) => tool))
+      .not.toContain("youtube_search");
+  });
+
+  it("does not mistake a selected private video file for public video discovery", () => {
+    expect(rankCapabilities("Show me this uploaded video file").candidates.map(({ tool }) => tool))
       .not.toContain("youtube_search");
   });
 

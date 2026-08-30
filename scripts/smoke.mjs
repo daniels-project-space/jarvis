@@ -237,13 +237,21 @@ await test("no phantom live lock", async () => {
   }
 });
 
-await test("metered realtime API route is absent", async () => {
+await test("metered realtime JSON API route is absent", async () => {
   const r = await fetch(`${BASE}/api/realtime-token`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${VIEWER_TOKEN}` },
     body: JSON.stringify({ client: "smoke" }),
   });
-  assert(r.status === 404, `retired realtime route returned ${r.status}`);
+  const contentType = r.headers.get("content-type") ?? "";
+  const body = await r.text();
+  // Authenticated unknown paths render Next's HTML not-found shell with a 200
+  // status after streaming has begun. The retired paid route is absent as long
+  // as it cannot return a JSON token contract.
+  assert(
+    r.status === 404 || (r.status === 200 && contentType.startsWith("text/html") && /^<!DOCTYPE html>/i.test(body)),
+    `retired realtime route returned an API response (${r.status} ${contentType})`,
+  );
 });
 
 await test("timed reminder sets + is due-deliverable", async () => {
