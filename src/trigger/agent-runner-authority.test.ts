@@ -7,7 +7,12 @@ import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import schema from "../../convex/schema";
 import { testMissionAdmission } from "../../convex/testSourceAdmission";
-import { GOAL_PLAN_MARKER, GOAL_PLAN_RESULT_MAX_CHARS, parseGoalPlan } from "../lib/goal-mode";
+import {
+  GOAL_PLAN_MARKER,
+  GOAL_PLAN_RESULT_MAX_CHARS,
+  GOAL_VALIDATION_MARKER,
+  parseGoalPlan,
+} from "../lib/goal-mode";
 import { workGroupAuthority } from "../lib/work-scheduler";
 import { WORK_ORDER_MACHINE_TEMPLATE } from "../lib/work-order-revision";
 import { canonicalWorkspaceCheckpoint } from "../lib/workspace-checkpoint";
@@ -110,6 +115,7 @@ function bridgeProductionRunnerToConvex(
   t: HarnessConvex,
   beforeCall?: (call: MutationTrace) => Promise<void>,
   afterCall?: (call: MutationTrace, value: unknown) => Promise<void>,
+  overrideCall?: (call: MutationTrace) => Promise<{ handled: true; value: unknown } | undefined>,
 ) {
   const trace: MutationTrace[] = [];
   const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -117,6 +123,14 @@ function bridgeProductionRunnerToConvex(
     const call = { path: body.path, args: body.args, signal: init?.signal ?? undefined };
     trace.push(call);
     await beforeCall?.(call);
+    const override = await overrideCall?.(call);
+    if (override?.handled) {
+      await afterCall?.(body, override.value);
+      return new Response(JSON.stringify({ status: "success", value: override.value }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     let value: unknown;
     switch (body.path) {
       case "jobs:activateHeartbeatProtocolV2":
@@ -1420,6 +1434,115 @@ describe("production Trigger worker authority harness", () => {
     expect(String(finished?.result).length).toBeGreaterThan(4_000);
     expect(String(finished?.result).length).toBeLessThanOrEqual(GOAL_PLAN_RESULT_MAX_CHARS);
     expect(parseGoalPlan(String(finished?.result), 8).workstreams).toHaveLength(4);
+  });
+
+  it("immediately correction-requeues a structurally valid validator pass rejected by the measurable-outcome gate", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { reservation } = await reservedWritableJob(
+      t,
+      "runner-invalid-goal-pass-correction",
+      "xhigh",
+      {
+        task: "Inspect the admitted source and report the bounded read-only evidence.",
+        model: "terra",
+        readonly: true,
+        goalStage: "building",
+      },
+    );
+    const invalidPass = `${GOAL_VALIDATION_MARKER}${JSON.stringify({
+      verdict: "pass",
+      summary: "The source inspection finished, but the measured outcome is not evidenced.",
+      evidence: ["source inspection", "runtime status"],
+      outcomeAchieved: true,
+      outcomeEvidence: ["source inspection", "runtime status"],
+      stopConditionsSatisfied: ["A proxy condition, not the accepted stop condition"],
+      observedOutcome: {
+        metric: "verified worker lifecycle stages",
+        baseline: "No live evidence recorded",
+        observed: "Source inspection only",
+        target: "One completed long-running worker lifecycle",
+        measurementWindow: "This validation run",
+      },
+      gaps: ["The accepted measurable outcome is not proved."],
+      refinements: [],
+      blocker: "",
+    })}`;
+    let advanceClaims = 0;
+    const bridge = bridgeProductionRunnerToConvex(
+      t,
+      undefined,
+      undefined,
+      async (call) => {
+        if (call.path === "goalMode:claimAdvance") {
+          advanceClaims += 1;
+          return {
+            handled: true,
+            value: advanceClaims === 1
+              ? {
+                  kind: "validation",
+                  missionId: "synthetic-goal",
+                  jobId: "synthetic-validator",
+                  result: invalidPass,
+                  expectedAdvanceAttempt: 3,
+                  advanceLeaseOwner: "controller-owner",
+                  advanceLeaseToken: "controller-token",
+                  advanceLeaseVersion: 2,
+                }
+              : null,
+          };
+        }
+        if (call.path === "goalMode:renewAdvance") {
+          return { handled: true, value: true };
+        }
+        if (call.path === "goalMode:recordValidation") {
+          return {
+            handled: true,
+            value: {
+              advanced: false,
+              rejected: true,
+              error: "Goal completion requires the accepted measurable outcome and every stop condition to be evidenced",
+            },
+          };
+        }
+        if (call.path === "goalMode:rejectAdvance") {
+          return { handled: true, value: { requeued: true, stale: false } };
+        }
+        return undefined;
+      },
+    );
+    const runProcess = vi.fn(async (input: any) => {
+      await input.turnReceipt.beforeRequest();
+      input.turnReceipt.requestWritten();
+      await input.turnReceipt.accepted();
+      await input.turnReceipt.completed();
+      return {
+        text: "Read-only source evidence collected.",
+        timedOut: false,
+        stopped: null,
+        checkpointLog: "read-only inspection complete",
+        commands: [],
+      };
+    });
+
+    await expect(invokeHarness(
+      reservation,
+      "invalid-goal-pass-controller-run",
+      injectedRunnerDependencies({ runProcess }),
+    )).resolves.toEqual({ processed: 1 });
+
+    expect(bridge.trace.filter((call) => call.path === "goalMode:recordValidation")).toHaveLength(1);
+    expect(bridge.trace.filter((call) => call.path === "goalMode:rejectAdvance")).toEqual([
+      expect.objectContaining({
+        args: expect.objectContaining({
+          id: "synthetic-goal",
+          jobId: "synthetic-validator",
+          expectedAdvanceAttempt: 3,
+          error: expect.stringMatching(/measurable outcome and every stop condition/),
+        }),
+      }),
+    ]);
+    expect(advanceClaims).toBe(2);
   });
 
   it("runs the real specialist and delivery lifecycle with exact server authority and reconciles a lost observation response", async () => {

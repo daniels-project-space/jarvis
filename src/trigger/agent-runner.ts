@@ -1561,6 +1561,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           }).catch(() => null));
           if (!validationWrite.live) continue;
           const result: any = validationWrite.value;
+          if (result?.rejected) {
+            await convexMutation("goalMode:rejectAdvance", {
+              id: claim.missionId,
+              jobId: claim.jobId,
+              expectedAdvanceAttempt: Number(claim.expectedAdvanceAttempt),
+              ...advanceFence(claim),
+              error: String(result.error ?? "Goal validation contract was rejected"),
+            }).catch(() => null);
+            advanced += 1;
+            continue;
+          }
           if (!result?.advanced) continue;
           advanced += 1;
           if (result.status === "done") {

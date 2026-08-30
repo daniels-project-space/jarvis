@@ -481,7 +481,11 @@ describe("real Convex multi-agent workspace and integration races", () => {
         stopConditionsSatisfied: ["Sales increased"],
       },
       workerToken: TOKEN,
-    })).rejects.toThrow(/measurable outcome and every stop condition/);
+    })).resolves.toMatchObject({
+      advanced: false,
+      rejected: true,
+      error: expect.stringMatching(/measurable outcome and every stop condition/),
+    });
     await expect(f.t.mutation(api.goalMode.recordValidation, {
       id: f.missionId,
       expectedAdvanceAttempt: 1,

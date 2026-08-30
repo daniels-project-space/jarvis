@@ -1789,7 +1789,15 @@ export const recordValidation = mutation({
         || !observed.measurementWindow || !matchesAcceptedOutcome
         || requiredStops.length < 1
         || !requiredStops.every((condition) => satisfiedStops.has(condition.trim()))) {
-        throw new Error("Goal completion requires the accepted measurable outcome and every stop condition to be evidenced");
+        // This is an expected model-contract rejection, not a transient
+        // control-plane failure. Return it explicitly so the exact validator
+        // job can be correction-requeued immediately instead of holding its
+        // ten-minute advance lease until recovery happens to notice it.
+        return {
+          advanced: false,
+          rejected: true,
+          error: "Goal completion requires the accepted measurable outcome and every stop condition to be evidenced",
+        };
       }
     }
     const now = Date.now();
