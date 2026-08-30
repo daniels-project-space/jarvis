@@ -1,5 +1,3 @@
-import type { BrowserPermission } from "./permissions";
-
 export type LiveVoiceLeaseStart<T> =
   | { status: "ready"; microphone: T }
   | { status: "not-owned" }
@@ -98,46 +96,6 @@ export async function startLiveWithLease<T>(args: {
   }
 
   return { status: "ready", microphone };
-}
-
-export function shouldAutoStartLiveVoice(args: {
-  embedded: boolean;
-  visible: boolean;
-  liveDefault: boolean;
-  permission: BrowserPermission;
-  attempted: boolean;
-  manuallyStopped: boolean;
-}): boolean {
-  return !args.embedded
-    && args.visible
-    && args.liveDefault
-    && !args.attempted
-    && !args.manuallyStopped
-    && (args.permission === "granted" || args.permission === "prompt");
-}
-
-export function liveVoiceRetryDelay(attempt: number): number | null {
-  if (!Number.isFinite(attempt) || attempt < 1 || attempt > 4) return null;
-  return Math.min(12_000, 1_500 * (2 ** (attempt - 1)));
-}
-
-export function scheduleAutoLiveBootstrap(
-  attempt: () => void | Promise<void>,
-  setAttempted: (attempted: boolean) => void,
-  // Enough time for hydration to attach the stop/retry handlers, without
-  // making a remembered microphone grant feel like an idle half-second.
-  delayMs = 150,
-): () => void {
-  let cancelled = false;
-  setAttempted(true);
-  const timer = globalThis.setTimeout(() => {
-    if (!cancelled) void attempt();
-  }, delayMs);
-  return () => {
-    cancelled = true;
-    globalThis.clearTimeout(timer);
-    setAttempted(false);
-  };
 }
 
 export function speechServiceRetryDelay(attempt: number, requestedDelayMs = 0): number {

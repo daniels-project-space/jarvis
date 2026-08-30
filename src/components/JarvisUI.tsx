@@ -44,10 +44,7 @@ import { isPanelFollowUp } from "@/lib/panel-relevance";
 import { nextVoiceLoopAction, shouldMaintainLiveHeartbeat, type VoiceCaptureOutcome } from "@/lib/voice-loop";
 import {
   coalesceLiveVoiceStart,
-  liveVoiceRetryDelay,
   loadLiveVoiceStartupDependency,
-  scheduleAutoLiveBootstrap,
-  shouldAutoStartLiveVoice,
   speechServiceRetryDelay,
   startLiveWithLease,
 } from "@/lib/live-voice-bootstrap";
@@ -211,7 +208,7 @@ const VisualSceneView = dynamic(() => import("./VisualSceneView"), {
   loading: () => <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-cyan">assembling visual workspace…</div>,
 });
 
-type JarvisPrefs = { reduceMotion: boolean; liveDefault: boolean };
+type JarvisPrefs = { reduceMotion: boolean };
 type LiveMicrophoneResources = {
   stream: MediaStream;
   context: AudioContext;
@@ -571,14 +568,13 @@ const OPTION_MOODS: { k: string; c: string }[] = [
   { k: "curious", c: "#33e0d0" }, { k: "serious", c: "#8fa3bd" }, { k: "excited", c: "#ff5470" },
 ];
 function OptionsPanel({
-  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, live, wake, locOn, onLocation, onClose, onToggleWake, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice, controllerSessionReadiness, owner,
+  prefs, setPref, permissions, permissionBusy, onEnableMicrophone, wake, locOn, onLocation, onClose, onToggleWake, onMood, onClearMood, onOpenLibrary, onOpenTravel, onOpenGoals, onMacSetup, googleOAuthNotice, controllerSessionReadiness, owner,
 }: {
   prefs: JarvisPrefs;
-  setPref: (k: keyof JarvisPrefs, v: string | boolean) => void;
+  setPref: (k: keyof JarvisPrefs, v: boolean) => void;
   permissions: JarvisPermissionState;
   permissionBusy: boolean;
   onEnableMicrophone: () => void;
-  live: string;
   wake: boolean;
   locOn: boolean;
   onLocation: () => void;
@@ -786,7 +782,7 @@ function OptionsPanel({
               {novitaPatchProposer.label}
             </span>
           </Row>
-          <Row label="Voice activation" hint={wake ? "wake-only · nothing is submitted until you say Jarvis" : permissions.microphone === "denied" ? "blocked in browser settings" : "off · enable once to listen for Jarvis locally"}>
+          <Row label="Voice activation" hint={wake ? "wake standby · Jarvis capture stays off until you say Jarvis" : permissions.microphone === "denied" ? "blocked in browser settings" : "off · enable wake standby once"}>
             <button
               type="button"
               disabled={permissionBusy}
@@ -794,11 +790,6 @@ function OptionsPanel({
               className={`rounded-lg px-3 py-1 text-[11px] transition disabled:opacity-60 ${wake ? "bg-cyan/20 text-cyan ring-1 ring-cyan/50" : "border border-white/10 text-slate hover:text-ice"}`}
             >
               {permissionBusy ? "enabling…" : wake ? "wake-only" : permissions.microphone === "denied" ? "browser settings" : "enable"}
-            </button>
-          </Row>
-          <Row label="Continuous voice" hint={live !== "off" ? "on now · tap the one voice control to stop" : "optional hands-free follow-up mode · off by default"}>
-            <button onClick={() => setPref("liveDefault", !prefs.liveDefault)} className={`h-5 w-9 rounded-full p-0.5 transition ${prefs.liveDefault ? "bg-cyan/60" : "bg-white/15"}`}>
-              <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${prefs.liveDefault ? "translate-x-4" : ""}`} />
             </button>
           </Row>
           <Row label="Location" hint={locOn ? "live updates on this device · pause stops updates; the last point expires shortly" : "for 'pizza near me', local hours and moving-city maps"}>
@@ -2308,12 +2299,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const [authRepairRecovered, setAuthRepairRecovered] = useState(false);
   const [googleOAuthNotice, setGoogleOAuthNotice] = useState<GoogleOAuthReturnNotice | null>(null);
   const setMoodMut = (args: Record<string, unknown>) => privateMutation("ui:setMood", args);
-  const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false, liveDefault: false });
+  const [prefs, setPrefs] = useState<JarvisPrefs>({ reduceMotion: false });
   const [permissions, setPermissions] = useState<JarvisPermissionState>({ microphone: "prompt", notifications: "prompt" });
   const [permissionBusy, setPermissionBusy] = useState(false);
-  const liveAutoStarted = useRef(false);
-  const liveAutoRetryCount = useRef(0);
-  const liveAutoRetryTimer = useRef<number | null>(null);
   const liveManuallyStopped = useRef(false);
   const resumeLiveWhenVisible = useRef(false);
   const sttFailureStreak = useRef(0);
@@ -2334,13 +2322,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     localStorage.removeItem("jarvis_voice");
     localStorage.removeItem("jarvis_tts");
     localStorage.removeItem("jarvis_kokoro_voice");
-    setPrefs({
-      reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1",
-      // Wake-only is the privacy-safe default. Continuous capture is an
-      // explicit opt-in and never starts just because an older browser has
-      // already granted microphone permission.
-      liveDefault: localStorage.getItem("jarvis_live_default") === "1",
-    });
+    // Full microphone capture is never a persisted startup preference. Clear
+    // the superseded flag so an older Jarvis build cannot silently reopen a
+    // continuous stream after reload. Wake-only standby is the sole automatic
+    // entry; live capture begins after "Jarvis" or an explicit voice-button tap.
+    localStorage.removeItem("jarvis_live_default");
+    setPrefs({ reduceMotion: localStorage.getItem("jarvis_reduce_motion") === "1" });
     // Greeting synthesis is never run on mount. It competes with wake-word
     // recognition and makes an assistant speak before Daniel has asked.
   }, []);
@@ -2381,11 +2368,9 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       window.removeEventListener("keyup", keyboardActivity, { capture: true });
     };
   }, []);
-  const setPref = (k: keyof JarvisPrefs, v: string | boolean) => {
+  const setPref = (k: keyof JarvisPrefs, v: boolean) => {
     setPrefs((p) => ({ ...p, [k]: v }));
-    const key = k === "reduceMotion" ? "jarvis_reduce_motion" : "jarvis_live_default";
-    localStorage.setItem(key, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
-    if (k === "liveDefault" && v === true) liveAutoStarted.current = false;
+    localStorage.setItem("jarvis_reduce_motion", v ? "1" : "0");
   };
   const refreshPermissions = async () => {
     setPermissions(await readJarvisPermissions());
@@ -2398,7 +2383,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     void watchMicrophonePermission((microphone) => {
       setPermissions((current) => ({ ...current, microphone }));
       if (microphone === "denied" && liveCaptureIsActiveOrStarting()) endFreeVoiceSession();
-      if (microphone === "granted") liveAutoStarted.current = false;
     }).then((stop) => {
       if (disposed) stop();
       else stopWatching = stop;
@@ -4651,10 +4635,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         rearmWake();
         if (resumeLiveWhenVisible.current && !liveManuallyStopped.current) {
           resumeLiveWhenVisible.current = false;
-          liveAutoStarted.current = true;
-          void toggleLive(true).then((started) => {
-            if (!started) liveAutoStarted.current = false;
-          });
+          void toggleLive(true);
         }
         return;
       }
@@ -4683,7 +4664,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     setPermissions(current);
     if (current.microphone === "granted") {
       localStorage.setItem(wakePreferenceKey, "1");
-      setPref("liveDefault", false);
       rearmWake();
       return;
     }
@@ -4691,48 +4671,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       alert("Microphone access is blocked. Open this site's browser settings and allow it once.");
     }
   }
-
-  useEffect(() => {
-    if (!shouldAutoStartLiveVoice({
-      embedded,
-      visible: !document.hidden,
-      liveDefault: prefs.liveDefault,
-      permission: permissions.microphone,
-      attempted: liveAutoStarted.current,
-      manuallyStopped: liveManuallyStopped.current,
-    })) return;
-    let disposed = false;
-    const attempt = async () => {
-      if (disposed || liveRef.current || liveManuallyStopped.current || document.hidden) return;
-      const started = await toggleLive(true);
-      if (disposed) return;
-      if (started) {
-        liveAutoRetryCount.current = 0;
-        return;
-      }
-      const current = await readJarvisPermissions();
-      if (disposed) return;
-      setPermissions(current);
-      if (current.microphone === "denied" || current.microphone === "unsupported" || liveManuallyStopped.current) return;
-      liveAutoRetryCount.current += 1;
-      const delay = liveVoiceRetryDelay(liveAutoRetryCount.current);
-      if (delay == null) return;
-      liveAutoRetryTimer.current = window.setTimeout(() => void attempt(), delay);
-    };
-    const cancelBootstrap = scheduleAutoLiveBootstrap(
-      attempt,
-      (attempted) => { liveAutoStarted.current = attempted; },
-    );
-    return () => {
-      disposed = true;
-      cancelBootstrap();
-      if (liveAutoRetryTimer.current) window.clearTimeout(liveAutoRetryTimer.current);
-      liveAutoRetryTimer.current = null;
-    };
-    // This is intentionally a once-per-load boot. Stopping live mode manually
-    // must not cause the next render to reopen the microphone.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [embedded, prefs.liveDefault, permissions.microphone]);
 
   // Screen sight: share a screen/window for ONE frame — JARVIS reads it and
   // answers about what's actually in front of Daniel.
@@ -5897,7 +5835,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           permissions={permissions}
           permissionBusy={permissionBusy}
           onEnableMicrophone={() => void enableMicrophone()}
-          live={live}
           wake={wake}
           locOn={locOn}
           onLocation={toggleLocation}
@@ -6077,17 +6014,6 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             onOpenAction={openSearchResult}
             onShowAction={showSearchResult}
           />
-          {!overlayUp && live === "off" && prefs.liveDefault && permissions.microphone !== "granted" && permissions.microphone !== "unsupported" && (
-            <button
-              type="button"
-              data-jarvis-enable-live-voice
-              onClick={() => void enableMicrophone()}
-              disabled={permissionBusy}
-              className="glass absolute bottom-[16%] left-1/2 z-30 -translate-x-1/2 rounded-full border-cyan/30 px-4 py-2 text-xs text-cyan shadow-[0_0_28px_rgba(103,232,249,.12)] transition hover:border-cyan/60 hover:bg-cyan/10 disabled:opacity-60"
-            >
-              {permissionBusy ? "enabling live voice…" : permissions.microphone === "denied" ? "allow microphone in site settings" : "enable live voice once"}
-            </button>
-          )}
           {speaking && !fullBleed && (
             <button
               type="button"

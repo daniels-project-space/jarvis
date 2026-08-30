@@ -2,10 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   coalesceLiveVoiceStart,
-  liveVoiceRetryDelay,
   loadLiveVoiceStartupDependency,
-  scheduleAutoLiveBootstrap,
-  shouldAutoStartLiveVoice,
   speechServiceRetryDelay,
   startLiveWithLease,
 } from "./live-voice-bootstrap";
@@ -22,36 +19,17 @@ function deferred<T>() {
 }
 
 describe("live voice bootstrap policy", () => {
-  it("defaults to local wake-only instead of continuous capture", () => {
+  it("defaults to wake standby instead of continuous Jarvis capture", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
-    expect(source).toContain('liveDefault: localStorage.getItem("jarvis_live_default") === "1"');
+    expect(source).toContain('localStorage.removeItem("jarvis_live_default")');
     expect(source).toContain('const wakeIsEnabled = () => localStorage.getItem(wakePreferenceKey) !== "0"');
     expect(source).toContain('localStorage.setItem(wakePreferenceKey, "1")');
-    expect(source).toContain('setPref("liveDefault", false)');
-    expect(shouldAutoStartLiveVoice({ embedded: false, visible: true, liveDefault: false, permission: "granted", attempted: false, manuallyStopped: false })).toBe(false);
+    expect(source).not.toContain("shouldAutoStartLiveVoice({");
+    expect(source).not.toContain('setPref("liveDefault"');
+    expect(source).not.toContain('label="Continuous voice"');
   });
 
-  it.each(["prompt", "granted"] as const)("starts the main site when microphone permission is %s", (permission) => {
-    expect(shouldAutoStartLiveVoice({
-      embedded: false,
-      visible: true,
-      liveDefault: true,
-      permission,
-      attempted: false,
-      manuallyStopped: false,
-    })).toBe(true);
-  });
-
-  it("never loops after denial, manual stop, backgrounding, or inside an embed", () => {
-    const base = { embedded: false, visible: true, liveDefault: true, permission: "granted" as const, attempted: false, manuallyStopped: false };
-    expect(shouldAutoStartLiveVoice({ ...base, permission: "denied" })).toBe(false);
-    expect(shouldAutoStartLiveVoice({ ...base, manuallyStopped: true })).toBe(false);
-    expect(shouldAutoStartLiveVoice({ ...base, visible: false })).toBe(false);
-    expect(shouldAutoStartLiveVoice({ ...base, embedded: true })).toBe(false);
-  });
-
-  it("bounds startup and speech-service retry pressure", () => {
-    expect([1, 2, 3, 4, 5].map(liveVoiceRetryDelay)).toEqual([1_500, 3_000, 6_000, 12_000, null]);
+  it("bounds speech-service retry pressure", () => {
     expect(speechServiceRetryDelay(1)).toBe(2_000);
     expect(speechServiceRetryDelay(5)).toBe(30_000);
     expect(speechServiceRetryDelay(2, 20_000)).toBe(20_000);
@@ -111,37 +89,6 @@ describe("live voice bootstrap policy", () => {
     secondPending.resolve(true);
     await expect(resumed).resolves.toBe(true);
     firstPending.resolve(false);
-  });
-
-  it("releases the bootstrap fence when a remembered grant arrives before the startup timer", async () => {
-    vi.useFakeTimers();
-    try {
-      let attempted = false;
-      let starts = 0;
-      const setAttempted = (value: boolean) => { attempted = value; };
-
-      const cancelPromptBootstrap = scheduleAutoLiveBootstrap(() => { starts += 1; }, setAttempted);
-      expect(attempted).toBe(true);
-
-      // A prompt -> granted permission refresh tears down the old effect before 150 ms.
-      cancelPromptBootstrap();
-      expect(attempted).toBe(false);
-      expect(shouldAutoStartLiveVoice({
-        embedded: false,
-        visible: true,
-        liveDefault: true,
-        permission: "granted",
-        attempted,
-        manuallyStopped: false,
-      })).toBe(true);
-
-      const cancelGrantedBootstrap = scheduleAutoLiveBootstrap(() => { starts += 1; }, setAttempted);
-      await vi.advanceTimersByTimeAsync(150);
-      expect(starts).toBe(1);
-      cancelGrantedBootstrap();
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("keeps one browser-owned microphone request pending instead of timing out into overlapping streams", () => {
