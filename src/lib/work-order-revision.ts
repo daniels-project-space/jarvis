@@ -23,6 +23,7 @@ export const WORK_ORDER_MACHINE_CLASS = `${WORK_ORDER_MACHINE_RUNTIME}/${WORK_OR
 
 export const WORK_ORDER_MCP_ALLOWLIST = Object.freeze(["context7", "playwright"] as const);
 export const WORK_ORDER_READ_TOOLS = Object.freeze([
+  "repository_validate",
   "repository_read_file",
   "repository_list_files",
 ] as const);

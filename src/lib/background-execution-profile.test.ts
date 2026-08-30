@@ -43,6 +43,7 @@ describe("background execution profile", () => {
       modelTier: "terra",
       readonly: true,
       repositoryCapabilities: [
+        "repository_validate",
         "repository_read_file",
         "repository_list_files",
       ],

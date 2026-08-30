@@ -18,12 +18,14 @@ export const BACKGROUND_DELEGATED_EXECUTION_PROFILE_VERSION = 2 as const;
 
 export const BACKGROUND_REPOSITORY_CAPABILITIES = Object.freeze([
   "repository_exec",
+  "repository_validate",
   "repository_read_file",
   "repository_list_files",
   "repository_write_file",
 ] as const);
 
 const BACKGROUND_READ_REPOSITORY_CAPABILITIES = Object.freeze([
+  "repository_validate",
   "repository_read_file",
   "repository_list_files",
 ] as const satisfies readonly BackgroundRepositoryCapability[]);

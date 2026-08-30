@@ -2868,13 +2868,17 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         const immutableReadOnlyResult = job.readonly === true
           && Array.isArray(job.toolScope)
           && job.toolScope.every((tool: unknown) =>
-            tool === "repository_read_file" || tool === "repository_list_files")
+            tool === "repository_validate"
+            || tool === "repository_read_file"
+            || tool === "repository_list_files")
           && !run.timedOut
           && run.stopped === null
           && result !== "(no output)"
           && !/^error:/i.test(result);
-        // A successfully completed job with only immutable read/list
-        // capabilities has no mutable workspace state to preserve or export.
+        // A successfully completed read-only job with only bounded validation,
+        // read, and list capabilities has no deliverable workspace state. The
+        // validator may write ephemeral caches inside the deny-all sandbox,
+        // but none of that state is exported or delivered.
         // Finalize its durable model receipt directly instead of letting an
         // unrelated Git checkpoint failure discard the completed result. Any
         // writable, timed-out, stopped, or failed turn still requires the full

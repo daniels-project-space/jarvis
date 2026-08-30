@@ -21,6 +21,26 @@ export const CLOUD_REPOSITORY_TOOLS: CodexDynamicToolSpec[] = [
     },
   },
   {
+    type: "function",
+    name: "repository_validate",
+    description:
+      "Run one fixed validation command in the isolated deny-all repository workspace. " +
+      "The caller cannot supply shell text; read-only work never exports workspace changes.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        kind: { type: "string", enum: ["tests", "typecheck", "build"] },
+        paths: {
+          type: "array",
+          maxItems: 24,
+          items: { type: "string", minLength: 1, maxLength: 240 },
+        },
+      },
+      required: ["kind"],
+    },
+  },
+  {
     type: "function", name: "repository_read_file",
     description: "Read one bounded UTF-8 text file from the isolated cloud repository workspace.",
     inputSchema: { type: "object", additionalProperties: false, properties: { path: { type: "string", minLength: 1, maxLength: 1_000 } }, required: ["path"] },
@@ -41,10 +61,16 @@ export const CLOUD_REPOSITORY_TOOLS: CodexDynamicToolSpec[] = [
   },
 ];
 
-export type CloudRepositoryToolName = "repository_exec" | "repository_read_file" | "repository_write_file" | "repository_list_files";
+export type CloudRepositoryToolName =
+  | "repository_exec"
+  | "repository_validate"
+  | "repository_read_file"
+  | "repository_write_file"
+  | "repository_list_files";
 
 const CLOUD_REPOSITORY_TOOL_NAMES = new Set<CloudRepositoryToolName>([
   "repository_exec",
+  "repository_validate",
   "repository_read_file",
   "repository_write_file",
   "repository_list_files",
@@ -78,6 +104,33 @@ function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+const VALIDATION_TEST_PATH = /^(?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_@.-]+\.(?:test|spec)\.[cm]?[jt]sx?$/;
+
+function validationCommand(args: Record<string, unknown>): string {
+  const kind = String(args.kind ?? "");
+  if (kind === "typecheck") {
+    if (args.paths !== undefined) throw new Error("typecheck does not accept paths");
+    return "npx tsc --noEmit --pretty false";
+  }
+  if (kind === "build") {
+    if (args.paths !== undefined) throw new Error("build does not accept paths");
+    return "npm run build";
+  }
+  if (kind !== "tests" || !Array.isArray(args.paths) || args.paths.length < 1 || args.paths.length > 24) {
+    throw new Error("tests require one to twenty-four bounded test paths");
+  }
+  const paths = args.paths.map((path) => String(path));
+  if (new Set(paths).size !== paths.length || paths.some((path) =>
+    path.length > 240 || path.startsWith("/") || path.startsWith("-")
+    || path.split("/").includes("..") || !VALIDATION_TEST_PATH.test(path))) {
+    throw new Error("test path is outside the admitted project-relative test-file grammar");
+  }
+  // Paths use a deliberately shell-inert grammar, so the resulting command
+  // cannot smuggle flags, substitutions, separators, or traversal into the
+  // fixed local Vitest invocation.
+  return `npx vitest run --reporter=verbose -- ${paths.join(" ")}`;
+}
+
 export class CloudWorkspaceToolBridge {
   constructor(
     private readonly provider: CloudWorkspaceProvider,
@@ -104,6 +157,20 @@ export class CloudWorkspaceToolBridge {
         const stdout = validateSandboxOutput(execution.stdout, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
         const stderr = validateSandboxOutput(execution.stderr, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
         return result(JSON.stringify({ exitCode: execution.exitCode, stdout, stderr, durationMs: execution.durationMs }), true);
+      }
+      if (call.tool === "repository_validate") {
+        const execution = await this.provider.exec(this.workspace, {
+          command: validationCommand(args),
+          timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
+          maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
+          signal: this.options.signal,
+        });
+        const stdout = validateSandboxOutput(execution.stdout, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
+        const stderr = validateSandboxOutput(execution.stderr, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
+        return result(
+          JSON.stringify({ exitCode: execution.exitCode, stdout, stderr, durationMs: execution.durationMs }),
+          execution.exitCode === 0,
+        );
       }
       if (call.tool === "repository_read_file") {
         const bytes = await this.provider.readFile(this.workspace, String(args.path ?? ""), DEFAULT_WORKSPACE_LIMITS.maxFileBytes);

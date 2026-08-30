@@ -43,6 +43,7 @@ export class FakeCloudWorkspaceProvider implements CloudWorkspaceProvider {
   };
   readonly calls: string[] = [];
   readonly observedExecEnvironments: Array<Record<string, string>> = [];
+  readonly observedExecCommands: string[] = [];
   private readonly states = new Map<string, FakeState>();
   private serial = 0;
 
@@ -81,6 +82,7 @@ export class FakeCloudWorkspaceProvider implements CloudWorkspaceProvider {
 
   async exec(workspace: CloudWorkspace, request: ExecRequest) {
     this.calls.push("exec");
+    this.observedExecCommands.push(request.command);
     this.state(workspace);
     this.observedExecEnvironments.push({});
     if (request.signal?.aborted) throw new CloudWorkspaceError(this.name, "cancelled", "command cancelled", "deferred");

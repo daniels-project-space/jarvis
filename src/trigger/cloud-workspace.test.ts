@@ -275,7 +275,7 @@ describe("fail-closed cloud workspace boundary", () => {
       attemptKey: "readonly:1", template: "node", runtime: "node-22", lockfileDigest: "c".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
     });
     const bridge = new CloudWorkspaceToolBridge(provider, workspace, {
-      allowedToolScope: ["repository_read_file", "repository_list_files"],
+      allowedToolScope: ["repository_validate", "repository_read_file", "repository_list_files"],
     });
     const outcome = await bridge.invoke({
       threadId: "t", turnId: "r", callId: "c", namespace: null,
@@ -283,8 +283,49 @@ describe("fail-closed cloud workspace boundary", () => {
     });
     expect(outcome.success).toBe(false);
     expect(provider.calls).not.toContain("writeFile");
-    expect(cloudRepositoryToolsForScope(["repository_read_file", "repository_list_files"])
-      .map((tool) => tool.name)).toEqual(["repository_read_file", "repository_list_files"]);
+    expect(cloudRepositoryToolsForScope(["repository_validate", "repository_read_file", "repository_list_files"])
+      .map((tool) => tool.name)).toEqual(["repository_validate", "repository_read_file", "repository_list_files"]);
+  });
+
+  it("lets read-only work run fixed local validation without accepting shell authority", async () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const workspace = await provider.createWorkspace({
+      attemptKey: "readonly-validation:1", template: "node", runtime: "node-22",
+      lockfileDigest: "d".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+    });
+    const bridge = new CloudWorkspaceToolBridge(provider, workspace, {
+      allowedToolScope: ["repository_validate", "repository_read_file", "repository_list_files"],
+    });
+    const valid = await bridge.invoke({
+      threadId: "t", turnId: "r", callId: "validate", namespace: null,
+      tool: "repository_validate",
+      arguments: { kind: "tests", paths: ["src/lib/agent-fleet-dispatch.test.ts", "convex/jobsClaim.test.ts"] },
+    });
+    expect(valid.success).toBe(true);
+    expect(provider.observedExecCommands).toEqual([
+      "npx vitest run --reporter=verbose -- src/lib/agent-fleet-dispatch.test.ts convex/jobsClaim.test.ts",
+    ]);
+
+    const typecheck = await bridge.invoke({
+      threadId: "t", turnId: "r", callId: "typecheck", namespace: null,
+      tool: "repository_validate", arguments: { kind: "typecheck" },
+    });
+    expect(typecheck.success).toBe(true);
+    expect(provider.observedExecCommands[1]).toBe("npx tsc --noEmit --pretty false");
+
+    const injected = await bridge.invoke({
+      threadId: "t", turnId: "r", callId: "inject", namespace: null,
+      tool: "repository_validate",
+      arguments: { kind: "tests", paths: ["src/lib/safe.test.ts; touch owned"] },
+    });
+    const traversed = await bridge.invoke({
+      threadId: "t", turnId: "r", callId: "traverse", namespace: null,
+      tool: "repository_validate",
+      arguments: { kind: "tests", paths: ["../outside.test.ts"] },
+    });
+    expect(injected.success).toBe(false);
+    expect(traversed.success).toBe(false);
+    expect(provider.observedExecCommands).toHaveLength(2);
   });
 
   it.each([
