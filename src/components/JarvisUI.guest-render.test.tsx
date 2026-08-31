@@ -56,7 +56,7 @@ vi.mock("next/dynamic", () => ({
 }));
 
 import Home from "../app/page";
-import JarvisUI, { MessageFileBadges, safeEmbeddedMessageText, Viewport, voiceActionPresentation } from "./JarvisUI";
+import JarvisUI, { activeVoiceActionSurface, MessageFileBadges, safeEmbeddedMessageText, Viewport, voiceActionPresentation } from "./JarvisUI";
 
 describe("guest Home application render", () => {
   it("uses one stateful voice action instead of competing live and microphone controls", () => {
@@ -78,6 +78,10 @@ describe("guest Home application render", () => {
     expect(voiceActionPresentation({ live: "live", recording: false, speaking: true })).toMatchObject({
       action: "interrupt", ariaLabel: "Interrupt Jarvis", label: "hush",
     });
+    expect(activeVoiceActionSurface({ embedded: true, chatMode: "bar" })).toBe("embedded");
+    expect(activeVoiceActionSurface({ embedded: false, chatMode: "full" })).toBe("full");
+    expect(activeVoiceActionSurface({ embedded: false, chatMode: "bar" })).toBe("bar");
+    expect(activeVoiceActionSurface({ embedded: false, chatMode: "off" })).toBeNull();
   });
 
   it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {

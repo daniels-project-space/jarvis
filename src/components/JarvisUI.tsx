@@ -1611,6 +1611,16 @@ export function voiceActionPresentation(args: {
     : { action: "toggle-live", ariaLabel: "Start Jarvis live listening", title: "Start live voice", label: "voice", glyph: "●", tone: "idle" };
 }
 
+export function activeVoiceActionSurface(args: {
+  embedded: boolean;
+  chatMode: "full" | "bar" | "off";
+}): "embedded" | "full" | "bar" | null {
+  if (args.embedded) return "embedded";
+  if (args.chatMode === "full") return "full";
+  if (args.chatMode === "bar") return "bar";
+  return null;
+}
+
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const viewerToken = useViewerSession();
@@ -5608,6 +5618,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     || (durableRecovery === "retry-ready" && !durableRetryReady);
   const voiceRecoveryVisible = ttsRuntimeStatus === "blocked" || voiceReplayReady;
   const voiceAction = voiceActionPresentation({ live, recording, speaking, wakeReady: wake });
+  const voiceActionSurface = activeVoiceActionSurface({ embedded, chatMode });
   const runVoiceAction = () => {
     if (voiceAction.action === "interrupt") {
       stopTalking();
@@ -6362,17 +6373,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 ◖
               </button>
             )}
-            <button
-              type="button"
-              onClick={runVoiceAction}
-              title={voiceAction.title}
-              aria-label={voiceAction.ariaLabel}
-              data-jarvis-voice-action={voiceAction.action}
-              className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2 text-sm ring-1 transition sm:px-3 ${voiceActionTone}`}
-            >
-              <span aria-hidden="true" className={voiceAction.tone === "connecting" ? "animate-pulse" : voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
-              <span className="max-sm:hidden">{voiceAction.label}</span>
-            </button>
+            {voiceActionSurface === "full" && (
+              <button
+                type="button"
+                onClick={runVoiceAction}
+                title={voiceAction.title}
+                aria-label={voiceAction.ariaLabel}
+                data-jarvis-voice-action={voiceAction.action}
+                className={`flex shrink-0 items-center gap-1.5 rounded-xl px-2 text-sm ring-1 transition sm:px-3 ${voiceActionTone}`}
+              >
+                <span aria-hidden="true" className={voiceAction.tone === "connecting" ? "animate-pulse" : voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
+                <span className="max-sm:hidden">{voiceAction.label}</span>
+              </button>
+            )}
             {!guest && <>
               <button
                 onClick={() => void lookAtScreen()}
@@ -6534,16 +6547,18 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             </div>
           )}
           <div className="glass flex h-12 min-w-0 max-w-full items-stretch gap-1 overflow-hidden rounded-full p-1 shadow-2xl">
-            <button
-              type="button"
-              onClick={runVoiceAction}
-              title={voiceAction.title}
-              aria-label={voiceAction.ariaLabel}
-              data-jarvis-voice-action={voiceAction.action}
-              className={`grid h-10 w-10 shrink-0 place-items-center rounded-full text-sm ring-1 transition ${voiceActionTone}`}
-            >
-              <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
-            </button>
+            {voiceActionSurface === "bar" && (
+              <button
+                type="button"
+                onClick={runVoiceAction}
+                title={voiceAction.title}
+                aria-label={voiceAction.ariaLabel}
+                data-jarvis-voice-action={voiceAction.action}
+                className={`grid h-10 w-10 shrink-0 place-items-center rounded-full text-sm ring-1 transition ${voiceActionTone}`}
+              >
+                <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
+              </button>
+            )}
             <div className={`flex min-w-0 flex-1 items-stretch gap-1 transition-opacity duration-200 ${input.trim() || sending || pendingFileIds.length || selectedFileIds.length ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}>
               <button
                 onClick={() => setChatMode("full")}
