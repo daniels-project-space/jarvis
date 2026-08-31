@@ -3727,6 +3727,13 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         `then "## Findings" (the substance, deduplicated, agent labels only where they add clarity), then "## Next moves" ` +
         `(concrete recommended actions). Be direct; flag agents that failed. Under 500 words.\n\n` +
         `MISSION: ${synth.goal}\n\nAGENT RESULTS:\n${body.slice(0, 24000)}`;
+      // A mission synthesis claim is controller work, not a continuation of
+      // whichever specialist happened to make the mission terminal. The
+      // specialist may already be done, checkpointed, or cancelled, so its
+      // immutable attempt authority must not be reused for a new model turn.
+      // Until synthesis has its own Convex-issued controller authority, fail
+      // closed on that model boundary and use the bounded deterministic report
+      // below instead of crashing the free fleet daemon or reopening a job.
       const merged = await withFreshCodexBoundary({
         scope: `mission-${missionId}-synthesis`,
         validityMs: backgroundSubscriptionValidityMs(segmentTimeoutMs("terra")),
@@ -3737,8 +3744,8 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           synthesisPrompt,
           "terra",
         ),
-      });
-      const report = merged.text && !/^error:/.test(merged.text) && merged.text !== "(no output)"
+      }).catch(() => null);
+      const report = merged?.text && !/^error:/.test(merged.text) && merged.text !== "(no output)"
         ? merged.text
         : `## Mission\n${synth.goal}\n\n${body.slice(0, 6000)}`;
       const finished = await convexMutation("missions:finish", {
@@ -3754,7 +3761,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           scope: `mission-${missionId}-weave`,
           validityMs: backgroundSubscriptionValidityMs(60_000),
           run: (weaveEnv) => weaveLine(bin, weaveEnv, `MISSION: ${synth.goal}`, report),
-        })) ||
+        }).catch(() => null)) ||
         (failedAll ? "The fleet came back empty-handed, sir — mission report is on your screen." : "Mission complete, sir — the fleet's full report is on your screen.");
       await convexMutation("chatQueue:postAssistant", { threadId: thread, text: spoken });
       await convexMutation("chatQueue:postCard", {
