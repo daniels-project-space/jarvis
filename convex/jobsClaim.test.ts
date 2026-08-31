@@ -178,6 +178,48 @@ describe("real Convex specialist/controller race matrix", () => {
     });
   });
 
+  it("cancels an unclaimed reservation and fences every delayed worker", async () => {
+    const f = await unclaimedDispatchFixture("cancel-unclaimed-dispatch");
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({
+      status: "cancelled",
+      stage: "cancelled",
+      progress: "cancelled by Daniel",
+    });
+    expect(state.jobs[0]).not.toHaveProperty("dispatchId");
+    expect(state.jobs[0]).not.toHaveProperty("workerRunId");
+    expect(state.dispatches).toEqual([
+      expect.objectContaining({
+        status: "closed",
+        closeReason: "job cancelled by owner control",
+      }),
+    ]);
+
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation),
+      workerRunId: "delayed-trigger-run",
+      workerToken: WORKER,
+    })).toMatchObject({
+      jobId: f.jobId,
+      held: true,
+      executable: false,
+      code: "trigger_launch_authority_held",
+    });
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+  });
+
   it("resumes only a cleared controller-session hold into a fresh attempt", async () => {
     const f = await specialistFixture("read_only");
     expect(await f.t.mutation(api.jobs.requestInput, {

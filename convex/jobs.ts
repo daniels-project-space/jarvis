@@ -217,20 +217,43 @@ async function closeOrConfirmDispatchReceiptForControl(
     closeReason,
     now,
   )) return true;
-  if (typeof workerRunId !== "string" || !row.dispatchReceiptId) return false;
+  if (!row.dispatchReceiptId) return false;
   const receipt: any = await ctx.db.get(row.dispatchReceiptId);
-  return Boolean(
+  const exact = Boolean(
     receipt
-    && receipt.status === "closed"
-    && typeof receipt.closedAt === "number"
     && receipt.jobId === row._id
-    && receipt.attempt === row.attempt
-    && receipt.workerRunId === workerRunId
+    && receipt.attempt === (row.attempt ?? 1)
     && receipt.dispatchId === row.dispatchId
     && receipt.generation === row.dispatchGeneration
     && receipt.phase === row.dispatchPhase
     && receipt.receiptDigest === row.dispatchReceiptDigest
-    && receipt.payloadDigest === row.dispatchPayloadDigest,
+    && receipt.payloadDigest === row.dispatchPayloadDigest
+  );
+  if (!exact) return false;
+
+  // A Trigger launch may be queued while its immutable receipt is still
+  // unclaimed. Owner cancellation must be able to close that reservation
+  // atomically; otherwise the Cancel control appears to do nothing until a
+  // worker starts. A delayed Trigger or self-hosted worker then observes the
+  // closed receipt and cannot claim or resurrect the cancelled job.
+  if (typeof workerRunId !== "string") {
+    if (typeof receipt.workerRunId === "string") return false;
+    if (receipt.status === "closed") return typeof receipt.closedAt === "number";
+    if (!["reserved", "reconciling"].includes(String(receipt.status))) return false;
+    await ctx.db.patch(receipt._id, {
+      status: "closed",
+      closeReason: closeReason.slice(0, 180),
+      leaseUntil: undefined,
+      closedAt: now,
+      updatedAt: now,
+    });
+    return true;
+  }
+
+  return Boolean(
+    receipt.status === "closed"
+    && typeof receipt.closedAt === "number"
+    && receipt.workerRunId === workerRunId
   );
 }
 
