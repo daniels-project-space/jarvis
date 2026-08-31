@@ -70,12 +70,32 @@ function reviewedTrip() {
 describe("legacy calendar write boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mock.convexMutation.mockResolvedValue(undefined);
+    mock.convexQuery.mockResolvedValue(null);
     mock.getTrip.mockResolvedValue(reviewedTrip());
     mock.computeTransfer.mockResolvedValue({ durationText: "25 min", distanceText: "8 km" });
     mock.buildItinerary.mockReturnValue([]);
     mock.refreshTripItineraryRoutes.mockResolvedValue([]);
     mock.saveTripItinerary.mockResolvedValue(undefined);
     mock.saveTrip.mockResolvedValue(undefined);
+  });
+
+  it("surfaces an iCloud outage instead of calling the visible period empty", async () => {
+    mock.listICloudEvents.mockRejectedValue(new Error("vault unavailable"));
+
+    const result = await executeTool("calendar_view", {
+      view: "week",
+      date: "2026-08-31",
+    });
+
+    expect(result).toContain("couldn't reach iCloud Calendar");
+    expect(result).not.toContain("Nothing scheduled");
+    const panel = mock.convexMutation.mock.calls.find(([path]) => path === "ui:setPanel");
+    expect(panel).toBeTruthy();
+    expect(JSON.parse(panel![1].value)).toMatchObject({
+      kind: "calendar",
+      sources: { iCloud: "unavailable" },
+    });
   });
 
   it("does not advertise legacy iCloud calendar mutation tools", () => {

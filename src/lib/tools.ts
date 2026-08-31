@@ -2263,10 +2263,14 @@ async function calendarView(args: any): Promise<string> {
     count = Math.ceil((dow + daysInMonth) / 7) * 7;
   }
   const stripStart = londonDateStr(startMs);
-  const [iCloudEvents, strip] = await Promise.all([
-    listICloudEvents(startMs, startMs + count * DAY).catch(() => []),
+  const [iCloud, strip] = await Promise.all([
+    listICloudEvents(startMs, startMs + count * DAY)
+      .then((events) => ({ events, status: "connected" as const }))
+      .catch(() => ({ events: [], status: "unavailable" as const })),
     rentalQuery("calendar:getCalendarStrip", { accountSlug: null, startDate: stripStart, days: Math.min(count, 30) }),
   ]);
+  const iCloudEvents = iCloud.events;
+  const rentalStatus = Array.isArray(strip) ? "connected" : "unavailable";
   const byDate: Record<string, any[]> = {};
   for (const e of iCloudEvents) {
     const d = londonDateStr(e.start);
@@ -2304,12 +2308,29 @@ async function calendarView(args: any): Promise<string> {
       : view === "week"
         ? `Week of ${new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", day: "numeric", month: "short" }).format(startMs)}`
         : new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", month: "long", year: "numeric" }).format(anchorMs);
-  await showWidget({ kind: "calendar", view, anchor, label, days }, `calendar · ${label}`);
+  await showWidget({
+    kind: "calendar",
+    view,
+    anchor,
+    label,
+    days,
+    sources: { iCloud: iCloud.status, rentals: rentalStatus },
+  }, `calendar · ${label}`);
   const busyDays = days.filter((d) => d.events.length);
   const spokenBits = busyDays.slice(0, 4).map((d) => `${d.dow} ${d.date.slice(8)}: ${d.events.slice(0, 3).map((e: any) => e.title).join(", ")}`);
+  const sourceNote = iCloud.status === "unavailable"
+    ? " I couldn't reach iCloud Calendar, so this view only includes the sources that are currently connected."
+    : rentalStatus === "unavailable"
+      ? " The rental calendar is temporarily unavailable, so this view currently shows iCloud only."
+      : "";
   return (
     `Calendar (${label}) is on screen.` +
-    (spokenBits.length ? ` Highlights — ${spokenBits.join("; ")}.` : " Nothing scheduled.") +
+    sourceNote +
+    (spokenBits.length
+      ? ` Highlights — ${spokenBits.join("; ")}.`
+      : iCloud.status === "connected" && rentalStatus === "connected"
+        ? " Nothing scheduled."
+        : " I can't safely say the period is clear until the missing source reconnects.") +
     " (Speak one short sentence only.)"
   );
 }

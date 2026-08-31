@@ -23,6 +23,7 @@ export function PanelUnavailable({ label = "panel" }: { label?: string }) {
 
 type CalEvent = { title: string; time?: string; kind: string; location?: string };
 type CalDay = { date: string; dow: string; inMonth: boolean; today: boolean; events: CalEvent[]; more: number };
+type CalendarSources = { iCloud?: "connected" | "unavailable"; rentals?: "connected" | "unavailable" };
 
 const KIND_STYLE: Record<string, string> = {
   event: "bg-cyan/15 text-cyan border-cyan/30",
@@ -44,8 +45,21 @@ function EventPill({ e, small }: { e: CalEvent; small?: boolean }) {
   );
 }
 
+function CalendarSourceNotice({ sources }: { sources?: CalendarSources }) {
+  const missing = [
+    sources?.iCloud === "unavailable" ? "iCloud Calendar" : null,
+    sources?.rentals === "unavailable" ? "rental calendar" : null,
+  ].filter(Boolean);
+  if (!missing.length) return null;
+  return (
+    <div role="status" className="mb-3 rounded-lg border border-amber/25 bg-amber/[0.08] px-3 py-2 text-[11px] leading-relaxed text-amber-100">
+      {missing.join(" and ")} {missing.length === 1 ? "is" : "are"} temporarily unavailable. This view only includes connected sources; Jarvis will not call missing data a clear day.
+    </div>
+  );
+}
+
 export function CalendarView({ value }: { value: string }) {
-  let w: { view: string; label: string; days: CalDay[] } | null = null;
+  let w: { view: string; label: string; days: CalDay[]; sources?: CalendarSources } | null = null;
   try {
     w = JSON.parse(value);
   } catch {
@@ -53,6 +67,7 @@ export function CalendarView({ value }: { value: string }) {
   }
   if (!w) return <PanelUnavailable label="calendar" />;
   const glass = "rounded-xl border border-white/10 bg-white/[0.045] backdrop-blur-xl";
+  const sourcesUnavailable = Object.values(w.sources ?? {}).includes("unavailable");
 
   if (w.view === "month") {
     return (
@@ -61,6 +76,7 @@ export function CalendarView({ value }: { value: string }) {
           <div className="text-lg font-semibold text-ice">{w.label}</div>
           <div className="hud-label">month</div>
         </div>
+        <CalendarSourceNotice sources={w.sources} />
         <div className="grid min-w-[700px] grid-cols-7 gap-1 pb-1">
           {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => (
             <div key={d} className="hud-label !text-[9px] pb-1 text-center">
@@ -95,6 +111,7 @@ export function CalendarView({ value }: { value: string }) {
           <div className="text-lg font-semibold text-ice">{w.label}</div>
           <div className="hud-label">week</div>
         </div>
+        <CalendarSourceNotice sources={w.sources} />
         <div className="grid gap-2 @min-[760px]:grid-cols-7">
           {w.days.map((d) => (
             <div key={d.date} className={`${glass} p-2 ${d.today ? "ring-1 ring-cyan/60" : ""}`}>
@@ -122,7 +139,8 @@ export function CalendarView({ value }: { value: string }) {
         <div className="text-xl font-semibold text-ice">{w.label}</div>
         <div className="hud-label">day plan</div>
       </div>
-      {!day?.events.length && <div className="mt-8 text-center text-sm text-slate">Clear day, sir.</div>}
+      <CalendarSourceNotice sources={w.sources} />
+      {!day?.events.length && !sourcesUnavailable && <div className="mt-8 text-center text-sm text-slate">Clear day, sir.</div>}
       <div className="space-y-2">
         {day?.events.map((e, i) => (
           <div key={i} className={`${glass} flex items-center gap-3 p-3`}>
