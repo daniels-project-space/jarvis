@@ -1318,17 +1318,30 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
     const authorityDigest = typeof job.authorityDigest === "string" ? job.authorityDigest : "";
     const claimedWorkerRunId = options.reservation.workerRunId.slice(0, 120);
     const authorizeBoundary = async (phase: AgentRunnerAuthorityPhase) => {
-      const boundary: any = await convexMutation("jobs:authorizeExecutionBoundary", {
-        jobId: job.jobId,
-        expectedAttempt,
-        workerRunId: options.reservation.workerRunId,
-        authorityDigest,
-        dispatchGeneration: options.reservation.dispatchGeneration,
-        dispatchPhase: options.reservation.dispatchPhase,
-        dispatchReceiptDigest: options.reservation.dispatchReceiptDigest,
-        dispatchPayloadDigest: options.reservation.dispatchPayloadDigest,
-        phase,
-      }).catch(() => null);
+      let boundary: any;
+      try {
+        boundary = await convexMutation("jobs:authorizeExecutionBoundary", {
+          jobId: job.jobId,
+          expectedAttempt,
+          workerRunId: options.reservation.workerRunId,
+          authorityDigest,
+          dispatchGeneration: options.reservation.dispatchGeneration,
+          dispatchPhase: options.reservation.dispatchPhase,
+          dispatchReceiptDigest: options.reservation.dispatchReceiptDigest,
+          dispatchPayloadDigest: options.reservation.dispatchPayloadDigest,
+          phase,
+        });
+      } catch (error) {
+        // A transport/server error is fail-closed just like a stale attempt,
+        // but it is not the same diagnosis. Keep the operator signal bounded
+        // and secret-redacted so the free daemon can recover the right layer
+        // instead of reporting every outage as immutable-authority drift.
+        const reason = redactSensitiveText(
+          error instanceof Error ? error.message : String(error),
+          process.env,
+        ).replace(/\s+/g, " ").slice(0, 240);
+        throw new Error(`execution authority lookup failed during ${phase}: ${reason || "unknown server error"}`);
+      }
       if (!boundary
         || boundary.phase !== phase
         || boundary.authorityDigest !== authorityDigest
