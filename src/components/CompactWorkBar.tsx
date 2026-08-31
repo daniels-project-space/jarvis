@@ -166,6 +166,7 @@ function WorkProgressBar({
   tone,
   status,
   progressAt,
+  startedAt = null,
   marker,
 }: {
   label: string;
@@ -174,24 +175,34 @@ function WorkProgressBar({
   tone: string;
   status: string;
   progressAt: number | null;
+  startedAt?: number | null;
   marker: string;
 }) {
   const bounded = Math.max(0, Math.min(100, percent));
+  const now = useLiveWorkClock(active);
+  const elapsed = liveWorkElapsedLabel(startedAt, now, active);
+  const heartbeat = liveWorkHeartbeatLabel(progressAt, now, active);
+  const heartbeatState = liveWorkHeartbeatState(progressAt, now, active);
   return <div
     data-work-progress-bar={marker}
+    data-work-heartbeat={heartbeatState}
     role="progressbar"
     aria-label={label}
     aria-valuemin={0}
     aria-valuemax={100}
     aria-valuenow={bounded}
-    aria-valuetext={`${bounded}% · ${status} · ${progressStamp(progressAt)}`}
+    aria-valuetext={`${bounded}% checkpoint · ${status}${active ? ` · ${elapsed} · ${heartbeat}` : ""}`}
     className="rounded-lg border border-white/[0.06] bg-black/15 px-2 py-1.5"
   >
     <div className="mb-1 flex min-w-0 items-center gap-2 font-mono text-[8px] uppercase tracking-[0.08em]">
       <span className="min-w-0 flex-1 truncate text-slate">{status}</span>
-      <span className="shrink-0 text-ice">{bounded}%</span>
+      <span className="shrink-0 text-ice">{bounded}%{active ? " checkpoint" : ""}</span>
     </div>
     <WorkProgressTrack percent={bounded} active={active} tone={tone} marker={marker} />
+    {active && <div className="mt-1 flex items-center justify-between gap-2 font-mono text-[7px] uppercase tracking-[0.06em] text-slate">
+      <span data-work-elapsed>{elapsed}</span>
+      <span data-work-heartbeat-label className={heartbeatState === "stale" ? "text-amber" : heartbeatState === "fresh" ? "text-cyan" : "text-slate"}>{heartbeat}</span>
+    </div>}
   </div>;
 }
 
@@ -759,6 +770,7 @@ export function WorkerDetail({
       tone={workProgressTone(node)}
       status={workStatusLabel(node)}
       progressAt={node.progressAt}
+      startedAt={node.startedAt}
       marker={node.jobId}
     />
     <div className="grid grid-cols-2 gap-1 text-[9px] text-slate"><div className="truncate">status · <span className="text-ice">{workStatusLabel(node)}</span></div><div className="truncate">merge · <span className="text-ice">{node.mergeState}</span></div><div className="truncate">handoffs · <span className="text-ice">{node.dependenciesReady}/{node.dependencyCount}</span></div><div className="truncate">runtime · <span className="text-ice">{node.workerRuntime ?? "not assigned"}</span></div><div className="col-span-2 truncate">last meaningful progress · <span className="font-mono text-ice">{progressStamp(node.progressAt)}</span></div></div>
@@ -849,6 +861,92 @@ export function liveWorkFreshnessLabel(progressAt: number | null, now: number | 
   if (ageMs < 60_000) return `updated ${Math.max(1, Math.floor(ageMs / 1_000))}s ago`;
   if (ageMs < 3_600_000) return `updated ${Math.floor(ageMs / 60_000)}m ago`;
   return `updated ${Math.floor(ageMs / 3_600_000)}h ago`;
+}
+
+export function liveWorkElapsedLabel(
+  startedAt: number | null,
+  now: number | null,
+  active = true,
+) {
+  if (!active) return "finished";
+  if (!startedAt || now === null) return "active";
+  const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1_000));
+  if (elapsedSeconds < 60) return `active ${elapsedSeconds}s`;
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) return `active ${elapsedMinutes}m`;
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  const remainderMinutes = elapsedMinutes % 60;
+  return `active ${elapsedHours}h${remainderMinutes ? ` ${remainderMinutes}m` : ""}`;
+}
+
+export function liveWorkHeartbeatState(
+  progressAt: number | null,
+  now: number | null,
+  active = true,
+): "idle" | "waiting" | "fresh" | "quiet" | "stale" {
+  if (!active) return "idle";
+  if (!progressAt || now === null) return "waiting";
+  const ageMs = Math.max(0, now - progressAt);
+  if (ageMs < 45_000) return "fresh";
+  if (ageMs < 90_000) return "quiet";
+  return "stale";
+}
+
+export function liveWorkHeartbeatLabel(
+  progressAt: number | null,
+  now: number | null,
+  active = true,
+) {
+  const state = liveWorkHeartbeatState(progressAt, now, active);
+  if (state === "idle") return "complete";
+  if (state === "waiting") return "waiting for heartbeat";
+  if (state === "fresh") return "heartbeat live";
+  if (state === "quiet") return "heartbeat quiet";
+  return "heartbeat delayed";
+}
+
+function useLiveWorkClock(active: boolean) {
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    if (!active) return;
+    const refresh = () => setNow(Date.now());
+    refresh();
+    const timer = window.setInterval(refresh, 5_000);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [active]);
+  return now;
+}
+
+function LiveWorkTiming({
+  node,
+  realtime = false,
+}: {
+  node: Pick<FleetNode, "progressAt" | "startedAt" | "state">;
+  realtime?: boolean;
+}) {
+  const active = EXECUTING_WORK_STATES.has(node.state);
+  const now = useLiveWorkClock(active);
+  const elapsed = liveWorkElapsedLabel(node.startedAt, now, active);
+  const heartbeatState = realtime && active ? "fresh" : liveWorkHeartbeatState(node.progressAt, now, active);
+  const inactiveLabel = node.state === "done" ? "complete"
+    : node.state === "needs_input" ? "awaiting input"
+    : node.state === "blocked" ? "blocked"
+    : node.state === "paused" ? "paused"
+    : node.state === "dependency_held" ? "waiting on work"
+    : "queued";
+  const heartbeat = active
+    ? realtime ? "heartbeat live" : liveWorkHeartbeatLabel(node.progressAt, now, true)
+    : inactiveLabel;
+  return <span
+    data-work-live-timing
+    data-work-heartbeat={heartbeatState}
+    data-work-elapsed={elapsed}
+    className={heartbeatState === "stale" ? "text-amber" : heartbeatState === "fresh" ? "text-cyan" : "text-slate"}
+  >{active ? `${elapsed} · ${heartbeat}` : heartbeat}</span>;
 }
 
 export function mergeRealtimeWorkNode(
@@ -1066,27 +1164,6 @@ function useWorkRealtimeTicket(node: Pick<FleetNode, "jobId" | "workerRunId">, e
   return enabled && ticket.key === key ? ticket : EMPTY_REALTIME_TICKET;
 }
 
-function LiveWorkFreshness({ progressAt, realtime }: { progressAt: number | null; realtime: boolean }) {
-  // This is a local display clock, not polling. Convex still pushes every real
-  // work update; the timer only tells Daniel how fresh the last signal is.
-  const [now, setNow] = useState<number | null>(null);
-  useEffect(() => {
-    if (realtime) return;
-    const refresh = () => setNow(Date.now());
-    refresh();
-    if (!progressAt) return;
-    const timer = window.setInterval(refresh, 15_000);
-    document.addEventListener("visibilitychange", refresh);
-    return () => {
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", refresh);
-    };
-  }, [progressAt, realtime]);
-  if (realtime) return <span aria-hidden="true" data-work-signal-freshness>connected</span>;
-  const freshness = liveWorkFreshnessLabel(progressAt, now);
-  return <span aria-hidden="true" data-work-signal-freshness>{freshness.replace("waiting for signal", "waiting for checkpoint").replace("live signal", "last checkpoint").replace("live now", "checkpoint now").replace("updated ", "checkpoint ")}</span>;
-}
-
 function CompactLiveWorkBubbleView({
   snapshot,
   signalNode,
@@ -1132,7 +1209,7 @@ function CompactLiveWorkBubbleView({
           data-work-progress={percent}
           onClick={() => onOpen(node.projectionKind === "supervisor_planning" ? undefined : node.jobId)}
           aria-expanded="false"
-          aria-label={`Open ${title}: ${percent}% ${status}. ${progress}`}
+          aria-label={`Open ${title}: ${percent}% checkpoint · ${status}. ${progress}`}
           className={`work-progress-button glass group relative grid min-h-[68px] w-full grid-cols-[44px_minmax(0,1fr)_auto] items-center gap-2 overflow-hidden rounded-xl bg-[#071019]/94 px-2 py-1.5 pr-2.5 text-left shadow-[0_8px_28px_rgba(0,0,0,.34)] transition-[border-color,box-shadow,transform] duration-200 ease-out hover:-translate-y-px hover:shadow-[0_10px_32px_rgba(0,0,0,.4)] motion-reduce:transform-none motion-reduce:transition-none ${
             personal ? "!border-amber/35 hover:!border-amber/60" : system ? "!border-sky-400/30 hover:!border-sky-400/55" : "!border-cyan/25 hover:!border-cyan/50"
           }`}
@@ -1152,7 +1229,7 @@ function CompactLiveWorkBubbleView({
           </span>
           <span className="flex max-w-[90px] flex-col items-end gap-1" aria-hidden="true">
             <span className="truncate font-mono text-[7px] uppercase tracking-[0.08em] text-slate">{workModelLabel(node.model, node.reasoningEffort)}</span>
-            <span className={`font-mono text-[7px] ${textClass}`}>{cardRealtime === "realtime" ? "live" : cardRealtime === "connecting" ? "syncing" : <LiveWorkFreshness progressAt={node.progressAt} realtime={false} />}</span>
+            <span className={`max-w-[90px] truncate font-mono text-[7px] ${textClass}`}>{cardRealtime === "connecting" ? "syncing" : <LiveWorkTiming node={node} realtime={cardRealtime === "realtime"} />}</span>
             <span className="work-progress-arrow text-[11px] text-cyan/50 transition-transform duration-200 group-hover:translate-x-px motion-reduce:transform-none">›</span>
           </span>
           <span className={`absolute inset-x-2 bottom-0 h-px overflow-hidden rounded-full bg-white/[0.06] ${EXECUTING_WORK_STATES.has(node.state) ? "work-progress-glint" : ""}`} aria-hidden="true"><span data-work-progress-meter className={`work-progress-meter block h-full rounded-full ${meterClass}`} style={{ width: `${percent}%` }} /></span>
@@ -1200,7 +1277,8 @@ function SubscribedLiveWorkBubble({
     if (error) onFailed();
     else if (valid) onHealthy();
   }, [error, onFailed, onHealthy, valid]);
-  const signalNode = mergeRealtimeWorkNode(node, valid ? metadata : null);
+  const observedAt = useLiveWorkClock(valid);
+  const signalNode = mergeRealtimeWorkNode(node, valid ? metadata : null, observedAt);
   return <CompactLiveWorkBubbleView snapshot={snapshot} signalNode={signalNode} realtimeState={realtimeState} onOpen={onOpen} />;
 }
 
@@ -1301,10 +1379,14 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, showColla
   const planningCount = hierarchyJobs.filter((node) => node.projectionKind === "supervisor_planning").length;
   const activeJobCount = hierarchyJobs.length - planningCount;
   const fleetPhase = workPhaseLabel(fleet.phase, hierarchyJobs);
+  const fleetStartedAt = hierarchyJobs.reduce<number | null>((earliest, node) => {
+    if (!EXECUTING_WORK_STATES.has(node.state) || !node.startedAt) return earliest;
+    return earliest === null ? node.startedAt : Math.min(earliest, node.startedAt);
+  }, null);
   return (
     <aside data-fleet-surface="expanded" aria-label="Live Jarvis fleet" className={`materialize glass absolute inset-x-1 bottom-1 z-40 flex min-h-0 flex-col overflow-hidden rounded-2xl !border-cyan/25 bg-[#071019]/96 p-3 shadow-2xl md:left-2 md:right-auto md:w-[min(760px,62%)] ${retainedSelectedId ? "h-auto max-h-[min(72vh,560px)] md:bottom-auto md:top-2" : "h-[min(78vh,680px)] md:inset-y-2 md:h-auto"}`}>
       <header className="flex min-w-0 shrink-0 items-start gap-2 border-b border-white/[0.07] pb-2">
-        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">Jarvis live work</div><h2 className="mt-0.5 truncate text-sm text-ice">{workTaskTitle(fleet.goal)}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleetPhase} · {fleet.percent}%</span><span>{hierarchy.length} missions · {projectCount} projects · {activeJobCount} active tasks{planningCount > 0 ? ` · ${planningCount} planning` : ""}</span></div><div className="mt-1.5"><WorkProgressBar label={`${workTaskTitle(fleet.goal)} overall progress`} percent={fleet.percent} active={hierarchyJobs.some((node) => EXECUTING_WORK_STATES.has(node.state))} tone="bg-cyan" status={fleetPhase} progressAt={hierarchyJobs.reduce<number | null>((latest, node) => Math.max(latest ?? 0, node.progressAt ?? 0) || null, null)} marker="fleet" /></div></div>
+        <div className="min-w-0 flex-1"><div className="hud-label text-cyan">Jarvis live work</div><h2 className="mt-0.5 truncate text-sm text-ice">{workTaskTitle(fleet.goal)}</h2><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[8px] uppercase tracking-[0.1em] text-slate"><span>{fleetPhase} · {fleet.percent}% checkpoint</span><span>{hierarchy.length} missions · {projectCount} projects · {activeJobCount} active tasks{planningCount > 0 ? ` · ${planningCount} planning` : ""}</span></div><div className="mt-1.5"><WorkProgressBar label={`${workTaskTitle(fleet.goal)} overall progress`} percent={fleet.percent} active={hierarchyJobs.some((node) => EXECUTING_WORK_STATES.has(node.state))} tone="bg-cyan" status={fleetPhase} progressAt={hierarchyJobs.reduce<number | null>((latest, node) => Math.max(latest ?? 0, node.progressAt ?? 0) || null, null)} startedAt={fleetStartedAt} marker="fleet" /></div></div>
         <button type="button" onClick={() => setOpen(false)} className="rounded-lg px-2 py-1 text-[9px] text-slate hover:text-cyan" aria-label="Collapse live fleet">minimize</button>
       </header>
       <div className="mt-2 flex min-h-0 flex-1 gap-2 overflow-hidden">
@@ -1316,7 +1398,7 @@ export function FleetCommandCenter({ snapshot, detail, hidden = false, showColla
                 <header className="flex min-w-0 items-center gap-2 px-0.5"><div className="min-w-0 flex-1 truncate font-mono text-[8px] text-sky-200">{project.repository?.replace(/^daniels-project-space\//, "") ?? "Read-only evidence"}</div><span className="shrink-0 font-mono text-[7px] text-slate">{project.jobs.length} task{project.jobs.length === 1 ? "" : "s"}</span></header>
                 <div className="mt-1 grid gap-1 sm:grid-cols-2">{project.jobs.map((node) => {
                   const planning = node.projectionKind === "supervisor_planning";
-                  const content = <div className="flex min-w-0 gap-2"><AgentAvatar agent={node.agent} size={30} /><div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{workTaskTitle(node.label)}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}%</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{agentName(node.agent)} · {workStatusLabel(node)}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{workModelLabel(node.model, node.reasoningEffort)}</div><div className="mt-1.5"><WorkProgressTrack percent={node.percent} active={EXECUTING_WORK_STATES.has(node.state)} tone={workProgressTone(node)} marker={node.jobId} /></div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">{node.attentionLabel ?? "Your input is needed"}</div>}{!node.needsDaniel && node.attentionLabel && <div className="mt-1 text-[8px] text-sky-300">{node.attentionLabel}</div>}</div></div>;
+                  const content = <div className="flex min-w-0 gap-2"><AgentAvatar agent={node.agent} size={30} /><div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate text-[10px] text-ice">{workTaskTitle(node.label)}</span><span className="shrink-0 font-mono text-[8px]">{node.percent}% checkpoint</span></div><div className="mt-1 truncate font-mono text-[8px] uppercase tracking-[0.08em] opacity-75">{agentName(node.agent)} · {workStatusLabel(node)}</div><div className="mt-1 truncate text-[8px] text-slate" title={node.modelReason ?? (planning ? "Supervisor authority" : "Policy route")}>{workModelLabel(node.model, node.reasoningEffort)}</div><div className="mt-1 truncate font-mono text-[7px] uppercase tracking-[0.06em]"><LiveWorkTiming node={node} /></div><div className="mt-1.5"><WorkProgressTrack percent={node.percent} active={EXECUTING_WORK_STATES.has(node.state)} tone={workProgressTone(node)} marker={node.jobId} /></div>{node.needsDaniel && <div className="mt-1 text-[8px] text-amber">{node.attentionLabel ?? "Your input is needed"}</div>}{!node.needsDaniel && node.attentionLabel && <div className="mt-1 text-[8px] text-sky-300">{node.attentionLabel}</div>}</div></div>;
                   return planning
                     ? <div key={node.jobId} data-supervisor-planning={node.jobId} role="status" className={`min-w-0 rounded-lg border p-2 text-left ${STATE_STYLE[node.state]}`} aria-label={`${agentName(node.agent)} planning ${node.label}`}>{content}</div>
                     : <button type="button" key={node.jobId} data-active-job={node.jobId} onClick={() => selectJob(node.jobId)} className={`min-w-0 rounded-lg border p-2 text-left transition hover:border-cyan/40 ${STATE_STYLE[node.state]}`} aria-label={`Open ${agentName(node.agent)} detail for ${node.label}`}>{content}</button>;

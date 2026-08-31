@@ -16,7 +16,10 @@ import {
   fleetDagLayout,
   fleetNodeStateLabel,
   legacyWorkControlPayload,
+  liveWorkElapsedLabel,
   liveWorkFreshnessLabel,
+  liveWorkHeartbeatLabel,
+  liveWorkHeartbeatState,
   liveWorkSignalNode,
   mergeRealtimeWorkNode,
   preserveSupervisorRequestKey,
@@ -119,7 +122,8 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain('data-work-realtime="durable"');
     expect(markup).toContain("Running focused tests");
     expect(markup).toContain("checkpoint");
-    expect(markup).toContain("last checkpoint");
+    expect(markup).toContain("waiting for heartbeat");
+    expect(markup).toContain("data-work-live-timing");
     expect(markup).toContain("data-work-progress-ring");
     expect(markup).toContain("data-work-progress-meter");
     expect(markup).toContain("stroke-dashoffset=\"36\"");
@@ -378,6 +382,26 @@ describe("FleetCommandCenter", () => {
     expect(liveWorkFreshnessLabel(1_000, 42_000)).toBe("updated 41s ago");
     expect(liveWorkFreshnessLabel(1_000, 181_000)).toBe("updated 3m ago");
     expect(liveWorkFreshnessLabel(1_000, 7_201_000)).toBe("updated 2h ago");
+  });
+
+  it("shows elapsed activity and heartbeat health without inventing percent progress", () => {
+    expect(liveWorkElapsedLabel(1_000, 46_000)).toBe("active 45s");
+    expect(liveWorkElapsedLabel(1_000, 421_000)).toBe("active 7m");
+    expect(liveWorkElapsedLabel(1_000, 7_261_000)).toBe("active 2h 1m");
+    expect(liveWorkElapsedLabel(1_000, 7_261_000, false)).toBe("finished");
+
+    expect(liveWorkHeartbeatState(10_000, 40_000)).toBe("fresh");
+    expect(liveWorkHeartbeatState(10_000, 80_000)).toBe("quiet");
+    expect(liveWorkHeartbeatState(10_000, 101_000)).toBe("stale");
+    expect(liveWorkHeartbeatLabel(10_000, 40_000)).toBe("heartbeat live");
+    expect(liveWorkHeartbeatLabel(10_000, 101_000)).toBe("heartbeat delayed");
+
+    const markup = renderToStaticMarkup(<FleetCommandCenter snapshot={work} initialExpanded />);
+    expect(markup).toContain("64% checkpoint");
+    expect(markup).toContain('data-work-heartbeat="waiting"');
+    expect(markup).toContain("waiting for heartbeat");
+    expect(markup).toContain('style="width:64%"');
+    expect(markup).not.toContain("65% checkpoint");
   });
 
   it("requests one exact realtime run and uses the authoritative run id", async () => {

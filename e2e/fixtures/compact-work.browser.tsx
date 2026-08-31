@@ -2,6 +2,8 @@ import { createRoot } from "react-dom/client";
 import { FleetCommandCenter } from "../../src/components/CompactWorkBar";
 import type { CompactJobDetail, CompactWorkSnapshot, FleetNode } from "../../src/lib/active-work";
 
+const FIXTURE_NOW = Date.now();
+
 function worker(
   id: string,
   label: string,
@@ -19,7 +21,7 @@ function worker(
     stage: "fixture validation",
     percent: 55,
     progress: "Fixture work is actively projected",
-    progressAt: 1,
+    progressAt: FIXTURE_NOW - 10_000,
     model: "terra",
     reasoningEffort: "high",
     modelReason: "local fixture",
@@ -37,7 +39,7 @@ function worker(
     needsDaniel: false,
     attentionReason: null,
     controls: ["pause"],
-    startedAt: 1,
+    startedAt: FIXTURE_NOW - 7 * 60_000,
     ...overrides,
   };
 }
@@ -111,7 +113,7 @@ const approvalDetail: CompactJobDetail = {
   label: "Approval gate",
   agentId: "chloe",
   repo: "daniels-project-space/jarvis",
-  progressAt: 1,
+  progressAt: FIXTURE_NOW - 10_000,
   model: "terra",
   reasoningEffort: "high",
   modelReason: "local fixture",
@@ -121,7 +123,7 @@ const approvalDetail: CompactJobDetail = {
   maxAttempts: 2,
   integrationState: "not_applicable",
   deliveryStatus: null,
-  startedAt: 1,
+  startedAt: FIXTURE_NOW - 7 * 60_000,
   stallReason: null,
 };
 

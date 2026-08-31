@@ -41,6 +41,9 @@ test.describe("compact work fixture", () => {
     await expect(page.locator("[data-work-avatar=chloe]")).toHaveCount(1);
     await expect(page.locator("[data-work-avatar=paul]")).toHaveCount(1);
     await expect(page.locator("[data-work-more]")).toHaveText("+2 more workview all ›");
+    await expect(page.locator('[data-work-card="job-validation"] [data-work-live-timing]')).toContainText("active 7m · heartbeat live");
+    await expect(page.locator('[data-work-card="job-validation"] [data-work-live-timing]')).toHaveAttribute("data-work-heartbeat", "fresh");
+    await expect(page.locator('[data-work-card="job-validation"]')).toHaveAttribute("data-work-progress", "55");
 
     const more = page.getByRole("button", { name: "Open all 4 active Jarvis tasks; 2 more available" });
     await more.focus();
@@ -52,6 +55,7 @@ test.describe("compact work fixture", () => {
     await expect(page.locator("[data-active-job]")).toHaveCount(4);
     await expect(page.locator("[data-work-avatar]")).toHaveCount(4);
     await expect(page.locator('[data-work-progress-bar="fleet"]')).toHaveAttribute("aria-valuenow", "55");
+    await expect(page.locator('[data-work-progress-bar="fleet"]')).toHaveAttribute("aria-valuetext", /55% checkpoint .* active 7m .* heartbeat live/);
     await expect(page.locator("[data-active-job] [data-expanded-work-progress]")).toHaveCount(4);
     await expect(page.locator("[data-fleet-surface=collapsed]")).toHaveCount(0);
     await page.screenshot({ path: testInfo.outputPath("compact-work-expanded.png"), fullPage: true });
