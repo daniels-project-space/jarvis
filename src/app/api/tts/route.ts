@@ -26,10 +26,22 @@ const idleEdgeClients: MsEdgeTTS[] = [];
 let edgeWarmPromise: Promise<void> | null = null;
 
 async function acquireEdgeClient(): Promise<MsEdgeTTS> {
-  const client = idleEdgeClients.pop() ?? new MsEdgeTTS();
+  const pooled = idleEdgeClients.pop();
+  if (pooled) {
+    try {
+      // setMetadata is also the package's connection health check: it is a
+      // no-op on a live socket and reconnects an ordinarily closed socket.
+      await pooled.setMetadata(EDGE_TTS_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+      return pooled;
+    } catch {
+      // Vercel may freeze a WebSocket after the warm GET has returned. That
+      // stale pooled socket is only an optimization failure, never a reason to
+      // drop speech: retire it and open one fresh upstream in this request.
+      pooled.close();
+    }
+  }
+  const client = new MsEdgeTTS();
   try {
-    // setMetadata is also the package's connection health check: it is a
-    // no-op on a live socket and reconnects a frozen/stale serverless socket.
     await client.setMetadata(EDGE_TTS_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
     return client;
   } catch (error) {

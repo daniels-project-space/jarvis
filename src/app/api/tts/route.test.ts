@@ -116,6 +116,23 @@ describe("Ryan Neural route", () => {
     expect(tts.close).not.toHaveBeenCalled();
   });
 
+  it("replaces a serverless-frozen warm socket instead of dropping speech", async () => {
+    const stale = mock.instances.at(-1);
+    stale.setMetadata.mockRejectedValueOnce(new Error("warm socket was frozen"));
+    const before = mock.instances.length;
+
+    const response = await POST(request("Recover the warm socket") as any);
+    const replacement = mock.instances.at(-1);
+
+    expect(stale.close).toHaveBeenCalledTimes(1);
+    expect(mock.instances).toHaveLength(before + 1);
+    expect(replacement).not.toBe(stale);
+    expect(replacement.setMetadata).toHaveBeenCalledWith(EDGE_TTS_VOICE, "mp3");
+    mock.streams.at(-1)!.emit("data", Buffer.from([7, 8, 9]));
+    mock.streams.at(-1)!.emit("end");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([7, 8, 9]));
+  });
+
   it("uses only the authenticated self-hosted Kokoro stream when opted in", async () => {
     process.env.JARVIS_SELF_HOSTED_TTS = "1";
     process.env.SELF_HOSTED_TTS_URL = "https://speech.example";
