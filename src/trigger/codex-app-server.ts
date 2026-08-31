@@ -107,6 +107,8 @@ export type CodexAppServerOptions = {
   ephemeral?: boolean;
   onAuthConsumed?: () => void;
   dynamicToolsOnly?: boolean;
+  /** Foreground-only latency tier. A rejected cold thread safely retries without it. */
+  serviceTier?: "priority";
   protocolLimits?: Partial<CodexAppServerProtocolLimits>;
 };
 
@@ -564,42 +566,55 @@ export class CodexAppServer {
     const isNewThread = !threadId;
     if (!threadId) {
       const permissionProfile = this.options.permissionProfile;
+      const threadStartParams: JsonObject = {
+        model: selection.model,
+        baseInstructions: input.preamble,
+        developerInstructions: this.options.developerInstructions ?? "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
+        cwd: this.options.controllerCwd ?? "/tmp",
+        approvalPolicy: "never",
+        ...(permissionProfile ? {
+          permissions: permissionProfile.id,
+          config: permissionProfile.config,
+          environments: permissionProfile.environments,
+          runtimeWorkspaceRoots: permissionProfile.runtimeWorkspaceRoots,
+        } : {
+          sandbox: this.options.threadSandbox ?? "danger-full-access",
+          ...(this.options.dynamicToolsOnly ? {
+            config: {
+              web_search: "disabled",
+              shell_environment_policy: { inherit: "none" },
+              features: {
+                shell_tool: false,
+                unified_exec: false,
+                apps: false,
+                plugins: false,
+                hooks: false,
+                browser_use: false,
+                computer_use: false,
+                multi_agent: false,
+              },
+            },
+            environments: [],
+          } : {}),
+        }),
+        ephemeral: this.options.ephemeral ?? false,
+        dynamicTools: input.allowTools === false ? [] : this.options.dynamicTools,
+      };
       let response: JsonObject;
       try {
-        response = await this.request("thread/start", {
-          model: selection.model,
-          baseInstructions: input.preamble,
-          developerInstructions: this.options.developerInstructions ?? "Remain the foreground Jarvis conversation. Give the useful answer immediately. Delegate long work instead of blocking conversation.",
-          cwd: this.options.controllerCwd ?? "/tmp",
-          approvalPolicy: "never",
-          ...(permissionProfile ? {
-            permissions: permissionProfile.id,
-            config: permissionProfile.config,
-            environments: permissionProfile.environments,
-            runtimeWorkspaceRoots: permissionProfile.runtimeWorkspaceRoots,
-          } : {
-            sandbox: this.options.threadSandbox ?? "danger-full-access",
-            ...(this.options.dynamicToolsOnly ? {
-              config: {
-                web_search: "disabled",
-                shell_environment_policy: { inherit: "none" },
-                features: {
-                  shell_tool: false,
-                  unified_exec: false,
-                  apps: false,
-                  plugins: false,
-                  hooks: false,
-                  browser_use: false,
-                  computer_use: false,
-                  multi_agent: false,
-                },
-              },
-              environments: [],
-            } : {}),
-          }),
-          ephemeral: this.options.ephemeral ?? false,
-          dynamicTools: input.allowTools === false ? [] : this.options.dynamicTools,
-        }, 30_000, undefined, input.signal);
+        const preferredTier = this.options.serviceTier;
+        try {
+          response = await this.request("thread/start", {
+            ...threadStartParams,
+            ...(preferredTier ? { serviceTier: preferredTier } : {}),
+          }, 30_000, undefined, input.signal);
+        } catch (error) {
+          // A JSON-RPC rejection proves thread/start did not begin. Retrying
+          // the static request without priority is safe because no user text,
+          // context, or side-effecting tool input has crossed the protocol.
+          if (!preferredTier || !(error instanceof CodexRequestRejectedError)) throw error;
+          response = await this.request("thread/start", threadStartParams, 30_000, undefined, input.signal);
+        }
       } catch (error) {
         if (permissionProfile) {
           throw new CodexPermissionAttestationError("Codex thread permission attestation was unavailable");
