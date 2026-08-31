@@ -3,6 +3,7 @@ import {
   cumulativeWorkEvidence,
   EVIDENCE_INTEGRITY_RULES,
   isPermittedReadonlyAccessGap,
+  SUPERVISOR_MEASUREMENT_RULES,
   supervisorDeliveryBoundary,
   WORK_VERIFICATION_EVIDENCE_MAX_CHARS,
 } from "./work-verification";
@@ -19,6 +20,12 @@ describe("supervisor verification boundaries", () => {
     expect(EVIDENCE_INTEGRITY_RULES).toContain("persisted lineage");
     expect(EVIDENCE_INTEGRITY_RULES).toContain("compile-time placeholder");
     expect(EVIDENCE_INTEGRITY_RULES).toContain("static expiring token");
+  });
+
+  it("does not promote incidental runtime observations into exact acceptance targets", () => {
+    expect(SUPERVISOR_MEASUREMENT_RULES).toContain("ordinary runtime variance is not a concern");
+    expect(SUPERVISOR_MEASUREMENT_RULES).toContain("declared metric/target");
+    expect(SUPERVISOR_MEASUREMENT_RULES).toContain("inequality");
   });
 
   it("carries completed checkpoint evidence into repair-pass supervision", () => {

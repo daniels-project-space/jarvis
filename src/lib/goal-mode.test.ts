@@ -206,6 +206,8 @@ describe("Goal Mode contracts", () => {
     expect(prompt).toContain("7,500 characters");
     expect(prompt).toContain("fix their generation, render, configuration, or data root cause");
     expect(prompt).toContain("a rejection-only gate does not satisfy the outcome");
+    expect(prompt).toContain("never copy an incidental elapsed runtime");
+    expect(prompt).toContain("never turn a baseline observation into an exact target");
   });
 
   it("rejects cyclic plans", () => {

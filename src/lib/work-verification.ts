@@ -13,6 +13,18 @@ export const EVIDENCE_INTEGRITY_RULES = [
   "Long-lived service authentication must be renewable or have an evidenced rotation path; a static expiring token is not launch-ready merely because it works today.",
 ].join(" ");
 
+/**
+ * Keeps a verifier from turning an observed wall-clock duration into an
+ * impossible byte-for-byte acceptance target. Goal plans intentionally carry
+ * both a baseline observation and a measurement window; only the declared
+ * metric/target or an explicit threshold can make latency normative.
+ */
+export const SUPERVISOR_MEASUREMENT_RULES = [
+  "Treat observed durations, timestamps, IDs, and counts in baseline or measurement-window prose as evidence context, not exact acceptance values.",
+  "A numeric value is normative only when the authoritative acceptance criteria or declared metric/target explicitly requires that value, an inequality, or a tolerance.",
+  "For a repeated test or validation run, judge the requested scope, result counts, failures, provenance, and lifecycle evidence; ordinary runtime variance is not a concern unless latency is itself the metric.",
+].join(" ");
+
 export function supervisorDeliveryBoundary(goalStage: unknown): string {
   return goalStage === "building" || goalStage === "refining"
     ? "This is one shared-branch Goal Mode implementation session. Judge its scoped definition of done. Do not return concerns solely because the branch is not merged/deployed or because goal-level provider validation remains: the final Release Proof, deep outcome validator, and trusted delivery controller own those later boundaries."

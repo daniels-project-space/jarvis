@@ -55,6 +55,7 @@ import {
   cumulativeWorkEvidence,
   EVIDENCE_INTEGRITY_RULES,
   isPermittedReadonlyAccessGap,
+  SUPERVISOR_MEASUREMENT_RULES,
   supervisorDeliveryBoundary,
 } from "../lib/work-verification";
 import {
@@ -556,6 +557,7 @@ async function verifyWork(
     `${SAFE_SANDBOX_EXECUTION_RULES}\n\n` +
     `${supervisorDeliveryBoundary(goalStage)}\n\n` +
     `${EVIDENCE_INTEGRITY_RULES}\n\n` +
+    `${SUPERVISOR_MEASUREMENT_RULES}\n\n` +
     "For repository work, the controller receipt—not narrative Git claims—is authoritative. Require a complete history, " +
     "the expected branch/head/base, proven base ancestry, a clean tree, the exact commit list and diff, and controller-observed " +
     "command exit evidence appropriate to the task. A shallow boundary never proves a commit is parentless.\n\n" +
