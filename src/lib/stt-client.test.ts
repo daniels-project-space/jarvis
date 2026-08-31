@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { SpeechRecognitionRequestError, transcribeRecordedAudio } from "./stt-client";
+import {
+  directTranscriptFromSttResponse,
+  SpeechRecognitionRequestError,
+  transcribeRecordedAudio,
+} from "./stt-client";
 
 const audio = new Blob(["recorded audio"], { type: "audio/webm" });
 
@@ -57,5 +61,31 @@ describe("transcribeRecordedAudio", () => {
       code: "STT_PROVIDERS_UNAVAILABLE",
       retryable: false,
     });
+  });
+});
+
+describe("direct final speech filtering", () => {
+  it("accepts a useful private transcript with strong live VAD evidence", async () => {
+    const response = Response.json({
+      text: "  Jarvis, open the project.  ",
+      segments: [{ start: 0, end: 1.2, avg_logprob: -0.2, no_speech_prob: 0.02 }],
+    });
+    await expect(directTranscriptFromSttResponse(response, {
+      acceptedFrames: 8,
+      speechSpanMs: 920,
+      peakVoiceMargin: 18,
+    })).resolves.toBe("Jarvis, open the project.");
+  });
+
+  it("keeps weak noise and common hands-free ghosts out of the chat queue", async () => {
+    const weak = Response.json({
+      text: "Thanks for watching.",
+      segments: [{ start: 0, end: 0.1, avg_logprob: -1.2, no_speech_prob: 0.8 }],
+    });
+    await expect(directTranscriptFromSttResponse(weak, {
+      acceptedFrames: 2,
+      speechSpanMs: 120,
+      peakVoiceMargin: 3,
+    })).resolves.toBe("");
   });
 });

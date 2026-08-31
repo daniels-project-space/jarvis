@@ -1,6 +1,13 @@
 "use client";
 
 import { viewerFetchWithTimeout } from "./viewer-request";
+import {
+  cleanSpeechTranscript,
+  hasConfidentSpeechSegments,
+  hasStrongClientSpeechEvidence,
+  isMeaningfulSpeechTranscript,
+  shouldIgnoreHandsFreeTranscript,
+} from "./transcript";
 
 type TimedFetcher = (
   input: RequestInfo | URL,
@@ -51,6 +58,23 @@ export async function transcriptFromSttResponse(response: Response): Promise<str
     );
   }
   return typeof payload?.text === "string" ? payload.text.trim() : "";
+}
+
+export async function directTranscriptFromSttResponse(
+  response: Response,
+  evidence: { acceptedFrames: number; speechSpanMs: number; peakVoiceMargin: number },
+): Promise<string> {
+  const payload = await response.json().catch(() => null) as {
+    text?: unknown;
+    segments?: unknown;
+  } | null;
+  if (!response.ok || typeof payload?.text !== "string") return "";
+  if (!hasConfidentSpeechSegments(payload.segments) && !hasStrongClientSpeechEvidence(evidence)) return "";
+  let text = cleanSpeechTranscript(payload.text);
+  if (shouldIgnoreHandsFreeTranscript(text, evidence)) text = "";
+  const latin = (text.match(/[a-zA-Z0-9\s.,!?\"'£$%()@:;/-]/g) ?? []).length;
+  if (text && latin / text.length < 0.7) text = "";
+  return isMeaningfulSpeechTranscript(text) ? text : "";
 }
 
 export async function transcribeRecordedAudio(

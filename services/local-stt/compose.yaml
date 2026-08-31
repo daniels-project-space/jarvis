@@ -10,6 +10,7 @@ services:
       STT_COMPUTE_TYPE: int8
       STT_BEAM_SIZE: ${STT_BEAM_SIZE:-5}
       STT_MODEL_DIR: /models
+      STT_ALLOWED_ORIGINS: ${STT_ALLOWED_ORIGINS:-https://jarvis-orcin-six.vercel.app}
       # Set this in the host shell or a protected compose override, never commit it.
       STT_SHARED_SECRET: ${LOCAL_STT_SHARED_SECRET:?set_LOCAL_STT_SHARED_SECRET}
     volumes:

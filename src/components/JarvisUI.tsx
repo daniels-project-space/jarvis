@@ -159,10 +159,15 @@ import {
 } from "@/lib/standby-listener-lease";
 import { resolveTrustedJarvisEmbedOrigin } from "@/lib/embed-origin";
 import {
+  directTranscriptFromSttResponse,
   SpeechRecognitionRequestError,
   transcriptFromSttResponse,
   transcribeRecordedAudio,
 } from "@/lib/stt-client";
+import {
+  prepareDirectFinalStt,
+  type PreparedDirectFinalStt,
+} from "@/lib/direct-final-stt-client";
 import {
   selfHostedStreamingSpeechEnabled,
   startSelfHostedStreamingSpeech,
@@ -5005,6 +5010,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     let browserPreviewCaptureOpen = false;
     let browserFinalSettleSignal: (() => void) | null = null;
     const selfHostedStreaming = { current: null as SelfHostedStreamingSpeech | null };
+    let directFinalStt: PreparedDirectFinalStt | null = null;
     let selfHostedPartial = "";
     const researchState: {
       controller: AbortController | null;
@@ -5045,23 +5051,33 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         const speechSpanMs = evidence.voiceStartedAt
           ? Math.max(0, evidence.lastVoice - evidence.voiceStartedAt)
           : 0;
+        const speechEvidence = {
+          acceptedFrames: evidence.acceptedFrames,
+          speechSpanMs,
+          peakVoiceMargin: evidence.peakVoiceMargin,
+        };
         for (let attempt = 0; attempt < attempts; attempt += 1) {
           let failure: SpeechRecognitionRequestError | null = null;
           try {
-            const response = await viewerFetchWithTimeout("/api/stt", {
-              method: "POST",
-              headers: {
-                "content-type": mime,
-                "x-jarvis-continuous-live": "1",
-                "x-jarvis-stt-attempt": String(attempt + 1),
-                "x-jarvis-voice-frames": String(evidence.acceptedFrames),
-                "x-jarvis-speech-span-ms": String(Math.round(speechSpanMs)),
-                "x-jarvis-peak-voice-margin": String(Math.round(evidence.peakVoiceMargin * 10) / 10),
-              },
-              body: blob,
-              signal: controller.signal,
-            }, timeoutMs);
-            const transcript = await transcriptFromSttResponse(response);
+            const directResponse = attempt === 0
+              ? await directFinalStt?.transcribe(blob, mime, controller.signal, timeoutMs) ?? null
+              : null;
+            const transcript = directResponse
+              ? await directTranscriptFromSttResponse(directResponse, speechEvidence)
+              : await transcriptFromSttResponse(await viewerFetchWithTimeout("/api/stt", {
+                method: "POST",
+                headers: {
+                  "content-type": mime,
+                  "x-jarvis-continuous-live": "1",
+                  "x-jarvis-stt-attempt": String(attempt + 1),
+                  "x-jarvis-voice-frames": String(evidence.acceptedFrames),
+                  "x-jarvis-speech-span-ms": String(Math.round(speechSpanMs)),
+                  "x-jarvis-peak-voice-margin": String(Math.round(evidence.peakVoiceMargin * 10) / 10),
+                },
+                body: blob,
+                signal: controller.signal,
+              }, timeoutMs));
+            document.documentElement.dataset.jarvisFinalSttPath = directResponse ? "direct" : "proxy";
             sttFailureStreak.current = 0;
             return transcript;
           } catch (error) {
@@ -5291,6 +5307,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         });
         vad = result.state;
         if (result.acceptedSpeech) {
+          if (!directFinalStt) directFinalStt = prepareDirectFinalStt();
           selfHostedStreaming.current?.activate();
           energyRef.current = Math.min(1, level / 90);
           if (!listeningCaptionShown) {

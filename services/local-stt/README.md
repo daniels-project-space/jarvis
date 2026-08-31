@@ -30,6 +30,14 @@ the Vercel app, expose this worker over a private authenticated network and set
 `LOCAL_STT_URL` and `LOCAL_STT_SHARED_SECRET` under the `local-stt` vault
 service. Jarvis appends `/v1/audio/transcriptions` automatically.
 
+The live owner UI can avoid the extra Vercel audio-proxy hop. Jarvis mints a
+60-second, origin-bound, one-use upload ticket from the same secret while the
+speaker is still talking. The browser sends that ticket directly to the HTTPS
+worker; it never receives `LOCAL_STT_SHARED_SECRET`. Set
+`STT_ALLOWED_ORIGINS=https://jarvis-orcin-six.vercel.app` on the worker. Direct
+upload is an optimization only: ticket, CORS, or network failure immediately
+falls back to the authenticated `/api/stt` proxy.
+
 The production host installs `infra/systemd/jarvis-local-stt.service` and
 `infra/nginx/jarvis-speech.conf`. The same root-only secret is supplied to the
 container and to the Jarvis server environment; the public HTTPS endpoint is
