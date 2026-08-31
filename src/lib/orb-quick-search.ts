@@ -1,6 +1,6 @@
 import type { FleetNode } from "./active-work";
 
-export type OrbSearchSource = "project" | "work" | "creation" | "file";
+export type OrbSearchSource = "project" | "work" | "creation" | "file" | "memory" | "hub";
 
 export type OrbSearchResult = {
   id: string;
@@ -43,11 +43,29 @@ export type OrbSearchProject = {
   productionUrl?: string;
 };
 
+export type OrbSearchMemory = {
+  _id: string;
+  title: string;
+  body: string;
+  kind: string;
+  tags?: string[];
+};
+
+export type OrbSearchHub = {
+  id: string;
+  kind: "todo" | "event";
+  title: string;
+  detail: string;
+  target: "todo" | "calendar";
+};
+
 export type OrbSearchInput = {
   creations?: OrbSearchCreation[];
   files?: OrbSearchFile[];
   projects?: OrbSearchProject[];
   jobs?: FleetNode[];
+  memories?: OrbSearchMemory[];
+  hub?: OrbSearchHub[];
 };
 
 const WORD = /[a-z0-9][a-z0-9-]{1,}/gi;
@@ -56,6 +74,8 @@ const SOURCE_ORDER: Record<OrbSearchSource, number> = {
   work: 1,
   creation: 2,
   file: 3,
+  memory: 4,
+  hub: 5,
 };
 
 function terms(value: string) {
@@ -151,6 +171,33 @@ export function searchOrbSurfaces(query: string, input: OrbSearchInput, limit = 
     });
   }
 
+  for (const memory of input.memories ?? []) {
+    const detail = [memory.kind, ...(memory.tags ?? []), memory.body].filter(Boolean).join(" · ");
+    const score = rank(trimmed, memory.title, detail);
+    if (score) results.push({
+      id: `memory:${memory._id}`,
+      source: "memory",
+      title: memory.title,
+      detail: memory.kind || "memory",
+      payload: { title: memory.title, body: memory.body, kind: memory.kind, tags: memory.tags ?? [] },
+      canShow: true,
+      score,
+    });
+  }
+
+  for (const hub of input.hub ?? []) {
+    const score = rank(trimmed, hub.title, hub.detail);
+    if (score) results.push({
+      id: hub.id,
+      source: "hub",
+      title: hub.title,
+      detail: hub.detail,
+      payload: hub,
+      canShow: false,
+      score,
+    });
+  }
+
   const perSource = new Map<OrbSearchSource, number>();
   return results
     .sort((left, right) => right.score - left.score || SOURCE_ORDER[left.source] - SOURCE_ORDER[right.source] || left.title.localeCompare(right.title))
@@ -165,5 +212,15 @@ export function searchOrbSurfaces(query: string, input: OrbSearchInput, limit = 
 }
 
 export function searchSourceLabel(source: OrbSearchSource) {
-  return source === "project" ? "project" : source === "work" ? "work" : source === "creation" ? "saved" : "file";
+  return source === "project"
+    ? "project"
+    : source === "work"
+      ? "work"
+      : source === "creation"
+        ? "saved"
+        : source === "memory"
+          ? "memory"
+          : source === "hub"
+            ? "Project Hub"
+            : "file";
 }

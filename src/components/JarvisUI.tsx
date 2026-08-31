@@ -2084,15 +2084,45 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       if (fileId) window.open(`/api/files/${encodeURIComponent(fileId)}`, "_blank", "noopener,noreferrer");
       return;
     }
+    if (result.source === "memory") {
+      const title = typeof result.payload.title === "string" ? result.payload.title : "Memory";
+      const body = typeof result.payload.body === "string" ? result.payload.body : "";
+      if (body) {
+        setPanelFull(false);
+        setPanelMin(false);
+        void setPanel({ type: "markdown", value: body, title });
+      }
+      return;
+    }
+    if (result.source === "hub") {
+      const target = result.payload.target === "calendar" ? "calendar" : result.payload.target === "todo" ? "todo" : "";
+      const projectHubUrl = PROJECT_REGISTRY.find((project) => project.slug === "project-hub")?.productionUrl;
+      if (target && projectHubUrl) {
+        const url = new URL(projectHubUrl);
+        url.hash = `w-${target}`;
+        window.open(url.toString(), "_blank", "noopener,noreferrer");
+      }
+      return;
+    }
     const url = typeof result.payload.productionUrl === "string" ? result.payload.productionUrl : "";
     if (url) window.open(url, "_blank", "noopener,noreferrer");
-  }, [openMapWork, openSearchCreation]);
+  }, [openMapWork, openSearchCreation, setPanel]);
   const showSearchResult = useCallback((result: OrbSearchResult) => {
     if (result.source === "creation") {
       const creation = result.payload as unknown as OrbSearchCreation;
       setPanelFull(false);
       setPanelMin(false);
       void setPanel({ type: "creations", value: JSON.stringify({ folder: creation.folder, search: creation.title }), title: "saved work" });
+      return;
+    }
+    if (result.source === "memory") {
+      const title = typeof result.payload.title === "string" ? result.payload.title : "Memory";
+      const body = typeof result.payload.body === "string" ? result.payload.body : "";
+      if (body) {
+        setPanelFull(false);
+        setPanelMin(false);
+        void setPanel({ type: "markdown", value: body, title });
+      }
       return;
     }
     if (result.source !== "file") return;

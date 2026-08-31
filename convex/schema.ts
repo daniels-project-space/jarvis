@@ -172,7 +172,8 @@ export default defineSchema({
     .index("by_createdAt", ["createdAt"])
     .index("by_updatedAt", ["updatedAt"])
     .index("by_dedupeKey", ["dedupeKey"])
-    .searchIndex("search_body", { searchField: "body", filterFields: ["kind"] }),
+    .searchIndex("search_body", { searchField: "body", filterFields: ["kind"] })
+    .searchIndex("search_title", { searchField: "title", filterFields: ["kind"] }),
 
   // A durable page cursor for the Git-backed Obsidian mirror. It advances only
   // after the corresponding page has been committed and pushed by Trigger.

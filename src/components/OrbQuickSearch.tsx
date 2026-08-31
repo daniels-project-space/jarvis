@@ -4,11 +4,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import type { CompactWorkSnapshot } from "@/lib/active-work";
 import { useJarvisQuery } from "@/lib/secure-convex";
+import { viewerFetchWithTimeout } from "@/lib/viewer-request";
 import {
   searchOrbSurfaces,
   searchSourceLabel,
   type OrbSearchCreation,
   type OrbSearchFile,
+  type OrbSearchHub,
+  type OrbSearchMemory,
   type OrbSearchProject,
   type OrbSearchResult,
 } from "@/lib/orb-quick-search";
@@ -36,22 +39,57 @@ export function OrbQuickSearch({
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(false);
   const [hovered, setHovered] = useState(false);
-  const [scope, setScope] = useState<"all" | "file" | "project" | "work" | "creation">("all");
+  const [scope, setScope] = useState<"all" | "file" | "project" | "work" | "creation" | "memory" | "hub">("all");
+  const [hubResults, setHubResults] = useState<OrbSearchHub[]>([]);
   const search = query.trim();
   const files = useJarvisQuery(
     api.files.quickSearchLibrary,
     owner && search.length >= 2 ? { search, limit: 10 } : "skip",
   ) as OrbSearchFile[] | undefined;
+  const memories = useJarvisQuery(
+    api.memory.quickSearch,
+    owner && search.length >= 2 ? { q: search, limit: 8 } : "skip",
+  ) as OrbSearchMemory[] | undefined;
+
+  useEffect(() => {
+    if (!owner || search.length < 2) {
+      setHubResults([]);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void viewerFetchWithTimeout(
+        `/api/hub-search?q=${encodeURIComponent(search)}`,
+        { cache: "no-store", signal: controller.signal },
+        1_800,
+      ).then(async (response) => {
+        if (!response.ok) return [];
+        const payload = await response.json().catch(() => null) as { results?: unknown } | null;
+        return Array.isArray(payload?.results) ? payload.results as OrbSearchHub[] : [];
+      }).then((results) => {
+        if (!controller.signal.aborted) setHubResults(results.slice(0, 8));
+      }).catch(() => {
+        if (!controller.signal.aborted) setHubResults([]);
+      });
+    }, 100);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort("search superseded");
+    };
+  }, [owner, search]);
+
   const results = useMemo(
     () => searchOrbSurfaces(search, {
       creations,
       files,
       projects,
+      memories,
+      hub: hubResults,
       jobs: snapshot.hierarchy.length
         ? snapshot.hierarchy.flatMap((mission) => mission.projects.flatMap((project) => project.jobs))
         : snapshot.fleet?.nodes ?? [],
     }),
-    [creations, files, projects, search, snapshot],
+    [creations, files, hubResults, memories, projects, search, snapshot],
   );
   const visible = active && search.length >= 2;
   const visibleResults = scope === "all" ? results : results.filter((result) => result.source === scope);
@@ -113,7 +151,7 @@ export function OrbQuickSearch({
       </div>
       {visible && (
         <div id="orb-quick-search-results" role="listbox" aria-label="Quick search results" className="relative left-1/2 mt-1.5 w-[min(360px,calc(100vw-24px))] -translate-x-1/2 overflow-hidden rounded-2xl border border-white/10 bg-[#07131e]/[.98] p-1.5 shadow-[0_18px_52px_rgba(0,0,0,.48)] backdrop-blur-xl">
-          <div className="mb-1 flex gap-1 overflow-x-auto px-1 py-1" aria-label="Search result type">{([['all','all'],['file','files'],['project','projects'],['work','work'],['creation','saved']] as const).map(([id,label]) => <button key={id} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => setScope(id)} className={`rounded-full px-2 py-1 font-mono text-[7px] uppercase tracking-[.08em] ${scope === id ? "bg-cyan/12 text-cyan ring-1 ring-cyan/25" : "text-slate hover:text-ice"}`}>{label}</button>)}</div>
+          <div className="mb-1 flex gap-1 overflow-x-auto px-1 py-1" aria-label="Search result type">{([['all','all'],['file','files'],['project','projects'],['work','work'],['creation','saved'],['memory','memory'],['hub','hub']] as const).map(([id,label]) => <button key={id} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => setScope(id)} className={`rounded-full px-2 py-1 font-mono text-[7px] uppercase tracking-[.08em] ${scope === id ? "bg-cyan/12 text-cyan ring-1 ring-cyan/25" : "text-slate hover:text-ice"}`}>{label}</button>)}</div>
           {visibleResults.length ? visibleResults.map((result) => (
             <div key={result.id} role="option" aria-selected={false} aria-label={`${searchSourceLabel(result.source)}: ${result.title}`} className="group flex min-w-0 items-center gap-2 rounded-xl px-2 py-2 transition hover:bg-cyan/[.07]">
               <span aria-hidden="true" className={`h-1.5 w-1.5 shrink-0 rounded-full ${result.source === "work" ? "bg-amber" : result.source === "project" ? "bg-cyan" : "bg-slate"}`} />

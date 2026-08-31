@@ -29,6 +29,7 @@ vi.mock("../../convex/_generated/api", () => ({
     },
     creations: { list: { _name: "creations:list" } },
     files: { quickSearchLibrary: { _name: "files:quickSearchLibrary" } },
+    memory: { quickSearch: { _name: "memory:quickSearch" } },
     projectState: { list: { _name: "projectState:list" } },
     commandCenter: { snapshot: { _name: "commandCenter:snapshot" } },
     controllerSession: { status: { _name: "controllerSession:status" } },

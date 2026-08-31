@@ -24,6 +24,36 @@ afterEach(() => {
 });
 
 describe("governed durable memory", () => {
+  it("projects search-safe Obsidian memory without storage or provenance fields", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation((api as any).memory.write, {
+      kind: "project",
+      title: "Snuffelo profitability plan",
+      body: "Track verified Shopify revenue, margin, and current conversion blockers.",
+      tags: ["shopify", "profitability"],
+      r2Key: "private-memory/full-plan.md",
+      sourceMessageId: "private_message_identity",
+      workerToken: WORKER,
+    });
+
+    const results = await t.query((api as any).memory.quickSearch, {
+      q: "Shopify revenue",
+      limit: 8,
+      workerToken: WORKER,
+    });
+
+    expect(results).toEqual([
+      expect.objectContaining({
+        title: "Snuffelo profitability plan",
+        kind: "project",
+        tags: ["shopify", "profitability"],
+      }),
+    ]);
+    expect(results[0]).not.toHaveProperty("r2Key");
+    expect(results[0]).not.toHaveProperty("sourceMessageIds");
+    expect(results[0]).not.toHaveProperty("dedupeKey");
+  });
+
   it("consolidates the same canonical claim and retains bounded provenance", async () => {
     const t = convexTest(schema, modules);
     const first = await t.mutation((api as any).memory.write, {

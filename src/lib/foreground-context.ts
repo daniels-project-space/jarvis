@@ -44,7 +44,7 @@ async function query<T = unknown>(
   }
 }
 
-async function hubSnapshot(signal?: AbortSignal): Promise<HubContext> {
+export async function readHubSnapshot(signal?: AbortSignal): Promise<HubContext> {
   const args = hubContextRequestArgs();
   if (!args) return null;
   if (hubCache && hubCache.expiresAt > Date.now()) return hubCache.value;
@@ -111,7 +111,7 @@ export async function buildContext(userText?: string): Promise<string> {
     ),
     requiresHubSnapshot(userText)
       ? boundedSnapshot(
-        (signal) => hubSnapshot(signal),
+        (signal) => readHubSnapshot(signal),
         () => hubLastKnownGood,
         (snapshot) => { hubLastKnownGood = snapshot; },
       )

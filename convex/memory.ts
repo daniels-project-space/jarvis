@@ -233,3 +233,24 @@ export const search = query({
     return rows.filter((row) => activeMemory(row, Date.now())).slice(0, lim);
   },
 });
+
+/** Owner-visible command-palette projection; storage/provenance fields stay server-side. */
+export const quickSearch = query({
+  args: { q: v.string(), limit: v.optional(v.number()), ...viewerAuthArgs },
+  handler: async (ctx, a) => {
+    await requireViewer(ctx, a);
+    const lim = Math.max(1, Math.min(a.limit ?? 8, 12));
+    const needle = a.q.trim().slice(0, 120);
+    if (needle.length < 2) return [];
+    const take = Math.min(lim * 2, 24);
+    const [titleRows, bodyRows] = await Promise.all([
+      ctx.db.query("memory").withSearchIndex("search_title", (q) => q.search("title", needle)).take(take),
+      ctx.db.query("memory").withSearchIndex("search_body", (q) => q.search("body", needle)).take(take),
+    ]);
+    const rows = [...new Map([...titleRows, ...bodyRows].map((row) => [row._id, row])).values()];
+    return rows
+      .filter((row) => activeMemory(row, Date.now()))
+      .slice(0, lim)
+      .map(({ _id, title, body, kind, tags }) => ({ _id, title, body, kind, tags }));
+  },
+});
