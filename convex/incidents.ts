@@ -1,4 +1,6 @@
 import { mutation, query } from "./_generated/server";
+import type { MutationCtx } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
 import { v } from "convex/values";
 import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
 import { normalizeIncidentSignature } from "../src/lib/incident-signature";
@@ -10,6 +12,8 @@ import { normalizeIncidentSignature } from "../src/lib/incident-signature";
 
 const WINDOW_MS = 48 * 60 * 60 * 1000;
 const TRANSIENT_NETWORK_REPORT_THRESHOLD = 3;
+const LEGACY_FAILED_FETCH_ATTENTION_FINGERPRINT = "jarvis:failed-fetch-unhandled-rejection";
+const LEGACY_FAILED_FETCH_SIGNATURE = normalizeIncidentSignature("client:rejection:TypeError: Failed to fetch");
 
 const attentionFingerprint = (id: unknown) => `incident:${String(id)}`;
 
@@ -31,13 +35,22 @@ async function syncIncidentAttention(
     .first();
   const needsDaniel = incident.status === "needs-daniel";
   const resolved = incident.status === "resolved";
+  const transientNetwork = isTransientBrowserNetworkIncident(incident);
+  // A resolved observation that never had a user-facing item should stay
+  // invisible. In particular, one suspended-tab/browser-radio fetch failure
+  // is useful telemetry but is not work for Daniel.
+  if (resolved && !existing) return;
   const item = {
     fingerprint,
     project: incident.app,
-    title: needsDaniel
-      ? `Repair needs Daniel · ${incident.app ?? "Jarvis"}`.slice(0, 140)
-      : `Self-repair · ${incident.app ?? "Jarvis"}`.slice(0, 140),
-    detail: incident.message.slice(0, 2_000),
+    title: transientNetwork
+      ? needsDaniel ? "Connection needs your attention · Jarvis" : "Restoring Jarvis's connection"
+      : needsDaniel
+        ? `Repair needs Daniel · ${incident.app ?? "Jarvis"}`.slice(0, 140)
+        : `Self-repair · ${incident.app ?? "Jarvis"}`.slice(0, 140),
+    detail: transientNetwork
+      ? `The browser connection was interrupted ${incident.count} times. Jarvis kept your work and is checking the affected route.`
+      : incident.message.slice(0, 2_000),
     evidence: [`source ${incident.source}`, `seen ${incident.count}x`, `incident ${String(incident._id)}`],
     severity: needsDaniel ? "critical" : "warning",
     impact: incident.source === "stack-poller" ? 80 : 65,
@@ -50,6 +63,28 @@ async function syncIncidentAttention(
   };
   if (existing) await ctx.db.patch(existing._id, item);
   else await ctx.db.insert("attentionItems", { ...item, createdAt: Date.now() });
+}
+
+async function retireLegacyFailedFetchAttention(ctx: MutationCtx, now: number) {
+  const attention = await ctx.db
+    .query("attentionItems")
+    .withIndex("by_fingerprint", (q) => q.eq("fingerprint", LEGACY_FAILED_FETCH_ATTENTION_FINGERPRINT))
+    .first();
+  if (!attention || attention.status === "resolved") return false;
+
+  const matching = await ctx.db
+    .query("incidents")
+    .withIndex("by_signature", (q) => q.eq("signature", LEGACY_FAILED_FETCH_SIGNATURE))
+    .order("desc")
+    .take(10);
+  const hasLiveRecurrence = matching.some((incident: Doc<"incidents">) =>
+    now - Number(incident.lastSeenAt ?? incident.createdAt) < WINDOW_MS
+    && incident.count >= TRANSIENT_NETWORK_REPORT_THRESHOLD
+    && ["open", "dispatched", "needs-daniel"].includes(incident.status),
+  );
+  if (hasLiveRecurrence) return false;
+  await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
+  return true;
 }
 
 export const report = mutation({
@@ -75,12 +110,21 @@ export const report = mutation({
       .filter((i: any) => now - Number(i.lastSeenAt ?? i.createdAt) < WINDOW_MS)
       .sort((x: any, y: any) => Number(y.lastSeenAt ?? y.createdAt) - Number(x.lastSeenAt ?? x.createdAt))[0];
     if (recent) {
-      const nextStatus = recent.status === "resolved" ? "open" : recent.status;
+      const nextCount = recent.count + 1;
+      const transientBelowThreshold = isTransientBrowserNetworkIncident({
+        source: a.source,
+        signature: sig,
+        message: a.message,
+      }) && nextCount < TRANSIENT_NETWORK_REPORT_THRESHOLD;
+      const nextStatus = transientBelowThreshold
+        ? "resolved"
+        : recent.status === "resolved" ? "open" : recent.status;
       const patch: Record<string, unknown> = {
-        count: recent.count + 1,
+        count: nextCount,
         lastSeenAt: now,
         updatedAt: now,
         message: a.message.slice(0, 1500),
+        status: nextStatus,
       };
       // Give legacy exhausted incidents a pre-recurrence baseline. Without
       // this migration-on-write, their first post-release recurrence could be
@@ -88,24 +132,27 @@ export const report = mutation({
       if (recent.observedCountAtLastAttempt === undefined && recent.attempts > 0) {
         patch.observedCountAtLastAttempt = recent.count;
       }
-      // recurrence after a "fix" = the fix didn't hold — reopen with history
-      if (recent.status === "resolved") patch.status = nextStatus;
       await ctx.db.patch(recent._id, patch);
       await syncIncidentAttention(ctx, {
         ...recent,
         message: a.message.slice(0, 1500),
-        count: recent.count + 1,
+        count: nextCount,
         status: nextStatus,
       });
       return recent._id;
     }
+    const initialStatus = isTransientBrowserNetworkIncident({
+      source: a.source,
+      signature: sig,
+      message: a.message,
+    }) ? "resolved" : "open";
     const id = await ctx.db.insert("incidents", {
       source: a.source,
       app: a.app,
       signature: sig,
       message: a.message.slice(0, 1500),
       count: 1,
-      status: "open",
+      status: initialStatus,
       attempts: 0,
       lastSeenAt: now,
       createdAt: now,
@@ -117,7 +164,7 @@ export const report = mutation({
       app: a.app,
       message: a.message.slice(0, 1500),
       count: 1,
-      status: "open",
+      status: initialStatus,
     });
     return id;
   },
@@ -129,6 +176,8 @@ export const claimForRepair = mutation({
   args: { limit: v.optional(v.number()), maxAttempts: v.optional(v.number()), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
+    const now = Date.now();
+    await retireLegacyFailedFetchAttention(ctx, now);
     // Migrate one-off browser network incidents that an older healer already
     // dispatched or escalated before the recurrence threshold existed. A
     // stale status must not keep a phantom "repair running" notification alive
@@ -148,7 +197,7 @@ export const claimForRepair = mutation({
           status: "resolved",
           attempts: 0,
           observedCountAtLastAttempt: incident.count,
-          updatedAt: Date.now(),
+          updatedAt: now,
         });
         await syncIncidentAttention(ctx, { ...incident, status: "resolved" });
       }

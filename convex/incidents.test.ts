@@ -35,6 +35,14 @@ describe("incident observation fencing", () => {
     const t = convexTest(schema, modules);
     const id = await report(t);
 
+    await expect(t.run(async (ctx) => ({
+      incident: await ctx.db.get(id),
+      attention: await ctx.db.query("attentionItems").collect(),
+    }))).resolves.toMatchObject({
+      incident: { status: "resolved", count: 1, attempts: 0 },
+      attention: [],
+    });
+
     await expect(t.mutation(api.incidents.claimForRepair, {
       workerToken: WORKER,
       limit: 2,
@@ -77,7 +85,25 @@ describe("incident observation fencing", () => {
     await t.mutation(api.incidents.claimForRepair, { workerToken: WORKER });
     await report(t);
     await t.mutation(api.incidents.claimForRepair, { workerToken: WORKER });
+
+    await expect(t.run(async (ctx) => ({
+      incident: await ctx.db.get(id),
+      attention: await ctx.db.query("attentionItems").collect(),
+    }))).resolves.toMatchObject({
+      incident: { status: "resolved", count: 2 },
+      attention: [],
+    });
+
     await report(t);
+
+    await expect(t.run(async (ctx) => await ctx.db
+      .query("attentionItems")
+      .withIndex("by_fingerprint", (q) => q.eq("fingerprint", `incident:${String(id)}`))
+      .first())).resolves.toMatchObject({
+        status: "open",
+        title: "Restoring Jarvis's connection",
+        detail: expect.not.stringMatching(/failed to fetch/i),
+      });
 
     const result = await t.mutation(api.incidents.claimForRepair, {
       workerToken: WORKER,
@@ -86,6 +112,31 @@ describe("incident observation fencing", () => {
     });
     expect(result.escalations).toEqual([]);
     expect(result.claims).toEqual([expect.objectContaining({ id, count: 3, attempts: 1 })]);
+  });
+
+  it("retires the legacy failed-fetch approval when no live recurrence remains", async () => {
+    const t = convexTest(schema, modules);
+    const attentionId = await t.run(async (ctx) => await ctx.db.insert("attentionItems", {
+      fingerprint: "jarvis:failed-fetch-unhandled-rejection",
+      title: "Approve root-cause repair for repeated failed fetch",
+      detail: "A stale approval from the old incident policy.",
+      severity: "warning",
+      impact: 65,
+      urgency: 60,
+      confidence: 1,
+      actionClass: "ask",
+      status: "open",
+      createdAt: Date.now() - 10_000,
+      updatedAt: Date.now() - 10_000,
+    }));
+
+    await expect(t.mutation(api.incidents.claimForRepair, {
+      workerToken: WORKER,
+    })).resolves.toEqual({ claims: [], escalations: [] });
+    await expect(t.run(async (ctx) => await ctx.db.get(attentionId))).resolves.toMatchObject({
+      status: "resolved",
+      updatedAt: expect.any(Number),
+    });
   });
 
   it("silently monitors an exhausted repair unless the product reports the failure again", async () => {
