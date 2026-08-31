@@ -62,12 +62,14 @@ function isDispatchReceiptReservation(value: unknown): value is AgentFleetReserv
 export async function reserveAgentFleetBatch(
   reason: string,
   fanOut = DEFAULT_FAN_OUT,
+  options: { createdAtFloor?: number } = {},
 ): Promise<AgentFleetReservation[]> {
   const cleanReason = reason.trim().replace(/\s+/g, " ").slice(0, 160) || "work-available";
   const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(fanOut)));
   const reserved = await workerMutation<{ reservations?: unknown[] }>("jobs:reserveDispatchBatch", {
     limit,
     reason: cleanReason,
+    ...(options.createdAtFloor === undefined ? {} : { createdAtFloor: options.createdAtFloor }),
   });
   const offered = Array.isArray(reserved?.reservations) ? reserved.reservations : [];
   const reservations = offered.filter(isDispatchReceiptReservation);

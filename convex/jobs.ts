@@ -1285,7 +1285,12 @@ async function protectedApprovalAllowsExecution(ctx: any, job: any) {
     && !approvals.some((approval: any) => approval.status === "pending");
 }
 
-export async function projectedDispatchCandidates(ctx: any, now: number, requestedLimit: number) {
+export async function projectedDispatchCandidates(
+  ctx: any,
+  now: number,
+  requestedLimit: number,
+  createdAtFloor?: number,
+) {
   const active = await activeBackgroundRows(ctx, now);
   const available = active.uncertainActiveAuthority
     ? 0
@@ -1329,13 +1334,17 @@ export async function projectedDispatchCandidates(ctx: any, now: number, request
   for (const group of dueGroups) {
     const groupKey = String(group.groupKey);
     if ((activeByGroup.get(groupKey) ?? 0) >= MAX_ACTIVE_PER_WORK_GROUP) continue;
-    const rows = await ctx.db.query("jobRuntime")
+    let pending = ctx.db.query("jobRuntime")
       .withIndex("by_group_dispatch_ready", (q: any) => q
         .eq("schedulingGroupKey", groupKey)
         .eq("status", "pending")
         .eq("schedulingBound", true)
         .eq("dispatchReady", true)
-        .lte("nextRunAt", now))
+        .lte("nextRunAt", now));
+    if (createdAtFloor !== undefined) {
+      pending = pending.filter((q: any) => q.gte(q.field("createdAt"), createdAtFloor));
+    }
+    const rows = await pending
       .order("asc")
       .take(BACKGROUND_CONCURRENCY_LIMIT);
     const executable = rows.filter((candidate: any) => executableRuntimeProjection(candidate)
@@ -1447,8 +1456,8 @@ async function validateSelectedDispatchCandidate(ctx: any, runtime: any, now: nu
   return { job, authority, executionAuthority };
 }
 
-async function runnableCandidates(ctx: any, now: number, requestedLimit: number) {
-  const projected = await projectedDispatchCandidates(ctx, now, requestedLimit);
+async function runnableCandidates(ctx: any, now: number, requestedLimit: number, createdAtFloor?: number) {
+  const projected = await projectedDispatchCandidates(ctx, now, requestedLimit, createdAtFloor);
   const validated = [];
   for (const runtime of projected.selected) {
     const candidate = await validateSelectedDispatchCandidate(ctx, runtime, now);
@@ -1637,6 +1646,7 @@ export const reserveDispatchBatch = mutation({
   args: {
     limit: v.number(),
     reason: v.optional(v.string()),
+    createdAtFloor: v.optional(v.number()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -1644,14 +1654,23 @@ export const reserveDispatchBatch = mutation({
     const now = Date.now();
     const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(a.limit)));
     const reason = a.reason?.trim().replace(/\s+/g, " ").slice(0, 160) || "work-available";
+    if (a.createdAtFloor !== undefined && (
+      !Number.isSafeInteger(a.createdAtFloor)
+      || a.createdAtFloor < 1_700_000_000_000
+      || a.createdAtFloor > now + 5 * 60_000
+    )) throw new Error("createdAtFloor is invalid");
     const reservations: any[] = [];
+    const retryableReceipts = async (status: "reserved" | "reconciling") => {
+      let query = ctx.db.query("dispatchReceipts")
+        .withIndex("by_status_lease", (q: any) => q.eq("status", status).lte("leaseUntil", now));
+      if (a.createdAtFloor !== undefined) {
+        query = query.filter((q: any) => q.gte(q.field("createdAt"), a.createdAtFloor));
+      }
+      return await query.take(limit);
+    };
     const retryable = [
-      ...await ctx.db.query("dispatchReceipts")
-        .withIndex("by_status_lease", (q: any) => q.eq("status", "reconciling").lte("leaseUntil", now))
-        .take(limit),
-      ...await ctx.db.query("dispatchReceipts")
-        .withIndex("by_status_lease", (q: any) => q.eq("status", "reserved").lte("leaseUntil", now))
-        .take(limit),
+      ...await retryableReceipts("reconciling"),
+      ...await retryableReceipts("reserved"),
     ].sort((left: any, right: any) => left.createdAt - right.createdAt);
     const retriedJobs = new Set<string>();
     for (const receipt of retryable) {
@@ -1697,7 +1716,12 @@ export const reserveDispatchBatch = mutation({
       reservations.push(reservation);
       retriedJobs.add(String(receipt.jobId));
     }
-    const candidates = await runnableCandidates(ctx, now, Math.max(0, limit - reservations.length));
+    const candidates = await runnableCandidates(
+      ctx,
+      now,
+      Math.max(0, limit - reservations.length),
+      a.createdAtFloor,
+    );
     const reservedJobs = [];
     for (const candidate of candidates.candidates) {
       const j = candidate.job;

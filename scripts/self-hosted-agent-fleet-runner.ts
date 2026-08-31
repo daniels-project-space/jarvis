@@ -131,9 +131,11 @@ export async function runSelfHostedAgentFleet(): Promise<void> {
             );
             return { id: runId };
           },
-        }));
+        }), config.admitCreatedAtOrAfter);
       },
-      reserve: reserveAgentFleetBatch,
+      reserve: (reason, limit) => reserveAgentFleetBatch(reason, limit, {
+        createdAtFloor: config.admitCreatedAtOrAfter,
+      }),
       runJob: async (reservation: AgentFleetReservation) => {
         if (!liveProbe) throw new Error("self-hosted agent fleet provider proof is unavailable");
         const workerRunId = `selfhost-agent:${config.instanceId}:${randomUUID()}`.slice(0, 120);

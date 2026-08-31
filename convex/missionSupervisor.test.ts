@@ -3605,6 +3605,37 @@ describe("dormant mission supervisor authority", () => {
     expect(returned.has(String(starts[5].missionId))).toBe(false);
   });
 
+  it("does not wake a supervised mission created before the self-hosted activation cutoff", async () => {
+    const t = convexTest(schema, modules);
+    const admission = await testProjectSourceAdmission();
+    const historic = await start(t, "due-before-activation", {
+      projectAdmissions: [admission],
+    });
+    vi.setSystemTime(START_AT + 5 * 60_000);
+    const createdAtFloor = Date.now() - 1;
+    const current = await start(t, "due-after-activation", {
+      projectAdmissions: [admission],
+    });
+    await t.run(async (ctx) => {
+      for (const missionId of [historic.missionId, current.missionId]) {
+        const state = (await ctx.db
+          .query("missionSupervisorState")
+          .withIndex("by_mission", (q) => q.eq("missionId", missionId))
+          .unique())!;
+        await ctx.db.patch(state._id, { state: "ready", nextTickAt: Date.now() - 1 });
+      }
+    });
+
+    const due = await t.query(supervisorApi.dueV1, {
+      limit: MISSION_SUPERVISOR_MAX_DUE,
+      createdAtFloor,
+      workerToken: WORKER,
+    });
+
+    expect(due.map((row: { missionId: Id<"missions"> }) => String(row.missionId)))
+      .toEqual([String(current.missionId)]);
+  });
+
   it("quarantines active supervised states when the supervisor rollout is disabled", async () => {
     const t = convexTest(schema, modules);
     const admission = await testProjectSourceAdmission();

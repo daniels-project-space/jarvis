@@ -111,7 +111,16 @@ describe("Trigger-native agent fleet dispatch", () => {
     ));
     const { reserveAgentFleetBatch } = await import("./agent-fleet-dispatch");
 
-    await expect(reserveAgentFleetBatch("selfhost-daemon", 1)).resolves.toEqual([offered]);
+    await expect(reserveAgentFleetBatch("selfhost-daemon", 1, {
+      createdAtFloor: 1_788_170_000_000,
+    })).resolves.toEqual([offered]);
+    const fetchMock = vi.mocked(fetch);
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(body.args).toMatchObject({
+      reason: "selfhost-daemon",
+      limit: 1,
+      createdAtFloor: 1_788_170_000_000,
+    });
     expect(batchTrigger).not.toHaveBeenCalled();
     expect(createIdempotencyKey).not.toHaveBeenCalled();
   });

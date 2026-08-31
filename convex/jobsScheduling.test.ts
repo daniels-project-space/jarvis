@@ -72,6 +72,35 @@ async function finishReservations(t: SchedulerTest, reservations: Array<{ jobId:
 }
 
 describe("project-group fair reservation authority", () => {
+  it("leaves pre-activation backlog untouched while admitting newer work in the same project group", async () => {
+    const t = convexTest(schema, modules);
+    const oldJobId = await enqueue(t, {
+      missionId: "activation-cutoff",
+      label: "Historic queued work",
+    });
+    vi.setSystemTime(new Date("2026-07-22T12:05:00Z"));
+    const createdAtFloor = Date.now() - 1;
+    const newJobId = await enqueue(t, {
+      missionId: "activation-cutoff",
+      label: "New spoken work",
+    });
+
+    const batch = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 2,
+      reason: "selfhost-activation",
+      createdAtFloor,
+      workerToken: WORKER,
+    });
+
+    expect(batch.reservations.map((reservation) => reservation.jobId)).toEqual([String(newJobId)]);
+    const oldJob = await t.run(async (ctx) => ctx.db.get(oldJobId));
+    expect(oldJob).toMatchObject({ status: "pending" });
+    expect(oldJob).not.toHaveProperty("dispatchId");
+    expect(await t.run(async (ctx) => ctx.db.get(newJobId))).toMatchObject({
+      status: "dispatching",
+    });
+  });
+
   it("binds admitted dynamic machines, holds old workers, and records only Trigger OOM escalation", async () => {
     const t = convexTest(schema, modules);
     const readId = await enqueue(t, { missionId: "mission-bounded-read" });

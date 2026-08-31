@@ -906,6 +906,21 @@ describe("mission supervisor Trigger sweep", () => {
     expect(observed[0]).toEqual(observed[1]);
     expect(observed[0].idempotencyKeyTTL).toBe("1m");
   });
+
+  it("passes an explicit activation cutoff to the durable due query", async () => {
+    const convex = vi.fn(async () => []);
+    const dependencies: MissionSupervisorSweepDependencies = {
+      convex,
+      dispatchTick: vi.fn(async () => ({ id: "unused" })),
+    };
+
+    await expect(runMissionSupervisorSweep(dependencies, 1_788_170_000_000)).resolves
+      .toMatchObject({ due: 0, dispatched: 0 });
+    expect(convex).toHaveBeenCalledWith("query", "missionSupervisor:dueV1", {
+      limit: MISSION_SUPERVISOR_MAX_DUE,
+      createdAtFloor: 1_788_170_000_000,
+    });
+  });
 });
 
 describe("mission supervisor Trigger tick", () => {

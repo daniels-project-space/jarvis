@@ -2606,6 +2606,7 @@ export const controlV1 = mutation({
 export const dueV1 = query({
   args: {
     limit: v.optional(v.number()),
+    createdAtFloor: v.optional(v.number()),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
@@ -2618,28 +2619,36 @@ export const dueV1 = query({
       MISSION_SUPERVISOR_MAX_DUE,
     );
     const now = Date.now();
+    if (args.createdAtFloor !== undefined && (
+      !Number.isSafeInteger(args.createdAtFloor)
+      || args.createdAtFloor < 1_700_000_000_000
+      || args.createdAtFloor > now + 5 * 60_000
+    )) throw new Error("createdAtFloor is invalid");
+    let readyQuery = ctx.db
+      .query("missionSupervisorState")
+      .withIndex("by_state_due", (q) =>
+        q.eq("state", "ready").gt("nextTickAt", 0).lte("nextTickAt", now)
+      );
+    let waitingQuery = ctx.db
+      .query("missionSupervisorState")
+      .withIndex("by_state_due", (q) =>
+        q.eq("state", "waiting").gt("nextTickAt", 0).lte("nextTickAt", now)
+      );
+    let expiredQuery = ctx.db
+      .query("missionSupervisorState")
+      .withIndex("by_state_lease", (q) =>
+        q.eq("state", "leased").gt("leaseUntil", 0).lte("leaseUntil", now)
+      );
+    if (args.createdAtFloor !== undefined) {
+      const createdAtFloor = args.createdAtFloor;
+      readyQuery = readyQuery.filter((q) => q.gte(q.field("createdAt"), createdAtFloor));
+      waitingQuery = waitingQuery.filter((q) => q.gte(q.field("createdAt"), createdAtFloor));
+      expiredQuery = expiredQuery.filter((q) => q.gte(q.field("createdAt"), createdAtFloor));
+    }
     const [ready, waiting, expired] = await Promise.all([
-      ctx.db
-        .query("missionSupervisorState")
-        .withIndex("by_state_due", (q) =>
-          q.eq("state", "ready").gt("nextTickAt", 0).lte("nextTickAt", now)
-        )
-        .order("asc")
-        .take(limit),
-      ctx.db
-        .query("missionSupervisorState")
-        .withIndex("by_state_due", (q) =>
-          q.eq("state", "waiting").gt("nextTickAt", 0).lte("nextTickAt", now)
-        )
-        .order("asc")
-        .take(limit),
-      ctx.db
-        .query("missionSupervisorState")
-        .withIndex("by_state_lease", (q) =>
-          q.eq("state", "leased").gt("leaseUntil", 0).lte("leaseUntil", now)
-        )
-        .order("asc")
-        .take(limit),
+      readyQuery.order("asc").take(limit),
+      waitingQuery.order("asc").take(limit),
+      expiredQuery.order("asc").take(limit),
     ]);
     return [...ready, ...waiting, ...expired]
       .sort((left, right) => {

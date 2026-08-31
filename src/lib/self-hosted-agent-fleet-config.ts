@@ -10,6 +10,7 @@ export type SelfHostedAgentFleetConfig = {
   stateDirectory: string;
   convexUrl: string;
   controllerDeploymentId: string;
+  admitCreatedAtOrAfter: number;
   pollMs: number;
 };
 
@@ -73,6 +74,18 @@ function boundedInteger(raw: string | undefined, fallback: number, minimum: numb
   return value;
 }
 
+function activationCutoff(raw: string | undefined): number {
+  const value = Number(raw);
+  if (
+    !Number.isSafeInteger(value)
+    || value < 1_700_000_000_000
+    || value > Date.now() + 5 * 60_000
+  ) {
+    throw new Error("self-hosted agent fleet admission cutoff is invalid");
+  }
+  return value;
+}
+
 export function readSelfHostedAgentFleetConfig(
   environment: Readonly<Record<string, string | undefined>> = process.env,
   workingDirectory = process.cwd(),
@@ -117,6 +130,9 @@ export function readSelfHostedAgentFleetConfig(
     ),
     convexUrl: convexOrigin(environment),
     controllerDeploymentId,
+    admitCreatedAtOrAfter: activationCutoff(
+      environment.JARVIS_SELF_HOSTED_AGENT_FLEET_NOT_BEFORE_MS,
+    ),
     pollMs: boundedInteger(environment.JARVIS_SELF_HOSTED_AGENT_FLEET_POLL_MS, 2_000, 250, 30_000),
   };
 }

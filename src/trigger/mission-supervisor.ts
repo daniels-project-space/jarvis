@@ -2576,6 +2576,7 @@ export async function runMissionSupervisorTick(
 
 export async function runMissionSupervisorSweep(
   dependencies: MissionSupervisorSweepDependencies,
+  createdAtFloor?: number,
 ): Promise<{
   due: number;
   dispatched: number;
@@ -2591,7 +2592,10 @@ export async function runMissionSupervisorSweep(
     await dependencies.convex(
       "query",
       "missionSupervisor:dueV1",
-      { limit: MISSION_SUPERVISOR_MAX_DUE },
+      {
+        limit: MISSION_SUPERVISOR_MAX_DUE,
+        ...(createdAtFloor === undefined ? {} : { createdAtFloor }),
+      },
     ),
     "due_invalid",
     "Mission supervisor due response is invalid",
@@ -2831,6 +2835,7 @@ function productionSweepDependencies(): MissionSupervisorSweepDependencies {
 
 export async function runMissionSupervisorDeadmanSweep(
   dependenciesFactory: () => MissionSupervisorSweepDependencies = productionSweepDependencies,
+  createdAtFloor?: number,
 ) {
   const mode = missionSupervisorRolloutMode();
   if (mode === "dormant" || mode === "rollback") {
@@ -2855,5 +2860,9 @@ export async function runMissionSupervisorDeadmanSweep(
       launches: [],
     };
   }
-  return { mode, skipped: false, ...(await runMissionSupervisorSweep(dependenciesFactory())) };
+  return {
+    mode,
+    skipped: false,
+    ...(await runMissionSupervisorSweep(dependenciesFactory(), createdAtFloor)),
+  };
 }
