@@ -4703,7 +4703,7 @@ export const authorizeExecutionBoundary = mutation({
       : null;
     const row: any = await ctx.db.get(a.jobId);
     if (!row) return denied("job_missing");
-    if (row.status !== "running") return denied("job_status");
+    if (row.status !== "running") return denied(`job_status_${String(row.status).slice(0, 32)}`);
     if ((row.attempt ?? 1) !== a.expectedAttempt) return denied("attempt_number");
     if (row.workerRunId !== a.workerRunId) return denied("worker_run");
     if (row.dispatchGeneration !== a.dispatchGeneration) return denied("dispatch_generation");
