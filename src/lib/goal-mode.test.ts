@@ -5,6 +5,7 @@ import {
   GOAL_PLAN_RESULT_MAX_CHARS,
   GOAL_VALIDATION_MARKER,
   GOAL_VALIDATOR_TASK_MAX_CHARS,
+  goalPlanContractRepairInstruction,
   goalJobRunnableForMission,
   goalJobMatchesMissionPhase,
   goalBranch,
@@ -48,6 +49,27 @@ const workstream = (value: Record<string, unknown>) => ({
 });
 
 describe("Goal Mode contracts", () => {
+  it("gives mixed-version planners one exact, truthful contract-repair instruction", () => {
+    const repair = goalPlanContractRepairInstruction(
+      new Error("Goal plan requires a measurable outcome contract"),
+      4,
+    );
+
+    expect(repair).toContain("Goal plan requires a measurable outcome contract");
+    expect(repair).toContain(GOAL_PLAN_MARKER);
+    expect(repair).toContain("1-4 necessary workstreams");
+    expect(repair).toContain('"measurementWindow"');
+    expect(repair).toContain('"evidenceSources"');
+    expect(repair).toContain('"stopConditions"');
+    expect(repair).toContain('"process":"hierarchical"');
+    expect(repair).toContain('"manager":"jarvis"');
+    expect(repair).toContain('"deliverable"');
+    expect(repair).toContain('"guardrails"');
+    expect(repair).toContain("do not redo repository or provider discovery");
+    expect(repair).toContain("Do not invent a measured baseline");
+    expect(repair.length).toBeLessThan(4_000);
+  });
+
   it("keeps automatic continuation budgets stage-bounded and explicitly resumable", () => {
     expect(GOAL_AUTOMATIC_ATTEMPT_LIMITS).toEqual({
       planning: 3,

@@ -46,6 +46,7 @@ import {
 import {
   GOAL_PLAN_MARKER,
   GOAL_VALIDATION_MARKER,
+  goalPlanContractRepairInstruction,
   parseGoalPlan,
   parseGoalValidation,
   workResultMaxChars,
@@ -3205,9 +3206,10 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             await checkpointMutation({
               jobId: job.jobId,
               expectedAttempt,
-              checkpoint:
-                `The investigation completed, but the machine contract was invalid: ${String(error).slice(0, 1_000)}\n` +
-                `Preserve the reasoning and return the required marker plus compact valid JSON. Do not redo discovery merely to repair formatting.`,
+              checkpoint: job.goalStage === "planning"
+                ? goalPlanContractRepairInstruction(error, 8)
+                : `The investigation completed, but the machine contract was invalid: ${String(error).slice(0, 1_000)}\n` +
+                  `Preserve the reasoning and return the required marker plus compact valid JSON. Do not redo discovery merely to repair formatting.`,
               checkpointHeadSha: checkpointHeadSha || undefined,
               result: result.slice(0, 4_000),
               branch: branch ?? undefined,

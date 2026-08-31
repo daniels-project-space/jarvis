@@ -1494,6 +1494,80 @@ describe("production Trigger worker authority harness", () => {
     expect(parseGoalPlan(persisted, 8).workstreams).toHaveLength(4);
   });
 
+  it("correction-requeues a legacy planner with the complete current Goal contract", async () => {
+    configureFakeControllerAuthority();
+    const legacyPlan = `${GOAL_PLAN_MARKER}${JSON.stringify({
+      summary: "The repository inspection and durable worker evidence are complete.",
+      route: "existing_project",
+      workstreams: [{
+        id: "validate-lifecycle",
+        label: "Validate lifecycle",
+        task: "Inspect the current repository and report the already observed durable lifecycle evidence.",
+        agentId: "paul",
+        readonly: true,
+        dependsOn: [],
+        acceptanceCriteria: ["Report the observed README heading and durable lifecycle stages"],
+        deliverable: {
+          kind: "research_brief",
+          description: "A concise factual lifecycle validation report",
+          requiredEvidence: ["README heading and source-backed lifecycle stages"],
+        },
+        guardrails: ["Do not change repository or provider state"],
+        mcp: [],
+      }],
+      validation: { criteria: [], tests: [], liveChecks: [] },
+    })}`;
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-legacy-goal-plan-correction",
+      "ultra",
+      {
+        task: "Return the legacy Goal plan using the contract embedded in this old work order.",
+        model: "terra",
+        readonly: true,
+        goalStage: "planning",
+      },
+    );
+    const runProcess = vi.fn(async (input: any) => {
+      await input.turnReceipt.beforeRequest();
+      input.turnReceipt.requestWritten();
+      await input.turnReceipt.accepted();
+      await input.turnReceipt.completed();
+      return {
+        text: legacyPlan,
+        timedOut: false,
+        stopped: null,
+        checkpointLog: "legacy Goal contract emitted after truthful repository inspection",
+        commands: [],
+      };
+    });
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies({ runProcess });
+
+    expect(await invokeHarness(
+      reservation,
+      "legacy-goal-plan-correction-run",
+      dependencies,
+    )).toEqual({ processed: 1 });
+
+    const correction = bridge.trace.find((call) => call.path === "jobs:checkpointAndRequeue");
+    expect(correction).toBeTruthy();
+    const checkpoint = String(correction?.args.checkpoint ?? "");
+    expect(checkpoint).toContain("Goal plan requires a measurable outcome contract");
+    expect(checkpoint).toContain(GOAL_PLAN_MARKER);
+    expect(checkpoint).toContain('"measurementWindow"');
+    expect(checkpoint).toContain('"evidenceSources"');
+    expect(checkpoint).toContain('"stopConditions"');
+    expect(checkpoint).toContain('"process":"hierarchical"');
+    expect(checkpoint).toContain('"deliverable"');
+    expect(checkpoint).toContain("do not redo repository or provider discovery");
+    expect(checkpoint).toContain("Do not invent a measured baseline");
+    expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:markVerifiedForDelivery");
+    const requeued = await t.run(async (ctx) => ctx.db.get(jobId));
+    expect(requeued).toMatchObject({ status: "pending", attempt: 2, goalStage: "planning" });
+  });
+
   it("immediately correction-requeues a structurally valid validator pass rejected by the measurable-outcome gate", async () => {
     configureFakeControllerAuthority();
     const t = convexTest(schema, modules);

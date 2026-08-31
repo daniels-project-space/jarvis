@@ -7,6 +7,7 @@ import { validateWorkDag } from "./workspace-protocol";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
+export const GOAL_PLAN_CONTRACT_SHAPE = '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"outcome":{"objective":"...","metric":"one primary metric","baseline":"current measured state/source","target":"observable threshold","measurementWindow":"...","evidenceSources":["authoritative source"],"stopConditions":["condition that ends work"]},"crew":{"process":"hierarchical","manager":"jarvis","delegationRules":["only necessary specialists"],"humanEscalation":["protected decision only after independent work"],"reportingCadence":"event-driven checkpoints; no idle polling"},"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|chloe|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"deliverable":{"kind":"code_change|research_brief|creative_artifact|operational_result|decision_brief","description":"exact output","requiredEvidence":["proof"]},"guardrails":["explicit boundary"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}';
 // The planner is asked to stay below 7,500 characters, but the durable
 // boundary must not corrupt an otherwise valid contract when a model exceeds
 // that soft prompt budget by a small amount. The runner persists only the
@@ -20,6 +21,24 @@ export function workResultMaxChars(goalStage: unknown) {
   return goalStage === "planning"
     ? GOAL_PLAN_RESULT_MAX_CHARS
     : WORK_RESULT_MAX_CHARS;
+}
+
+export function goalPlanContractRepairInstruction(
+  error: unknown,
+  maxBuildSessions = 6,
+): string {
+  const limit = Math.max(1, Math.min(8, Math.floor(maxBuildSessions || 6)));
+  const reason = String(error).replace(/\s+/g, " ").trim().slice(0, 1_000)
+    || "The Goal plan contract was rejected";
+  return [
+    "Your prior investigation is complete, but its machine contract was rejected.",
+    `Rejection: ${reason}`,
+    "Repair the contract only. Preserve the prior truthful reasoning and evidence; do not redo repository or provider discovery merely to repair formatting.",
+    `Return exactly one compact JSON object after ${GOAL_PLAN_MARKER}. Include every top-level field shown below and 1-${limit} necessary workstreams.`,
+    "The outcome must include objective, metric, baseline, target, measurementWindow, evidenceSources, and stopConditions. The crew must use process \"hierarchical\", manager \"jarvis\", delegationRules, humanEscalation, and reportingCadence. Every workstream must include a concrete task, acceptanceCriteria, structured deliverable with requiredEvidence, and guardrails. Validation must include criteria, tests, and liveChecks.",
+    "Do not invent a measured baseline, target, evidence source, completed check, or provider fact. If something was not observed, describe that limitation truthfully while keeping the contract structurally complete.",
+    GOAL_PLAN_CONTRACT_SHAPE,
+  ].join("\n\n");
 }
 
 // A model segment is already 15 minutes for Luna/Terra and 25 minutes for Sol.
@@ -673,7 +692,7 @@ export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: 
     `Create only the ${maxBuildSessions === 1 ? "single necessary" : `1-${maxBuildSessions} necessary`} workstream${maxBuildSessions === 1 ? "" : "s"}; never add a ceremonial specialist merely to make a larger crew. Assign Paul to engineering/integration, Atlas to evidence research, Iris to media/visual quality, Maya to travel/calendar work, Chloe to social/content operations, and Sentry to reliability/security review. Give each workstream one structured deliverable, required evidence and explicit guardrails. Repository work intentionally runs in an isolated provider workspace: never invent "no provider workspace was opened" as a stop condition. A specialist receives its immutable task, controller-bound source identity, allowed tools, and verified upstream handoffs; it cannot query arbitrary live mission/job, workEvent, workAttempt, or post-exit lifecycle rows. Never put those controller-only predicates in a specialist task, deliverable, or definition of done. Reserve them for the server-captured final validation audit. Do not require a specialist to prove its own current progress record. Do not require a specialist to prove its own post-exit provider-workspace termination. Express only real ordering requirements as dependsOn edges; verified upstream outputs become the dependent worker's context. Continue reversible independent work before escalating, and ask Daniel only for the smallest genuinely protected decision. Once every stop condition is proved, stop the crew and leave no polling worker running merely to look busy.`,
     `When quality defects are found, fix their generation, render, configuration, or data root cause; detection filters are secondary regression guards and a rejection-only gate does not satisfy the outcome. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
     "End with exactly one compact JSON object after GOAL_PLAN_JSON:. It must use this shape:",
-    '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"outcome":{"objective":"...","metric":"one primary metric","baseline":"current measured state/source","target":"observable threshold","measurementWindow":"...","evidenceSources":["authoritative source"],"stopConditions":["condition that ends work"]},"crew":{"process":"hierarchical","manager":"jarvis","delegationRules":["only necessary specialists"],"humanEscalation":["protected decision only after independent work"],"reportingCadence":"event-driven checkpoints; no idle polling"},"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|chloe|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"deliverable":{"kind":"code_change|research_brief|creative_artifact|operational_result|decision_brief","description":"exact output","requiredEvidence":["proof"]},"guardrails":["explicit boundary"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
+    GOAL_PLAN_CONTRACT_SHAPE,
     "The JSON is a machine contract. Keep the whole response and JSON concise enough to fit in 7,500 characters.",
   ].filter(Boolean).join("\n\n");
 }
