@@ -7,6 +7,7 @@ const mock = vi.hoisted(() => ({
   controlActor: vi.fn(),
   getSecret: vi.fn(),
   hasConfidentSpeechSegments: vi.fn(),
+  hasStrongClientSpeechEvidence: vi.fn(),
 }));
 
 vi.mock("@/lib/request-auth", () => ({ controlActor: mock.controlActor }));
@@ -15,6 +16,7 @@ vi.mock("@/lib/sttvocab", () => ({ STT_PROMPT: "Jarvis, Daniel, Codex" }));
 vi.mock("@/lib/transcript", () => ({
   cleanSpeechTranscript: (text: string) => text.trim(),
   hasConfidentSpeechSegments: mock.hasConfidentSpeechSegments,
+  hasStrongClientSpeechEvidence: mock.hasStrongClientSpeechEvidence,
   isMeaningfulSpeechTranscript: (text: string) => Boolean(text),
   shouldIgnoreHandsFreeTranscript: () => false,
 }));
@@ -39,6 +41,12 @@ describe("resilient STT route", () => {
     vi.stubEnv("GROQ_API_KEY", "");
     mock.controlActor.mockResolvedValue({ kind: "owner" });
     mock.hasConfidentSpeechSegments.mockImplementation((segments: unknown) => Array.isArray(segments) && segments.length > 0);
+    mock.hasStrongClientSpeechEvidence.mockImplementation((evidence: { acceptedFrames?: number; speechSpanMs?: number; peakVoiceMargin?: number } | null) => Boolean(
+      evidence
+      && Number(evidence.acceptedFrames) >= 5
+      && Number(evidence.speechSpanMs) >= 320
+      && Number(evidence.peakVoiceMargin) >= 7,
+    ));
     mock.getSecret.mockImplementation(async (_service: string, name: string) => ({
       LOCAL_STT_URL: localSttUrl,
       LOCAL_STT_SHARED_SECRET: "shared-secret",
@@ -242,5 +250,33 @@ describe("resilient STT route", () => {
     await expect(response.json()).resolves.toEqual({ text: "" });
     expect(response.headers.get("x-jarvis-stt-provider")).toBe("local-faster-whisper");
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a live private transcript when sustained browser VAD corroborates the speaker", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json({
+      text: "Jarvis start the team",
+      segments: [{ start: 0, end: 1, avg_logprob: -0.84, no_speech_prob: 0.08 }],
+    }));
+    mock.hasConfidentSpeechSegments.mockReturnValue(false);
+    vi.stubGlobal("fetch", fetcher);
+
+    const response = await POST(request({
+      method: "POST",
+      headers: {
+        "content-type": "audio/webm",
+        "x-jarvis-continuous-live": "1",
+        "x-jarvis-voice-frames": "8",
+        "x-jarvis-speech-span-ms": "810",
+        "x-jarvis-peak-voice-margin": "12",
+      },
+      body: new Uint8Array(2_100),
+    }));
+
+    await expect(response.json()).resolves.toEqual({ text: "Jarvis start the team" });
+    expect(mock.hasStrongClientSpeechEvidence).toHaveBeenCalledWith({
+      acceptedFrames: 8,
+      speechSpanMs: 810,
+      peakVoiceMargin: 12,
+    });
   });
 });

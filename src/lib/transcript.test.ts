@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   cleanSpeechTranscript,
   hasConfidentSpeechSegments,
+  hasStrongClientSpeechEvidence,
   isMeaningfulSpeechTranscript,
   isRecentVoiceDuplicate,
   shouldIgnoreHandsFreeTranscript,
@@ -13,6 +14,13 @@ describe("cleanSpeechTranscript", () => {
       .toBe("Hey, how are you?");
     expect(cleanSpeechTranscript("Can you investigate this shell issue, please? Can you investigate this shell issue, please?"))
       .toBe("Can you investigate this shell issue, please?");
+  });
+
+  it("corroborates sustained near-field live speech without trusting weak noise", () => {
+    expect(hasStrongClientSpeechEvidence({ acceptedFrames: 6, speechSpanMs: 540, peakVoiceMargin: 11 })).toBe(true);
+    expect(hasStrongClientSpeechEvidence({ acceptedFrames: 4, speechSpanMs: 540, peakVoiceMargin: 11 })).toBe(false);
+    expect(hasStrongClientSpeechEvidence({ acceptedFrames: 6, speechSpanMs: 240, peakVoiceMargin: 11 })).toBe(false);
+    expect(hasStrongClientSpeechEvidence({ acceptedFrames: 6, speechSpanMs: 540, peakVoiceMargin: 4 })).toBe(false);
   });
 
   it("handles three repeated STT segments", () => {

@@ -41,6 +41,19 @@ export type ClientSpeechEvidence = {
   peakVoiceMargin: number;
 };
 
+/**
+ * The private recognizer can be conservative on an ordinary laptop or phone
+ * microphone even after the browser has observed a sustained near-field
+ * voice. This corroboration is intentionally unavailable to arbitrary uploads:
+ * only continuous live capture sends all three bounded VAD measurements.
+ */
+export function hasStrongClientSpeechEvidence(evidence?: ClientSpeechEvidence | null): boolean {
+  if (!evidence) return false;
+  return evidence.acceptedFrames >= 5
+    && evidence.speechSpanMs >= 320
+    && evidence.peakVoiceMargin >= 7;
+}
+
 const HANDS_FREE_ACKNOWLEDGEMENT =
   /^(?:thank you|thanks|thank you very much|thanks very much|cheers)$/i;
 const COMMON_WHISPER_GHOST =

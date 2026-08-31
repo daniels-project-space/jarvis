@@ -4,6 +4,7 @@ import { STT_PROMPT } from "@/lib/sttvocab";
 import {
   cleanSpeechTranscript,
   hasConfidentSpeechSegments,
+  hasStrongClientSpeechEvidence,
   isMeaningfulSpeechTranscript,
   shouldIgnoreHandsFreeTranscript,
 } from "@/lib/transcript";
@@ -176,19 +177,24 @@ export async function POST(req: NextRequest) {
       },
     }, { status: retryable ? 502 : 503 });
   }
-  let text = transcription.confidentSpeech ? cleanSpeechTranscript(transcription.text) : "";
+  const continuousLive = req.headers.get("x-jarvis-continuous-live") === "1";
+  const numberHeader = (name: string) => {
+    const value = Number(req.headers.get(name));
+    return Number.isFinite(value) ? Math.max(0, value) : 0;
+  };
+  const clientSpeechEvidence = continuousLive ? {
+    acceptedFrames: numberHeader("x-jarvis-voice-frames"),
+    speechSpanMs: numberHeader("x-jarvis-speech-span-ms"),
+    peakVoiceMargin: numberHeader("x-jarvis-peak-voice-margin"),
+  } : null;
+  // A strong browser VAD signal may corroborate a useful private transcript
+  // that narrowly missed Whisper's segment threshold. Silence/untrusted file
+  // uploads still require the original server-side segment confidence.
+  let text = transcription.confidentSpeech || hasStrongClientSpeechEvidence(clientSpeechEvidence)
+    ? cleanSpeechTranscript(transcription.text)
+    : "";
 
-  if (req.headers.get("x-jarvis-continuous-live") === "1") {
-    const numberHeader = (name: string) => {
-      const value = Number(req.headers.get(name));
-      return Number.isFinite(value) ? Math.max(0, value) : 0;
-    };
-    if (shouldIgnoreHandsFreeTranscript(text, {
-      acceptedFrames: numberHeader("x-jarvis-voice-frames"),
-      speechSpanMs: numberHeader("x-jarvis-speech-span-ms"),
-      peakVoiceMargin: numberHeader("x-jarvis-peak-voice-margin"),
-    })) text = "";
-  }
+  if (continuousLive && shouldIgnoreHandsFreeTranscript(text, clientSpeechEvidence)) text = "";
 
   // Foreign-script junk on noise never reaches the brain (an English speaker's
   // real words are overwhelmingly Latin).
