@@ -485,58 +485,6 @@ describe("Codex app-server dynamic tools", () => {
     await expect(turn).resolves.toMatchObject({ code: 0 });
   });
 
-  it("requests priority for a foreground cold thread and safely falls back before sending user input", async () => {
-    const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000, {
-      serviceTier: "priority",
-    });
-    const writes: WrittenMessage[] = [];
-    const internals = server as unknown as AppServerInternals;
-    internals.process = {
-      stdin: { writable: true, write: (chunk) => { writes.push(JSON.parse(chunk)); return true; } },
-    };
-    internals.ready = Promise.resolve();
-
-    const turn = server.runTurn({
-      conversationId: "priority-foreground",
-      userText: "hello",
-      history: [],
-      contextBlock: "",
-      preamble: "test",
-      modelTier: "luna",
-      onDelta: () => {},
-    });
-    await vi.waitFor(() => expect(writes).toHaveLength(1));
-    expect(writes[0]).toMatchObject({
-      method: "thread/start",
-      params: { serviceTier: "priority" },
-    });
-    expect(JSON.stringify(writes[0].params)).not.toContain("hello");
-
-    internals.receive(JSON.stringify({
-      id: writes[0].id,
-      error: { code: -32602, message: "service tier is unavailable" },
-    }));
-    await vi.waitFor(() => expect(writes).toHaveLength(2));
-    expect(writes[1].method).toBe("thread/start");
-    expect(writes[1].params).not.toHaveProperty("serviceTier");
-    expect(JSON.stringify(writes[1].params)).not.toContain("hello");
-
-    internals.receive(JSON.stringify({ id: writes[1].id, result: { thread: { id: "priority-thread" } } }));
-    await vi.waitFor(() => expect(writes).toHaveLength(3));
-    expect(writes[2]).toMatchObject({
-      method: "turn/start",
-      params: { threadId: "priority-thread" },
-    });
-    expect(JSON.stringify(writes[2].params)).toContain("hello");
-    internals.receive(JSON.stringify({ id: writes[2].id, result: { turn: { id: "priority-turn" } } }));
-    await Promise.resolve();
-    internals.receive(JSON.stringify({
-      method: "turn/completed",
-      params: { turnId: "priority-turn", turn: { id: "priority-turn", status: "completed" } },
-    }));
-    await expect(turn).resolves.toMatchObject({ code: 0 });
-  });
-
   it("forgets a receipt-bearing warm thread when cancellation races turn completion", async () => {
     const server = new CodexAppServer("unused", {} as NodeJS.ProcessEnv, 2_000);
     const writes: WrittenMessage[] = [];

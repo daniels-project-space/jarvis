@@ -600,7 +600,6 @@ export async function processChatQueue(
       dynamicTools: JARVIS_DYNAMIC_TOOLS,
       dynamicToolsOnly: true,
       ephemeral: true,
-      serviceTier: "priority",
       onDynamicToolCall: (call) => bridge.invoke(call),
       onAuthConsumed: () => consumeSubscriptionAuth(serverEnv),
     });
