@@ -49,7 +49,7 @@ vi.mock("@/lib/viewer-session", () => ({
 vi.mock("convex/react", () => ({ usePaginatedQuery: () => ({ results: [], status: "Exhausted", loadMore: vi.fn() }) }));
 vi.mock("next/dynamic", () => ({ default: () => () => <div data-orb-renderer /> }));
 
-import JarvisUI from "./JarvisUI";
+import { AssistantApprovalCards, assistantApprovalPresentation } from "./JarvisUI";
 
 afterEach(() => {
   viewer.guest = false;
@@ -57,7 +57,11 @@ afterEach(() => {
 
 describe("Gmail send approval message", () => {
   it("hides the signed receipt and renders the explicit owner send control", () => {
-    const markup = renderToStaticMarkup(<JarvisUI />);
+    const approval = assistantApprovalPresentation(assistantRow.text);
+    const markup = renderToStaticMarkup(<>
+      <span>{approval.visibleText}</span>
+      <AssistantApprovalCards guest={false} {...approval} />
+    </>);
 
     expect(markup).toContain("I prepared the Gmail draft for your review.");
     expect(markup).toContain("data-gmail-send-approval");
@@ -69,7 +73,11 @@ describe("Gmail send approval message", () => {
 
   it("never renders a Gmail send control for a guest session", () => {
     viewer.guest = true;
-    const markup = renderToStaticMarkup(<JarvisUI />);
+    const approval = assistantApprovalPresentation(assistantRow.text);
+    const markup = renderToStaticMarkup(<>
+      <span>{approval.visibleText}</span>
+      <AssistantApprovalCards guest {...approval} />
+    </>);
 
     expect(markup).not.toContain("data-gmail-send-approval");
     expect(markup).not.toContain("Send approved email");

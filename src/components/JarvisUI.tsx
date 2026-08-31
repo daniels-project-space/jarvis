@@ -367,7 +367,15 @@ function ChatHistoryArchive({ threadId }: { threadId: string }) {
   </section>;
 }
 
-function ICloudCalendarApprovalCard({ token }: { token: string }) {
+export function assistantApprovalPresentation(text: string) {
+  return {
+    visibleText: stripAssistantApprovals(text),
+    iCloudCalendarApprovalToken: extractICloudCalendarApproval(text),
+    gmailSendApprovalToken: extractGmailSendApproval(text),
+  };
+}
+
+export function ICloudCalendarApprovalCard({ token }: { token: string }) {
   const [state, setState] = useState<ICloudCalendarApprovalCardState>("ready");
   const [detail, setDetail] = useState("");
 
@@ -424,7 +432,7 @@ function ICloudCalendarApprovalCard({ token }: { token: string }) {
   );
 }
 
-function GmailSendApprovalCard({ token }: { token: string }) {
+export function GmailSendApprovalCard({ token }: { token: string }) {
   const [state, setState] = useState<"ready" | "sending" | "completed" | "error">("ready");
   const [detail, setDetail] = useState("");
 
@@ -471,6 +479,22 @@ function GmailSendApprovalCard({ token }: { token: string }) {
       )}
     </div>
   );
+}
+
+export function AssistantApprovalCards({
+  guest,
+  iCloudCalendarApprovalToken,
+  gmailSendApprovalToken,
+}: {
+  guest: boolean;
+  iCloudCalendarApprovalToken: string | null;
+  gmailSendApprovalToken: string | null;
+}) {
+  if (guest) return null;
+  return <>
+    {iCloudCalendarApprovalToken && <ICloudCalendarApprovalCard token={iCloudCalendarApprovalToken} />}
+    {gmailSendApprovalToken && <GmailSendApprovalCard token={gmailSendApprovalToken} />}
+  </>;
 }
 
 // One speaking tab per Daniel — everyone else stays quiet (voice election).
@@ -1623,6 +1647,22 @@ export function activeVoiceActionSurface(args: {
   return null;
 }
 
+export function compactChatDockExpanded(args: {
+  hovered: boolean;
+  focused: boolean;
+  hasDraft: boolean;
+  sending: boolean;
+  attachedFileCount: number;
+  needsAttention: boolean;
+}): boolean {
+  return args.hovered
+    || args.focused
+    || args.hasDraft
+    || args.sending
+    || args.attachedFileCount > 0
+    || args.needsAttention;
+}
+
 export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const orbMotionRef = useRef<OrbMotionFrame>(createOrbMotionFrame());
   const viewerToken = useViewerSession();
@@ -2574,13 +2614,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   // Chat presence: full column ↔ floating type bar ↔ hidden ("zen"). Zen keeps
   // JARVIS always listening (wake word forced on) with no chrome in the way.
   const [chatMode, setChatModeRaw] = useState<"full" | "bar" | "off">("bar");
-  const chatModeRef = useRef<"full" | "bar" | "off">("full");
+  const chatModeRef = useRef<"full" | "bar" | "off">("bar");
+  const [chatDockHovered, setChatDockHovered] = useState(false);
+  const [chatDockFocused, setChatDockFocused] = useState(false);
   const setChatMode = (m: "full" | "bar" | "off", persist = true) => {
     chatModeRef.current = m;
     setChatModeRaw(m);
     if (persist) {
       try {
-        localStorage.setItem("jarvis_chat_mode", m);
+        // The detailed conversation is an intentional, temporary expansion.
+        // A reload returns to the compact dock instead of restoring old chrome.
+        localStorage.setItem("jarvis_chat_mode", m === "full" ? "bar" : m);
       } catch {
         /* private mode */
       }
@@ -2593,7 +2637,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     }
     try {
       const saved = localStorage.getItem("jarvis_chat_mode");
-      if (saved === "bar" || saved === "off" || saved === "full") setChatMode(saved, false);
+      if (saved === "off") setChatMode("off", false);
+      else setChatMode("bar", false);
     } catch {
       /* private mode */
     }
@@ -5669,6 +5714,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const voiceRecoveryVisible = ttsRuntimeStatus === "blocked" || voiceReplayReady;
   const voiceAction = voiceActionPresentation({ live, recording, speaking, wakeReady: wake });
   const voiceActionSurface = activeVoiceActionSurface({ embedded, chatMode });
+  const chatDockExpanded = compactChatDockExpanded({
+    hovered: chatDockHovered,
+    focused: chatDockFocused,
+    hasDraft: Boolean(input.trim()),
+    sending,
+    attachedFileCount: pendingFileIds.length + selectedFileIds.length,
+    needsAttention: foregroundRecoveryVisible || voiceRecoveryVisible,
+  });
   const runVoiceAction = () => {
     if (voiceAction.action === "interrupt") {
       stopTalking();
@@ -5698,6 +5751,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
   const overlayUp = !!panel && !panelMin;
   const fullBleed = overlayUp && (panelFull || !panelRoute?.keepOrbVisible);
   const compactAside = overlayUp && !fullBleed && panel!.type !== "video";
+  const fullChatVisible = chatMode === "full" && !panelFull && !overlayUp;
   const workMapHidden = shouldHideWorkMap({
     chatMode,
     live,
@@ -6103,7 +6157,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       <div className={`relative mx-auto flex w-full flex-1 flex-col overflow-clip p-3 pt-2 sm:p-4 ${chatMode === "bar" ? "pb-24" : ""}`}>
         {/* the stage is ALWAYS full-bleed; the chat floats over it and slides
             away on pure transforms — compositor-only, 120fps-smooth */}
-        <div ref={stageRef} className={`brackets relative min-h-0 flex-1 transition-[margin] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${chatMode === "full" ? "xl:mr-[416px]" : ""}`}>
+        <div ref={stageRef} className={`brackets relative min-h-0 flex-1 transition-[margin] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${fullChatVisible ? "xl:mr-[416px]" : ""}`}>
           <span className="bk" />
           {/* orbit bubbles — demoted panels bobbing beside the orb */}
           {bubbles.length > 0 && (!panel || panelMin) && (
@@ -6258,14 +6312,10 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
 
         {/* conversation panel — on PHONES it's a bottom sheet (orb stays visible
             above it, keyboard pushes it up naturally); on desktop it floats over
-            the stage's right edge. Both slide on pure transforms. */}
-        <div
-          className={`absolute inset-x-1 bottom-1 top-[34dvh] z-30 will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] xl:inset-x-auto xl:bottom-2 xl:right-4 xl:top-2 xl:w-[min(400px,45vw)] ${overlayUp ? "max-xl:pointer-events-none max-xl:translate-y-[calc(100%+24px)] max-xl:opacity-0" : ""} ${
-            chatMode === "full"
-              ? "translate-x-0 translate-y-0 opacity-100"
-              : "pointer-events-none translate-y-[calc(100%+24px)] opacity-0 xl:translate-x-[calc(100%+32px)] xl:translate-y-0"
-          }`}
-        >
+            the stage's right edge. It is absent, not merely transparent, when
+            another surface owns the controls. */}
+        {fullChatVisible && (
+        <div className="absolute inset-x-1 bottom-1 top-[34dvh] z-30 will-change-transform motion-reduce:transition-none xl:inset-x-auto xl:bottom-2 xl:right-4 xl:top-2 xl:w-[min(400px,45vw)]">
         <div className="glass flex h-full w-full flex-col overflow-hidden rounded-2xl">
           <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1.5">
             <button
@@ -6295,12 +6345,11 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               .slice(-20)
               .map((m) => {
                 if (m.role === "assistant" && m.text) {
-                  const iCloudCalendarApprovalToken = extractICloudCalendarApproval(m.text);
-                  const gmailSendApprovalToken = extractGmailSendApproval(m.text);
+                  const approval = assistantApprovalPresentation(m.text);
                   const visibleText = isToolGarbage(m.text)
-                    ? sanitizeAssistantText(m.text)
-                    : stripAssistantApprovals(m.text);
-                  return { ...m, text: visibleText, iCloudCalendarApprovalToken, gmailSendApprovalToken };
+                    ? sanitizeAssistantText(approval.visibleText)
+                    : approval.visibleText;
+                  return { ...m, text: visibleText, ...approval };
                 }
                 if (m.role === "user" && m.text) {
                   return { ...m, text: visibleTurnText(m.text), iCloudCalendarApprovalToken: null, gmailSendApprovalToken: null };
@@ -6344,11 +6393,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                       ))}
                   </span>
                 </GuestSafeAttachment>
-                {m.role === "assistant" && !guest && m.iCloudCalendarApprovalToken && (
-                  <ICloudCalendarApprovalCard token={m.iCloudCalendarApprovalToken} />
-                )}
-                {m.role === "assistant" && !guest && m.gmailSendApprovalToken && (
-                  <GmailSendApprovalCard token={m.gmailSendApprovalToken} />
+                {m.role === "assistant" && (
+                  <AssistantApprovalCards
+                    guest={guest}
+                    iCloudCalendarApprovalToken={m.iCloudCalendarApprovalToken}
+                    gmailSendApprovalToken={m.gmailSendApprovalToken}
+                  />
                 )}
                 {m.role === "user" && <MessageFileBadges files={m.files} align="right" />}
                 {m.role === "assistant" && m.model && (
@@ -6473,6 +6523,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           </div>
         </div>
         </div>
+        )}
       </div>
 
       {/* the video window — never remounts, morphs stage ↔ picture-in-picture */}
@@ -6502,16 +6553,15 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       )}
 
       {/* threads drawer — chat history in a slide-out */}
+      {drawerOpen && (
       <div
-        className={`fixed inset-0 z-50 transition-opacity duration-300 ${drawerOpen ? "opacity-100" : "pointer-events-none opacity-0"}`}
+        className="fixed inset-0 z-50 opacity-100"
         onClick={() => setDrawerOpen(false)}
       >
         <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
         <div
           onClick={(e) => e.stopPropagation()}
-          className={`glass absolute left-0 top-0 flex h-full w-[300px] flex-col rounded-r-2xl transition-transform duration-300 ease-out ${
-            drawerOpen ? "translate-x-0" : "-translate-x-full"
-          }`}
+          className="glass absolute left-0 top-0 flex h-full w-[300px] translate-x-0 flex-col rounded-r-2xl"
         >
           <div className="flex items-center justify-between border-b border-white/5 px-4 py-3">
             <span className="hud-label !text-cyan">chats</span>
@@ -6556,14 +6606,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           </div>
         </div>
       </div>
+      )}
 
       {/* bar mode: chat collapsed to a floating type bar — the screen gets the room */}
-      {!panelFull && (
+      {chatMode === "bar" && !panelFull && (
         <div
-          tabIndex={0}
-          className={`group safe-floating-bottom fixed inset-x-0 z-40 mx-auto overflow-visible will-change-transform motion-reduce:transition-none transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${input.trim() || sending || pendingFileIds.length || selectedFileIds.length ? "w-[min(94vw,680px)]" : "w-12 hover:w-[min(94vw,680px)] focus-within:w-[min(94vw,680px)]"} ${
-            chatMode === "bar" ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-28 opacity-0"
-          }`}
+          data-jarvis-chat-dock={chatDockExpanded ? "expanded" : "compact"}
+          onPointerEnter={() => setChatDockHovered(true)}
+          onPointerLeave={() => setChatDockHovered(false)}
+          onFocusCapture={() => setChatDockFocused(true)}
+          onBlurCapture={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setChatDockFocused(false);
+          }}
+          className={`safe-floating-bottom fixed inset-x-0 z-40 mx-auto overflow-visible will-change-transform motion-reduce:transition-none transition-[width] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${chatDockExpanded ? "w-[min(94vw,680px)]" : "w-12"}`}
         >
           {foregroundRecoveryVisible && (
             <div className="mx-auto mb-1 flex w-fit items-center gap-2 rounded-full border border-amber/20 bg-black/75 px-3 py-1 text-[11px] text-slate backdrop-blur">
@@ -6611,7 +6666,8 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
               </button>
             )}
-            <div className={`flex min-w-0 flex-1 items-stretch gap-1 transition-opacity duration-200 ${input.trim() || sending || pendingFileIds.length || selectedFileIds.length ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}>
+            {chatDockExpanded && (
+            <div className="flex min-w-0 flex-1 items-stretch gap-1 opacity-100">
               <button
                 onClick={() => setChatMode("full")}
                 title="Open conversations and files"
@@ -6659,21 +6715,22 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 ↑
               </button>
             </div>
+            )}
           </div>
         </div>
       )}
 
       {/* Hidden-chat mode keeps one unobtrusive state dot for recovery. */}
+      {chatMode === "off" && !panelFull && (
       <button
         onClick={() => speaking ? stopTalking() : setChatMode("bar")}
         aria-label={speaking ? "Stop Jarvis speaking" : "Show Jarvis chat controls"}
-        className={`glass fixed bottom-4 right-4 z-40 grid h-9 w-9 place-items-center rounded-full text-slate will-change-transform motion-reduce:transition-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:text-ice ${
-          chatMode === "off" && !panelFull ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-20 opacity-0"
-        }`}
+        className="glass fixed bottom-4 right-4 z-40 grid h-9 w-9 place-items-center rounded-full text-slate hover:text-ice"
         title={speaking ? "Stop speaking" : "Show chat"}
       >
         <span className={`h-1.5 w-1.5 rounded-full ${speaking ? "bg-red-300 animate-pulse" : live === "live" ? "bg-cyan animate-pulse" : wake ? "bg-cyan breathe" : "bg-slate"}`} />
       </button>
+      )}
 
       {/* full-screen viewport — keeps a floating composer so Daniel can still talk */}
       {panel && panelFull && (
@@ -6691,11 +6748,16 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             />
           </div>
           <div className="mx-auto mt-3 flex w-full max-w-2xl gap-2">
-            {(speaking || (live === "live" && caption?.who === "jarvis")) && (
-              <button onClick={stopTalking} className="shrink-0 rounded-xl bg-red-500/15 px-3 text-sm text-red-300 ring-1 ring-red-500/40">
-                hush
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={runVoiceAction}
+              title={voiceAction.title}
+              aria-label={voiceAction.ariaLabel}
+              data-jarvis-voice-action={voiceAction.action}
+              className={`grid w-10 shrink-0 place-items-center rounded-xl text-sm ring-1 transition ${voiceActionTone}`}
+            >
+              <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
+            </button>
             {live === "live" && caption ? (
               <span className={`glass min-w-0 flex-1 truncate rounded-xl px-4 py-2.5 text-sm ${caption.who === "you" ? "text-amber" : "text-cyan"}`}>
                 {caption.text}

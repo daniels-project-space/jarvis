@@ -57,7 +57,9 @@ vi.mock("next/dynamic", () => ({
 }));
 
 import Home from "../app/page";
-import JarvisUI, { activeVoiceActionSurface, MessageFileBadges, safeEmbeddedMessageText, Viewport, voiceActionPresentation } from "./JarvisUI";
+import { GuestSafeAttachment } from "./GuestSafeAttachment";
+import JarvisUI, { activeVoiceActionSurface, compactChatDockExpanded, MessageFileBadges, safeEmbeddedMessageText, Viewport, voiceActionPresentation } from "./JarvisUI";
+import { GuestChatFileAccess } from "./chat-files/GuestChatFileAccess";
 
 describe("guest Home application render", () => {
   it("uses one stateful voice action instead of competing live and microphone controls", () => {
@@ -85,8 +87,42 @@ describe("guest Home application render", () => {
     expect(activeVoiceActionSurface({ embedded: false, chatMode: "off" })).toBeNull();
   });
 
-  it("keeps text visible while suppressing a legacy persistent card in the actual page tree", () => {
+  it("keeps the default dock genuinely compact until interaction or useful state needs it", () => {
+    const idle = {
+      hovered: false,
+      focused: false,
+      hasDraft: false,
+      sending: false,
+      attachedFileCount: 0,
+      needsAttention: false,
+    };
+    expect(compactChatDockExpanded(idle)).toBe(false);
+    expect(compactChatDockExpanded({ ...idle, hovered: true })).toBe(true);
+    expect(compactChatDockExpanded({ ...idle, focused: true })).toBe(true);
+    expect(compactChatDockExpanded({ ...idle, hasDraft: true })).toBe(true);
+    expect(compactChatDockExpanded({ ...idle, needsAttention: true })).toBe(true);
+
     const markup = renderToStaticMarkup(<Home />);
+    expect(markup).toContain('data-jarvis-chat-dock="compact"');
+    expect(markup.match(/data-jarvis-voice-action=/g)).toHaveLength(1);
+    expect(markup).not.toContain('title="chat history"');
+    expect(markup).not.toContain('placeholder="Talk to me…"');
+    expect(markup).not.toContain('aria-label="Open conversations and files"');
+  });
+
+  it("keeps guest text visible while suppressing a legacy persistent card", () => {
+    const markup = renderToStaticMarkup(
+      <>
+        <GuestSafeAttachment
+          guest
+          attachment={legacyGuestRow.attachment}
+          renderAttachment={(attachment) => <img src={attachment.value} alt={attachment.title} />}
+        >
+          <span>{legacyGuestRow.text}</span>
+        </GuestSafeAttachment>
+        <GuestChatFileAccess embedded={false} onRequestOwnerAccess={() => undefined} />
+      </>,
+    );
 
     expect(markup).toContain("This text remains visible to the guest.");
     expect(markup).toContain('id="jarvis-attachment-trigger"');

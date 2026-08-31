@@ -49,7 +49,7 @@ vi.mock("@/lib/viewer-session", () => ({
 vi.mock("convex/react", () => ({ usePaginatedQuery: () => ({ results: [], status: "Exhausted", loadMore: vi.fn() }) }));
 vi.mock("next/dynamic", () => ({ default: () => () => <div data-orb-renderer /> }));
 
-import JarvisUI from "./JarvisUI";
+import { AssistantApprovalCards, assistantApprovalPresentation } from "./JarvisUI";
 
 afterEach(() => {
   viewer.guest = false;
@@ -57,7 +57,11 @@ afterEach(() => {
 
 describe("iCloud Calendar approval message", () => {
   it("hides the signed receipt and renders the explicit owner approval control", () => {
-    const markup = renderToStaticMarkup(<JarvisUI />);
+    const approval = assistantApprovalPresentation(assistantRow.text);
+    const markup = renderToStaticMarkup(<>
+      <span>{approval.visibleText}</span>
+      <AssistantApprovalCards guest={false} {...approval} />
+    </>);
 
     expect(markup).toContain("I prepared the iCloud Calendar event for your review.");
     expect(markup).toContain("data-icloud-calendar-approval");
@@ -69,7 +73,11 @@ describe("iCloud Calendar approval message", () => {
 
   it("never renders the iCloud approval control for a guest session", () => {
     viewer.guest = true;
-    const markup = renderToStaticMarkup(<JarvisUI />);
+    const approval = assistantApprovalPresentation(assistantRow.text);
+    const markup = renderToStaticMarkup(<>
+      <span>{approval.visibleText}</span>
+      <AssistantApprovalCards guest {...approval} />
+    </>);
 
     expect(markup).not.toContain("data-icloud-calendar-approval");
     expect(markup).not.toContain("Approve iCloud event");
