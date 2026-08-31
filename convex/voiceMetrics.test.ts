@@ -11,16 +11,19 @@ declare global {
 
 const modules = import.meta.glob("./**/*.ts");
 const WORKER = "voice-metrics-test-worker";
+const DISPATCH = "voice-metrics-test-dispatcher";
 const OWNER_HASH = "a".repeat(64);
 
 beforeEach(() => {
   process.env.JARVIS_WORKER_TOKEN = WORKER;
+  process.env.JARVIS_DISPATCH_TOKEN = DISPATCH;
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-08-09T12:00:00Z"));
 });
 
 afterEach(() => {
   delete process.env.JARVIS_WORKER_TOKEN;
+  delete process.env.JARVIS_DISPATCH_TOKEN;
   vi.useRealTimers();
 });
 
@@ -124,5 +127,7 @@ describe("voice performance metrics", () => {
     });
     expect(summary).not.toHaveProperty("turnId");
     expect(JSON.stringify(summary)).not.toContain("voice-a");
+
+    await expect(t.query(api.voiceMetrics.summary, { dispatchToken: DISPATCH })).resolves.toEqual(summary);
   });
 });

@@ -1,6 +1,11 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { actorAuthArgs, requireActor, requireAdmin } from "./controlAuth";
+import {
+  actorAuthArgs,
+  ownerDispatcherAuthArgs,
+  requireActor,
+  requireOwnerOrDispatcher,
+} from "./controlAuth";
 
 const TURN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const MAX_DURATION_MS = 10 * 60_000;
@@ -98,9 +103,9 @@ export const record = mutation({
  * turn IDs, timestamps, transcript text, source URLs, or device data.
  */
 export const summary = query({
-  args: { authTokenHash: v.optional(v.string()) },
+  args: ownerDispatcherAuthArgs,
   handler: async (ctx, args) => {
-    await requireAdmin(ctx, args.authTokenHash);
+    await requireOwnerOrDispatcher(ctx, args);
     const rows = await ctx.db
       .query("voiceTurnMetrics")
       .withIndex("by_updatedAt")
