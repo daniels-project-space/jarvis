@@ -2767,4 +2767,52 @@ describe("real Convex multi-agent workspace and integration races", () => {
     expect(state.failed).toMatchObject({ status: "pending", attempt: 2, progress: "Goal Mode recovery queued" });
     expect(state.sibling).toMatchObject({ status: "pending", attempt: 1 });
   });
+
+  it("does not auto-recover an exact needs-input receipt into another specialist attempt", async () => {
+    const f = await plannedGoal();
+    const [held, sibling] = f.jobs;
+    await f.t.run(async (ctx) => {
+      const current: any = await ctx.db.get(held._id);
+      if (!current) throw new Error("held workstream missing");
+      await ctx.db.insert("workReceipts", {
+        protocolVersion: 2,
+        jobId: current._id,
+        attempt: Number(current.attempt ?? 1),
+        status: "needs_input",
+        terminalCode: "agent_input_required",
+        recoveryDisposition: "needs_input",
+        acceptanceEvidence: [],
+        artifacts: [`convex://jobs/${String(held._id)}/attempt/1/input`],
+        verification: "needs_input",
+        terminalEventKey: "terminal-acceptance-conflict",
+        resultDigest: sha256("The terminal receipt contradicts a stale exact-count acceptance criterion."),
+        evidenceDigest: sha256("The work order forbids repeating the one-time validator."),
+        createdAt: Date.now(),
+      });
+      await ctx.db.patch(held._id, {
+        status: "needs_input",
+        progress: "acceptance scope revision required",
+        completedAt: Date.now(),
+      });
+      const runtime = await ctx.db.query("jobRuntime")
+        .withIndex("by_job", (q) => q.eq("jobId", held._id))
+        .first();
+      if (runtime) await ctx.db.patch(runtime._id, {
+        status: "needs_input",
+        active: true,
+        updatedAt: Date.now(),
+      });
+    });
+
+    expect(await f.t.mutation(api.goalMode.claimAdvance, { workerToken: TOKEN }))
+      .toMatchObject({ kind: "advanced", phase: "blocked" });
+    const state = await f.t.run(async (ctx) => ({
+      mission: await ctx.db.get(f.missionId),
+      held: await ctx.db.get(held._id),
+      sibling: await ctx.db.get(sibling._id),
+    }));
+    expect(state.mission).toMatchObject({ status: "needs_input", phase: "blocked" });
+    expect(state.held).toMatchObject({ status: "needs_input", attempt: 1 });
+    expect(state.sibling).toMatchObject({ status: "paused", attempt: 1 });
+  });
 });

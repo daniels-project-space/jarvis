@@ -54,6 +54,7 @@ import { redactSensitiveText } from "../lib/secret-redaction";
 import {
   cumulativeWorkEvidence,
   EVIDENCE_INTEGRITY_RULES,
+  isNonRepeatableTerminalEvidence,
   isPermittedReadonlyAccessGap,
   SUPERVISOR_MEASUREMENT_RULES,
   supervisorDeliveryBoundary,
@@ -530,7 +531,12 @@ async function verifyWork(
   gitReview?: { envelope: GitReviewEnvelope; binding: GitReviewBinding },
   receiptAuthority?: ReturnType<typeof createGitReviewReceiptAuthority> | null,
   acceptanceCriteria?: unknown,
-): Promise<{ verdict: "pass" | "concerns" | "needs_input"; note: string; answer: string } | null> {
+): Promise<{
+  verdict: "pass" | "concerns" | "needs_input";
+  note: string;
+  answer: string;
+  remediation?: "retry_specialist" | "hold_for_scope_revision";
+} | null> {
   let repositoryEvidence = "No repository checkout was in scope for this work.";
   if (gitReview) {
     if (!receiptAuthority) return { verdict: "concerns", note: "The stable controller Git receipt authority is unavailable.", answer: "" };
@@ -550,9 +556,12 @@ async function verifyWork(
   }
   const prompt =
     "You are JARVIS quickly verifying a background agent's finished work. Reply with ONLY minified JSON: " +
-    '{"verdict":"pass"|"concerns"|"needs_input","note":"<one short sentence>","answer":"<only for needs_input: your answer/decision if YOU can make it from context, else empty>"} ' +
+    '{"verdict":"pass"|"concerns"|"needs_input","note":"<one short sentence>","answer":"<only for needs_input: your answer/decision if YOU can make it from context, else empty>","remediation":"retry_specialist"|"hold_for_scope_revision"} ' +
     "verdict rules: pass = work matches the task and looks complete; concerns = done but something specific looks wrong/unfinished (say what in note); " +
-    "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences).\n\n" +
+    "needs_input = the agent stopped on a question or decision. If that question is answerable with common sense or the task's own context, fill answer so the run can continue autonomously; leave answer empty only when Daniel genuinely must decide (money, accounts, personal preferences). " +
+    "For concerns, remediation=retry_specialist only when another specialist pass can materially change the work or gather new permitted evidence. " +
+    "Use remediation=hold_for_scope_revision when terminal immutable evidence conflicts with the authoritative acceptance scope and rerunning the same one-time validation or poll cannot change that evidence. " +
+    "Never ask a specialist to repeat a validator, provider poll, or other one-time terminal operation that the task explicitly forbids repeating.\n\n" +
     "If the task explicitly says to stop and name a missing read-access gap, a documented gap is a completed evidence outcome, not a request for Daniel to relax the boundary.\n\n" +
     `${SAFE_SANDBOX_EXECUTION_RULES}\n\n` +
     `${supervisorDeliveryBoundary(goalStage)}\n\n` +
@@ -571,7 +580,15 @@ async function verifyWork(
     if (!m) return null;
     const j = JSON.parse(m[0]);
     if (!["pass", "concerns", "needs_input"].includes(j.verdict)) return null;
-    return { verdict: j.verdict, note: String(j.note ?? "").slice(0, 240), answer: String(j.answer ?? "").slice(0, 500) };
+    const remediation = ["retry_specialist", "hold_for_scope_revision"].includes(j.remediation)
+      ? j.remediation as "retry_specialist" | "hold_for_scope_revision"
+      : undefined;
+    return {
+      verdict: j.verdict,
+      note: String(j.note ?? "").slice(0, 240),
+      answer: String(j.answer ?? "").slice(0, 500),
+      remediation,
+    };
   } catch {
     return null;
   }
@@ -3361,6 +3378,33 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             }).catch(() => {});
           else if (job.missionId && !continuation?.requeued)
             await maybeSynthesizeMission(job.missionId).catch(() => {});
+          return;
+        }
+        if (
+          verify.verdict === "concerns"
+          && (verify.remediation === "hold_for_scope_revision"
+            || isNonRepeatableTerminalEvidence({ task: String(job.task ?? ""), result }))
+        ) {
+          const question = verify.note
+            || "The completed terminal evidence conflicts with this workstream's acceptance scope; revise the scope before another specialist runs.";
+          const heldForInput = await convexMutation("jobs:requestInput", {
+            jobId: job.jobId,
+            expectedAttempt,
+            authorityDigest,
+            workerRunId: String(job.workerRunId),
+            question,
+            checkpoint: [
+              `Completed evidence:\n${result.slice(0, 4_800)}`,
+              `JARVIS scope conflict: ${question}`,
+              "The terminal one-time operation will not be repeated. Revise the acceptance scope or start a corrected successor.",
+            ].join("\n\n").slice(0, 6_000),
+          });
+          if (!heldForInput) return;
+          await convexMutation("chatQueue:postAssistant", {
+            threadId: originThread,
+            text: `I stopped a wasteful retry for ${profile.name}: ${question}`,
+          }).catch(() => {});
+          await sendPush("JARVIS needs a scope decision", question.slice(0, 140), "/").catch(() => {});
           return;
         }
         if (verify.verdict === "concerns") {

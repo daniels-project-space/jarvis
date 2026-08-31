@@ -3,6 +3,7 @@ import {
   cumulativeWorkEvidence,
   EVIDENCE_INTEGRITY_RULES,
   isPermittedReadonlyAccessGap,
+  isNonRepeatableTerminalEvidence,
   SUPERVISOR_MEASUREMENT_RULES,
   supervisorDeliveryBoundary,
   WORK_VERIFICATION_EVIDENCE_MAX_CHARS,
@@ -53,6 +54,17 @@ describe("supervisor verification boundaries", () => {
       readonly: true,
       task: "Prove the live rows and finish the report.",
       result: "Authenticated access is unavailable.",
+    })).toBe(false);
+  });
+
+  it("recognizes an explicit one-time terminal evidence boundary", () => {
+    expect(isNonRepeatableTerminalEvidence({
+      task: "Never retry the one-time validator or poll after terminal evidence.",
+      result: "The controller-bound validation receipt is terminal with zero failed tests.",
+    })).toBe(true);
+    expect(isNonRepeatableTerminalEvidence({
+      task: "Repair the test and rerun validation.",
+      result: "The first validation result has one failed test.",
     })).toBe(false);
   });
 });

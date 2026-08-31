@@ -63,3 +63,23 @@ export function isPermittedReadonlyAccessGap(input: {
     || /\b(?:access|capability)\b[\s\S]{0,140}\b(?:missing|unavailable|blocked|required)\b/i.test(input.result);
   return taskPermitsGap && resultNamesGap;
 }
+
+/**
+ * Some evidence operations are deliberately one-shot: after the controller
+ * has a terminal receipt, repeating them cannot repair a stale acceptance
+ * scope and may spend another provider/Codex attempt. Keep this check narrow
+ * and deterministic so a verifier model cannot accidentally override the
+ * work order's explicit no-repeat boundary.
+ */
+export function isNonRepeatableTerminalEvidence(input: {
+  task: string;
+  result: string;
+}): boolean {
+  const taskForbidsRepeat =
+    /\b(?:never|do\s+not|don't)\b[\s\S]{0,80}\b(?:retry|repeat|re-?run)\b[\s\S]{0,100}\b(?:validator|validation|poll|one-time)\b/i.test(input.task)
+    || /\bone-time\b[\s\S]{0,80}\b(?:validator|validation|poll)\b[\s\S]{0,100}\b(?:never|do\s+not|don't)\b[\s\S]{0,60}\b(?:retry|repeat|re-?run)\b/i.test(input.task);
+  const resultIsTerminal =
+    /\b(?:terminal|completed|final)\b[\s\S]{0,120}\b(?:receipt|evidence|result|validation|poll)\b/i.test(input.result)
+    || /\b(?:receipt|validation|poll)\b[\s\S]{0,120}\b(?:terminal|completed|final)\b/i.test(input.result);
+  return taskForbidsRepeat && resultIsTerminal;
+}

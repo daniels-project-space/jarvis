@@ -249,6 +249,7 @@ async function reservedWritableJob(
     model?: "luna" | "terra" | "sol";
     readonly?: boolean;
     goalStage?: "planning" | "building" | "validating" | "refining";
+    acceptanceCriteria?: string[];
   }> = {},
 ) {
   const mission = await testMissionAdmission(t, { key, workerToken: WORKER, repository: REPO });
@@ -259,6 +260,7 @@ async function reservedWritableJob(
     reasoningEffort,
     ...(options.model ? { model: options.model } : {}),
     ...(options.goalStage ? { goalStage: options.goalStage } : {}),
+    ...(options.acceptanceCriteria ? { acceptanceCriteria: options.acceptanceCriteria } : {}),
     missionId: String(mission.missionId),
     label: "identical mutable runner label",
     workerToken: WORKER,
@@ -2274,6 +2276,66 @@ describe("production Trigger worker authority harness", () => {
       "chatQueue:postAssistant",
     );
     expect(notifications.sendPush).not.toHaveBeenCalled();
+  });
+
+  it("holds a terminal acceptance conflict instead of rerunning a one-time validator", async () => {
+    configureFakeControllerAuthority();
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-terminal-acceptance-conflict",
+      "xhigh",
+      {
+        task: "Run repository_validate once. Never retry the one-time validator after terminal evidence.",
+        model: "terra",
+        readonly: true,
+        goalStage: "building",
+        acceptanceCriteria: ["The receipt reports exactly 9 suites and 107 tests."],
+      },
+    );
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies({
+      runProcess: vi.fn(async () => ({
+        text: "Terminal controller-bound receipt: 8 suites, 152 tests, 150 passed, 0 failed, 2 pending.",
+        timedOut: false,
+        stopped: null,
+        checkpointLog: "one terminal repository_validate receipt",
+        commands: [],
+      })),
+    });
+    (dependencies.verifyWork as any).mockResolvedValue({
+      verdict: "concerns",
+      note: "The immutable receipt is healthy but contradicts the stale exact-count acceptance criterion.",
+      answer: "",
+      // Even an older/malformed verifier that omits remediation cannot
+      // override the explicit one-time work-order boundary.
+    });
+
+    expect(await invokeHarness(
+      reservation,
+      "terminal-acceptance-conflict-run",
+      dependencies,
+    )).toEqual({ processed: 1 });
+
+    const state = await t.run(async (ctx) => ({
+      job: await ctx.db.get(jobId),
+      attempts: await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", jobId))
+        .collect(),
+    }));
+    expect(state.job).toMatchObject({
+      status: "needs_input",
+      attempt: 1,
+    });
+    expect(state.job).not.toHaveProperty("verificationVerdict");
+    expect(state.attempts).toHaveLength(1);
+    expect(bridge.trace.map((call) => call.path)).toContain("jobs:requestInput");
+    expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:checkpointAndRequeue");
+    expect(notifications.sendPush).toHaveBeenCalledWith(
+      "JARVIS needs a scope decision",
+      expect.stringContaining("immutable receipt"),
+      "/",
+    );
   });
 
   it("durably checkpoints and requeues a provider startup timeout instead of leaving the attempt running", async () => {

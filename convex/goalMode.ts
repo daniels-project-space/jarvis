@@ -2683,7 +2683,23 @@ async function ensureGoalSteeringApproval(ctx: any, job: any, steer: string, now
 async function recoverGoalPhaseLeaves(ctx: any, mission: any, phaseJobs: any[], phase: string) {
   const now = Date.now();
   const candidates = phaseJobs.filter((job: any) => ["error", "cancelled", "needs_input"].includes(job.status));
-  const recoverable = candidates.filter((job: any) => Number(job.attempt ?? 1) < Number(job.maxAttempts ?? 12));
+  const recoverable: any[] = [];
+  for (const job of candidates) {
+    if (Number(job.attempt ?? 1) >= Number(job.maxAttempts ?? 12)) continue;
+    if (job.status === "needs_input") {
+      // A v2 input receipt is an explicit operator/scope boundary. Legacy
+      // rows can still use the bounded lost-wake recovery below, but exact
+      // needs-input authority must never be silently converted into another
+      // paid specialist attempt by the compatibility coordinator.
+      const receipts = await ctx.db.query("workReceipts")
+        .withIndex("by_job_attempt", (q: any) => q.eq("jobId", job._id).eq("attempt", Number(job.attempt ?? 1)))
+        .take(2);
+      if (receipts.some((receipt: any) => receipt.protocolVersion === 2
+        && receipt.status === "needs_input"
+        && receipt.recoveryDisposition === "needs_input")) continue;
+    }
+    recoverable.push(job);
+  }
   if (!recoverable.length) return false;
   const recovered: string[] = [];
   for (const job of recoverable) {
