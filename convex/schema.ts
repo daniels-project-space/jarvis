@@ -2536,6 +2536,13 @@ export default defineSchema({
     count: v.number(),
     status: v.string(), // "open" | "dispatched" | "resolved" | "needs-daniel"
     attempts: v.number(),
+    // Updated only when the failing surface reports the incident again. Repair
+    // claims/status transitions must not make an old failure look freshly
+    // observed and page Daniel hours later.
+    lastSeenAt: v.optional(v.number()),
+    // Count observed when the most recent repair attempt was claimed. An
+    // exhausted repair escalates only after a later report increments count.
+    observedCountAtLastAttempt: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })

@@ -9,8 +9,15 @@ import { normalizeIncidentSignature } from "../src/lib/incident-signature";
 // Daniel instead of looping repair agents forever.
 
 const WINDOW_MS = 48 * 60 * 60 * 1000;
+const TRANSIENT_NETWORK_REPORT_THRESHOLD = 3;
 
 const attentionFingerprint = (id: unknown) => `incident:${String(id)}`;
+
+function isTransientBrowserNetworkIncident(incident: { source?: string; signature?: string; message?: string }) {
+  if (incident.source !== "client") return false;
+  const text = `${incident.signature ?? ""} ${incident.message ?? ""}`;
+  return /(?:typeerror:\s*)?(?:failed to fetch|load failed)|networkerror/i.test(text);
+}
 
 async function syncIncidentAttention(
   ctx: any,
@@ -65,15 +72,22 @@ export const report = mutation({
       .take(10);
     const now = Date.now();
     const recent = existing
-      .filter((i: any) => now - i.updatedAt < WINDOW_MS)
-      .sort((x: any, y: any) => y.updatedAt - x.updatedAt)[0];
+      .filter((i: any) => now - Number(i.lastSeenAt ?? i.createdAt) < WINDOW_MS)
+      .sort((x: any, y: any) => Number(y.lastSeenAt ?? y.createdAt) - Number(x.lastSeenAt ?? x.createdAt))[0];
     if (recent) {
       const nextStatus = recent.status === "resolved" ? "open" : recent.status;
       const patch: Record<string, unknown> = {
         count: recent.count + 1,
+        lastSeenAt: now,
         updatedAt: now,
         message: a.message.slice(0, 1500),
       };
+      // Give legacy exhausted incidents a pre-recurrence baseline. Without
+      // this migration-on-write, their first post-release recurrence could be
+      // silently treated as an old unobserved repair.
+      if (recent.observedCountAtLastAttempt === undefined && recent.attempts > 0) {
+        patch.observedCountAtLastAttempt = recent.count;
+      }
       // recurrence after a "fix" = the fix didn't hold — reopen with history
       if (recent.status === "resolved") patch.status = nextStatus;
       await ctx.db.patch(recent._id, patch);
@@ -93,6 +107,7 @@ export const report = mutation({
       count: 1,
       status: "open",
       attempts: 0,
+      lastSeenAt: now,
       createdAt: now,
       updatedAt: now,
     });
@@ -123,14 +138,38 @@ export const claimForRepair = mutation({
     const escalations: any[] = [];
     const max = a.maxAttempts ?? 2;
     for (const inc of open.sort((x: any, y: any) => x.updatedAt - y.updatedAt)) {
+      // Browser radios, page suspension and deploy transitions can reject one
+      // local fetch even while the route is healthy. Keep the observation in
+      // the ledger, but do not spend repair workers or notify Daniel unless it
+      // actually recurs in the 48-hour incident window.
+      if (isTransientBrowserNetworkIncident(inc) && inc.count < TRANSIENT_NETWORK_REPORT_THRESHOLD) {
+        await ctx.db.patch(inc._id, { status: "resolved", updatedAt: Date.now() });
+        await syncIncidentAttention(ctx, { ...inc, status: "resolved" });
+        continue;
+      }
       if (inc.attempts >= max) {
+        const observedAtAttempt = Number(inc.observedCountAtLastAttempt ?? inc.count);
+        if (inc.count <= observedAtAttempt) {
+          // The repair worker may have failed its own verification, but the
+          // product has not emitted the failure again since that attempt. Keep
+          // the evidence and silently monitor; a real recurrence reopens the
+          // same row with an incremented count and will then escalate.
+          await ctx.db.patch(inc._id, { status: "resolved", updatedAt: Date.now() });
+          await syncIncidentAttention(ctx, { ...inc, status: "resolved" });
+          continue;
+        }
         await ctx.db.patch(inc._id, { status: "needs-daniel", updatedAt: Date.now() });
         await syncIncidentAttention(ctx, { ...inc, status: "needs-daniel" });
         escalations.push({ id: inc._id, signature: inc.signature, message: inc.message, attempts: inc.attempts });
         continue;
       }
       if (claims.length >= (a.limit ?? 2)) continue;
-      await ctx.db.patch(inc._id, { status: "dispatched", attempts: inc.attempts + 1, updatedAt: Date.now() });
+      await ctx.db.patch(inc._id, {
+        status: "dispatched",
+        attempts: inc.attempts + 1,
+        observedCountAtLastAttempt: inc.count,
+        updatedAt: Date.now(),
+      });
       await syncIncidentAttention(ctx, { ...inc, status: "dispatched", count: inc.count });
       claims.push({
         id: inc._id,
@@ -159,6 +198,32 @@ export const setStatus = mutation({
     if (!incident) return false;
     await ctx.db.patch(a.id, { status: a.status, updatedAt: Date.now() });
     await syncIncidentAttention(ctx, { ...incident, status: a.status });
+    return true;
+  },
+});
+
+// A live health check may retire a noisy stale incident only if no new report
+// raced with that proof. Resetting its exhausted attempt budget is deliberate:
+// a later recurrence should get a fresh bounded repair cycle, not an immediate
+// page caused by yesterday's unrelated worker failures.
+export const resolveIfUnchanged = mutation({
+  args: {
+    id: v.id("incidents"),
+    expectedCount: v.number(),
+    authTokenHash: v.optional(v.string()),
+    workerToken: v.optional(v.string()),
+  },
+  handler: async (ctx, a) => {
+    await requireActor(ctx, a);
+    const incident = await ctx.db.get(a.id);
+    if (!incident || incident.count !== a.expectedCount) return false;
+    await ctx.db.patch(a.id, {
+      status: "resolved",
+      attempts: 0,
+      observedCountAtLastAttempt: incident.count,
+      updatedAt: Date.now(),
+    });
+    await syncIncidentAttention(ctx, { ...incident, status: "resolved" });
     return true;
   },
 });
