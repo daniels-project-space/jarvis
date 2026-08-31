@@ -161,6 +161,23 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; vi.useRealTimers();
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
 describe("real Convex specialist/controller race matrix", () => {
+  it("records the self-hosted controller runtime on the exact claimed job", async () => {
+    const f = await unclaimedDispatchFixture("selfhost-runtime-claim");
+    expect(await f.t.mutation(api.jobs.claimDispatched, {
+      jobId: f.jobId,
+      dispatchId: f.reservation.dispatchId,
+      ...triggerClaimAuthority(f.reservation),
+      workerRunId: "selfhost-agent:daniel-vps:run-1",
+      workerRuntime: "selfhost",
+      workerToken: WORKER,
+    })).toMatchObject({ workerRunId: "selfhost-agent:daniel-vps:run-1" });
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({
+      workerRuntime: "selfhost",
+      workerRunId: "selfhost-agent:daniel-vps:run-1",
+    });
+  });
+
   it("resumes only a cleared controller-session hold into a fresh attempt", async () => {
     const f = await specialistFixture("read_only");
     expect(await f.t.mutation(api.jobs.requestInput, {

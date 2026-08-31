@@ -2842,6 +2842,7 @@ export const claimDispatched = mutation({
     triggerMachineReason: v.optional(v.string()),
     triggerObservedMachinePreset: v.optional(v.string()),
     triggerPlatformAttempt: v.optional(v.number()),
+    workerRuntime: v.optional(v.union(v.literal("trigger"), v.literal("selfhost"))),
     workerToken: v.optional(v.string()),
   },
   handler: async (ctx, a) => {
@@ -2994,7 +2995,7 @@ export const claimDispatched = mutation({
         status: "running", stage: "delivery", progress: "resuming verified controller delivery", startedAt: now,
         heartbeatAt: now, nextRunAt: undefined, dispatchLeaseUntil: undefined, dispatchId: a.dispatchId,
         providerEffectLeaseUntil: undefined,
-        workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), deliveryGeneration: generation, activeDeliveryAttemptId: deliveryId, workerRuntime: "trigger",
+        workerRunId: a.workerRunId.slice(0, 120), deliveryRunId: a.workerRunId.slice(0, 120), deliveryGeneration: generation, activeDeliveryAttemptId: deliveryId, workerRuntime: a.workerRuntime ?? "trigger",
         triggerObservedMachinePreset: a.triggerObservedMachinePreset,
         triggerObservedMachineReason: triggerObservedReason,
         triggerPlatformAttempt: a.triggerPlatformAttempt,
@@ -3045,7 +3046,7 @@ export const claimDispatched = mutation({
       // worker may legitimately claim a later retry during the rollout.
       heartbeatProtocolVersion: a.heartbeatProtocolVersion,
       dispatchId: a.dispatchId,
-      workerRuntime: "trigger",
+      workerRuntime: a.workerRuntime ?? "trigger",
       triggerObservedMachinePreset: a.triggerObservedMachinePreset,
       triggerObservedMachineReason: triggerObservedReason,
       triggerPlatformAttempt: a.triggerPlatformAttempt,

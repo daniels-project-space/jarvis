@@ -91,7 +91,12 @@ export const insightEngine = schedules.task({
         threadId: await chatThread(),
         text: `This genuinely needs you: ${String(title).slice(0, 180)}. I have preserved the queued work and its checkpoints.`,
       }).catch(() => null);
-      await sendPush("JARVIS needs you", String(title).slice(0, 140), "/").catch(() => {});
+      await sendPush(
+        "JARVIS needs you",
+        String(title).slice(0, 140),
+        "/",
+        { category: "work" },
+      ).catch(() => {});
     }
 
     return {

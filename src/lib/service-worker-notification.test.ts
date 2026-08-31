@@ -46,35 +46,50 @@ describe("Jarvis service-worker notification retirement", () => {
     expect(worker.skipWaiting).toHaveBeenCalledOnce();
   });
 
-  it("closes retired failed-fetch notifications when the repaired worker activates", async () => {
+  it("closes retired connection and routine-health notifications when the repaired worker activates", async () => {
     const retired = { title: "JARVIS needs you", body: "Approve root-cause repair for repeated failed fetch", close: vi.fn() };
+    const health = { title: "JARVIS health check", body: "All systems operational", close: vi.fn() };
     const current = { title: "Reminder", body: "Call Maya", close: vi.fn() };
-    const worker = loadServiceWorker([retired, current]);
+    const worker = loadServiceWorker([retired, health, current]);
 
     await dispatch(worker.listeners.get("activate"));
 
     expect(worker.claim).toHaveBeenCalledOnce();
     expect(retired.close).toHaveBeenCalledOnce();
+    expect(health.close).toHaveBeenCalledOnce();
     expect(current.close).not.toHaveBeenCalled();
   });
 
-  it("never resurfaces a delayed raw failed-fetch push payload", async () => {
+  it.each([
+    { title: "JARVIS needs you", body: "Failed to fetch" },
+    { title: "JARVIS health check", body: "All systems operational" },
+    { title: "Jarvis is connected", body: "Connection restored" },
+  ])("silently discards a delayed generic payload: $title", async (payload) => {
     const worker = loadServiceWorker();
 
     await dispatch(worker.listeners.get("push"), {
       data: {
-        json: () => ({ title: "JARVIS needs you", body: "Failed to fetch", url: "/" }),
+        json: () => ({ ...payload, url: "/" }),
+        text: () => "",
+      },
+    });
+
+    expect(worker.showNotification).not.toHaveBeenCalled();
+  });
+
+  it("still delivers an explicit reminder", async () => {
+    const worker = loadServiceWorker();
+
+    await dispatch(worker.listeners.get("push"), {
+      data: {
+        json: () => ({ title: "Reminder", body: "Call Maya", url: "/" }),
         text: () => "",
       },
     });
 
     expect(worker.showNotification).toHaveBeenCalledWith(
-      "Jarvis is connected",
-      expect.objectContaining({
-        body: "The earlier connection alert is resolved. Nothing is waiting on you.",
-        tag: "jarvis-connection-recovered",
-      }),
+      "Reminder",
+      expect.objectContaining({ body: "Call Maya" }),
     );
-    expect(JSON.stringify(worker.showNotification.mock.calls)).not.toMatch(/failed to fetch/i);
   });
 });

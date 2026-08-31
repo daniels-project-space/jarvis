@@ -796,15 +796,27 @@ describe("background notification separation", () => {
       delivery: "notification",
       text: "Heads up, sir — Jarvis just failed to deploy. I'm sending an engineer in to trace it and fix it now.",
     })).toBe(true);
+    expect(isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+      text: "JARVIS health check · all systems operational",
+    })).toBe(true);
+    expect(isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+      text: "Reminder: book the health appointment",
+    })).toBe(false);
   });
 
-  it("hides and physically retires stale repair errors without deleting useful reports", async () => {
+  it("rejects new automatic noise while retaining useful reports", async () => {
     const t = convexTest(schema, modules);
-    await t.mutation(api.chatQueue.postAssistant, {
+    await expect(t.mutation(api.chatQueue.postAssistant, {
       threadId: "main",
       text: obsolete,
       workerToken: WORKER,
-    });
+    })).resolves.toBeNull();
     await t.mutation(api.chatQueue.postAssistant, {
       threadId: "main",
       text: "Mission complete — the verified report is ready.",
@@ -815,13 +827,30 @@ describe("background notification separation", () => {
       threadId: "main",
       workerToken: WORKER,
     })).toHaveLength(1);
-    expect(await t.run(async (ctx) => await ctx.db.query("chatMessages").collect())).toHaveLength(2);
+    expect(await t.run(async (ctx) => await ctx.db.query("chatMessages").collect())).toHaveLength(1);
     await expect(t.mutation(api.chatQueue.retireLegacyAutomaticNotifications, {
       workerToken: WORKER,
-    })).resolves.toEqual({ retired: 1 });
+    })).resolves.toEqual({ retired: 0 });
     expect(await t.run(async (ctx) => await ctx.db.query("chatMessages").collect())).toEqual([
       expect.objectContaining({ text: "Mission complete — the verified report is ready." }),
     ]);
+  });
+
+  it("physically retires an obsolete row stored by an older deployment", async () => {
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => await ctx.db.insert("chatMessages", {
+      threadId: "main",
+      role: "assistant",
+      text: "JARVIS health check · all systems operational",
+      status: "done",
+      delivery: "notification",
+      createdAt: Date.now(),
+    }));
+
+    await expect(t.mutation(api.chatQueue.retireLegacyAutomaticNotifications, {
+      workerToken: WORKER,
+    })).resolves.toEqual({ retired: 1 });
+    expect(await t.run(async (ctx) => await ctx.db.query("chatMessages").collect())).toEqual([]);
   });
 });
 

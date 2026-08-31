@@ -1,15 +1,18 @@
 /* JARVIS service worker — web push + notification click. */
-const RETIRED_CONNECTION_ALERT = /failed to fetch|approve root-cause repair for repeated failed fetch/i;
+// Push is reserved for something Daniel deliberately asked to be reminded
+// about or something that needs a decision. Routine machine state belongs in
+// the in-app status surfaces, not in his notification tray.
+const RETIRED_AUTOMATIC_ALERT = /failed to fetch|approve root-cause repair for repeated failed fetch|\b(?:jarvis|system|stack|service|deployment) health(?: check)?\b|\bhealth check (?:passed|complete|completed|healthy|failed)\b|\b\d+\/\d+ deploys healthy\b|\ball systems (?:healthy|operational)\b|\b(?:heartbeat|routine maintenance) (?:passed|complete|completed|healthy)\b|\bjarvis is connected\b|\bconnection (?:recovered|restored)\b/i;
 
-function isRetiredConnectionAlert(value) {
-  return RETIRED_CONNECTION_ALERT.test(`${value && value.title ? value.title : ""} ${value && value.body ? value.body : ""}`);
+function isRetiredAutomaticAlert(value) {
+  return RETIRED_AUTOMATIC_ALERT.test(`${value && value.title ? value.title : ""} ${value && value.body ? value.body : ""}`);
 }
 
-async function retireLegacyConnectionAlerts() {
+async function retireLegacyAutomaticAlerts() {
   if (!self.registration.getNotifications) return;
   const notifications = await self.registration.getNotifications();
   for (const notification of notifications) {
-    if (isRetiredConnectionAlert(notification)) notification.close();
+    if (isRetiredAutomaticAlert(notification)) notification.close();
   }
 }
 
@@ -23,7 +26,7 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(Promise.all([
     self.clients.claim(),
-    retireLegacyConnectionAlerts(),
+    retireLegacyAutomaticAlerts(),
   ]));
 });
 
@@ -34,17 +37,12 @@ self.addEventListener("push", (event) => {
   } catch {
     data = { body: event.data ? event.data.text() : "" };
   }
-  // A one-off browser disconnect used to create a durable critical alert.
-  // Those records are now retired server-side, but an already-delivered or
-  // delayed Web Push payload can outlive that repair on a phone. Never revive
-  // the raw browser exception; replace it with a single quiet recovery state.
-  if (isRetiredConnectionAlert(data)) {
-    data = {
-      title: "Jarvis is connected",
-      body: "The earlier connection alert is resolved. Nothing is waiting on you.",
-      tag: "jarvis-connection-recovered",
-      url: "/",
-    };
+  // A delayed provider payload may outlive the server-side repair. Retire it
+  // silently: replacing it with a "connected" notification merely turns one
+  // generic automatic alert into another.
+  if (isRetiredAutomaticAlert(data)) {
+    event.waitUntil(Promise.resolve());
+    return;
   }
   event.waitUntil(
     self.registration.showNotification(data.title || "JARVIS", {

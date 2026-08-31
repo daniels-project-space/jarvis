@@ -18,6 +18,7 @@
     "deploy:vercel": "tsx scripts/deploy-vercel-production.ts",
     "harness:codex-session": "tsx scripts/codex-session-concurrency-harness.ts",
     "foreground:selfhost": "node --conditions=react-server --import tsx scripts/self-hosted-foreground-runner.ts",
+    "agent-fleet:selfhost": "node --conditions=react-server --import tsx scripts/self-hosted-agent-fleet-runner.ts",
     "runner:selfhost": "node --import tsx scripts/self-hosted-runner-server.ts",
     "probe:codex-cloud-permissions": "tsx scripts/probe-codex-cloud-permissions.ts",
     "probe:cloud-workspace-provider": "tsx scripts/probe-cloud-workspace-provider.ts",

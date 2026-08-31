@@ -34,22 +34,24 @@ export type PushOptions = {
   ttl?: number;
   urgency?: "very-low" | "low" | "normal" | "high";
   /**
-   * Which notification category this is. Callers that omit it still send —
-   * failing open keeps an uncategorised alert from vanishing silently, which
-   * is the worse failure for something like a price hit.
+   * Which user-visible interruption this is. Uncategorized background output
+   * stays in Jarvis and must not become a generic automatic phone alert.
    */
   category?: "price_hunt" | "errand" | "work" | "reminder" | "incident";
 };
 
+export function isActionablePush(options: PushOptions): boolean {
+  return options.category !== undefined;
+}
+
 export async function sendPush(title: string, body: string, url = "/", options: PushOptions = {}): Promise<void> {
   try {
-    if (options.category) {
-      const gate = (await cq("notificationPrefs:shouldPush", { category: options.category })) as
-        { allowed: boolean; reason: string } | null;
-      // Suppression is push-only: the in-app bell is fed from watchEvents and
-      // attentionItems, so a muted category is deferred, never discarded.
-      if (gate && gate.allowed === false) return;
-    }
+    if (!isActionablePush(options)) return;
+    const gate = (await cq("notificationPrefs:shouldPush", { category: options.category })) as
+      { allowed: boolean; reason: string } | null;
+    // Suppression is push-only: the in-app bell is fed from watchEvents and
+    // attentionItems, so a muted category is deferred, never discarded.
+    if (gate && gate.allowed === false) return;
     const env = await vaultService("jarvis");
     if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return;
     webpush.setVapidDetails(

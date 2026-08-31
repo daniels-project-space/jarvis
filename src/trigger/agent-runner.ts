@@ -878,6 +878,7 @@ export type AgentWorkerPayload = {
   triggerMachineReason: TriggerAgentMachineReason;
   triggerObservedMachinePreset?: TriggerAgentMachinePreset;
   triggerPlatformAttempt?: number;
+  workerRuntime?: "trigger" | "selfhost";
   reason?: string;
 };
 
@@ -1274,6 +1275,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
       triggerMachineReason: options.reservation.triggerMachineReason,
       triggerObservedMachinePreset: options.reservation.triggerObservedMachinePreset,
       triggerPlatformAttempt: options.reservation.triggerPlatformAttempt,
+      workerRuntime: options.reservation.workerRuntime,
     };
     let job: any;
     try {
@@ -1654,7 +1656,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               threadId: thread,
               text: `The deep validator found a boundary I cannot cross honestly: ${String(result.reason ?? validation.summary).slice(0, 320)} I have preserved every checkpoint in Goal Mode.`,
             }).catch(() => {});
-            await sendPush("JARVIS needs your decision", String(result.reason ?? validation.summary).slice(0, 120), "/").catch(() => {});
+            await sendPush(
+              "JARVIS needs your decision",
+              String(result.reason ?? validation.summary).slice(0, 120),
+              "/",
+              { category: "work" },
+            ).catch(() => {});
           }
         }
       }
@@ -3416,7 +3423,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             threadId: originThread,
             text: `I stopped a wasteful retry for ${profile.name}: ${question}`,
           }).catch(() => {});
-          await sendPush("JARVIS needs a scope decision", question.slice(0, 140), "/").catch(() => {});
+          await sendPush(
+            "JARVIS needs a scope decision",
+            question.slice(0, 140),
+            "/",
+            { category: "work" },
+          ).catch(() => {});
           return;
         }
         if (verify.verdict === "concerns") {
@@ -3502,7 +3514,12 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
             threadId: originThread,
             text: `Quick decision for ${profile.name}: ${question}`,
           }).catch(() => {});
-          await sendPush("JARVIS needs your decision", question.slice(0, 140), "/").catch(() => {});
+          await sendPush(
+            "JARVIS needs your decision",
+            question.slice(0, 140),
+            "/",
+            { category: "work" },
+          ).catch(() => {});
           return;
         }
 
@@ -3840,6 +3857,7 @@ export const agentWorker = task({
     const result = await runAgentHarness({
       reservation: {
         ...payload,
+        workerRuntime: "trigger",
         workerRunId: ctx.run.id,
         triggerObservedMachinePreset: ctx.machine.name as TriggerAgentMachinePreset,
         triggerPlatformAttempt: ctx.attempt.number,

@@ -91,7 +91,12 @@ export function isRetiredAutomaticChatNotification(message: {
     || /^I have to be honest, sir — the background job "[\s\S]{1,500}" kept dying on me and I've stopped retrying it\.$/.test(text)
     || /^I've stopped the background job "[\s\S]{1,500}" because its worker reservation could not be verified\. It is waiting for review; I have not started a replacement\.$/.test(text)
     || /^Heads up, sir — [\s\S]{1,500} just failed to deploy\. I'm sending an engineer in to trace it and fix it now\.$/.test(text)
-    || /^☀️ Morning, sir\.\n[\s\S]{1,1000}\n\d+\/\d+ deploys healthy/.test(text);
+    || /^☀️ Morning, sir\.\n[\s\S]{1,1000}\n\d+\/\d+ deploys healthy/.test(text)
+    || /^(?:JARVIS|System|Stack|Service|Deployment) health(?: check)?(?:\s|[·:—-])/i.test(text)
+    || /^(?:Health check|Heartbeat|Routine maintenance)(?:\s|[·:—-])[\s\S]{0,500}\b(?:passed|complete|completed|healthy|operational)\b/i.test(text)
+    || /^Jarvis is connected\b/i.test(text)
+    || /^Connection (?:recovered|restored)\b/i.test(text)
+    || /(?:^|\n)\d+\/\d+ deploys healthy\b/i.test(text);
 }
 
 export const FOREGROUND_HISTORY_OMISSION_MARKER = "\n… [earlier history omitted] …\n";
@@ -1642,6 +1647,15 @@ export const postAssistant = mutation({
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
+    // Enforce the quiet-notification policy at the durable boundary as well
+    // as on reads. This also protects production while an older worker
+    // deployment is still capable of posting a retired template.
+    if (isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+      text: a.text,
+    })) return null;
     await ctx.db.insert("chatMessages", {
       threadId: a.threadId,
       role: "assistant",

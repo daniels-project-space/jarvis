@@ -2727,7 +2727,7 @@ export function createSupervisorConvexClient(
   };
 }
 
-function productionTickDependencies(): MissionSupervisorTickDependencies {
+export function createProductionMissionSupervisorTickDependencies(): MissionSupervisorTickDependencies {
   return {
     convex: createSupervisorConvexClient(),
     createLeaseToken: freshLeaseToken,
@@ -2754,7 +2754,8 @@ function productionTickDependencies(): MissionSupervisorTickDependencies {
 export async function runMissionSupervisorTickForRollout(
   payload: MissionSupervisorTickPayload,
   runContext: MissionSupervisorRunContext,
-  dependenciesFactory: () => MissionSupervisorTickDependencies = productionTickDependencies,
+  dependenciesFactory: () => MissionSupervisorTickDependencies = createProductionMissionSupervisorTickDependencies,
+  wakeFleet: (reason: string, fanOut?: number) => Promise<boolean> = wakeAgentFleet,
 ) {
   const mode = missionSupervisorRolloutMode();
   if (mode === "dormant" || mode === "rollback") {
@@ -2765,7 +2766,7 @@ export async function runMissionSupervisorTickForRollout(
     runContext,
     dependenciesFactory(),
   );
-  return handoffCreatedSupervisorJobs(result);
+  return handoffCreatedSupervisorJobs(result, wakeFleet);
 }
 
 export async function handoffCreatedSupervisorJobs(

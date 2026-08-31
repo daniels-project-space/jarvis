@@ -13,7 +13,7 @@ import { BACKGROUND_CONCURRENCY_LIMIT } from "./work-scheduler";
 const CONVEX_URL = resolveConvexUrl(process.env.CONVEX_URL, process.env.NEXT_PUBLIC_CONVEX_URL);
 const DEFAULT_FAN_OUT = BACKGROUND_CONCURRENCY_LIMIT;
 
-type Reservation = {
+export type AgentFleetReservation = {
   jobId: string;
   dispatchId: string;
   attempt: number;
@@ -36,8 +36,8 @@ type Reservation = {
   reason: string;
 };
 
-function isDispatchReceiptReservation(value: unknown): value is Reservation {
-  const row = value as Partial<Reservation> | null;
+function isDispatchReceiptReservation(value: unknown): value is AgentFleetReservation {
+  const row = value as Partial<AgentFleetReservation> | null;
   return Boolean(row
     && typeof row.jobId === "string"
     && typeof row.dispatchId === "string"
@@ -52,6 +52,42 @@ function isDispatchReceiptReservation(value: unknown): value is Reservation {
     && ["medium-1x", "medium-2x"].includes(String(row.triggerMachinePreset))
     && typeof row.triggerMachineReason === "string"
     && typeof row.reason === "string");
+}
+
+/**
+ * Reserve the exact Convex-owned work envelopes without choosing an execution
+ * transport. Trigger and the self-hosted controller both consume this single
+ * authority boundary; neither transport may manufacture a job payload.
+ */
+export async function reserveAgentFleetBatch(
+  reason: string,
+  fanOut = DEFAULT_FAN_OUT,
+): Promise<AgentFleetReservation[]> {
+  const cleanReason = reason.trim().replace(/\s+/g, " ").slice(0, 160) || "work-available";
+  const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(fanOut)));
+  const reserved = await workerMutation<{ reservations?: unknown[] }>("jobs:reserveDispatchBatch", {
+    limit,
+    reason: cleanReason,
+  });
+  const offered = Array.isArray(reserved?.reservations) ? reserved.reservations : [];
+  const reservations = offered.filter(isDispatchReceiptReservation);
+  const held = offered.filter((reservation) => !isDispatchReceiptReservation(reservation)) as Array<Record<string, unknown>>;
+  if (held.length) {
+    // Convex-first is safe because old workers are held by claim validation.
+    // A newer transport against old Convex releases only the legacy envelope
+    // and waits for the receipt schema/code rather than guessing authority.
+    await Promise.all(held.map((reservation) =>
+      typeof reservation?.jobId === "string" && typeof reservation?.dispatchId === "string"
+        ? workerMutation("jobs:rejectDispatch", {
+          jobId: reservation.jobId,
+          dispatchId: reservation.dispatchId,
+          reason: "dispatch receipt protocol v2 is not active",
+          delayMs: 60_000,
+        }).catch(() => false)
+        : Promise.resolve(false),
+    ));
+  }
+  return reservations;
 }
 
 function safeTag(prefix: string, value: string): string {
@@ -80,30 +116,7 @@ async function workerMutation<T>(path: string, args: Record<string, unknown>): P
  * arbitrary number of routes and supervisors can call this safely at once.
  */
 export async function wakeAgentFleet(reason: string, fanOut = DEFAULT_FAN_OUT): Promise<boolean> {
-  const cleanReason = reason.trim().replace(/\s+/g, " ").slice(0, 160) || "work-available";
-  const limit = Math.max(1, Math.min(BACKGROUND_CONCURRENCY_LIMIT, Math.floor(fanOut)));
-  const reserved = await workerMutation<{ reservations?: unknown[] }>("jobs:reserveDispatchBatch", {
-    limit,
-    reason: cleanReason,
-  });
-  const offered = Array.isArray(reserved?.reservations) ? reserved.reservations : [];
-  const reservations = offered.filter(isDispatchReceiptReservation);
-  const held = offered.filter((reservation) => !isDispatchReceiptReservation(reservation)) as Array<Record<string, unknown>>;
-  if (held.length) {
-    // Convex-first is safe because old workers are held by claim validation.
-    // Trigger-first must also fail closed: release an old reservation using
-    // only the legacy validator shape, then wait for the receipt schema/code.
-    await Promise.all(held.map((reservation) =>
-      typeof reservation?.jobId === "string" && typeof reservation?.dispatchId === "string"
-        ? workerMutation("jobs:rejectDispatch", {
-          jobId: reservation.jobId,
-          dispatchId: reservation.dispatchId,
-          reason: "dispatch receipt protocol v2 is not active",
-          delayMs: 60_000,
-        }).catch(() => false)
-        : Promise.resolve(false),
-    ));
-  }
+  const reservations = await reserveAgentFleetBatch(reason, fanOut);
   if (!reservations.length) return false;
 
   try {

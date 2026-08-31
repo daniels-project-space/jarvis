@@ -86,6 +86,36 @@ describe("Trigger-native agent fleet dispatch", () => {
     ], { scope: "global" });
   });
 
+  it("exposes the same exact reservation to a self-hosted transport without starting Trigger", async () => {
+    vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
+    const offered = {
+      jobId: "job-selfhost",
+      dispatchId: "job-selfhost:1:123",
+      attempt: 1,
+      expectedAttempt: 1,
+      dispatchGeneration: 2,
+      dispatchPhase: "specialist",
+      dispatchReceiptDigest: "e".repeat(64),
+      dispatchPayloadDigest: "f".repeat(64),
+      missionId: "mission-selfhost",
+      agentId: "paul",
+      label: "Paul · self-hosted audit",
+      authorityDigest: "a".repeat(64),
+      workOrderRevisionDigest: "b".repeat(64),
+      triggerMachinePreset: "medium-1x",
+      triggerMachineReason: "admitted_bounded_read",
+      reason: "selfhost-daemon",
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ value: { reservations: [offered] } }), { status: 200 }),
+    ));
+    const { reserveAgentFleetBatch } = await import("./agent-fleet-dispatch");
+
+    await expect(reserveAgentFleetBatch("selfhost-daemon", 1)).resolves.toEqual([offered]);
+    expect(batchTrigger).not.toHaveBeenCalled();
+    expect(createIdempotencyKey).not.toHaveBeenCalled();
+  });
+
   it("does not create empty workers when another supervisor reserved the queue first", async () => {
     vi.stubEnv("JARVIS_WORKER_TOKEN", "worker-capability");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(

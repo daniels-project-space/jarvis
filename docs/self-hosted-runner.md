@@ -1,10 +1,12 @@
 # Self-hosted background workspace runner
 
-Jarvis can use a Daniel-controlled machine for the repository workspace part
-of long-running work. This avoids Vercel Sandbox compute. It does **not** add
-a second job queue: Convex remains the durable authority for jobs, leases,
-checkpoints, cancellation, and recovery; Trigger continues to run the
-subscription-authenticated Codex controller; the runner receives only a
+Jarvis can use a Daniel-controlled machine for both the controller and the
+repository workspace part of long-running work. This avoids Vercel Sandbox
+compute and, when Trigger production is paused, avoids paid Trigger execution.
+It does **not** add a second job queue: Convex remains the durable authority for
+jobs, dispatch receipts, leases, checkpoints, cancellation, and recovery. The
+self-hosted controller imports the same `runAgentHarness` and mission-supervisor
+state machine used by Trigger; the workspace runner still receives only a
 credentialless git archive and bounded repository-tool calls.
 
 The route is disabled by default. Selecting `selfhost` without every item
@@ -24,6 +26,18 @@ Trigger-side adapter:
 ```bash
 npm run runner:selfhost
 ```
+
+The same checkout also contains the outbound durable controller:
+
+```bash
+npm run agent-fleet:selfhost
+```
+
+The controller validates the full workspace lifecycle before it touches the
+queue, then re-runs that proof every four hours. It reserves only Convex-issued
+dispatch receipt envelopes, reports `workerRuntime=selfhost`, and processes one
+workspace at a time. A crash leaves no alternate local authority: Convex lease
+recovery releases or succeeds the exact attempt on restart.
 
 It binds to loopback, keeps a small crash-recovery ledger outside every
 workspace, and launches one rootless Podman container per attempt. The pinned
@@ -60,10 +74,10 @@ cancel kills every descendant, not just a shell wrapper.
 
 ## Configuration
 
-Store these values only in the Jarvis Vercel/Trigger server environment (or
-the Project Hub vault materialized there). They must never be `NEXT_PUBLIC_*`
-values and must not be put in a repository, browser, sandbox, job payload, or
-Codex child environment.
+Store the provider values only in the trusted controller environment (Trigger
+or the encrypted self-hosted systemd credential). They must never be
+`NEXT_PUBLIC_*` values and must not be put in a repository, browser, sandbox,
+job payload, or Codex child environment.
 
 ```text
 JARVIS_CLOUD_WORKSPACE_PROVIDER=selfhost
@@ -74,6 +88,27 @@ JARVIS_CLOUD_WORKSPACE_TEMPLATE_DIGEST=<sha256 of the immutable image policy>
 JARVIS_CLOUD_PROVIDER_PROBE=live
 JARVIS_CLOUD_PROVIDER_PROBE_KEYRING=<existing controller-only keyring>
 ```
+
+The self-hosted controller additionally requires:
+
+```text
+JARVIS_SELF_HOSTED_AGENT_FLEET=live
+JARVIS_SELF_HOSTED_AGENT_FLEET_INSTANCE=daniel-vps
+JARVIS_SELF_HOSTED_AGENT_FLEET_STATE_DIR=/var/lib/jarvis-agent-fleet
+JARVIS_SELF_HOSTED_AGENT_FLEET_POLL_MS=2000
+JARVIS_CLOUD_PROVIDER_DEPLOYMENT_ID=selfhost-controller:<immutable-release-sha>
+JARVIS_CODEX_SESSION_SOURCE=vault-broker
+CONVEX_URL=https://<deployment>.convex.cloud
+JARVIS_WORKER_TOKEN=<server-only worker capability>
+JARVIS_DISPATCH_TOKEN=<server-only dispatch capability>
+VAULT_ACCESS_TOKEN=<read-only controller vault client>
+```
+
+The local Vault client should be read-only and scoped only to the services the
+controller actually consumes (`codex-session` and the private checkpoint-store
+service). GitHub delivery remains in the controller and uses its own
+server-only token. Store this environment as a host-bound encrypted systemd
+credential; do not use a plaintext `EnvironmentFile`.
 
 Configure the runner host separately. These values stay on that host and are
 not synchronized into the disposable container:
@@ -110,14 +145,15 @@ The existing `jarvis` vault service must also retain its
 `CLOUD_PROVIDER_PROBE_BOOTSTRAP_CAPABILITY`; it authorizes the existing
 owner-only verification task and is never copied into the runner or browser.
 
-After the host is up and the variables are deployed to Trigger, use Jarvis’s
-existing owner-only **Verify release** control. The probe creates a real
+After the host is up, either use Jarvis’s existing owner-only **Verify release**
+control for Trigger or start the self-hosted controller with its explicit live
+opt-in. Both paths run the same probe, which creates a real
 workspace, checks the runner's policy claim, uploads a credentialless archive,
 checks empty environment / resource bounds / denied egress, proves exact
 cancellation, creates and replays a portable checkpoint, and terminates both
-workspaces. Only then does it write the deployment-bound signed receipt that
-Goal Mode requires. It is safe to leave `JARVIS_CLOUD_PROVIDER_PROBE` unset
-until the host is ready.
+workspaces. The self-hosted controller keeps the signed receipt only in memory
+and binds it to its immutable controller release identity. It is safe to leave
+`JARVIS_CLOUD_PROVIDER_PROBE` unset until the host is ready.
 
 After **Verify release** reports attested, **Background readiness** verifies
 that the published receipt belongs to the exact Trigger deployment currently

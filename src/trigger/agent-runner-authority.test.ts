@@ -2500,6 +2500,7 @@ describe("production Trigger worker authority harness", () => {
       "JARVIS needs a scope decision",
       expect.stringContaining("immutable receipt"),
       "/",
+      { category: "work" },
     );
   });
 
