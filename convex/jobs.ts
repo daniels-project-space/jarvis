@@ -4702,12 +4702,14 @@ export const authorizeExecutionBoundary = mutation({
       ? { phase: a.phase, deniedReason: reason }
       : null;
     const row: any = await ctx.db.get(a.jobId);
-    if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
-      || row.workerRunId !== a.workerRunId
-      || row.dispatchGeneration !== a.dispatchGeneration
-      || row.dispatchPhase !== a.dispatchPhase
-      || row.dispatchReceiptDigest !== a.dispatchReceiptDigest
-      || row.dispatchPayloadDigest !== a.dispatchPayloadDigest) return denied("job_or_dispatch_state");
+    if (!row) return denied("job_missing");
+    if (row.status !== "running") return denied("job_status");
+    if ((row.attempt ?? 1) !== a.expectedAttempt) return denied("attempt_number");
+    if (row.workerRunId !== a.workerRunId) return denied("worker_run");
+    if (row.dispatchGeneration !== a.dispatchGeneration) return denied("dispatch_generation");
+    if (row.dispatchPhase !== a.dispatchPhase) return denied("dispatch_phase");
+    if (row.dispatchReceiptDigest !== a.dispatchReceiptDigest) return denied("dispatch_receipt_digest");
+    if (row.dispatchPayloadDigest !== a.dispatchPayloadDigest) return denied("dispatch_payload_digest");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- schema-validated dispatch receipt
     const receipt: any = row.dispatchReceiptId ? await ctx.db.get(row.dispatchReceiptId) : null;
     if (!receipt || receipt.status !== "claimed"
