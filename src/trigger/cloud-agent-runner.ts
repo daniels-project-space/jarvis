@@ -110,6 +110,7 @@ export async function runCloudWorkspaceAgent(input: {
       }
       await input.turnReceipt?.effect();
       effect = true;
+      input.onProgress?.("inspecting the admitted source", log, "executing", 42);
       return "running";
     },
   });
@@ -163,10 +164,15 @@ export async function runCloudWorkspaceAgent(input: {
       onTurnAccepted: async () => {
         await input.turnReceipt?.accepted();
         accepted = true;
+        input.onProgress?.("reasoning over the admitted source", log, "reasoning", 24);
       },
       onDelta: (delta) => {
         log = (log + delta).slice(-12_000);
-        input.onProgress?.(delta.trim().replace(/\s+/g, " ").slice(-160) || "working", log, "executing", 60);
+        // App-server deltas are arbitrary token fragments (often just `##`, a
+        // quote, or half a word). Persist the real protocol stage while keeping
+        // raw output in the bounded log; the compact work bubble should never
+        // pretend a markdown fragment is meaningful progress.
+        input.onProgress?.("drafting the verified result", log, "reasoning", 60);
       },
     });
     if (turn.code !== 0 && isCodexUnauthorizedError(turn.stderr)) {

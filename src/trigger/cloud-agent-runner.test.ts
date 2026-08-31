@@ -74,10 +74,12 @@ describe("cloud Codex runner attestation boundary", () => {
     rmSync(scratch, { recursive: true, force: true });
     mkdirSync(scratch, { recursive: true });
     const phases: string[] = [];
+    const progress: Array<{ line: string; stage?: string; percent?: number }> = [];
     const runTurn = vi.spyOn(CodexAppServer.prototype, "runTurn").mockImplementation(async (turn) => {
       await turn.beforeTurn?.();
       turn.onTurnRequestWritten?.();
       await turn.onTurnAccepted?.();
+      turn.onDelta?.("##");
       return { code: 0, stdout: "", stderr: "", finalText: "done", threadId: "thread-4" };
     });
     vi.spyOn(CodexAppServer.prototype, "stop").mockImplementation(() => undefined);
@@ -86,6 +88,7 @@ describe("cloud Codex runner attestation boundary", () => {
       bin: "unused", controllerScratch: scratch,
       controllerEnv: { NODE_ENV: "test", CODEX_HOME: "/authority/codex-job-4", HOME: "/authority" },
       provider, workspace, prompt: "work", model: "terra", toolScope: ["repository_read_file", "repository_list_files"], reasoningEffort: "high", timeoutMs: 2_000,
+      onProgress: (line, _log, stage, percent) => progress.push({ line, stage, percent }),
       turnReceipt: {
         beforeRequest: async () => { phases.push("request_intent"); },
         requestWritten: () => { phases.push("request_written"); },
@@ -100,5 +103,10 @@ describe("cloud Codex runner attestation boundary", () => {
     expect(runTurn).toHaveBeenCalledTimes(1);
     expect(runTurn).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: "high" }));
     expect(phases).toEqual(["request_intent", "request_written", "accepted", "completed"]);
+    expect(progress).toEqual([
+      { line: "reasoning over the admitted source", stage: "reasoning", percent: 24 },
+      { line: "drafting the verified result", stage: "reasoning", percent: 60 },
+    ]);
+    expect(progress.map((item) => item.line)).not.toContain("##");
   });
 });
