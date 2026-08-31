@@ -317,6 +317,10 @@ async function requestSpeechResponse(text: string, expectedGeneration: number): 
       cache: "no-store",
       signal: controller.signal,
     });
+    // The response body is intentionally streamed through playback. Keeping
+    // this connection timeout alive after headers arrive aborts longer speech
+    // mid-stream and surfaces to the browser as a network error.
+    window.clearTimeout(timeout);
     if (!response.ok) {
       const detail = await response.json().catch(() => null) as { error?: unknown } | null;
       throw new Error(String(detail?.error ?? `TTS returned ${response.status}`));
