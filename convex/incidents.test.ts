@@ -11,13 +11,16 @@ declare global {
 
 const modules = import.meta.glob("./**/*.ts");
 const WORKER = "incident-lifecycle-test-worker";
+const DISPATCH = "incident-lifecycle-test-dispatcher";
 
 beforeEach(() => {
   process.env.JARVIS_WORKER_TOKEN = WORKER;
+  process.env.JARVIS_DISPATCH_TOKEN = DISPATCH;
 });
 
 afterEach(() => {
   delete process.env.JARVIS_WORKER_TOKEN;
+  delete process.env.JARVIS_DISPATCH_TOKEN;
   vi.restoreAllMocks();
 });
 
@@ -137,6 +140,31 @@ describe("incident observation fencing", () => {
       status: "resolved",
       updatedAt: expect.any(Number),
     });
+  });
+
+  it("lets the trusted dispatcher perform the same idempotent release repair", async () => {
+    const t = convexTest(schema, modules);
+    const attentionId = await t.run(async (ctx) => await ctx.db.insert("attentionItems", {
+      fingerprint: "jarvis:failed-fetch-unhandled-rejection",
+      title: "Approve root-cause repair for repeated failed fetch",
+      detail: "A stale approval from the old incident policy.",
+      severity: "warning",
+      impact: 65,
+      urgency: 60,
+      confidence: 1,
+      actionClass: "ask",
+      status: "open",
+      createdAt: Date.now() - 10_000,
+      updatedAt: Date.now() - 10_000,
+    }));
+
+    await expect(t.mutation(api.incidents.reconcileLegacyTransientAttention, {
+      dispatchToken: DISPATCH,
+    })).resolves.toEqual({ resolved: true });
+    await expect(t.mutation(api.incidents.reconcileLegacyTransientAttention, {
+      dispatchToken: DISPATCH,
+    })).resolves.toEqual({ resolved: false });
+    await expect(t.run(async (ctx) => await ctx.db.get(attentionId))).resolves.toMatchObject({ status: "resolved" });
   });
 
   it("silently monitors an exhausted repair unless the product reports the failure again", async () => {

@@ -2,7 +2,15 @@ import { mutation, query } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
 import type { Doc } from "./_generated/dataModel";
 import { v } from "convex/values";
-import { requireActor, requireDispatcher, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
+import {
+  ownerDispatcherAuthArgs,
+  requireActor,
+  requireDispatcher,
+  requireOwnerOrDispatcher,
+  requireViewer,
+  requireWorker,
+  viewerAuthArgs,
+} from "./controlAuth";
 import { normalizeIncidentSignature } from "../src/lib/incident-signature";
 
 // Self-healing incident ledger. report() dedups by signature (48h window):
@@ -86,6 +94,17 @@ async function retireLegacyFailedFetchAttention(ctx: MutationCtx, now: number) {
   await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
   return true;
 }
+
+// Narrow release repair for the pre-threshold July attention record. Keeping
+// this owner/dispatcher callable makes the data repair deterministic during a
+// deploy; routine maintenance invokes the same idempotent helper below.
+export const reconcileLegacyTransientAttention = mutation({
+  args: ownerDispatcherAuthArgs,
+  handler: async (ctx, a) => {
+    await requireOwnerOrDispatcher(ctx, a);
+    return { resolved: await retireLegacyFailedFetchAttention(ctx, Date.now()) };
+  },
+});
 
 export const report = mutation({
   args: {
