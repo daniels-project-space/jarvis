@@ -26,6 +26,12 @@ export const JARVIS_TRIGGER_ENV_KEYS = [
   // Separate, narrowly scoped Hub to-do/widget actions capability.
   "JARVIS_HUB_ACTIONS_TOKEN",
   "JARVIS_PRIVATE_R2_BUCKET",
+  // V2 is dormant until the owner-controlled migration proves the isolated
+  // bucket and its dedicated Project Hub credential capability end to end.
+  "JARVIS_PRIVATE_CREATION_ASSET_STORE",
+  "JARVIS_PRIVATE_R2_V2_BUCKET",
+  "JARVIS_PRIVATE_R2_V2_ENDPOINT",
+  "JARVIS_PRIVATE_CREATION_ASSET_V2_VAULT_TOKEN",
   CODEX_SESSION_SOURCE_ENV,
   // Non-secret cutover fence used by Vercel and Trigger while legacy shared
   // derivative paths are drained before the attempt-scoped protocol activates.

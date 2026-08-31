@@ -6,7 +6,9 @@ import {
   isSameOriginRequest,
   validateAdminSession,
 } from "@/lib/control-session";
-import { creationMediaUrl, deletePrivateCreationAsset, putPrivateCreationAsset } from "@/lib/creation-assets";
+import { creationMediaUrl, putPrivateCreationAsset } from "@/lib/creation-assets";
+import { writePrivateCreationAssetWithRecord } from "@/lib/private-creation-asset-write";
+import type { PrivateCreationAssetLocator } from "@/lib/private-creation-asset-store";
 
 // Client-rendered board exports (PNG/SVG) land here: Excalidraw can only
 // rasterize its scene in the browser, so BoardView renders the bytes and
@@ -29,6 +31,22 @@ type Creation = {
   inquiry?: string;
   threadId?: string;
 };
+
+function privateCreationAssetLifecycle(authTokenHash: string) {
+  const args = (asset: PrivateCreationAssetLocator) => ({
+    assetR2Key: asset.assetLocator,
+    assetStore: asset.assetStore,
+    assetLocator: asset.assetLocator,
+  });
+  return {
+    reserve: async (asset: PrivateCreationAssetLocator, writerEpoch: string) => await controlMutation("creationAssetCleanup:reserve", { ...args(asset), writerEpoch, authTokenHash }),
+    renewForWrite: async (asset: PrivateCreationAssetLocator, writerEpoch: string) => await controlMutation("creationAssetCleanup:renewForWrite", { ...args(asset), writerEpoch, authTokenHash }),
+    markWritten: async (asset: PrivateCreationAssetLocator, writerEpoch: string) => await controlMutation("creationAssetCleanup:markWritten", { ...args(asset), writerEpoch, authTokenHash }),
+    abandon: async (asset: PrivateCreationAssetLocator, writerEpoch: string) => await controlMutation("creationAssetCleanup:abandon", { ...args(asset), writerEpoch, authTokenHash }),
+    complete: async (asset: PrivateCreationAssetLocator) => await controlMutation("creationAssetCleanup:complete", { ...args(asset), authTokenHash }),
+    findCreationByAssetLocator: async (asset: PrivateCreationAssetLocator) => await controlQuery("creations:getByAssetLocator", { ...args(asset), authTokenHash }),
+  };
+}
 
 export async function POST(req: NextRequest) {
   if (!isSameOriginRequest(req)) {
@@ -53,21 +71,16 @@ export async function POST(req: NextRequest) {
   if (bytes.byteLength > MAX_BYTES) return Response.json({ error: "export too large" }, { status: 413 });
 
   const contentType = format === "png" ? "image/png" : "image/svg+xml";
-  let asset: Awaited<ReturnType<typeof putPrivateCreationAsset>>;
-  try {
-    asset = await putPrivateCreationAsset(bytes, contentType);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "private R2 upload failed";
-    return Response.json({ error: message.slice(0, 180) }, { status: 502 });
-  }
-
-  let exportCreationId: string;
-  try {
-    const created = await controlMutation("creations:create", {
+  const saved = await writePrivateCreationAssetWithRecord({
+    writeAsset: async (assetId, beforeR2Write) => await putPrivateCreationAsset(bytes, contentType, "asset", assetId, { beforeR2Write }),
+    persistCreation: async (asset, assetWriteEpoch) => await controlMutation("creations:create", {
       kind: "export",
       title: `${row.title || "Board"} · ${format.toUpperCase()} export`,
-      assetR2Key: asset.key,
+      assetR2Key: asset.assetLocator,
+      assetStore: asset.assetStore,
+      assetLocator: asset.assetLocator,
       assetContentType: asset.contentType,
+      assetWriteEpoch,
       data: JSON.stringify({ sourceCreationId: row._id, format, contentType }),
       category: "exports",
       folder: row.folder ? `${row.folder} / Exports` : "Exports",
@@ -75,17 +88,16 @@ export async function POST(req: NextRequest) {
       inquiry: row.inquiry,
       threadId: row.threadId,
       authTokenHash,
-    });
-    if (typeof created !== "string" || !created) throw new Error("creation persistence returned no id");
-    exportCreationId = created;
-  } catch (error) {
-    // No durable record means no user can discover the private upload. Delete
-    // only this freshly created object; never convert a failed export into a
-    // false success response.
-    await deletePrivateCreationAsset(asset).catch(() => undefined);
-    const message = error instanceof Error ? error.message : "export persistence failed";
-    return Response.json({ error: message.slice(0, 180) }, { status: 502 });
+    }),
+    lifecycle: privateCreationAssetLifecycle(authTokenHash),
+  });
+  if (!saved.ok) {
+    const message = saved.stage === "asset_write"
+      ? "private R2 upload failed"
+      : "export persistence could not be verified; private storage is queued for safe recovery";
+    return Response.json({ error: message }, { status: 502 });
   }
+  const exportCreationId = saved.creationId;
 
   const url = creationMediaUrl(exportCreationId);
   // A PNG is a useful current board thumbnail, while each PNG/SVG remains an

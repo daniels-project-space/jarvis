@@ -18,6 +18,10 @@ describe("Trigger mission rollout environment", () => {
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_SELF_HOST_RUNNER_TOKEN");
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_FILE_INGEST_WAKE_PAUSED");
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_FILE_REHOME_TOKEN");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_PRIVATE_CREATION_ASSET_STORE");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_PRIVATE_R2_V2_BUCKET");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_PRIVATE_R2_V2_ENDPOINT");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_PRIVATE_CREATION_ASSET_V2_VAULT_TOKEN");
 
     const runner = readFileSync(new URL("./agent-runner.ts", import.meta.url), "utf8");
     const foregroundTools = readFileSync(new URL("../lib/tools.ts", import.meta.url), "utf8");

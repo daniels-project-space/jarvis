@@ -54,12 +54,20 @@ export const insightEngine = schedules.task({
       m("jobs:reapStale").catch(() => ({ requeued: [], abandoned: [] })),
       m("chatQueue:reapStuck").catch(() => ({ requeued: 0 })),
     ]);
-    const [state, pendingFiles, expiredUploads, pendingDerivedCleanup, pendingOutputCleanup] = await Promise.all([
+    const [
+      state,
+      pendingFiles,
+      expiredUploads,
+      pendingDerivedCleanup,
+      pendingOutputCleanup,
+      pendingCreationAssets,
+    ] = await Promise.all([
       m("proactive:reconcile", { now: Date.now() }),
       fileIngestWakePaused ? Promise.resolve([]) : q("files:pendingIngest", { limit: 4 }).catch(() => []),
       m("files:cleanupExpiredReservations", { limit: 2 }).catch(() => []),
       q("files:pendingIngestDerivedCleanup", { limit: 4 }).catch(() => []),
       q("files:pendingIngestOutputCleanup", { limit: 4 }).catch(() => []),
+      q("creationAssetCleanup:pending", { limit: 4 }).catch(() => []),
     ]);
     const recoveryWindow = Math.floor(Date.now() / (2 * 60 * 60_000));
     const ingestRecoveries = [];
@@ -105,6 +113,19 @@ export const insightEngine = schedules.task({
         { idempotencyKey: `jarvis-file-ingest-output-cleanup-reconcile-${outputAttemptId}-${recoveryWindow}` },
       ).catch(() => null));
     }
+    const creationAssetCleanupRecoveries = [];
+    for (const item of Array.isArray(pendingCreationAssets) ? pendingCreationAssets.slice(0, 4) : []) {
+      const assetR2Key = typeof item?.assetR2Key === "string" ? item.assetR2Key : "";
+      const assetStore = typeof item?.assetStore === "string" ? item.assetStore : "";
+      const assetLocator = typeof item?.assetLocator === "string" ? item.assetLocator : "";
+      const assetId = assetLocator.split("/").at(-2) ?? "";
+      if (!assetR2Key || !assetStore || !assetLocator || !assetId) continue;
+      creationAssetCleanupRecoveries.push(await tasks.trigger(
+        "jarvis-creation-asset-cleanup",
+        { assetR2Key, assetStore, assetLocator },
+        { idempotencyKey: `jarvis-creation-asset-cleanup-reconcile-${assetStore}-${assetId}-${recoveryWindow}` },
+      ).catch(() => null));
+    }
     const shouldWake =
       Number(state?.eligiblePending ?? 0) > 0 ||
       (Array.isArray(reaped?.requeued) && reaped.requeued.length > 0) ||
@@ -129,6 +150,7 @@ export const insightEngine = schedules.task({
       fileIngestWakePaused,
       fileCleanupRecoveries: cleanupRecoveries.filter(Boolean).length,
       fileDerivedCleanupRecoveries: derivedCleanupRecoveries.filter(Boolean).length,
+      creationAssetCleanupRecoveries: creationAssetCleanupRecoveries.filter(Boolean).length,
     };
   },
 });

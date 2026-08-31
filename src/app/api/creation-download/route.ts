@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { adminSessionHash, controlQuery, validateAdminSession } from "@/lib/control-session";
 import { fetchTrustedLegacyCreation, trustedLegacyCreationUrl } from "@/lib/legacy-creation-url";
 import { markdownToPdf } from "@/lib/pdf";
-import { privateR2Get } from "@/lib/private-r2";
+import { privateCreationAssetGet } from "@/lib/private-creation-asset-store";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -23,7 +23,8 @@ type Creation = {
 };
 
 type PrivateCreationMedia = {
-  assetR2Key: string;
+  assetStore: "private-r2-v1" | "private-r2-v2";
+  assetLocator: string;
   assetContentType?: string;
   title: string;
   kind: string;
@@ -155,8 +156,8 @@ export async function GET(req: NextRequest) {
 
   if (row.hasPrivateAsset) {
     const media = (await controlQuery("creations:getForMedia", { id, authTokenHash }).catch(() => null)) as CreationMedia | null;
-    if (!media || !("assetR2Key" in media)) return Response.json({ error: "creation asset unavailable" }, { status: 404 });
-    const upstream = await privateR2Get(media.assetR2Key).catch(() => null);
+    if (!media || !("assetStore" in media)) return Response.json({ error: "creation asset unavailable" }, { status: 404 });
+    const upstream = await privateCreationAssetGet({ assetStore: media.assetStore, assetLocator: media.assetLocator }).catch(() => null);
     if (upstream?.ok && upstream.body) {
       const stored = contentTypeAndExtension(upstream.headers.get("content-type") || media.assetContentType, media.kind);
       return attachment(upstream.body, `${safeName(media.title)}.${stored.extension}`, stored.contentType);
