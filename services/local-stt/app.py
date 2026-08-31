@@ -109,6 +109,20 @@ def whisper_model() -> WhisperModel:
         return _model
 
 
+def transcription_options(language: str | None, prompt: str | None) -> dict[str, object]:
+    return {
+        "language": language or None,
+        "beam_size": MODEL_BEAM_SIZE,
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+        # small.en can suppress the entire utterance when the same long
+        # vocabulary is supplied as both initial_prompt and hotwords. The
+        # prompt already preserves Jarvis/project names without that
+        # destructive duplicate decoder constraint.
+        "initial_prompt": prompt or None,
+    }
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # A recognizer that accepts traffic before loading Whisper turns the first
@@ -160,15 +174,7 @@ async def transcribe(
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
             temp.write(payload)
             temp_path = temp.name
-        segments, _info = whisper_model().transcribe(
-            temp_path,
-            language=language or None,
-            beam_size=MODEL_BEAM_SIZE,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            initial_prompt=prompt or None,
-            hotwords=prompt or None,
-        )
+        segments, _info = whisper_model().transcribe(temp_path, **transcription_options(language, prompt))
         rows = [
             {
                 "start": segment.start,

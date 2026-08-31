@@ -67,6 +67,11 @@ class BrowserTicketTests(unittest.TestCase):
     def test_keeps_server_to_server_shared_secret_compatible(self) -> None:
         self.app.require_authorization("Bearer local-test-secret", None)
 
+    def test_uses_the_vocabulary_once_as_an_initial_prompt(self) -> None:
+        options = self.app.transcription_options("en", "Jarvis, Paul, Maya")
+        self.assertEqual(options["initial_prompt"], "Jarvis, Paul, Maya")
+        self.assertNotIn("hotwords", options)
+
 
 if __name__ == "__main__":
     unittest.main()
