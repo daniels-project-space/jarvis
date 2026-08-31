@@ -5976,6 +5976,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             <input
               value={input}
               onChange={(event) => setInput(event.target.value)}
+              onFocus={prewarmForegroundReply}
               onKeyDown={(event) => event.key === "Enter" && submit(input)}
               placeholder={pendingFileIds.length ? "Indexing files before send…" : "Message Jarvis…"}
               className="min-w-0 flex-1 rounded-lg bg-black/35 px-2.5 text-xs text-ice outline-none ring-1 ring-white/10 focus:ring-cyan/50"
@@ -6455,6 +6456,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onFocus={prewarmForegroundReply}
               onKeyDown={(e) => e.key === "Enter" && submit(input)}
               placeholder={pendingFileIds.length ? "Indexing files before send…" : busy ? "Ask another thing while I work…" : "Talk to me…"}
               className="w-0 min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2.5 text-sm text-ice outline-none ring-1 ring-white/10 transition focus:ring-cyan/50 sm:w-auto sm:px-4"
@@ -6643,6 +6645,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
+                onFocus={prewarmForegroundReply}
                 onKeyDown={(e) => e.key === "Enter" && submit(input)}
                 placeholder={pendingFileIds.length ? "Indexing files…" : busy ? "Ask while I work…" : "Message Jarvis"}
                 className="min-w-0 flex-1 rounded-full bg-black/20 px-3 text-sm text-ice outline-none ring-1 ring-white/[.07] transition focus:ring-cyan/40"
