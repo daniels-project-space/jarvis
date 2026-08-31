@@ -23,6 +23,8 @@ export const SUPERVISOR_MEASUREMENT_RULES = [
   "Treat observed durations, timestamps, IDs, and counts in baseline or measurement-window prose as evidence context, not exact acceptance values.",
   "A numeric value is normative only when the authoritative acceptance criteria or declared metric/target explicitly requires that value, an inequality, or a tolerance.",
   "For a repeated test or validation run, judge the requested scope, result counts, failures, provenance, and lifecycle evidence; ordinary runtime variance is not a concern unless latency is itself the metric.",
+  "For credentialless cloud workspaces, the sandbox Git HEAD is a synthetic transport commit. Use the controller-bound sourceBinding and controller Git receipt for source provenance, never a sandbox .git ref.",
+  "A specialist cannot observe its own post-exit provider termination. Judge that lifecycle boundary only from the controller's durable attempt audit after the specialist exits.",
 ].join(" ");
 
 export function supervisorDeliveryBoundary(goalStage: unknown): string {

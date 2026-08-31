@@ -607,6 +607,16 @@ describe("real Convex multi-agent workspace and integration races", () => {
       const currentJobs = await ctx.db.query("jobs")
         .withIndex("by_mission", (q) => q.eq("missionId", String(f.missionId)))
         .take(100);
+      const attempt = await ctx.db.query("workAttempts")
+        .withIndex("by_job_attempt", (q) => q.eq("jobId", validatorJobId).eq("attempt", 2))
+        .unique();
+      expect(attempt).toBeTruthy();
+      await ctx.db.patch(attempt!._id, {
+        providerName: "vercel",
+        providerWorkspaceId: "jarvis-audit-workspace",
+        providerSessionId: "jarvis-audit-session",
+        providerTerminatedAt: 123_456,
+      });
       return JSON.parse(await validatorAuditSnapshot(ctx, currentMission, currentJobs));
     });
     expect(audit.executionTraces.find((trace: any) => trace.jobId === String(validatorJobId)))
@@ -617,7 +627,9 @@ describe("real Convex multi-agent workspace and integration races", () => {
           attempt: 2,
           exactSourceBound: true,
           authorityBound: true,
-          workspaceBound: false,
+          workspaceBound: true,
+          providerWorkspaceTerminal: true,
+          providerTerminatedAt: 123_456,
         })],
       });
   });

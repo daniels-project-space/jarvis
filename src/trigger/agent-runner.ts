@@ -2348,6 +2348,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                   ? `Your working directory is a read-only checkout of ${repo}. Inspect it deeply, but do not edit or commit.`
                   : `Your working directory is an isolated checkout of ${repo} on branch ${branch}. Actually perform the scoped task. You may edit and commit here; never push, merge, deploy, or switch branches because the runner owns delivery.`;
                 context += `\n\nRepository lineage rule: ${SHALLOW_PROVENANCE_RULE} The runner fetched explicit ${checkoutSourceBranch}, proved ${sourceHeadSha} belongs to it, and checked out that exact admitted lineage.`;
+                context += `\nController-bound source identity: sourceHeadSha=${sourceHeadSha}; workspaceBaseSha=${baseSha}. The cloud sandbox re-materializes these bytes into a synthetic credentialless Git commit, so its local .git/HEAD is transport metadata and must never be reported as source provenance.`;
                 const providerBoundary = projectProviderBoundary(repo);
                 if (providerBoundary) context += `\n\n${providerBoundary}`;
               }
@@ -2824,6 +2825,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               prompt,
               model,
               toolScope: job.toolScope,
+              sourceBinding: repo
+                ? { sourceHeadSha: String(job.sourceHeadSha), workspaceBaseSha }
+                : undefined,
               reasoningEffort,
               onProgress: reportProgress,
               executionState: async () => {

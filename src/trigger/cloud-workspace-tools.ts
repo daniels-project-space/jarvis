@@ -92,6 +92,13 @@ export function cloudRepositoryToolsForScope(scope: readonly string[]): CodexDyn
 type ToolBridgeOptions = {
   signal?: AbortSignal;
   allowedToolScope: readonly string[];
+  /** Controller-observed Git authority. The sandbox Git repository is a
+   * credentialless transport re-materialization with a synthetic commit, so
+   * its local HEAD must never be mistaken for the admitted source identity. */
+  sourceBinding?: {
+    sourceHeadSha: string;
+    workspaceBaseSha: string;
+  };
   beforeTool?: (call: CodexDynamicToolCall) => Promise<"running" | "stale" | "cancelled" | "steered">;
 };
 
@@ -152,11 +159,25 @@ function boundedCount(value: unknown): number | null {
   return Number.isSafeInteger(count) && count >= 0 && count <= 1_000_000 ? count : null;
 }
 
+function sourceBindingReceipt(value: ToolBridgeOptions["sourceBinding"]) {
+  if (!value
+    || !/^[0-9a-f]{40}$/.test(value.sourceHeadSha)
+    || !/^[0-9a-f]{40}$/.test(value.workspaceBaseSha)) return undefined;
+  return {
+    authority: "controller_bound_source_v1",
+    sourceHeadSha: value.sourceHeadSha,
+    workspaceBaseSha: value.workspaceBaseSha,
+    exactSourceBound: value.sourceHeadSha === value.workspaceBaseSha,
+    sandboxGitIdentity: "synthetic_credentialless_transport",
+  } as const;
+}
+
 function validationTestReceipt(
   stdout: string,
   exitCode: number,
   durationMs: number,
   requestedPaths: string[],
+  sourceBinding?: ToolBridgeOptions["sourceBinding"],
 ): { text: string; success: boolean } {
   try {
     const report = object(JSON.parse(stdout));
@@ -233,6 +254,7 @@ function validationTestReceipt(
         unexpectedFiles,
         totals,
         files,
+        sourceBinding: sourceBindingReceipt(sourceBinding),
       }),
       success,
     };
@@ -245,6 +267,7 @@ function validationTestReceipt(
         durationMs,
         reportAccepted: false,
         error: "validation report was not valid bounded Vitest JSON",
+        sourceBinding: sourceBindingReceipt(sourceBinding),
       }),
       success: false,
     };
@@ -292,13 +315,20 @@ export class CloudWorkspaceToolBridge {
             execution.exitCode,
             execution.durationMs,
             validation.paths,
+            this.options.sourceBinding,
           );
           return result(receipt.text, receipt.success);
         }
         const stdout = validateSandboxOutput(execution.stdout, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
         const stderr = validateSandboxOutput(execution.stderr, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
         return result(
-          JSON.stringify({ exitCode: execution.exitCode, stdout, stderr, durationMs: execution.durationMs }),
+          JSON.stringify({
+            exitCode: execution.exitCode,
+            stdout,
+            stderr,
+            durationMs: execution.durationMs,
+            sourceBinding: sourceBindingReceipt(this.options.sourceBinding),
+          }),
           execution.exitCode === 0,
         );
       }

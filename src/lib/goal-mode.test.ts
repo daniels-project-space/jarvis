@@ -208,6 +208,7 @@ describe("Goal Mode contracts", () => {
     expect(prompt).toContain("a rejection-only gate does not satisfy the outcome");
     expect(prompt).toContain("never copy an incidental elapsed runtime");
     expect(prompt).toContain("never turn a baseline observation into an exact target");
+    expect(prompt).toContain("Do not require a specialist to prove its own post-exit provider-workspace termination");
   });
 
   it("rejects cyclic plans", () => {

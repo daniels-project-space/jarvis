@@ -56,6 +56,9 @@ export async function runCloudWorkspaceAgent(input: {
   model: string;
   /** Immutable cloud repository capability snapshot from the work order. */
   toolScope: readonly string[];
+  /** Exact controller-observed source identity; local sandbox Git commits are
+   * synthetic transport and are never repository provenance. */
+  sourceBinding?: { sourceHeadSha: string; workspaceBaseSha: string };
   reasoningEffort?: unknown;
   timeoutMs: number;
   executionState?: () => Promise<string>;
@@ -99,6 +102,7 @@ export async function runCloudWorkspaceAgent(input: {
   const bridge = new CloudWorkspaceToolBridge(input.provider, input.workspace, {
     signal: abort.signal,
     allowedToolScope: input.toolScope,
+    sourceBinding: input.sourceBinding,
     beforeTool: async () => {
       const state = await input.executionState?.() ?? "running";
       if (state !== "running") {
@@ -119,7 +123,8 @@ export async function runCloudWorkspaceAgent(input: {
     developerInstructions:
       "You are a background repository specialist. The controller scratch is empty and read-only. " +
       "Use only the repository_* dynamic tools exposed for this work order; unavailable tools are forbidden. " +
-      "Never use a built-in host shell or filesystem tool for repository work. The sandbox has no credentials and no network by default.",
+      "Never use a built-in host shell or filesystem tool for repository work. The sandbox has no credentials and no network by default. " +
+      "Its local Git HEAD is a synthetic credentialless transport commit, never the admitted source SHA; use only the controller-bound sourceBinding in repository validation receipts for provenance.",
   });
   const control = input.executionState
     ? setInterval(async () => {
@@ -141,7 +146,9 @@ export async function runCloudWorkspaceAgent(input: {
       conversationId: `workspace:${input.workspace.providerWorkspaceId}:${input.workspace.providerSessionId}`,
       userText: input.prompt,
       history: [],
-      contextBlock: "The durable work item is authoritative; this provider session is disposable transport.",
+      contextBlock: input.sourceBinding
+        ? `The durable work item is authoritative; this provider session is disposable transport. Controller-bound sourceHeadSha=${input.sourceBinding.sourceHeadSha}; workspaceBaseSha=${input.sourceBinding.workspaceBaseSha}. Sandbox Git HEAD is synthetic and non-authoritative.`
+        : "The durable work item is authoritative; this provider session is disposable transport.",
       preamble: "Complete the scoped repository task using only the controller-owned cloud repository tools.",
       modelTier: input.model,
       reasoningEffort: input.reasoningEffort,

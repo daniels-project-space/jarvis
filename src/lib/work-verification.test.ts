@@ -26,6 +26,8 @@ describe("supervisor verification boundaries", () => {
     expect(SUPERVISOR_MEASUREMENT_RULES).toContain("ordinary runtime variance is not a concern");
     expect(SUPERVISOR_MEASUREMENT_RULES).toContain("declared metric/target");
     expect(SUPERVISOR_MEASUREMENT_RULES).toContain("inequality");
+    expect(SUPERVISOR_MEASUREMENT_RULES).toContain("sandbox Git HEAD is a synthetic transport commit");
+    expect(SUPERVISOR_MEASUREMENT_RULES).toContain("post-exit provider termination");
   });
 
   it("carries completed checkpoint evidence into repair-pass supervision", () => {

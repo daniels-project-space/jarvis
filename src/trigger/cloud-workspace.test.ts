@@ -301,6 +301,7 @@ describe("fail-closed cloud workspace boundary", () => {
     });
     const bridge = new CloudWorkspaceToolBridge(provider, workspace, {
       allowedToolScope: ["repository_validate", "repository_read_file", "repository_list_files"],
+      sourceBinding: { sourceHeadSha: "a".repeat(40), workspaceBaseSha: "a".repeat(40) },
     });
     const valid = await bridge.invoke({
       threadId: "t", turnId: "r", callId: "validate", namespace: null,
@@ -314,6 +315,13 @@ describe("fail-closed cloud workspace boundary", () => {
       reportAccepted: true,
       unexpectedFiles: 0,
       totals: { tests: 2, passed: 2, failed: 0 },
+      sourceBinding: {
+        authority: "controller_bound_source_v1",
+        sourceHeadSha: "a".repeat(40),
+        workspaceBaseSha: "a".repeat(40),
+        exactSourceBound: true,
+        sandboxGitIdentity: "synthetic_credentialless_transport",
+      },
       files: [
         { path: "src/lib/agent-fleet-dispatch.test.ts", reported: true, tests: 1, passed: 1 },
         { path: "convex/jobsClaim.test.ts", reported: true, tests: 1, passed: 1 },

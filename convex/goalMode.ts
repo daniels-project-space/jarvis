@@ -760,6 +760,10 @@ export async function validatorAuditSnapshot(ctx: any, mission: any, jobs: any[]
           workspaceBound: Boolean(attempt.providerWorkspaceId
             && attempt.providerSessionId
             && attempt.providerWorkspaceId !== attempt.providerSessionId),
+          providerWorkspaceTerminal: attempt.providerWorkspaceId
+            ? Boolean(attempt.providerTerminatedAt)
+            : null,
+          providerTerminatedAt: attempt.providerTerminatedAt ?? null,
           codexTurnReceiptPhase: attempt.codexTurnReceiptPhase ?? null,
           checkpointDigest: attempt.checkpointDigest ?? null,
           completedAt: attempt.completedAt ?? null,

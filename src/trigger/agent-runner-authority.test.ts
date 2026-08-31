@@ -1319,6 +1319,9 @@ describe("production Trigger worker authority harness", () => {
       dependencies,
     )).toEqual({ processed: 1 });
     expect(dependencies.persistPortableCheckpoint).not.toHaveBeenCalled();
+    expect(dependencies.runCloudWorkspaceAgent).toHaveBeenCalledWith(expect.objectContaining({
+      sourceBinding: { sourceHeadSha: SOURCE_SHA, workspaceBaseSha: SOURCE_SHA },
+    }));
     expect(bridge.trace.map((call) => call.path)).not.toContain("jobs:recordCloudCheckpoint");
     expect(dependencies.runCommand).toHaveBeenCalledWith(
       "git",
