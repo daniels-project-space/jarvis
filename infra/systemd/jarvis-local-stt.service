@@ -1,0 +1,20 @@
+[Unit]
+Description=Jarvis self-hosted high-accuracy speech recognition
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/jarvis-foreground/services/local-stt
+EnvironmentFile=/etc/jarvis-local-stt.env
+Environment=DOCKER_API_VERSION=1.52
+ExecStartPre=/usr/bin/docker compose build
+ExecStart=/usr/bin/docker compose up --no-build --remove-orphans
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=15min
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

@@ -10,9 +10,10 @@ from threading import Lock
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from faster_whisper import WhisperModel
 
-MODEL_NAME = os.environ.get("STT_MODEL", "turbo")
+MODEL_NAME = os.environ.get("STT_MODEL", "small.en")
 MODEL_DEVICE = os.environ.get("STT_DEVICE", "auto")
 MODEL_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")
+MODEL_BEAM_SIZE = max(1, min(5, int(os.environ.get("STT_BEAM_SIZE", "5"))))
 MODEL_DOWNLOAD_ROOT = os.environ.get("STT_MODEL_DIR", "/models")
 SHARED_SECRET = os.environ.get("STT_SHARED_SECRET", "")
 MAX_AUDIO_BYTES = int(os.environ.get("STT_MAX_AUDIO_BYTES", str(20 * 1024 * 1024)))
@@ -62,7 +63,7 @@ def healthz() -> dict[str, object]:
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
-    model: str = Form("turbo"),
+    model: str = Form(MODEL_NAME),
     language: str | None = Form("en"),
     prompt: str | None = Form(None),
     authorization: str | None = Header(None),
@@ -86,7 +87,7 @@ async def transcribe(
         segments, _info = whisper_model().transcribe(
             temp_path,
             language=language or None,
-            beam_size=5,
+            beam_size=MODEL_BEAM_SIZE,
             vad_filter=True,
             condition_on_previous_text=False,
             initial_prompt=prompt or None,

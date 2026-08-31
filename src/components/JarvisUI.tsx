@@ -168,6 +168,7 @@ import {
   startSelfHostedStreamingSpeech,
   type SelfHostedStreamingSpeech,
 } from "@/lib/streaming-stt-client";
+import { selectFinalLiveTranscript } from "@/lib/live-transcript-final";
 import {
   reconcileEmbeddedThreadReadiness,
   stableEmbeddedActorKey,
@@ -5032,11 +5033,19 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         blob: Blob,
         controller: AbortController,
         evidence: LiveVadState,
+        options: {
+          attempts?: number;
+          timeoutMs?: number;
+          reportRetry?: boolean;
+        } = {},
       ): Promise<string> => {
+        const attempts = Math.max(1, Math.min(2, options.attempts ?? 2));
+        const timeoutMs = Math.max(1_000, options.timeoutMs ?? 30_000);
+        const reportRetry = options.reportRetry ?? true;
         const speechSpanMs = evidence.voiceStartedAt
           ? Math.max(0, evidence.lastVoice - evidence.voiceStartedAt)
           : 0;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
           let failure: SpeechRecognitionRequestError | null = null;
           try {
             const response = await viewerFetchWithTimeout("/api/stt", {
@@ -5051,7 +5060,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               },
               body: blob,
               signal: controller.signal,
-            }, 30_000);
+            }, timeoutMs);
             const transcript = await transcriptFromSttResponse(response);
             sttFailureStreak.current = 0;
             return transcript;
@@ -5064,7 +5073,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
                 code: "stt_network_error",
               });
           }
-          if (!failure.retryable || attempt === 1) throw failure;
+          if (!failure.retryable || attempt === attempts - 1) throw failure;
 
           const browserRecovery = recoverLiveTranscriptFromBrowser({
             previous: previousBrowserPreview,
@@ -5081,10 +5090,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           }
 
           recoveryDelayMs = speechServiceRetryDelay(sttFailureStreak.current + 1, failure.retryAfterMs);
-          showCaption({
-            who: "jarvis",
-            text: `I kept your recording. Speech recognition is reconnecting and will retry it in ${Math.ceil(recoveryDelayMs / 1_000)} seconds.`,
-          });
+          if (reportRetry) {
+            showCaption({
+              who: "jarvis",
+              text: `I kept your recording. Speech recognition is reconnecting and will retry it in ${Math.ceil(recoveryDelayMs / 1_000)} seconds.`,
+            });
+          }
           await new Promise<void>((resolve, reject) => {
             const timer = window.setTimeout(resolve, recoveryDelayMs);
             const abort = () => {
@@ -5367,7 +5378,24 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       voiceTrace.speechClosedAt = speechClosedAt;
       document.documentElement.dataset.jarvisSpeechClosedMs = String(Math.round(speechClosedAt));
       showCaption({ who: "you", text: "Processing…" });
-      const streamedText = await selfHostedStreaming.current?.finish() ?? "";
+      // Start the high-accuracy final pass while the streaming socket flushes.
+      // Zipformer still supplies instant partials and speculative research,
+      // but a plausible low-quality partial must never become the submitted
+      // command merely because it is non-empty.
+      const accurateController = new AbortController();
+      pendingSttController = accurateController;
+      sttAbortRef.current = accurateController;
+      const recordedTextPromise = requestTranscript(blob, accurateController, { ...vad }, {
+        attempts: 1,
+        timeoutMs: 6_000,
+        reportRetry: false,
+      }).catch(() => "");
+      const [streamedText, recordedText] = await Promise.all([
+        selfHostedStreaming.current?.finish() ?? Promise.resolve(""),
+        recordedTextPromise,
+      ]);
+      if (sttAbortRef.current === accurateController) sttAbortRef.current = null;
+      if (pendingSttController === accurateController) pendingSttController = null;
       // SpeechRecognition mutates these refs from its event callback. Preserve
       // that runtime state across the recorder await; TypeScript cannot infer
       // callback writes from the linear control flow here.
@@ -5385,17 +5413,23 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           true,
         ),
       });
-      let text: string;
-      if (isMeaningfulSpeechTranscript(streamedText)) {
-        text = streamedText;
-        // Reuse the existing bounded "server" metric category rather than
-        // expanding durable telemetry before this optional host is deployed.
+      const finalTranscript = selectFinalLiveTranscript({
+        recordedText,
+        browserFinalText: transcriptSource.source === "browser-final" ? transcriptSource.text : "",
+        streamedText,
+      });
+      let text = finalTranscript.text;
+      if (finalTranscript.source === "recorded") {
         voiceTrace.transcriptSource = "server";
-        document.documentElement.dataset.jarvisAuthoritativeStt = "self-hosted-stream";
-      } else if (transcriptSource.source === "browser-final") {
-        text = transcriptSource.text;
+        document.documentElement.dataset.jarvisAuthoritativeStt = "recorded-whisper";
+      } else if (finalTranscript.source === "browser-final") {
         voiceTrace.transcriptSource = "browser-final";
         document.documentElement.dataset.jarvisAuthoritativeStt = "browser-final";
+      } else if (finalTranscript.source === "streaming") {
+        // Reuse the existing bounded "server" metric category rather than
+        // expanding durable telemetry for the optional partial recognizer.
+        voiceTrace.transcriptSource = "server";
+        document.documentElement.dataset.jarvisAuthoritativeStt = "self-hosted-stream";
       } else {
         const controller = new AbortController();
         pendingSttController = controller;

@@ -259,7 +259,8 @@ describe("browser speech preview", () => {
     );
     expect(liveTurn.match(/viewerFetchWithTimeout\("\/api\/stt"/g)).toHaveLength(1);
     expect(liveTurn.match(/await requestTranscript\(/g)).toHaveLength(1);
-    expect(liveTurn).toContain("attempt < 2");
+    expect(liveTurn).toContain("Math.min(2, options.attempts ?? 2)");
+    expect(liveTurn).toContain("attempt < attempts");
     expect(liveTurn).toContain('"x-jarvis-stt-attempt": String(attempt + 1)');
     expect(liveTurn).toContain("recoverLiveTranscriptFromBrowser");
     expect(liveTurn).toContain("waitForBrowserSpeechFinal");
