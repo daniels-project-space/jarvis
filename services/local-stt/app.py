@@ -91,6 +91,7 @@ async def transcribe(
             vad_filter=True,
             condition_on_previous_text=False,
             initial_prompt=prompt or None,
+            hotwords=prompt or None,
         )
         rows = [
             {
