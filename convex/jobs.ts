@@ -4945,7 +4945,7 @@ export const bindCloudWorkspace = mutation({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
     authorityDigest: v.optional(v.string()),
-    providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("vercel"), v.literal("cloudflare")),
+    providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("vercel"), v.literal("selfhost"), v.literal("cloudflare")),
     providerWorkspaceId: v.string(), providerSessionId: v.string(), workerToken: v.optional(v.string()),
     baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
     sourceArchiveDigest: v.string(), sourceArchiveBytes: v.number(),
@@ -5253,7 +5253,7 @@ export const cloudCheckpointForReplay = query({
   args: {
     jobId: v.id("jobs"), expectedAttempt: v.number(), workerRunId: v.string(),
     authorityDigest: v.optional(v.string()),
-    providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("vercel"), v.literal("cloudflare")),
+    providerName: v.union(v.literal("e2b"), v.literal("sandbox0"), v.literal("vercel"), v.literal("selfhost"), v.literal("cloudflare")),
     baseSha: v.string(), runtime: v.string(), lockfileDigest: v.string(), template: v.string(),
     sourceArchiveDigest: v.string(), sourceArchiveBytes: v.number(), workerToken: v.optional(v.string()),
   },

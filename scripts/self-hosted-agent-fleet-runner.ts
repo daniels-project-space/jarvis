@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 
 import { issueLiveCloudProviderProbe } from "./probe-cloud-workspace-provider";
 import { reserveAgentFleetBatch, type AgentFleetReservation } from "../src/lib/agent-fleet-dispatch";
+import { redactSensitiveText } from "../src/lib/secret-redaction";
 import { readSelfHostedAgentFleetConfig } from "../src/lib/self-hosted-agent-fleet-config";
 import { runSelfHostedAgentFleetController } from "../src/lib/self-hosted-agent-fleet";
 import {
@@ -183,8 +184,16 @@ export async function runSelfHostedAgentFleet(): Promise<void> {
 
 const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
 if (import.meta.url === invokedPath) {
-  runSelfHostedAgentFleet().catch(() => {
-    process.stderr.write("Jarvis self-hosted agent fleet stopped after a fail-closed controller error.\n");
+  runSelfHostedAgentFleet().catch((error) => {
+    const reason = redactSensitiveText(
+      error instanceof Error ? error.message : String(error),
+      process.env,
+    ).slice(0, 360);
+    process.stderr.write(JSON.stringify({
+      status: "stopped",
+      runtime: "selfhost",
+      reason: reason || "fail-closed controller error",
+    }) + "\n");
     process.exitCode = 1;
   });
 }

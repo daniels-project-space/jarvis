@@ -74,6 +74,44 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; });
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; });
 
 describe("durable cloud checkpoint control evidence", () => {
+  it("admits the attested self-hosted provider through the exact Convex workspace boundary", async () => {
+    const t = convexTest(schema, modules);
+    const current = await runningFixture(t, {
+      task: "self-hosted workspace authority", attempt: 1, maxAttempts: 3, workerRunId: "selfhost-run-1",
+    });
+    const binding = {
+      jobId: current.jobId,
+      expectedAttempt: 1,
+      authorityDigest: current.authorityDigest,
+      workerRunId: "selfhost-run-1",
+      providerName: "selfhost" as const,
+      baseSha: BASE,
+      runtime: WORK_ORDER_MACHINE_RUNTIME,
+      lockfileDigest: LOCK,
+      template: WORK_ORDER_MACHINE_TEMPLATE,
+      sourceArchiveDigest: SOURCE,
+      sourceArchiveBytes: 2_048,
+      workerToken: WORKER,
+    };
+
+    await expect(t.query(api.jobs.cloudCheckpointForReplay, binding)).resolves.toMatchObject({
+      disposition: "hydrate",
+      reason: "first_attempt",
+    });
+    await expect(t.mutation(api.jobs.bindCloudWorkspace, {
+      ...binding,
+      providerWorkspaceId: "selfhost-workspace-1",
+      providerSessionId: "selfhost-session-1",
+    })).resolves.toBe(true);
+    await expect(t.run(async (ctx) => await ctx.db.query("workAttempts")
+      .withIndex("by_job_attempt", (q) => q.eq("jobId", current.jobId).eq("attempt", 1))
+      .first())).resolves.toMatchObject({
+      providerName: "selfhost",
+      providerWorkspaceId: "selfhost-workspace-1",
+      providerSessionId: "selfhost-session-1",
+    });
+  });
+
   it("holds old Trigger replay-decision calls and records only exact v2 authority", async () => {
     const t = convexTest(schema, modules);
     const current = await runningFixture(t, {
