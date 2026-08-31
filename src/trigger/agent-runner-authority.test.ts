@@ -1409,7 +1409,7 @@ describe("production Trigger worker authority harness", () => {
       .toHaveLength(1);
     const reviewed = await t.run(async (ctx) => ctx.db.get(jobId));
     expect(reviewed).toMatchObject({ status: "pending", goalStage: "planning" });
-    expect(String(reviewed?.result)).toContain(planningResult);
+    expect(String(reviewed?.result)).toMatch(new RegExp(`^${GOAL_PLAN_MARKER}`));
     expect(parseGoalPlan(String(reviewed?.result), 8).workstreams).toHaveLength(4);
 
     const controllerBatch = await t.mutation(api.jobs.reserveDispatchBatch, {
@@ -1439,6 +1439,59 @@ describe("production Trigger worker authority harness", () => {
     expect(String(finished?.result).length).toBeGreaterThan(4_000);
     expect(String(finished?.result).length).toBeLessThanOrEqual(GOAL_PLAN_RESULT_MAX_CHARS);
     expect(parseGoalPlan(String(finished?.result), 8).workstreams).toHaveLength(4);
+  });
+
+  it("persists the validated Goal contract instead of truncating verbose planner prose", async () => {
+    configureFakeControllerAuthority();
+    const parsed = parseGoalPlan(longGoalPlanningResult(), 8);
+    parsed.workstreams[0].task += ` ${"bounded evidence ".repeat(220)}`;
+    const contract = `${GOAL_PLAN_MARKER}${JSON.stringify(parsed)}`;
+    expect(contract.length).toBeGreaterThan(8_000);
+    expect(contract.length).toBeLessThanOrEqual(GOAL_PLAN_RESULT_MAX_CHARS);
+    const planningResult = `${"DISCARDABLE_PLANNER_PROSE ".repeat(260)}\n${contract}`;
+    expect(planningResult.length).toBeGreaterThan(GOAL_PLAN_RESULT_MAX_CHARS);
+
+    const t = convexTest(schema, modules);
+    const { jobId, reservation } = await reservedWritableJob(
+      t,
+      "runner-goal-plan-contract-extraction",
+      "ultra",
+      {
+        task: "Return one complete compact Goal plan after any supporting analysis.",
+        model: "terra",
+        readonly: true,
+        goalStage: "planning",
+      },
+    );
+    const runProcess = vi.fn(async (input: any) => {
+      await input.turnReceipt.beforeRequest();
+      input.turnReceipt.requestWritten();
+      await input.turnReceipt.accepted();
+      await input.turnReceipt.completed();
+      return {
+        text: planningResult,
+        timedOut: false,
+        stopped: null,
+        checkpointLog: "verbose analysis followed by one valid contract",
+        commands: [],
+      };
+    });
+    const bridge = bridgeProductionRunnerToConvex(t);
+    const dependencies = injectedRunnerDependencies({ runProcess });
+
+    expect(await invokeHarness(
+      reservation,
+      "goal-plan-contract-extraction-run",
+      dependencies,
+    )).toEqual({ processed: 1 });
+    expect(bridge.trace.filter((call) => call.path === "jobs:markVerifiedForDelivery"))
+      .toHaveLength(1);
+    const reviewed = await t.run(async (ctx) => ctx.db.get(jobId));
+    const persisted = String(reviewed?.result ?? "");
+    expect(persisted).not.toContain("DISCARDABLE_PLANNER_PROSE");
+    expect(persisted.length).toBeGreaterThan(8_000);
+    expect(persisted.length).toBeLessThanOrEqual(GOAL_PLAN_RESULT_MAX_CHARS);
+    expect(parseGoalPlan(persisted, 8).workstreams).toHaveLength(4);
   });
 
   it("immediately correction-requeues a structurally valid validator pass rejected by the measurable-outcome gate", async () => {

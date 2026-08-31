@@ -44,6 +44,8 @@ import {
   controllerSessionAutonomousWorkStatus,
 } from "../lib/codex-session-status";
 import {
+  GOAL_PLAN_MARKER,
+  GOAL_VALIDATION_MARKER,
   parseGoalPlan,
   parseGoalValidation,
   workResultMaxChars,
@@ -3186,8 +3188,19 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
 
         if (job.goalStage === "planning" || job.goalStage === "validating") {
           try {
-            if (job.goalStage === "planning") parseGoalPlan(result, 8);
-            else parseGoalValidation(result);
+            const machineResult = job.goalStage === "planning"
+              ? `${GOAL_PLAN_MARKER}${JSON.stringify(parseGoalPlan(result, 8))}`
+              : `${GOAL_VALIDATION_MARKER}${JSON.stringify(parseGoalValidation(result))}`;
+            if (machineResult.length > resultMaxChars) {
+              throw new Error(
+                `${job.goalStage === "planning" ? "Goal plan" : "Goal validation"} contract is ${machineResult.length} characters; hard limit is ${resultMaxChars}`,
+              );
+            }
+            // Persist the validated machine contract itself. Keeping arbitrary
+            // leading prose and then slicing the combined string can cut the
+            // closing JSON brace off a valid result, causing an unnecessary
+            // second Terra/ultra session during controller advancement.
+            result = machineResult;
           } catch (error) {
             await checkpointMutation({
               jobId: job.jobId,
