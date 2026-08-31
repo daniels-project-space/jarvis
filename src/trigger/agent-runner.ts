@@ -2865,16 +2865,22 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
         }
         await durableProgress;
         let result = run.text;
+        const operationalCodexSuccess = !run.timedOut
+          && run.stopped === null
+          && result !== "(no output)"
+          && !/^error:/i.test(result);
+        if (operationalCodexSuccess) {
+          await convexMutation("controllerSession:confirmOperationalSuccess", {
+            source: "background",
+          }).catch(() => false);
+        }
         const immutableReadOnlyResult = job.readonly === true
           && Array.isArray(job.toolScope)
           && job.toolScope.every((tool: unknown) =>
             tool === "repository_validate"
             || tool === "repository_read_file"
             || tool === "repository_list_files")
-          && !run.timedOut
-          && run.stopped === null
-          && result !== "(no output)"
-          && !/^error:/i.test(result);
+          && operationalCodexSuccess;
         // A successfully completed read-only job with only bounded validation,
         // read, and list capabilities has no deliverable workspace state. The
         // validator may write ephemeral caches inside the deny-all sandbox,

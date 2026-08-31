@@ -211,6 +211,13 @@ export default defineSchema({
     sessionVersion: v.number(),
     tokenExpiresAt: v.number(),
     repairedAt: v.number(),
+    // A successful trusted Codex turn proves the shared controller session is
+    // operational after an older hold. It carries no transcript or credential.
+    operationalSuccessAt: v.optional(v.number()),
+    operationalSuccessSource: v.optional(v.union(
+      v.literal("foreground"),
+      v.literal("background"),
+    )),
   }).index("by_key", ["key"]),
 
   // Performance counters only: no transcript, source URLs, device fingerprint,
@@ -858,6 +865,7 @@ export default defineSchema({
     controllerSessionHoldCode: v.optional(v.string()),
     controllerSessionRepairRequired: v.optional(v.boolean()),
     controllerSessionRepairGeneration: v.optional(v.number()),
+    controllerSessionHoldAt: v.optional(v.number()),
     checkpoint: v.optional(v.string()),
     attempt: v.optional(v.number()),
     maxAttempts: v.optional(v.number()),
@@ -1029,6 +1037,7 @@ export default defineSchema({
     controllerSessionHoldCode: v.optional(v.string()),
     controllerSessionRepairRequired: v.optional(v.boolean()),
     controllerSessionRepairGeneration: v.optional(v.number()),
+    controllerSessionHoldAt: v.optional(v.number()),
     readonly: v.optional(v.boolean()),
     parentJobId: v.optional(v.string()),
     dependsOn: v.optional(v.array(v.string())),

@@ -939,6 +939,14 @@ export async function processChatQueue(
         return { processed, timings, finalization };
       }
       const deliveredAt = Date.now();
+      if (finalizeArgs.status === "done") {
+        // The reply is already durable and visible. Record only a credential-
+        // free success fence so an older session hold cannot keep telling the
+        // owner to reconnect after the same managed session just answered.
+        await convexMutation("controllerSession:confirmOperationalSuccess", {
+          source: "foreground",
+        }).catch(() => false);
+      }
       // Memory capture is a separate background task. It must never hold the
       // warm conversational worker hostage after Daniel already has a reply.
       if (turn.finalText.trim() && shouldCaptureDurableMemory(visibleUserText)) {

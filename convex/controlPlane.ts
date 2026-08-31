@@ -130,6 +130,9 @@ export function projectJobRuntime(job: any) {
     controllerSessionRepairGeneration: typeof job.controllerSessionRepairGeneration === "number"
       ? job.controllerSessionRepairGeneration
       : undefined,
+    controllerSessionHoldAt: typeof job.controllerSessionHoldAt === "number"
+      ? job.controllerSessionHoldAt
+      : undefined,
     readonly: typeof job.readonly === "boolean" ? job.readonly : undefined,
     parentJobId: typeof job.parentJobId === "string" ? job.parentJobId.slice(0, 120) : undefined,
     dependsOn: Array.isArray(job.dependsOn) ? job.dependsOn.slice(0, 16).map((id: unknown) => String(id).slice(0, 120)) : undefined,

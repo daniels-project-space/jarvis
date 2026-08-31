@@ -78,6 +78,23 @@ describe("controller session control-plane status", () => {
     }], 1)).toEqual({ state: "repair_required", code: "rotation_uncertain" });
   });
 
+  it("clears only a hold older than a trusted operational success", () => {
+    const hold = {
+      status: "needs_input",
+      active: true,
+      updatedAt: 200,
+      controllerSessionHoldAt: 200,
+      controllerSessionRepairRequired: true,
+      controllerSessionRepairGeneration: 1,
+      controllerSessionHoldCode: "credential_broker_unavailable",
+    };
+    expect(controllerSessionStatusFromRows([hold], 1, 199)).toEqual({
+      state: "repair_required",
+      code: "credential_broker_unavailable",
+    });
+    expect(controllerSessionStatusFromRows([hold], 1, 201)).toEqual({ state: "clear" });
+  });
+
   it("records only monotonic, credential-free repair receipts", async () => {
     const t = convexTest(schema, modules);
     const tokenExpiresAt = Date.now() + 4 * 60 * 60_000;
@@ -120,5 +137,29 @@ describe("controller session control-plane status", () => {
       "sessionVersion",
       "tokenExpiresAt",
     ]);
+  });
+
+  it("records a bounded operational success only after trusted enrollment", async () => {
+    const t = convexTest(schema, modules);
+    await expect(t.mutation(api.controllerSession.confirmOperationalSuccess, {
+      workerToken: WORKER,
+      source: "foreground",
+    })).resolves.toBe(false);
+    await t.mutation(api.controllerSession.confirmRepair, {
+      workerToken: WORKER,
+      sessionVersion: 1,
+      tokenExpiresAt: Date.now() + 4 * 60 * 60_000,
+    });
+    await expect(t.mutation(api.controllerSession.confirmOperationalSuccess, {
+      workerToken: WORKER,
+      source: "background",
+    })).resolves.toBe(true);
+    const row = await t.run((ctx) => ctx.db.query("controllerSessionRepairs").first());
+    expect(row).toMatchObject({
+      operationalSuccessSource: "background",
+      operationalSuccessAt: expect.any(Number),
+    });
+    expect(row).not.toHaveProperty("transcript");
+    expect(row).not.toHaveProperty("credential");
   });
 });

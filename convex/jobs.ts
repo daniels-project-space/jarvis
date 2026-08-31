@@ -5518,6 +5518,7 @@ export const requestInput = mutation({
       controllerSessionHoldCode: a.controllerSessionHoldCode,
       controllerSessionRepairRequired: a.controllerSessionHoldCode !== undefined ? true : undefined,
       controllerSessionRepairGeneration,
+      controllerSessionHoldAt: a.controllerSessionHoldCode !== undefined ? now : undefined,
       heartbeatAt: now,
     });
     if (
