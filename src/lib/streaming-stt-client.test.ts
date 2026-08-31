@@ -23,6 +23,18 @@ describe("self-hosted streaming speech browser PCM", () => {
     expect(worklet).toContain("const PCM_FRAME_SAMPLES = TARGET_SAMPLE_RATE / 10");
   });
 
+  it("buffers pre-roll locally and exposes an explicit speech-confirmed connection gate", () => {
+    const client = readFileSync(resolve(process.cwd(), "src/lib/streaming-stt-client.ts"), "utf8");
+    const live = readFileSync(resolve(process.cwd(), "src/components/JarvisUI.tsx"), "utf8");
+    const turn = live.slice(live.indexOf("async function freeVoiceTurn()"), live.indexOf("async function toggleMic()"));
+
+    expect(client).toContain("activate: () => void");
+    expect(client).toContain("if (connectionRequested || stopped) return");
+    expect(client).toContain("const queued: ArrayBuffer[] = []");
+    expect(turn.indexOf("prepareSelfHostedStream();")).toBeLessThan(turn.indexOf("const poll = setInterval"));
+    expect(turn).toContain("selfHostedStreaming.current?.activate()");
+  });
+
   it.each([16_000, 44_100, 48_000])("resamples one second of %i Hz microphone audio to exactly 16 kHz", (inputRate) => {
     const worklet = readFileSync(resolve(process.cwd(), "public/streaming-stt-capture.worklet.js"), "utf8");
     const output: ArrayBuffer[] = [];

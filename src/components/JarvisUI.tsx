@@ -5143,10 +5143,12 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           return result;
         }).catch(() => null);
       };
-      // Do not spend local CPU decoding silence. The stream opens only after
-      // this turn's VAD has accepted near-field speech, and has no authority
-      // over a command until it emits its explicit final result.
-      const startSelfHostedStream = () => {
+      // Capture a bounded local pre-roll from the start of this utterance
+      // window so tapping the mic and speaking immediately cannot lose the
+      // first word. The client delays its ticket and WSS connection until VAD
+      // confirms near-field speech, so idle listening still creates no
+      // network traffic and the stream has no authority before finalization.
+      const prepareSelfHostedStream = () => {
         if (!selfHostedStreamingSpeechEnabled) return;
         if (selfHostedStreaming.current) return;
         selfHostedStreaming.current = startSelfHostedStreamingSpeech({
@@ -5159,6 +5161,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           },
         });
       };
+      prepareSelfHostedStream();
       recRef.current = rec;
       const t0 = Date.now();
       let vad = createLiveVadState(t0);
@@ -5277,7 +5280,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         });
         vad = result.state;
         if (result.acceptedSpeech) {
-          startSelfHostedStream();
+          selfHostedStreaming.current?.activate();
           energyRef.current = Math.min(1, level / 90);
           if (!listeningCaptionShown) {
             listeningCaptionShown = true;

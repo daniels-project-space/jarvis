@@ -19,6 +19,7 @@ type StreamTicket = { url: string; ticket: string; expiresAt: number; sampleRate
 type SpeechMessage = { type?: unknown; text?: unknown; sampleRate?: unknown };
 
 export type SelfHostedStreamingSpeech = {
+  activate: () => void;
   finish: () => Promise<string>;
   stop: () => void;
 };
@@ -96,6 +97,7 @@ export function startSelfHostedStreamingSpeech(args: {
   let frameParts: ArrayBuffer[] = [];
   let frameBytes = 0;
   let started = false;
+  let connectionRequested = false;
   let awaitingWorkletFlush = false;
   let finishWorkletFlush: (() => void) | null = null;
   let flushWorkletCapture: (() => Promise<void>) | null = null;
@@ -232,51 +234,56 @@ export function startSelfHostedStreamingSpeech(args: {
     if (!connected) connectLegacyCapture();
   });
 
-  void ticket().then((issued) => {
-    if (!issued || stopped) return settle();
-    try {
-      socket = new WebSocket(issued.url);
-      socket.binaryType = "arraybuffer";
-      const timeout = window.setTimeout(() => {
-        if (!started) settle();
-      }, CONNECT_TIMEOUT_MS);
-      socket.onopen = () => {
-        if (!socket || stopped) return;
-        socket.send(JSON.stringify({ type: "auth", ticket: issued.ticket }));
-      };
-      socket.onmessage = (event) => {
-        const message = typeof event.data === "string"
-          ? (() => { try { return JSON.parse(event.data) as SpeechMessage; } catch { return null; } })()
-          : null;
-        if (!message || typeof message.type !== "string") return;
-        if (message.type === "ready") {
-          if (message.sampleRate !== TARGET_SAMPLE_RATE || !socket || stopped) return settle();
+  const activate = () => {
+    if (connectionRequested || stopped) return;
+    connectionRequested = true;
+    void ticket().then((issued) => {
+      if (!issued || stopped) return settle();
+      try {
+        socket = new WebSocket(issued.url);
+        socket.binaryType = "arraybuffer";
+        const timeout = window.setTimeout(() => {
+          if (!started) settle();
+        }, CONNECT_TIMEOUT_MS);
+        socket.onopen = () => {
+          if (!socket || stopped) return;
+          socket.send(JSON.stringify({ type: "auth", ticket: issued.ticket }));
+        };
+        socket.onmessage = (event) => {
+          const message = typeof event.data === "string"
+            ? (() => { try { return JSON.parse(event.data) as SpeechMessage; } catch { return null; } })()
+            : null;
+          if (!message || typeof message.type !== "string") return;
+          if (message.type === "ready") {
+            if (message.sampleRate !== TARGET_SAMPLE_RATE || !socket || stopped) return settle();
+            window.clearTimeout(timeout);
+            started = true;
+            for (const audio of queued.splice(0)) socket.send(audio);
+            queuedBytes = 0;
+            flushAudioFrame();
+            if (ended) socket.send(JSON.stringify({ type: "end" }));
+            return;
+          }
+          const text = normalizedText(message.text);
+          if (message.type === "partial" && text && !ended) args.onPartial(text);
+          if (message.type === "final") {
+            finalText = text;
+            settle(finalText);
+          }
+        };
+        socket.onerror = () => settle();
+        socket.onclose = () => {
           window.clearTimeout(timeout);
-          started = true;
-          for (const audio of queued.splice(0)) socket.send(audio);
-          queuedBytes = 0;
-          flushAudioFrame();
-          if (ended) socket.send(JSON.stringify({ type: "end" }));
-          return;
-        }
-        const text = normalizedText(message.text);
-        if (message.type === "partial" && text && !ended) args.onPartial(text);
-        if (message.type === "final") {
-          finalText = text;
-          settle(finalText);
-        }
-      };
-      socket.onerror = () => settle();
-      socket.onclose = () => {
-        window.clearTimeout(timeout);
-        if (!stopped) settle(finalText);
-      };
-    } catch {
-      settle();
-    }
-  });
+          if (!stopped) settle(finalText);
+        };
+      } catch {
+        settle();
+      }
+    });
+  };
 
   return {
+    activate,
     stop: () => settle(),
     finish: async () => {
       if (stopped) return await final;
