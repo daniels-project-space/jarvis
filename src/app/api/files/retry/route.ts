@@ -1,6 +1,7 @@
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { NextRequest } from "next/server";
 import { controlMutation, isSameOriginRequest } from "@/lib/control-session";
+import { isFileIngestWakePaused } from "@/lib/file-ingest-wake";
 import { controlActor, controlCredentials, isOwnerActor } from "@/lib/request-auth";
 
 export async function POST(req: NextRequest) {
@@ -16,8 +17,16 @@ export async function POST(req: NextRequest) {
     ingestVersion: number;
   } | null;
   if (!retry) return Response.json({ error: "file cannot be retried" }, { status: 409 });
-  await tasks.trigger("jarvis-file-ingest", retry, {
-    idempotencyKey: `jarvis-file-${retry.fileId}-v${retry.ingestVersion}`,
-  });
-  return Response.json({ ok: true, status: "uploaded" }, { status: 202, headers: { "cache-control": "private, no-store" } });
+  const wakePaused = isFileIngestWakePaused();
+  if (!wakePaused) {
+    await tasks.trigger("jarvis-file-ingest", retry, {
+      idempotencyKey: `jarvis-file-${retry.fileId}-v${retry.ingestVersion}`,
+    });
+  }
+  return Response.json({
+    ok: true,
+    status: "uploaded",
+    processingScheduled: !wakePaused,
+    ...(wakePaused ? { processingWakePaused: true } : {}),
+  }, { status: 202, headers: { "cache-control": "private, no-store" } });
 }

@@ -5,7 +5,8 @@ import { vaultFailureStage, type VaultFailureStage } from "./vault-client";
 import { CHAT_FILE_LIMITS, normalizeUploadMime, normalizeUploadSha256 } from "./chat-files";
 
 const REQUIRED_PRIVATE_BUCKET = "jarvis-private-files";
-const FILE_OBJECT_KEY = /^owners\/daniel\/files\/[a-zA-Z0-9_-]+\/v[1-9][0-9]*\/(?:original|extracted\.txt|preview\.webp)$/;
+const FILE_OBJECT_KEY = /^owners\/daniel\/files\/[a-zA-Z0-9_-]+\/v[1-9][0-9]*\/(?:original|extracted\.txt|preview\.webp|a[a-zA-Z0-9_-]+\/(?:extracted\.txt|preview\.webp))$/;
+const FILE_OUTPUT_ATTEMPT_ID = /^[a-zA-Z0-9_-]{16,180}$/;
 const OPAQUE_OBJECT_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const OPAQUE_OBJECT_ID = new RegExp(`^${OPAQUE_OBJECT_ID_SOURCE}$`, "i");
 const CREATION_OBJECT_KEY = new RegExp(`^owners/daniel/creations/${OPAQUE_OBJECT_ID_SOURCE}/(?:asset|thumb)$`, "i");
@@ -85,6 +86,29 @@ export function privateFileObjectKey(
     throw new Error("invalid private file object identity");
   }
   return validateObjectKey(`owners/daniel/files/${id}/v${version}/${purpose}`);
+}
+
+/**
+ * A derived-output generation is minted by Convex with the ingest claim. It
+ * deliberately cannot address an original upload or an arbitrary file prefix.
+ */
+export function privateFileAttemptObjectKey(
+  fileId: string,
+  version: number,
+  attemptId: string,
+  purpose: "extracted.txt" | "preview.webp",
+): string {
+  const id = String(fileId).trim();
+  const attempt = String(attemptId).trim();
+  if (
+    !/^[a-zA-Z0-9_-]+$/.test(id)
+    || !Number.isSafeInteger(version)
+    || version < 1
+    || !FILE_OUTPUT_ATTEMPT_ID.test(attempt)
+  ) {
+    throw new Error("invalid private file output attempt identity");
+  }
+  return validateObjectKey(`owners/daniel/files/${id}/v${version}/a${attempt}/${purpose}`);
 }
 
 // Generated artifacts and transient camera/screen captures get their own

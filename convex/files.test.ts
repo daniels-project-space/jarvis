@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { api } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { CHAT_FILE_LIMITS, privateFileSourceKey } from "../src/lib/chat-files";
-import { TURN_FILE_LEASE_MS } from "./files";
+import { INGEST_OUTPUT_PRODUCER_WINDOW_MS, LEGACY_V1_OUTPUT_DRAIN_MS, TURN_FILE_LEASE_MS } from "./files";
 import { linkFilesToMessage } from "./fileHelpers";
 import { reconcileReadyClaimAttachments, resolveReadyClaimAttachments } from "../src/trigger/private-attachment-fence";
 
@@ -15,6 +16,7 @@ declare global {
 
 const modules = import.meta.glob("./**/*.ts");
 const WORKER = "private-files-test-worker";
+const REHOME = "file-derived-artifact-rehome-test-token";
 
 function turnLeaseSources(attachments: Array<any>) {
   return attachments.map((attachment) => ({
@@ -25,12 +27,14 @@ function turnLeaseSources(attachments: Array<any>) {
 
 beforeEach(() => {
   process.env.JARVIS_WORKER_TOKEN = WORKER;
+  process.env.JARVIS_FILE_REHOME_TOKEN = REHOME;
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-08-07T09:00:00Z"));
 });
 
 afterEach(() => {
   delete process.env.JARVIS_WORKER_TOKEN;
+  delete process.env.JARVIS_FILE_REHOME_TOKEN;
   vi.useRealTimers();
 });
 
@@ -55,6 +59,33 @@ async function reserve(
     })),
     workerToken: WORKER,
   });
+}
+
+async function activateV2AfterVerifiedRehome(t: ReturnType<typeof convexTest>) {
+  await t.run(async (ctx: any) => {
+    const existing = await ctx.db
+      .query("fileDerivedArtifactRehomeControls")
+      .withIndex("by_key", (q: any) => q.eq("key", "file-derived-artifact-rehome-v1-to-v2"))
+      .first();
+    if (existing) return;
+    const now = Date.now();
+    await ctx.db.insert("fileDerivedArtifactRehomeControls", {
+      key: "file-derived-artifact-rehome-v1-to-v2",
+      phase: "ready",
+      inventoryStatus: "complete",
+      scannedCount: 0,
+      cleanupPreflightStatus: "complete",
+      cleanupPreflightScannedCount: 0,
+      auditStatus: "complete",
+      auditScannedCount: 0,
+      snapshotCount: 0,
+      cutoverCount: 0,
+      blockedCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+  return await t.mutation(api.files.activateIngestOutputProtocolV2, { rehomeToken: REHOME });
 }
 
 async function makeReady(
@@ -101,12 +132,94 @@ async function makeReady(
     detectedMimeType: mimeType,
     status: "ready",
     summary: `Indexed ${name}`,
-    extractedTextR2Key: `files/${fileId}/v1/extracted.txt`,
+    extractedTextR2Key: `owners/daniel/files/${fileId}/v1/extracted.txt`,
     extractedChars: textChunks.reduce((total, chunk) => total + chunk.length, 0),
     chunks: textChunks.map((chunk, ordinal) => ({ ordinal, text: chunk })),
     workerToken: WORKER,
   });
   return { batch, fileId };
+}
+
+async function makeProcessing(
+  t: ReturnType<typeof convexTest>,
+  threadId: string,
+  name: string,
+  sha256: string,
+  mimeType = "text/plain",
+) {
+  const batch = await reserve(t, threadId, name, sha256, 1, mimeType);
+  const fileId = batch.files[0].fileId;
+  const typedFileId = fileId as Id<"files">;
+  const typedBatchId = batch.batchId as Id<"uploadBatches">;
+  const uploadClaimToken = `upload-claim-${sha256.slice(0, 20)}`;
+  await t.mutation(api.files.claimUpload, {
+    batchId: typedBatchId,
+    fileId: typedFileId,
+    claimToken: uploadClaimToken,
+    contentType: mimeType,
+    sha256,
+    workerToken: WORKER,
+  });
+  await t.mutation(api.files.markUploaded, {
+    batchId: typedBatchId,
+    fileId: typedFileId,
+    sizeBytes: 24,
+    contentType: mimeType,
+    sha256,
+    claimToken: uploadClaimToken,
+    workerToken: WORKER,
+  });
+  const claimToken = `ingest-claim-${name}`;
+  await t.mutation(api.files.claimIngest, {
+    fileId: typedFileId,
+    ingestVersion: 1,
+    claimToken,
+    workerToken: WORKER,
+  });
+  return { batch, fileId, claimToken };
+}
+
+async function makeV2Processing(
+  t: ReturnType<typeof convexTest>,
+  threadId: string,
+  name: string,
+  sha256: string,
+  mimeType = "text/plain",
+) {
+  const batch = await reserve(t, threadId, name, sha256, 1, mimeType);
+  const fileId = batch.files[0].fileId as Id<"files">;
+  const batchId = batch.batchId as Id<"uploadBatches">;
+  const uploadClaimToken = `upload-claim-${sha256.slice(0, 20)}`;
+  await t.mutation(api.files.claimUpload, {
+    batchId,
+    fileId,
+    claimToken: uploadClaimToken,
+    contentType: mimeType,
+    sha256,
+    workerToken: WORKER,
+  });
+  await t.mutation(api.files.markUploaded, {
+    batchId,
+    fileId,
+    sizeBytes: 24,
+    contentType: mimeType,
+    sha256,
+    claimToken: uploadClaimToken,
+    workerToken: WORKER,
+  });
+  await activateV2AfterVerifiedRehome(t);
+  const claimToken = `v2-claim-${sha256.slice(0, 32)}`;
+  const claim = await t.mutation(api.files.claimIngest, {
+    fileId,
+    ingestVersion: 1,
+    claimToken,
+    outputProtocol: 2,
+    workerToken: WORKER,
+  });
+  if (!claim?.derivedOutput?.outputAttemptOutboxId || !claim.ingestOutputAttemptId) {
+    throw new Error("V2 output attempt was not allocated");
+  }
+  return { batch, fileId, claimToken, claim };
 }
 
 describe("durable private chat files", () => {
@@ -166,6 +279,61 @@ describe("durable private chat files", () => {
     expect(JSON.stringify(results)).not.toContain("r2Key");
     expect(JSON.stringify(results)).not.toContain("private rollout details");
     await expect(t.query(api.files.quickSearchLibrary, { search: "release" })).rejects.toThrow();
+  });
+
+  it("returns pre-activation uploads for the immediate V2 wake task", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "0".repeat(64);
+    const batch = await reserve(t, "main", "cutover-pending.txt", sha256);
+    const fileId = batch.files[0].fileId as Id<"files">;
+    const claimToken = "cutover-upload-claim-token";
+    await t.mutation(api.files.claimUpload, {
+      batchId: batch.batchId as Id<"uploadBatches">,
+      fileId,
+      claimToken,
+      contentType: "text/plain",
+      sha256,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.files.markUploaded, {
+      batchId: batch.batchId as Id<"uploadBatches">,
+      fileId,
+      sizeBytes: 24,
+      contentType: "text/plain",
+      sha256,
+      claimToken,
+      workerToken: WORKER,
+    });
+
+    // The V2 deployment can be present before the release marker, but its
+    // task must safely skip until a human has fully drained V1.
+    await expect(t.mutation(api.files.claimIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: "pre-activation-v2-claim-token",
+      outputProtocol: 2,
+      workerToken: WORKER,
+    })).resolves.toBeNull();
+
+    const activation = await activateV2AfterVerifiedRehome(t);
+    expect(activation).toMatchObject({
+      activated: true,
+      protocolVersion: 2,
+      requeue: expect.arrayContaining([{ fileId: String(fileId), ingestVersion: 1 }]),
+    });
+
+    // Retrying the activation task gets the same durable batch, so an
+    // activation response-loss cannot strand the initial wake-up.
+    await expect(activateV2AfterVerifiedRehome(t)).resolves.toMatchObject({
+      activated: false,
+      requeue: expect.arrayContaining([{ fileId: String(fileId), ingestVersion: 1 }]),
+    });
+    await expect(t.mutation(api.files.claimIngest, {
+      fileId,
+      ingestVersion: 1,
+      claimToken: "blocked-v1-claim-after-v2-activation",
+      workerToken: WORKER,
+    })).resolves.toBeNull();
   });
 
   it("reuses a file across chats only after an explicit durable thread link", async () => {
@@ -793,7 +961,7 @@ describe("durable private chat files", () => {
       detectedMimeType: "text/plain",
       status: "ready",
       summary: "Ready source from a still-open upload batch",
-      extractedTextR2Key: `files/${fileId}/v1/extracted.txt`,
+      extractedTextR2Key: `owners/daniel/files/${fileId}/v1/extracted.txt`,
       extractedChars: 18,
       chunks: [{ ordinal: 0, text: "BATCH_PRIVATE_SOURCE" }],
       workerToken: WORKER,
@@ -874,6 +1042,449 @@ describe("durable private chat files", () => {
     });
     expect(match?.file._id).toBe(source.fileId);
     expect(match?.chunks).toEqual([{ ordinal: 0, text: "deduplicated deterministic text", page: undefined, sheet: undefined, cellRange: undefined }]);
+  });
+
+  it("returns an exact worker-only receipt for a committed ingest", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "2".repeat(64);
+    const { fileId } = await makeReady(t, "main", "receipt.txt", sha256, "durable ingest receipt");
+    const receiptArgs = {
+      fileId: fileId as any,
+      ingestVersion: 1,
+      extractedTextR2Key: `owners/daniel/files/${fileId}/v1/extracted.txt`,
+      workerToken: WORKER,
+    };
+
+    await expect(t.query(api.files.ingestCommitReceipt, receiptArgs))
+      .resolves.toEqual({ committed: true, status: "ready" });
+    await expect(t.query(api.files.ingestCommitReceipt, {
+      ...receiptArgs,
+      extractedTextR2Key: `owners/daniel/files/${fileId}/v1/other.txt`,
+    })).resolves.toEqual({ committed: false });
+    await expect(t.query(api.files.ingestCommitReceipt, {
+      ...receiptArgs,
+      workerToken: undefined,
+    })).rejects.toThrow(/Unauthorized worker capability/);
+  });
+
+  it("durably fences an ambiguous ingest before derived cleanup can run", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "3".repeat(64);
+    const { fileId, claimToken } = await makeProcessing(t, "main", "response-loss.txt", sha256);
+    const typedFileId = fileId as Id<"files">;
+    const cleanup = await t.mutation(api.files.enqueueIngestDerivedCleanup, {
+      fileId: typedFileId,
+      ingestVersion: 1,
+      claimToken,
+      extractedTextR2Key: `owners/daniel/files/${fileId}/v1/extracted.txt`,
+      previewR2Key: `owners/daniel/files/${fileId}/v1/preview.webp`,
+      workerToken: WORKER,
+    });
+    expect(cleanup).toMatchObject({ committed: false, outboxId: expect.anything() });
+    if (!cleanup.outboxId) throw new Error("missing durable cleanup outbox id");
+    const outboxId = cleanup.outboxId;
+    expect(await t.mutation(api.files.claimIngest, {
+      fileId: typedFileId,
+      ingestVersion: 1,
+      claimToken: "must-not-race-cleanup",
+      workerToken: WORKER,
+    })).toBeNull();
+
+    const pending = await t.query(api.files.pendingIngestDerivedCleanup, { workerToken: WORKER });
+    expect(pending).toEqual([expect.objectContaining({ outboxId, fileId: String(fileId), ingestVersion: 1 })]);
+    const cleanupClaimToken = "legacy-derived-cleanup-claim-123e4567-e89b-12d3-a456-426614174000";
+    expect(await t.mutation(api.files.claimIngestDerivedCleanup, {
+      outboxId,
+      cleanupClaimToken,
+      workerToken: WORKER,
+    })).toEqual({
+      ready: true,
+      r2Keys: [
+        `owners/daniel/files/${fileId}/v1/extracted.txt`,
+        `owners/daniel/files/${fileId}/v1/preview.webp`,
+      ],
+    });
+    expect(await t.mutation(api.files.finishIngestDerivedCleanup, {
+      outboxId,
+      cleanupClaimToken,
+      workerToken: WORKER,
+    })).toBe(true);
+    // The legacy v1 pair remains permanently sweepable for a possible late
+    // PUT, so retry advances the generation before another V1 worker can own
+    // a shared path.
+    const retry = await t.mutation(api.files.retryIngest, { fileId: typedFileId, workerToken: WORKER });
+    expect(retry).toMatchObject({ ingestVersion: 2 });
+    expect(await t.mutation(api.files.claimIngest, {
+      fileId: typedFileId,
+      ingestVersion: 2,
+      claimToken: "claim-after-cleanup",
+      workerToken: WORKER,
+    })).toMatchObject({ status: "processing" });
+  });
+
+  it("retains the exact preview-only legacy cleanup subset and never sweeps a live V1 text pointer", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "c".repeat(64);
+    const { fileId } = await makeReady(t, "main", "legacy-text-only.txt", sha256, "LIVE_TEXT");
+    const typedFileId = fileId as any;
+    const textKey = `owners/daniel/files/${fileId}/v1/extracted.txt`;
+    const previewKey = `owners/daniel/files/${fileId}/v1/preview.webp`;
+    const enqueued = await t.mutation(api.files.enqueueIngestDerivedCleanup, {
+      fileId: typedFileId,
+      ingestVersion: 1,
+      claimToken: "legacy-preview-only-cleanup-123e4567-e89b-12d3-a456-426614174000",
+      extractedTextR2Key: textKey,
+      previewR2Key: previewKey,
+      workerToken: WORKER,
+    });
+    if (!enqueued.outboxId) throw new Error("legacy cleanup outbox was not created");
+    const cleanupClaimToken = "legacy-preview-only-worker-123e4567-e89b-12d3-a456-426614174000";
+    await expect(t.mutation(api.files.claimIngestDerivedCleanup, {
+      outboxId: enqueued.outboxId,
+      cleanupClaimToken,
+      workerToken: WORKER,
+    })).resolves.toEqual({ ready: true, r2Keys: [previewKey] });
+    await expect(t.mutation(api.files.finishIngestDerivedCleanup, {
+      outboxId: enqueued.outboxId,
+      cleanupClaimToken,
+      workerToken: WORKER,
+    })).resolves.toBe(true);
+    const [marker] = await t.run(async (ctx) => await ctx.db
+      .query("fileIngestOutputAttempts")
+      .withIndex("by_file_version", (q) => q.eq("fileId", typedFileId).eq("ingestVersion", 1))
+      .collect() as any[]);
+    expect(marker).toMatchObject({
+      outputProtocol: 1,
+      state: "legacy_sweeping",
+      cleanupExtractedText: false,
+      cleanupPreview: true,
+    });
+    const outputCleanup = await t.mutation(api.files.claimIngestOutputCleanup, {
+      outputAttemptId: marker!._id,
+      cleanupClaimToken: "legacy-preview-subset-sweep-123e4567-e89b-12d3-a456-426614174000",
+      workerToken: WORKER,
+    });
+    expect(outputCleanup).toEqual({ ready: true, r2Keys: [previewKey] });
+    const file: any = await t.run(async (ctx) => await ctx.db.get(typedFileId));
+    expect(file?.extractedTextR2Key).toBe(textKey);
+  });
+
+  it("keeps stale V2 cleanup attempt-scoped when a same-version preview-only attempt commits", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "7".repeat(64);
+    const first = await makeV2Processing(t, "main", "attempt-a.mp4", sha256, "video/mp4");
+    const firstOutput = first.claim.derivedOutput!;
+    const firstAttempt = first.claim.ingestOutputAttemptId!;
+
+    vi.advanceTimersByTime(90_001);
+    const secondToken = "v2-claim-second-123e4567-e89b-12d3-a456-426614174000";
+    const second = await t.mutation(api.files.claimIngest, {
+      fileId: first.fileId,
+      ingestVersion: 1,
+      claimToken: secondToken,
+      outputProtocol: 2,
+      workerToken: WORKER,
+    });
+    if (!second?.derivedOutput?.outputAttemptOutboxId || !second.ingestOutputAttemptId) throw new Error("missing second V2 attempt");
+    expect(second.derivedOutput.previewR2Key).not.toBe(firstOutput.previewR2Key);
+    expect(second.derivedOutput.extractedTextR2Key).not.toBe(firstOutput.extractedTextR2Key);
+
+    await expect(t.mutation(api.files.completeIngest, {
+      fileId: first.fileId,
+      ingestVersion: 1,
+      claimToken: secondToken,
+      outputAttemptId: second.ingestOutputAttemptId,
+      sha256,
+      detectedMimeType: "video/mp4",
+      status: "ready",
+      previewR2Key: second.derivedOutput.previewR2Key,
+      extractedChars: 0,
+      chunks: [],
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: true, status: "ready" });
+
+    const retired = await t.mutation(api.files.retireIngestOutputAttempt, {
+      fileId: first.fileId,
+      ingestVersion: 1,
+      claimToken: first.claimToken,
+      outputAttemptId: firstOutput.outputAttemptOutboxId as any,
+      workerToken: WORKER,
+    });
+    expect(retired).toMatchObject({ committed: false, outputAttemptId: firstOutput.outputAttemptOutboxId });
+    const cleanup = await t.mutation(api.files.claimIngestOutputCleanup, {
+      outputAttemptId: firstOutput.outputAttemptOutboxId as any,
+      cleanupClaimToken: "cleanup-attempt-a-123e4567-e89b-12d3-a456-426614174000",
+      workerToken: WORKER,
+    });
+    expect(cleanup).toEqual({
+      ready: true,
+      r2Keys: [firstOutput.extractedTextR2Key, firstOutput.previewR2Key],
+    });
+    expect(cleanup?.r2Keys).not.toContain(second.derivedOutput.previewR2Key);
+    expect(await t.mutation(api.files.finishIngestOutputCleanup, {
+      outputAttemptId: firstOutput.outputAttemptOutboxId as any,
+      cleanupClaimToken: "cleanup-attempt-a-123e4567-e89b-12d3-a456-426614174000",
+      workerToken: WORKER,
+    })).toBe(true);
+    const durable = await t.run(async (ctx) => await ctx.db.get(first.fileId));
+    expect(durable).toMatchObject({ status: "ready", previewR2Key: second.derivedOutput.previewR2Key });
+    expect(durable?.extractedTextR2Key).toBeUndefined();
+    expect(firstAttempt).not.toBe(second.ingestOutputAttemptId);
+  });
+
+  it("retains an expired V2 attempt for repeated exact-path sweeps until the worker explicitly hands off", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "a7".repeat(32);
+    const pending = await makeV2Processing(t, "main", "late-r2-put.mp4", sha256, "video/mp4");
+    const output = pending.claim.derivedOutput!;
+    const cleanupClaimToken = "cleanup-expired-attempt-123e4567-e89b-12d3-a456-426614174000";
+
+    // A logical worker deadline is not proof an already-accepted R2 PUT has
+    // not yet completed. The first cleanup must keep the attempt durable.
+    vi.advanceTimersByTime(INGEST_OUTPUT_PRODUCER_WINDOW_MS + 1);
+    expect(await t.mutation(api.files.claimIngestOutputCleanup, {
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      cleanupClaimToken,
+      workerToken: WORKER,
+    })).toEqual({
+      ready: true,
+      r2Keys: [output.extractedTextR2Key, output.previewR2Key],
+    });
+    expect(await t.mutation(api.files.finishIngestOutputCleanup, {
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      cleanupClaimToken,
+      workerToken: WORKER,
+    })).toBe(true);
+    const uncertainSweep = await t.run(async (ctx) => await ctx.db.get(output.outputAttemptOutboxId as any));
+    expect(uncertainSweep).toMatchObject({ state: "sweeping", writerHandoff: false });
+
+    // The retained attempt is eligible again, so a late write cannot orphan
+    // just because the first cleanup pass already deleted its keys.
+    vi.advanceTimersByTime(2 * 60 * 60_000 + 1);
+    expect(await t.query(api.files.pendingIngestOutputCleanup, { workerToken: WORKER }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ outputAttemptId: output.outputAttemptOutboxId })]));
+
+    // An explicit outcome handoff is the condition that permits consumption.
+    expect(await t.mutation(api.files.retireIngestOutputAttempt, {
+      fileId: pending.fileId,
+      ingestVersion: 1,
+      claimToken: pending.claimToken,
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      workerToken: WORKER,
+    })).toMatchObject({ committed: false, outputAttemptId: output.outputAttemptOutboxId });
+    const terminalCleanupToken = "cleanup-terminal-attempt-123e4567-e89b-12d3-a456-426614174000";
+    expect(await t.mutation(api.files.claimIngestOutputCleanup, {
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      cleanupClaimToken: terminalCleanupToken,
+      workerToken: WORKER,
+    })).toMatchObject({ ready: true });
+    expect(await t.mutation(api.files.finishIngestOutputCleanup, {
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      cleanupClaimToken: terminalCleanupToken,
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.run(async (ctx) => await ctx.db.get(output.outputAttemptOutboxId as any))).toBeNull();
+  });
+
+  it("keeps an explicitly retired V2 attempt sweepable after any derived PUT was started", async () => {
+    const t = convexTest(schema, modules);
+    const pending = await makeV2Processing(t, "main", "r2-response-loss.txt", "e7".repeat(32));
+    const output = pending.claim.derivedOutput!;
+    expect(await t.mutation(api.files.beginIngestOutputWrite, {
+      fileId: pending.fileId,
+      ingestVersion: 1,
+      claimToken: pending.claimToken,
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      purpose: "extracted.txt",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    // This models a client error after R2 accepted the PUT but before its
+    // response reached Trigger. The terminal Convex retirement is not an R2
+    // completion fence, so a single delete cannot consume the attempt.
+    expect(await t.mutation(api.files.retireIngestOutputAttempt, {
+      fileId: pending.fileId,
+      ingestVersion: 1,
+      claimToken: pending.claimToken,
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      workerToken: WORKER,
+    })).toMatchObject({ committed: false, outputAttemptId: output.outputAttemptOutboxId });
+    const cleanupToken = "cleanup-r2-response-loss-123e4567-e89b-12d3-a456-426614174000";
+    expect(await t.mutation(api.files.claimIngestOutputCleanup, {
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      cleanupClaimToken: cleanupToken,
+      workerToken: WORKER,
+    })).toMatchObject({ ready: true });
+    expect(await t.mutation(api.files.finishIngestOutputCleanup, {
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      cleanupClaimToken: cleanupToken,
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await t.run(async (ctx) => await ctx.db.get(output.outputAttemptOutboxId as any)))
+      .toMatchObject({ state: "sweeping", writerHandoff: true, writeStarted: true });
+  });
+
+  it("does not let future nonterminal sweep rows starve a newly due V2 cleanup", async () => {
+    const t = convexTest(schema, modules);
+    const seed = await makeV2Processing(t, "main", "sweep-queue.txt", "d7".repeat(32));
+    const now = Date.now();
+    const dueAttempt = "1-cleanup-target-123e4567-e89b-12d3-a456-426614174000";
+    const dueOutboxId = await t.run(async (ctx) => {
+      // These retained sweep rows are intentionally future-scheduled. A
+      // creation-time scan would consume its whole bounded window before
+      // reaching the due row inserted afterwards.
+      for (let index = 0; index < 4; index += 1) {
+        const outputAttemptId = `1-future-sweep-${String(index).padStart(2, "0")}-123e4567-e89b-12d3-a456-426614174000`;
+        await ctx.db.insert("fileIngestOutputAttempts", {
+          fileId: seed.fileId,
+          ingestVersion: 1,
+          outputProtocol: 2,
+          outputAttemptId,
+          claimToken: `future-sweep-claim-${index}-123e4567-e89b-12d3-a456-426614174000`,
+          extractedTextR2Key: `owners/daniel/files/${seed.fileId}/v1/a${outputAttemptId}/extracted.txt`,
+          previewR2Key: `owners/daniel/files/${seed.fileId}/v1/a${outputAttemptId}/preview.webp`,
+          producerMayWriteUntil: now,
+          state: "sweeping",
+          writerHandoff: false,
+          nextCleanupAt: now + 60_000,
+          sweepCount: 1,
+          createdAt: now + index,
+          updatedAt: now + index,
+        });
+      }
+      return await ctx.db.insert("fileIngestOutputAttempts", {
+        fileId: seed.fileId,
+        ingestVersion: 1,
+        outputProtocol: 2,
+        outputAttemptId: dueAttempt,
+        claimToken: "due-cleanup-claim-123e4567-e89b-12d3-a456-426614174000",
+        extractedTextR2Key: `owners/daniel/files/${seed.fileId}/v1/a${dueAttempt}/extracted.txt`,
+        previewR2Key: `owners/daniel/files/${seed.fileId}/v1/a${dueAttempt}/preview.webp`,
+        producerMayWriteUntil: now,
+        state: "cleanup",
+        writerHandoff: true,
+        nextCleanupAt: now,
+        sweepCount: 0,
+        createdAt: now + 10,
+        updatedAt: now + 10,
+      });
+    });
+    expect(await t.query(api.files.pendingIngestOutputCleanup, { limit: 1, workerToken: WORKER }))
+      .toEqual([expect.objectContaining({ outputAttemptId: dueOutboxId })]);
+  });
+
+  it("keeps V2 attempt cleanup independent when deleting a file with an expired producer", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "b7".repeat(32);
+    const pending = await makeV2Processing(t, "main", "delete-v2-late-put.mp4", sha256, "video/mp4");
+    const output = pending.claim.derivedOutput!;
+
+    const deletion = await t.mutation(api.files.beginDelete, { fileId: pending.fileId, workerToken: WORKER });
+    expect(deletion).toMatchObject({ ok: true, deferred: true });
+    expect((deletion as any).r2Keys).not.toContain(output.extractedTextR2Key);
+    expect((deletion as any).r2Keys).not.toContain(output.previewR2Key);
+    expect((deletion as any).r2Keys).not.toContain(`owners/daniel/files/${pending.fileId}/v1/extracted.txt`);
+    expect(await t.mutation(api.files.finishDelete, { fileId: pending.fileId, workerToken: WORKER })).toBe(false);
+
+    vi.advanceTimersByTime(INGEST_OUTPUT_PRODUCER_WINDOW_MS + 1);
+    // The file can disappear, while the separate exact-attempt reaper remains
+    // durable for a late accepted R2 PUT.
+    expect(await t.mutation(api.files.finishDelete, { fileId: pending.fileId, workerToken: WORKER })).toBe(true);
+    expect(await t.query(api.files.get, { fileId: pending.fileId, workerToken: WORKER })).toBeNull();
+    expect(await t.query(api.files.pendingIngestOutputCleanup, { workerToken: WORKER }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ outputAttemptId: output.outputAttemptOutboxId })]));
+  });
+
+  it("refuses a malformed V2 durable attempt before cleanup can receive an arbitrary private key", async () => {
+    const t = convexTest(schema, modules);
+    const pending = await makeV2Processing(t, "main", "malformed-v2-key.txt", "c7".repeat(32));
+    const output = pending.claim.derivedOutput!;
+    await t.run(async (ctx) => {
+      await ctx.db.patch(output.outputAttemptOutboxId as any, {
+        previewR2Key: "owners/daniel/creations/another-owner/private-output.bin",
+      });
+    });
+    await expect(t.mutation(api.files.claimIngestOutputCleanup, {
+      outputAttemptId: output.outputAttemptOutboxId as any,
+      cleanupClaimToken: "cleanup-malformed-attempt-123e4567-e89b-12d3-a456-426614174000",
+      workerToken: WORKER,
+    })).rejects.toThrow(/Derived output cleanup key is invalid/);
+  });
+
+  it("rotates a stale V1 claim into a distinct V2 version and rejects queued V1 claims after activation", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "8".repeat(64);
+    const legacy = await makeProcessing(t, "main", "legacy-cutover.mp4", sha256, "video/mp4");
+    await activateV2AfterVerifiedRehome(t);
+    // Activation is allowed only after release-level quiescence. The exact
+    // file-level stale bridge below remains the real output-path fence.
+    vi.advanceTimersByTime(LEGACY_V1_OUTPUT_DRAIN_MS + 1);
+
+    const v2Token = "v2-cutover-123e4567-e89b-12d3-a456-426614174000";
+    const v2 = await t.mutation(api.files.claimIngest, {
+      fileId: legacy.fileId as any,
+      ingestVersion: 1,
+      claimToken: v2Token,
+      outputProtocol: 2,
+      workerToken: WORKER,
+    });
+    if (!v2?.derivedOutput?.outputAttemptOutboxId || !v2.ingestOutputAttemptId) throw new Error("missing cutover V2 attempt");
+    expect(v2).toMatchObject({ ingestVersion: 2, ingestOutputProtocol: 2 });
+    expect(v2.derivedOutput.previewR2Key).toContain(`/v2/a${v2.ingestOutputAttemptId}/preview.webp`);
+
+    await expect(t.mutation(api.files.completeIngest, {
+      fileId: legacy.fileId as any,
+      ingestVersion: 1,
+      claimToken: legacy.claimToken,
+      sha256,
+      detectedMimeType: "video/mp4",
+      status: "ready",
+      previewR2Key: `owners/daniel/files/${legacy.fileId}/v1/preview.webp`,
+      extractedChars: 0,
+      chunks: [],
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: false, reason: "stale_claim" });
+    await expect(t.mutation(api.files.claimIngest, {
+      fileId: legacy.fileId as any,
+      ingestVersion: 2,
+      claimToken: "legacy-queued-claim-after-v2-1234567890",
+      workerToken: WORKER,
+    })).resolves.toBeNull();
+  });
+
+  it("rejects a wrong-purpose legacy cleanup key before it can create a deletion record", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "9".repeat(64);
+    const { fileId, claimToken } = await makeProcessing(t, "main", "wrong-key.txt", sha256);
+    await expect(t.mutation(api.files.enqueueIngestDerivedCleanup, {
+      fileId: fileId as any,
+      ingestVersion: 1,
+      claimToken,
+      extractedTextR2Key: `owners/daniel/files/${fileId}/v1/preview.webp`,
+      workerToken: WORKER,
+    })).rejects.toThrow(/Legacy extracted cleanup key is invalid/);
+    const file = await t.run(async (ctx) => await ctx.db.get(fileId as any));
+    expect(file).toMatchObject({ status: "processing", ingestClaimToken: claimToken });
+  });
+
+  it("rejects arbitrary V1 completion pointers during the compatibility bridge", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "f7".repeat(32);
+    const { fileId, claimToken } = await makeProcessing(t, "main", "legacy-pointer-fence.txt", sha256);
+    await expect(t.mutation(api.files.completeIngest, {
+      fileId: fileId as any,
+      ingestVersion: 1,
+      claimToken,
+      sha256,
+      detectedMimeType: "text/plain",
+      status: "ready",
+      extractedTextR2Key: `owners/daniel/files/${fileId}/v1/aunrelated-attempt-123e4567-e89b-12d3-a456-426614174000/extracted.txt`,
+      extractedChars: 0,
+      chunks: [],
+      workerToken: WORKER,
+    })).resolves.toEqual({ ok: false, reason: "output_key_mismatch" });
+    expect(await t.run(async (ctx) => await ctx.db.get(fileId as any)))
+      .toMatchObject({ status: "processing", ingestClaimToken: claimToken });
   });
 
   it("fences concurrent PUT claims and accepts only the winning claim token", async () => {
@@ -1052,6 +1663,127 @@ describe("durable private chat files", () => {
     expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId, workerToken: WORKER }))
       .toMatchObject({ ready: true });
     expect(await t.mutation(api.files.finishDelete, { fileId, workerToken: WORKER })).toBe(true);
+  });
+
+  it("bridges a pre-V2 deletion through a durable legacy sweep instead of direct shared-key cleanup", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "c7".repeat(32);
+    const legacy = await makeProcessing(t, "main", "delete-before-v2-bridge.mp4", sha256, "video/mp4");
+    const sharedExtracted = `owners/daniel/files/${legacy.fileId}/v1/extracted.txt`;
+    const sharedPreview = `owners/daniel/files/${legacy.fileId}/v1/preview.webp`;
+    // A retried/legacy row can still carry stale derived pointers. Deletion
+    // must not expose those shared paths while its old producer may write.
+    await t.run(async (ctx) => {
+      await ctx.db.patch(legacy.fileId as any, {
+        extractedTextR2Key: sharedExtracted,
+        previewR2Key: sharedPreview,
+      });
+    });
+
+    const deletion = await t.mutation(api.files.beginDelete, { fileId: legacy.fileId as any, workerToken: WORKER });
+    expect(deletion).toMatchObject({ ok: true, deferred: true });
+    expect((deletion as any).r2Keys).not.toContain(sharedExtracted);
+    expect((deletion as any).r2Keys).not.toContain(sharedPreview);
+    // The deployed V1 Trigger ignores this false heartbeat and may continue
+    // until its task deadline; the bridge, not this response, owns cleanup.
+    expect(await t.mutation(api.files.heartbeatIngest, {
+      fileId: legacy.fileId as any,
+      ingestVersion: 1,
+      claimToken: legacy.claimToken,
+      workerToken: WORKER,
+    })).toBe(false);
+    expect(await t.mutation(api.files.claimCancelledUploadCleanup, { fileId: legacy.fileId as any, workerToken: WORKER }))
+      .toMatchObject({ ready: false });
+
+    // The worker has gone quiet, but this is only a legacy producer window,
+    // not proof an accepted V1 PUT will not land later.
+    vi.advanceTimersByTime(LEGACY_V1_OUTPUT_DRAIN_MS + 1);
+    const cleanup = await t.mutation(api.files.claimCancelledUploadCleanup, { fileId: legacy.fileId as any, workerToken: WORKER });
+    expect(cleanup).toMatchObject({ ready: true });
+    expect(cleanup?.r2Keys).not.toContain(sharedExtracted);
+    expect(cleanup?.r2Keys).not.toContain(sharedPreview);
+    expect(await t.mutation(api.files.finishDelete, { fileId: legacy.fileId as any, workerToken: WORKER })).toBe(true);
+    expect(await t.query(api.files.get, { fileId: legacy.fileId as any, workerToken: WORKER })).toBeNull();
+    expect(await t.query(api.files.pendingIngestOutputCleanup, { workerToken: WORKER }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ fileId: String(legacy.fileId), ingestVersion: 1 })]));
+  });
+
+  it("bootstraps a permanent V1 bridge before retrying a terminal pre-compat error as V2", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "d7".repeat(32);
+    const legacy = await makeProcessing(t, "main", "terminal-v1-response-loss.txt", sha256);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(legacy.fileId as any, {
+        status: "error",
+        errorCode: "legacy_worker_failed_after_accepted_put",
+        ingestClaimToken: undefined,
+        lastProgressAt: Date.now() - LEGACY_V1_OUTPUT_DRAIN_MS - 1,
+      });
+    });
+    await activateV2AfterVerifiedRehome(t);
+
+    const v2Claim = await t.mutation(api.files.claimIngest, {
+      fileId: legacy.fileId as any,
+      ingestVersion: 1,
+      claimToken: "v2-after-terminal-v1-response-loss",
+      outputProtocol: 2,
+      workerToken: WORKER,
+    });
+    expect(v2Claim).toMatchObject({
+      ingestOutputProtocol: 2,
+      derivedOutput: expect.objectContaining({
+        extractedTextR2Key: expect.stringContaining(`/v1/a`),
+        previewR2Key: expect.stringContaining(`/v1/a`),
+      }),
+    });
+    const outputAttempts = await t.run(async (ctx) => await ctx.db
+      .query("fileIngestOutputAttempts")
+      .withIndex("by_file_version", (q) => q.eq("fileId", legacy.fileId as any).eq("ingestVersion", 1))
+      .collect());
+    expect(outputAttempts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        fileId: legacy.fileId,
+        ingestVersion: 1,
+        outputProtocol: 1,
+        state: "legacy_sweeping",
+      }),
+    ]));
+  });
+
+  it("keeps terminal V1 error pointers out of direct deletion and leaves their bridge sweeping", async () => {
+    const t = convexTest(schema, modules);
+    const sha256 = "e7".repeat(32);
+    const legacy = await makeProcessing(t, "main", "delete-terminal-v1-response-loss.txt", sha256);
+    const sharedExtracted = `owners/daniel/files/${legacy.fileId}/v1/extracted.txt`;
+    const sharedPreview = `owners/daniel/files/${legacy.fileId}/v1/preview.webp`;
+    await t.run(async (ctx) => {
+      await ctx.db.patch(legacy.fileId as any, {
+        status: "error",
+        errorCode: "legacy_worker_failed_after_accepted_put",
+        ingestClaimToken: undefined,
+        extractedTextR2Key: sharedExtracted,
+        previewR2Key: sharedPreview,
+        lastProgressAt: Date.now() - LEGACY_V1_OUTPUT_DRAIN_MS - 1,
+      });
+    });
+
+    const deletion = await t.mutation(api.files.beginDelete, { fileId: legacy.fileId as any, workerToken: WORKER });
+    expect(deletion).toMatchObject({ ok: true, deferred: false });
+    expect(deletion?.r2Keys).not.toContain(sharedExtracted);
+    expect(deletion?.r2Keys).not.toContain(sharedPreview);
+    expect(await t.mutation(api.files.finishDelete, { fileId: legacy.fileId as any, workerToken: WORKER })).toBe(true);
+    const outputAttempts = await t.run(async (ctx) => await ctx.db
+      .query("fileIngestOutputAttempts")
+      .withIndex("by_file_version", (q) => q.eq("fileId", legacy.fileId as any).eq("ingestVersion", 1))
+      .collect());
+    expect(outputAttempts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        fileId: legacy.fileId,
+        ingestVersion: 1,
+        outputProtocol: 1,
+        state: "legacy_sweeping",
+      }),
+    ]));
   });
 
   it("releases a delete-deferred ingest claim after its terminal failure callback", async () => {

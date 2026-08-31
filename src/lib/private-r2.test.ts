@@ -6,6 +6,7 @@ import {
   assertPrivateBucketName,
   privateCaptureObjectKey,
   privateCreationObjectKey,
+  privateFileAttemptObjectKey,
   privateR2ConfigurationCode,
 } from "./private-r2";
 
@@ -42,5 +43,16 @@ describe("private R2 configuration diagnostics", () => {
   it("rejects broad or non-opaque creation and capture paths", () => {
     expect(() => privateCreationObjectKey("owners/daniel/files/anything/v1/original")).toThrow("invalid private creation object identity");
     expect(() => privateCaptureObjectKey("capture-1")).toThrow("invalid private capture object identity");
+  });
+
+  it("mints derived-output keys only for a bounded attempt namespace", () => {
+    const fileId = "file_01A-opaque";
+    const attempt = "2-123e4567-e89b-12d3-a456-426614174000";
+    expect(privateFileAttemptObjectKey(fileId, 3, attempt, "extracted.txt"))
+      .toBe(`owners/daniel/files/${fileId}/v3/a${attempt}/extracted.txt`);
+    expect(privateFileAttemptObjectKey(fileId, 3, attempt, "preview.webp"))
+      .toBe(`owners/daniel/files/${fileId}/v3/a${attempt}/preview.webp`);
+    expect(() => privateFileAttemptObjectKey(fileId, 3, "../other-owner", "preview.webp"))
+      .toThrow("invalid private file output attempt identity");
   });
 });

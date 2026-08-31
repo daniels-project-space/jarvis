@@ -54,6 +54,23 @@ export function requireWorker(workerToken: string | undefined): void {
   if (!hasWorkerCapability(workerToken)) throw new Error("Unauthorized worker capability");
 }
 
+/**
+ * File-derived-artifact rehoming can make a one-way protocol cutover
+ * available. Keep that authority separate from the broadly-used worker token:
+ * an ordinary ingestion/cleanup worker must never be able to certify the
+ * migration or repoint an existing private-file pointer.
+ */
+export function hasFileDerivedArtifactRehomeCapability(token: string | undefined): boolean {
+  const expected = process.env.JARVIS_FILE_REHOME_TOKEN;
+  return Boolean(expected && constantTimeEqual(token, expected));
+}
+
+export function requireFileDerivedArtifactRehome(token: string | undefined): void {
+  if (!hasFileDerivedArtifactRehomeCapability(token)) {
+    throw new Error("Unauthorized file-derived-artifact rehome capability");
+  }
+}
+
 export async function isAdminSession(ctx: any, tokenHash: string | undefined): Promise<boolean> {
   if (!tokenHash || !/^[a-f0-9]{64}$/i.test(tokenHash)) return false;
   const session = await ctx.db

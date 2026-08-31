@@ -16,6 +16,8 @@ describe("Trigger mission rollout environment", () => {
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_CLOUD_PROVIDER_PROBE");
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_SELF_HOST_RUNNER_URL");
     expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_SELF_HOST_RUNNER_TOKEN");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_FILE_INGEST_WAKE_PAUSED");
+    expect(JARVIS_TRIGGER_ENV_KEYS).toContain("JARVIS_FILE_REHOME_TOKEN");
 
     const runner = readFileSync(new URL("./agent-runner.ts", import.meta.url), "utf8");
     const foregroundTools = readFileSync(new URL("../lib/tools.ts", import.meta.url), "utf8");
@@ -26,5 +28,8 @@ describe("Trigger mission rollout environment", () => {
     expect(foregroundTools).toContain("admissionMutationName");
     expect(rollout).toContain("process.env.JARVIS_MISSION_PROTOCOL_ROLLOUT");
     expect(rollout).toContain("missionProtocolPhase()");
+
+    const insightEngine = readFileSync(new URL("./insight-engine.ts", import.meta.url), "utf8");
+    expect(insightEngine).toContain("isFileIngestWakePaused");
   });
 });

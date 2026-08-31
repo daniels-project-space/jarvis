@@ -69,6 +69,29 @@ describe("server-mediated private upload", () => {
     expect(mock.trigger).toHaveBeenCalledWith("jarvis-file-ingest", { fileId: "file-1", ingestVersion: 1 }, expect.anything());
   });
 
+  it("holds the immediate ingest wake during the V1-to-V2 cutover without rejecting the upload", async () => {
+    process.env.JARVIS_FILE_INGEST_WAKE_PAUSED = "1";
+    try {
+      const request = new NextRequest("https://jarvis.example/api/files/upload/file-1?batchId=batch-1", {
+        method: "PUT",
+        headers: { "content-type": "text/plain", "x-jarvis-sha256": sha256, origin: "https://jarvis.example" },
+        body: bytes,
+      });
+      const response = await PUT(request, { params: Promise.resolve({ id: "file-1" }) });
+      expect(response.status).toBe(201);
+      await expect(response.json()).resolves.toMatchObject({
+        ok: true,
+        status: "uploaded",
+        processingScheduled: false,
+        processingWakePaused: true,
+      });
+      expect(mock.privateR2Put).toHaveBeenCalled();
+      expect(mock.trigger).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.JARVIS_FILE_INGEST_WAKE_PAUSED;
+    }
+  });
+
   it("never stores a body whose computed digest differs", async () => {
     mock.controlMutation.mockImplementationOnce(async () => ({
       claimed: true,
