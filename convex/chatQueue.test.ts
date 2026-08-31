@@ -782,6 +782,12 @@ describe("background notification separation", () => {
       role: "assistant",
       status: "done",
       delivery: "notification",
+      text: "I stopped a wasteful retry for Atlas: Required durable admission receipts are absent.",
+    })).toBe(true);
+    expect(isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
       text: "Mission complete — the verified report is ready.",
     })).toBe(false);
     expect(isRetiredAutomaticChatNotification({

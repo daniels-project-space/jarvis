@@ -88,6 +88,7 @@ export function isRetiredAutomaticChatNotification(message: {
   ) return false;
   const text = message.text ?? "";
   return /^Sir, I've had two goes at fixing "[\s\S]{0,120}" and it's still misbehaving — this one needs your eyes\.$/.test(text)
+    || /^I stopped a wasteful retry for [^:\n]{1,80}: [\s\S]{1,1000}$/.test(text)
     || /^I have to be honest, sir — the background job "[\s\S]{1,500}" kept dying on me and I've stopped retrying it\.$/.test(text)
     || /^I've stopped the background job "[\s\S]{1,500}" because its worker reservation could not be verified\. It is waiting for review; I have not started a replacement\.$/.test(text)
     || /^Heads up, sir — [\s\S]{1,500} just failed to deploy\. I'm sending an engineer in to trace it and fix it now\.$/.test(text)
