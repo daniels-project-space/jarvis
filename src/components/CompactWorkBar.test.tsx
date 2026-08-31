@@ -15,6 +15,7 @@ import {
   fetchWorkRealtimeTicket,
   fleetDagLayout,
   fleetNodeStateLabel,
+  legacyWorkControlPayload,
   liveWorkFreshnessLabel,
   liveWorkSignalNode,
   mergeRealtimeWorkNode,
@@ -571,6 +572,32 @@ describe("FleetCommandCenter", () => {
     expect(markup).toContain(">Stop worker</button>");
     expect(markup).not.toMatch(/>(?:pause|resume|steer|retry)(?: exact control)?<\/button>/);
     expect(markup).not.toContain('aria-label="Answer Jarvis"');
+  });
+
+  it("renders legacy worker input and maps it to the bounded answer mutation", () => {
+    const inputNode = node({
+      state: "needs_input",
+      status: "needs_input",
+      controls: ["provide_input", "cancel"],
+      attentionReason: "Choose whether to prepare a draft.",
+      needsDaniel: true,
+    });
+    const markup = renderToStaticMarkup(
+      <WorkerDetail
+        node={inputNode}
+        workerMissionId="work:job-1"
+        mission={{ id: "work:job-1", mode: "work" }}
+        onBack={() => undefined}
+      />,
+    );
+    expect(markup).toContain('data-worker-answer="true"');
+    expect(markup).toContain("Choose whether to prepare a draft.");
+    expect(markup).toContain('aria-label="Answer Jarvis"');
+    expect(legacyWorkControlPayload(
+      { jobId: "job-1" },
+      "provide_input",
+      "Prepare a draft.",
+    )).toEqual({ jobId: "job-1", action: "answer", input: "Prepare a draft." });
   });
 
   it("keeps supervised lifecycle controls on the mission authority surface", () => {

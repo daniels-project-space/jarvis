@@ -50,7 +50,10 @@ import {
   upsertJobRuntime,
   upsertMissionRuntime,
 } from "./controlPlane";
-import { currentControllerSessionRepairGeneration } from "./controllerSession";
+import {
+  controllerSessionHoldIsClear,
+  currentControllerSessionRepairGeneration,
+} from "./controllerSession";
 import {
   BACKGROUND_CONCURRENCY_LIMIT,
   DISPATCH_CANDIDATE_WINDOW_MAX,
@@ -6194,6 +6197,61 @@ export const control = mutation({
     }
     else if (a.action === "resume" && row.status === "needs_input" && row.integrationState === "needs_attention") {
       return await resumeIntegrationReconciliation(ctx, row, now);
+    }
+    else if (
+      a.action === "resume"
+      && row.status === "needs_input"
+      && row.controllerSessionRepairRequired === true
+    ) {
+      // A controller-session failure is system-owned, not a question Daniel
+      // must answer. Resume it only after trusted durable evidence clears the
+      // exact hold, then allocate a fresh attempt rather than reviving the
+      // terminal workspace in place.
+      if (!await controllerSessionHoldIsClear(ctx, row)) return false;
+      const previous = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
+      if (!previous || previous.status !== "needs_input" || !previous.completedAt) return false;
+      const nextAttempt = (row.attempt ?? 1) + 1;
+      if (!hasAttemptBudget(nextAttempt, row.maxAttempts ?? 12)) return false;
+      await patchJobWithRuntime(ctx, row, {
+        ...invalidateDeliveryLease(row),
+        status: "pending",
+        stage: "queued",
+        progress: "ChatGPT connection restored — fresh attempt queued",
+        percent: 0,
+        attempt: nextAttempt,
+        startedAt: undefined,
+        completedAt: undefined,
+        heartbeatAt: now,
+        progressAt: now,
+        nextRunAt: now,
+        dispatchId: undefined,
+        dispatchLeaseUntil: undefined,
+        workerRunId: undefined,
+        deliveryRunId: undefined,
+        controllerSessionHoldCode: undefined,
+        controllerSessionRepairRequired: undefined,
+        controllerSessionRepairGeneration: undefined,
+        controllerSessionHoldAt: undefined,
+      });
+      await ensureAttempt(ctx, a.jobId, nextAttempt, "pending", now);
+      await appendAttemptEvidence(ctx, row, "resume", "Trusted ChatGPT recovery cleared the controller-session hold", {
+        stage: "queued",
+        evidenceKind: "control",
+        eventKey: `control:session-resume:${row.attempt ?? 1}:${nextAttempt}`,
+        attempt: row.attempt ?? 1,
+      });
+      await appendAttemptEvidence(ctx, row, "queued", `Fresh attempt ${nextAttempt} queued after ChatGPT recovery`, {
+        stage: "queued",
+        evidenceKind: "intent",
+        eventKey: `intent:${nextAttempt}`,
+        attempt: nextAttempt,
+      });
+      const attention = await ctx.db
+        .query("attentionItems")
+        .withIndex("by_fingerprint", (q: any) => q.eq("fingerprint", `job-input:${a.jobId}`))
+        .first();
+      if (attention) await ctx.db.patch(attention._id, { status: "resolved", updatedAt: now });
+      controlEventEmitted = true;
     }
     else if (a.action === "resume" && ["paused", "stalled"].includes(row.status)) {
       const activeDelivery: any = row.activeDeliveryAttemptId ? await ctx.db.get(row.activeDeliveryAttemptId) : null;

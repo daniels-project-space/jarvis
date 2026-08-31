@@ -274,7 +274,15 @@ function controlsFor(row: RuntimeRow) {
     && (row.risk === "consequential" || row.deliveryMode === "manual");
   if (consequentialApproval) controls.push("approve", "decline");
   if (["running", "dispatching", "steering"].includes(status)) controls.push("pause", "cancel", "steer");
-  else if (["paused", "stalled", "needs_input"].includes(status)) controls.push("resume", "cancel", "steer");
+  else if (["paused", "stalled"].includes(status)) controls.push("resume", "cancel", "steer");
+  else if (
+    status === "needs_input"
+    && (
+      row.integrationState === "needs_attention"
+      || row.controllerSessionRepairRequired === true
+    )
+  ) controls.push("resume", "cancel");
+  else if (status === "needs_input") controls.push("provide_input", "cancel");
   else if (status === "pending") controls.push("cancel", "steer");
   return controls;
 }

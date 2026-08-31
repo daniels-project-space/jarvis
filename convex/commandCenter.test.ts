@@ -168,6 +168,7 @@ describe("commandCenter relevance and bounded projection", () => {
     expect(result.fleet?.edges[0].readiness).toBe("delivered");
     expect(result.fleet?.nodes[0]).toMatchObject({ attempt: 2, workerRuntime: "trigger", mergeState: "merged" });
     expect(result.fleet?.nodes[1]).toMatchObject({ state: "needs_input", recoverySummary: "Merge conflict needs a decision" });
+    expect(result.fleet?.nodes[1].controls).toEqual(["resume", "cancel"]);
     expect(result.fleet?.nodes[1]).toMatchObject({
       model: "terra", reasoningEffort: "high", modelReason: "Terra/high for bounded implementation",
     });
@@ -202,6 +203,24 @@ describe("commandCenter relevance and bounded projection", () => {
       attentionLabel: "Secure worker setup",
       controls: ["cancel"],
     });
+  });
+
+  it("offers a truthful input control and reserves resume for a repaired ChatGPT hold", () => {
+    const question = buildFleetSnapshot({
+      threadId,
+      activeRows: [runtime({ status: "needs_input", progress: "Choose the delivery boundary" })],
+    });
+    expect(question.fleet?.nodes[0].controls).toEqual(["provide_input", "cancel"]);
+
+    const sessionHold = buildFleetSnapshot({
+      threadId,
+      activeRows: [runtime({
+        status: "needs_input",
+        controllerSessionRepairRequired: true,
+        controllerSessionHoldCode: "rotation_uncertain",
+      })],
+    });
+    expect(sessionHold.fleet?.nodes[0].controls).toEqual(["resume", "cancel"]);
   });
 
   it("uses only an exact canonical supervisor affordance and ignores stale job totals", () => {

@@ -373,7 +373,22 @@ type ControlTarget = {
   jobId?: string;
   missionId?: string;
   supervisor?: FleetSupervisorAuthority;
+  question?: string;
+  legacyInput?: boolean;
 };
+
+export function legacyWorkControlPayload(
+  target: Pick<ControlTarget, "jobId" | "missionId">,
+  action: FleetControl,
+  input?: string,
+) {
+  return {
+    ...(target.jobId ? { jobId: target.jobId } : {}),
+    ...(target.missionId ? { missionId: target.missionId } : {}),
+    action: action === "provide_input" ? "answer" : action,
+    ...(action === "steer" || action === "provide_input" ? { input } : {}),
+  };
+}
 
 export type PendingSupervisorRequest = {
   signature: string;
@@ -648,11 +663,7 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
       onError("Supervisor input requires an exact mission authority.");
       return;
     }
-    const body = {
-      ...target,
-      action,
-      ...(action === "steer" ? { input } : {}),
-    };
+    const body = legacyWorkControlPayload(target, action, input);
     setActing(action);
     onError("");
     try {
@@ -673,6 +684,10 @@ function Controls({ controls, target, onError }: { controls: FleetControl[]; tar
   };
   return <div className="space-y-2">
     {retryableSupervisorRequest && <div data-supervisor-retry className="flex items-center gap-2 rounded-lg border border-amber/25 bg-amber/[0.07] px-2 py-1.5 text-[9px] text-amber"><span className="min-w-0 flex-1">The last control may already be recorded.</span><button type="button" disabled={Boolean(acting)} onClick={() => void apply(retryableSupervisorRequest.request.action, retryableSupervisorRequest)} className="shrink-0 rounded-md border border-amber/30 px-2 py-1 disabled:opacity-40">{acting ? "retrying…" : "retry exact control"}</button></div>}
+    {target.legacyInput && !target.supervisor && controls.includes("provide_input") && <div data-worker-answer className="rounded-lg border border-amber/25 bg-amber/[0.06] p-2">
+      <div className="mb-1 text-[10px] leading-snug text-amber">{target.question?.trim() || "Jarvis needs your answer before this worker can continue."}</div>
+      <div className="flex gap-1"><input aria-label="Answer Jarvis" value={answerInput} disabled={Boolean(acting)} onChange={(event) => setAnswerInput(event.target.value)} maxLength={2000} placeholder="Type or dictate your answer…" className="min-w-0 flex-1 rounded-lg border border-amber/20 bg-black/25 px-2 py-1 text-[10px] text-ice outline-none focus:border-amber/45 disabled:opacity-50" /><button type="button" disabled={!answerInput.trim() || Boolean(acting)} onClick={() => void apply("provide_input")} className="rounded-lg border border-amber/25 px-2 text-[9px] text-amber disabled:opacity-40">{acting === "provide_input" ? "sending…" : "send"}</button></div>
+    </div>}
     {target.supervisor && <div data-supervisor-authority={`${target.supervisor.state}:${target.supervisor.inputRevision}`} className="rounded-lg border border-cyan/15 bg-cyan/[0.035] p-2">
       <div className="font-mono text-[7px] uppercase tracking-[0.1em] text-cyan/60">supervisor · {target.supervisor.state} · revision {target.supervisor.inputRevision}</div>
       {controls.includes("provide_input") && <div data-supervisor-answer className="mt-1.5">
@@ -750,7 +765,11 @@ export function WorkerDetail({
     {node.recoverySummary && <div className="rounded-lg border border-blue-400/15 bg-blue-400/[0.05] px-2 py-1 text-[9px] text-blue-200">Recovery · {node.recoverySummary}</div>}
     {node.attentionReason && <div className={`rounded-lg border px-2 py-1 text-[9px] ${node.needsDaniel ? "border-amber/20 bg-amber/[0.06] text-amber" : "border-sky-400/20 bg-sky-400/[0.06] text-sky-200"}`}>{node.attentionLabel ?? (node.needsDaniel ? "Your input is needed" : "Jarvis is recovering")} · {node.attentionReason}</div>}
     {error && <div role="alert" data-control-error className="rounded-lg border border-rose-400/25 bg-rose-400/[0.07] px-2 py-1 text-[9px] text-rose-300">{error}</div>}
-    <Controls key={`job:${node.jobId}`} controls={controls} target={{ jobId: node.jobId }} onError={setError} />
+    <Controls key={`job:${node.jobId}`} controls={controls} target={{
+      jobId: node.jobId,
+      question: node.attentionReason ?? undefined,
+      legacyInput: mission.mode !== "supervised" && mission.supervisor?.protocolVersion !== 1,
+    }} onError={setError} />
     <details data-worker-activity className="rounded-xl border border-white/[0.07] bg-black/15 p-2">
       <summary className="cursor-pointer select-none font-mono text-[8px] uppercase tracking-[0.1em] text-slate hover:text-cyan">Technical activity log</summary>
       <div className="mt-2 h-[min(34vh,260px)]"><LazyWorkerLog node={node} /></div>

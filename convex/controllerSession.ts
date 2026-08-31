@@ -64,6 +64,28 @@ export async function currentControllerSessionRepairGeneration(ctx: { db: any })
 }
 
 /**
+ * A session-held job may continue only after a newer trusted enrollment or a
+ * later managed Codex completion has cleared that exact durable hold. This is
+ * deliberately narrower than a general "resume needs_input" escape hatch.
+ */
+export async function controllerSessionHoldIsClear(
+  ctx: { db: any },
+  row: RuntimeRow,
+) {
+  const repair = await ctx.db
+    .query("controllerSessionRepairs")
+    .withIndex("by_key", (q: any) => q.eq("key", REPAIR_KEY))
+    .unique();
+  return controllerSessionStatusFromRows(
+    [row],
+    typeof repair?.generation === "number" ? repair.generation : 0,
+    typeof repair?.operationalSuccessAt === "number"
+      ? repair.operationalSuccessAt
+      : 0,
+  ).state === "clear";
+}
+
+/**
  * Called only after the trusted enrollment task has durably reseeded the
  * encrypted controller session. It records no credential material. Exact
  * retries are idempotent; older or contradictory versions fail closed.

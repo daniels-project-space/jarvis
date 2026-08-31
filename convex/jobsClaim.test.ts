@@ -161,6 +161,46 @@ beforeEach(() => { process.env.JARVIS_WORKER_TOKEN = WORKER; vi.useRealTimers();
 afterEach(() => { delete process.env.JARVIS_WORKER_TOKEN; vi.useRealTimers(); });
 
 describe("real Convex specialist/controller race matrix", () => {
+  it("resumes only a cleared controller-session hold into a fresh attempt", async () => {
+    const f = await specialistFixture("read_only");
+    expect(await f.t.mutation(api.jobs.requestInput, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      authorityDigest: f.authorityDigest,
+      workerRunId: "specialist-run",
+      question: "Reconnect the controller-managed ChatGPT session.",
+      controllerSessionHoldCode: "rotation_uncertain",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "resume",
+      workerToken: WORKER,
+    })).toBe(false);
+
+    await f.t.mutation(api.controllerSession.confirmRepair, {
+      workerToken: WORKER,
+      sessionVersion: 1,
+      tokenExpiresAt: Date.now() + 4 * 60 * 60_000,
+    });
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "resume",
+      workerToken: WORKER,
+    })).toBe(true);
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({
+      status: "pending",
+      attempt: 2,
+      progress: "ChatGPT connection restored — fresh attempt queued",
+    });
+    expect(state.jobs[0]).not.toHaveProperty("controllerSessionRepairRequired");
+    expect(state.attempts.map((attempt) => [attempt.attempt, attempt.status])).toEqual([
+      [1, "needs_input"],
+      [2, "pending"],
+    ]);
+  });
+
   it("closes the exact claimed dispatch when a legacy goal cancellation is replayed", async () => {
     const f = await unclaimedDispatchFixture("cancel-claimed-goal-worker");
     expect(await f.t.mutation(api.jobs.claimDispatched, {
