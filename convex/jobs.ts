@@ -4682,6 +4682,7 @@ export const authorizeExecutionBoundary = mutation({
     dispatchPhase: v.optional(v.string()),
     dispatchReceiptDigest: v.optional(v.string()),
     dispatchPayloadDigest: v.optional(v.string()),
+    diagnostic: v.optional(v.boolean()),
     phase: v.union(
       v.literal("source_checkout"),
       v.literal("provider_create"),
@@ -4697,13 +4698,16 @@ export const authorizeExecutionBoundary = mutation({
   },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
+    const denied = (reason: string) => a.diagnostic
+      ? { phase: a.phase, deniedReason: reason }
+      : null;
     const row: any = await ctx.db.get(a.jobId);
     if (!row || row.status !== "running" || (row.attempt ?? 1) !== a.expectedAttempt
       || row.workerRunId !== a.workerRunId
       || row.dispatchGeneration !== a.dispatchGeneration
       || row.dispatchPhase !== a.dispatchPhase
       || row.dispatchReceiptDigest !== a.dispatchReceiptDigest
-      || row.dispatchPayloadDigest !== a.dispatchPayloadDigest) return null;
+      || row.dispatchPayloadDigest !== a.dispatchPayloadDigest) return denied("job_or_dispatch_state");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- schema-validated dispatch receipt
     const receipt: any = row.dispatchReceiptId ? await ctx.db.get(row.dispatchReceiptId) : null;
     if (!receipt || receipt.status !== "claimed"
@@ -4716,9 +4720,9 @@ export const authorizeExecutionBoundary = mutation({
         workOrderRevisionDigest: row.workOrderRevisionDigest,
         triggerMachinePreset: row.triggerMachinePreset,
         triggerMachineReason: row.triggerMachineReason,
-      })) return null;
+      })) return denied("claimed_dispatch_receipt");
     const authority = await attemptExecutionAuthorityFor(ctx, row, a.expectedAttempt, a.authorityDigest);
-    if (!authority) return null;
+    if (!authority) return denied("attempt_authority");
     const executionProfile = authority.workOrder.backgroundExecutionProfile === undefined
       ? resolveBackgroundExecutionProfileForWorkOrder({
         modelTier: authority.workOrder.minimumModel,
@@ -4726,7 +4730,7 @@ export const authorizeExecutionBoundary = mutation({
         repositoryCapabilities: authority.workOrder.toolScope,
       })
       : resolveBackgroundExecutionProfile(authority.workOrder.backgroundExecutionProfile);
-    if (!executionProfile.accepted) return null;
+    if (!executionProfile.accepted) return denied("execution_profile");
     return {
       phase: a.phase,
       authorityDigest: authority.authorityDigest,

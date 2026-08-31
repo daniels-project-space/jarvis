@@ -1329,6 +1329,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           dispatchPhase: options.reservation.dispatchPhase,
           dispatchReceiptDigest: options.reservation.dispatchReceiptDigest,
           dispatchPayloadDigest: options.reservation.dispatchPayloadDigest,
+          diagnostic: options.reservation.workerRuntime === "selfhost",
           phase,
         });
       } catch (error) {
@@ -1341,6 +1342,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
           process.env,
         ).replace(/\s+/g, " ").slice(0, 240);
         throw new Error(`execution authority lookup failed during ${phase}: ${reason || "unknown server error"}`);
+      }
+      if (boundary?.deniedReason) {
+        throw new Error(`execution authority denied during ${phase}: ${String(boundary.deniedReason).slice(0, 80)}`);
       }
       if (!boundary
         || boundary.phase !== phase
