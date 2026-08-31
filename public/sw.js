@@ -13,6 +13,13 @@ async function retireLegacyConnectionAlerts() {
   }
 }
 
+self.addEventListener("install", (event) => {
+  // This worker owns push handling only (no offline response cache), so it is
+  // safe to replace the prior version immediately and clean the phone without
+  // making Daniel close every already-open Jarvis tab first.
+  event.waitUntil(self.skipWaiting());
+});
+
 self.addEventListener("activate", (event) => {
   event.waitUntil(Promise.all([
     self.clients.claim(),

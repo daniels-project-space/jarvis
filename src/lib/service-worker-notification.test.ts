@@ -8,11 +8,13 @@ function loadServiceWorker(existingNotifications: Array<{ title: string; body: s
   const listeners = new Map<string, (event: WorkerEvent & Record<string, unknown>) => void>();
   const showNotification = vi.fn(async () => undefined);
   const claim = vi.fn(async () => undefined);
+  const skipWaiting = vi.fn(async () => undefined);
   const context = {
     self: {
       addEventListener: (type: string, listener: (event: WorkerEvent & Record<string, unknown>) => void) => {
         listeners.set(type, listener);
       },
+      skipWaiting,
       clients: { claim, matchAll: vi.fn(async () => []), openWindow: vi.fn(async () => undefined) },
       registration: {
         getNotifications: vi.fn(async () => existingNotifications),
@@ -23,7 +25,7 @@ function loadServiceWorker(existingNotifications: Array<{ title: string; body: s
     Promise,
   };
   vm.runInNewContext(fs.readFileSync("public/sw.js", "utf8"), context);
-  return { listeners, showNotification, claim };
+  return { listeners, showNotification, claim, skipWaiting };
 }
 
 async function dispatch(
@@ -36,6 +38,14 @@ async function dispatch(
 }
 
 describe("Jarvis service-worker notification retirement", () => {
+  it("activates the push-only repair without waiting for every old tab to close", async () => {
+    const worker = loadServiceWorker();
+
+    await dispatch(worker.listeners.get("install"));
+
+    expect(worker.skipWaiting).toHaveBeenCalledOnce();
+  });
+
   it("closes retired failed-fetch notifications when the repaired worker activates", async () => {
     const retired = { title: "JARVIS needs you", body: "Approve root-cause repair for repeated failed fetch", close: vi.fn() };
     const current = { title: "Reminder", body: "Call Maya", close: vi.fn() };
