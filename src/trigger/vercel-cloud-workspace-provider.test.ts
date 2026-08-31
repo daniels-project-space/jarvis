@@ -647,6 +647,16 @@ describe("VercelCloudWorkspaceProvider", () => {
     expect(observed.commands.some((command) => String(command.args).includes("fetch("))).toBe(true);
   });
 
+  it("skips package installation for read/list-only planning while still proving deny-all egress", async () => {
+    const { provider, workspace } = await providerAndWorkspace();
+    observed.files.set(`${workspace.root}/package-lock.json`, Buffer.from(JSON.stringify({ lockfileVersion: 3, packages: {} })));
+    await provider.hydrateDependencies(workspace, { installDependencies: false });
+    expect(observed.commands.some((command) => String(command.args).includes("npm ci"))).toBe(false);
+    expect(observed.commands.some((command) => String(command.args).includes("package-lock.json"))).toBe(false);
+    expect(observed.updates).toEqual(["deny-all"]);
+    expect(observed.commands.some((command) => String(command.args).includes("fetch("))).toBe(true);
+  });
+
   it("rejects unbounded command and listing requests before a session data-plane call", async () => {
     const { provider, workspace } = await providerAndWorkspace();
     await expect(provider.exec(workspace, { command: "true", timeoutMs: 45 * 60_000, maxOutputBytes: 1_000 })).rejects.toMatchObject({ code: "resource_limit" });

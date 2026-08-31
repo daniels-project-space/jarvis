@@ -190,6 +190,7 @@ type GoalJobInput = {
   model: WorkModelTier;
   reasoningEffort: GoalReasoningEffort;
   mcp?: string[];
+  toolScope?: string[];
   originThreadId?: string;
   agentId: string;
   risk?: string;
@@ -669,6 +670,9 @@ export const createV2 = mutation({
       model: plannerPolicy.model,
       reasoningEffort: plannerPolicy.reasoningEffort,
       mcp: ["context7"],
+      // Planning inspects source shape only. Removing execute/validate
+      // authority also avoids installing dependencies it cannot invoke.
+      toolScope: ["repository_read_file", "repository_list_files"],
       originThreadId: args.originThreadId,
       agentId: "jarvis",
       risk: "low",

@@ -117,6 +117,7 @@ import {
 } from "./cloud-agent-runner";
 import {
   applyValidatedPatchToControllerCheckout,
+  cloudDependencyModeForToolScope,
   createCredentiallessGitArchive,
   persistPortableCheckpoint,
   prepareCloudWorkspaceExecution,
@@ -2572,6 +2573,7 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
               providerFactory: () => cloudProvider,
               hydrateArchive: async () => sourceArchive,
               attemptKey, template: providerWorkspaceTemplate, runtime: workspaceRuntime, lockfileDigest,
+              dependencyMode: cloudDependencyModeForToolScope(job.toolScope),
               bindWorkspace: bindCloudWorkspace,
               assertCurrent: assertCurrentWorkspace,
               onStage: async (stage) => {

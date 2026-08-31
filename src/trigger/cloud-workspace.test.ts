@@ -13,6 +13,7 @@ import {
   validatePatchManifest,
   validatePortableCheckpointArchive,
   type CloudWorkspaceProvider,
+  type CloudWorkspace,
   type CredentiallessArchive,
   type PatchManifest,
 } from "./cloud-workspace";
@@ -20,6 +21,7 @@ import { FakeCloudWorkspaceProvider } from "./cloud-workspace-fake";
 import { CloudWorkspaceToolBridge, cloudRepositoryToolsForScope } from "./cloud-workspace-tools";
 import {
   CLOUD_WORKSPACE_HEARTBEAT_TIMEOUT_MS,
+  cloudDependencyModeForToolScope,
   persistPortableCheckpoint,
   prepareCloudWorkspaceExecution,
   replayCloudWorkspaceExecution,
@@ -108,6 +110,18 @@ async function storedCheckpointFixture() {
 }
 
 describe("fail-closed cloud workspace boundary", () => {
+  it("installs dependencies only for execution-capable work orders", () => {
+    expect(cloudDependencyModeForToolScope([
+      "repository_read_file",
+      "repository_list_files",
+    ])).toBe("verify_only");
+    expect(cloudDependencyModeForToolScope([
+      "repository_read_file",
+      "repository_validate",
+    ])).toBe("full");
+    expect(cloudDependencyModeForToolScope(["repository_exec"])).toBe("full");
+  });
+
   it("orchestrates attempt 1 edit -> R2 checkpoint -> termination -> attempt 2 exact replay with a safe preserved patch", async () => {
     const provider = new FakeCloudWorkspaceProvider();
     const source = archive([{ name: "README.md", data: new TextEncoder().encode("base") }]);
@@ -209,6 +223,24 @@ describe("fail-closed cloud workspace boundary", () => {
     })).rejects.toMatchObject({ code: "provider_unavailable" });
     expect(events).toEqual(["upload", "dependency"]);
     expect(provider.calls).toContain("terminate:terminal");
+  });
+
+  it("uses verification-only dependency preparation when the work order has no execution capability", async () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const observed: Array<boolean | undefined> = [];
+    const dependencyProvider = provider as typeof provider & {
+      hydrateDependencies: (_workspace: CloudWorkspace, options?: { installDependencies: boolean }) => Promise<void>;
+    };
+    dependencyProvider.hydrateDependencies = async (_workspace, options) => {
+      observed.push(options?.installDependencies);
+    };
+    await prepareCloudWorkspaceExecution({
+      providerFactory: () => provider,
+      hydrateArchive: async () => archive([{ name: "README.md", data: new TextEncoder().encode("safe") }]),
+      attemptKey: "planning-no-install:1", template: "node", runtime: "node-22", lockfileDigest: LOCK,
+      dependencyMode: "verify_only",
+    });
+    expect(observed).toEqual([false]);
   });
 
   it("keeps a quiet dependency hydration alive without inventing a new progress stage", async () => {

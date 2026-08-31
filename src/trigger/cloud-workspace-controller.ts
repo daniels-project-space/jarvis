@@ -86,6 +86,17 @@ export async function applyValidatedPatchToControllerCheckout(
   });
 }
 
+export function cloudDependencyModeForToolScope(
+  toolScope: unknown,
+): "full" | "verify_only" {
+  return Array.isArray(toolScope)
+    && toolScope.some(
+      (tool) => tool === "repository_validate" || tool === "repository_exec",
+    )
+    ? "full"
+    : "verify_only";
+}
+
 export async function prepareCloudWorkspaceExecution(input: {
   providerFactory: () => CloudWorkspaceProvider;
   hydrateArchive: () => Promise<CredentiallessArchive>;
@@ -93,6 +104,7 @@ export async function prepareCloudWorkspaceExecution(input: {
   template: string;
   runtime: string;
   lockfileDigest: string;
+  dependencyMode?: "full" | "verify_only";
   limits?: WorkspaceLimits;
   bindWorkspace?: (workspace: CloudWorkspace) => Promise<boolean>;
   assertCurrent?: (phase: string) => Promise<boolean>;
@@ -193,7 +205,9 @@ export async function prepareCloudWorkspaceExecution(input: {
       if (input.assertCurrent && !await input.assertCurrent("dependency_hydration")) {
         throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected dependency hydration", "deferred");
       }
-      await withHeartbeat("dependency_hydration", async () => await provider.hydrateDependencies!(workspace));
+      await withHeartbeat("dependency_hydration", async () => await provider.hydrateDependencies!(workspace, {
+        installDependencies: input.dependencyMode !== "verify_only",
+      }));
       if (input.assertCurrent && !await input.assertCurrent("dependency_relocked")) {
         throw new CloudWorkspaceError(provider.name, "stale_attempt", "attempt fence rejected dependency relock", "deferred");
       }

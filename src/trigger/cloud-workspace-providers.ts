@@ -1085,59 +1085,61 @@ export class VercelCloudWorkspaceProvider extends ProviderBase {
     await this.observeFreshSession(workspace); return names;
   }
 
-  async hydrateDependencies(workspace: CloudWorkspace): Promise<void> {
+  async hydrateDependencies(workspace: CloudWorkspace, options: { installDependencies: boolean } = { installDependencies: true }): Promise<void> {
     // Source has already been validated and uploaded. This parses only the
     // committed lockfile, opens one registry for one command, then relocks.
     try {
       let observed = await this.observeFreshSession(workspace);
       try {
-        const lockPath = `${this.workspaceRoot}/package-lock.json`;
-        const paths = this.pathsFor(workspace);
-        const cachePath = `${paths.controlDir}/npm-cache`;
-        const controlRelative = paths.controlDir.slice(this.workspaceRoot.length + 1);
-        // Exclude both the control directory itself and its descendants. Git
-        // clean otherwise removes the untracked directory as a whole before
-        // its descendant exclusions can preserve controller artifacts.
-        const controlCleanExcludes = `-e ${shellQuote(controlRelative)} -e ${shellQuote(`${controlRelative}/`)} -e ${shellQuote(`${controlRelative}/**`)}`;
-        // A missing lock means no egress. It still proceeds through the
-        // tracked deny-all update and behavioral probe below; an early return
-        // here could accidentally make a future policy regression invisible.
-        observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, lockPath, true);
-        const exists = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000 });
-        if (exists.exitCode !== 1) {
-          if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
-          // The source working tree must be byte-for-byte the controller base
-          // before its lock is parsed. This makes the streamed read below an
-          // observation of refs/jarvis/controller-base, not a mutable file a
-          // prior sandbox action could have substituted.
-          observed = await this.observeFreshSession(workspace);
-          const committed = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
-            command: "git ls-files --error-unmatch -- package-lock.json >/dev/null && git diff --quiet refs/jarvis/controller-base -- package-lock.json && git diff --cached --quiet refs/jarvis/controller-base -- package-lock.json",
-            cwd: this.workspaceRoot, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000,
-          });
-          if (committed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock is not the committed controller baseline", "rejected");
-          const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
-          if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
-          // Do not invoke update on the snapshot which preceded the lock read.
-          // A fresh no-resume observation is the policy-transition capability.
-          await this.transitionNetworkPolicy(workspace, VERCEL_NPM_POLICY);
-          observed = await this.observeFreshSession(workspace);
-          const installed = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
-            command: [
-              `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
-              "git reset --hard refs/jarvis/controller-base",
-              // `-X` is deliberately forbidden: a valid repository can
-              // ignore dot-directories, which would make it delete our
-              // controller-owned source archive before checkpointing.
-              // npm ci is scriptless and writes only node_modules plus the
-              // fenced cache, so reset plus ordinary untracked cleanup is the
-              // bounded cleanup required here.
-              `git clean -ffd -e node_modules ${controlCleanExcludes}`,
-              `rm -rf -- ${shellQuote(cachePath)}`,
-            ].join(" && "),
-            cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
-          });
-          if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
+        if (options.installDependencies) {
+          const lockPath = `${this.workspaceRoot}/package-lock.json`;
+          const paths = this.pathsFor(workspace);
+          const cachePath = `${paths.controlDir}/npm-cache`;
+          const controlRelative = paths.controlDir.slice(this.workspaceRoot.length + 1);
+          // Exclude both the control directory itself and its descendants. Git
+          // clean otherwise removes the untracked directory as a whole before
+          // its descendant exclusions can preserve controller artifacts.
+          const controlCleanExcludes = `-e ${shellQuote(controlRelative)} -e ${shellQuote(`${controlRelative}/`)} -e ${shellQuote(`${controlRelative}/**`)}`;
+          // A missing lock means no egress. It still proceeds through the
+          // tracked deny-all update and behavioral probe below; an early return
+          // here could accidentally make a future policy regression invisible.
+          observed = await this.assertNoSymlink(workspace, observed.sandbox, observed.session, lockPath, true);
+          const exists = await this.runSessionCommand(workspace, observed.sandbox, observed.session, { command: `test -f ${shellQuote(lockPath)}`, cwd: this.workspaceRoot, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000 });
+          if (exists.exitCode !== 1) {
+            if (exists.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "could not inspect committed package lock", "deferred");
+            // The source working tree must be byte-for-byte the controller base
+            // before its lock is parsed. This makes the streamed read below an
+            // observation of refs/jarvis/controller-base, not a mutable file a
+            // prior sandbox action could have substituted.
+            observed = await this.observeFreshSession(workspace);
+            const committed = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
+              command: "git ls-files --error-unmatch -- package-lock.json >/dev/null && git diff --quiet refs/jarvis/controller-base -- package-lock.json && git diff --cached --quiet refs/jarvis/controller-base -- package-lock.json",
+              cwd: this.workspaceRoot, timeoutMs: VERCEL_GUARD_COMMAND_TIMEOUT_MS, maxOutputBytes: 4_000,
+            });
+            if (committed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock is not the committed controller baseline", "rejected");
+            const lock = await this.readAbsolute(workspace, lockPath, DEFAULT_WORKSPACE_LIMITS.maxFileBytes);
+            if (!packageLockUsesOnlyNpmRegistry(lock)) throw new CloudWorkspaceError(this.name, "unsafe_archive", "package lock contains a non-npm-registry dependency", "rejected");
+            // Do not invoke update on the snapshot which preceded the lock read.
+            // A fresh no-resume observation is the policy-transition capability.
+            await this.transitionNetworkPolicy(workspace, VERCEL_NPM_POLICY);
+            observed = await this.observeFreshSession(workspace);
+            const installed = await this.runSessionCommand(workspace, observed.sandbox, observed.session, {
+              command: [
+                `npm ci --ignore-scripts --no-audit --no-fund --cache ${shellQuote(cachePath)}`,
+                "git reset --hard refs/jarvis/controller-base",
+                // `-X` is deliberately forbidden: a valid repository can
+                // ignore dot-directories, which would make it delete our
+                // controller-owned source archive before checkpointing.
+                // npm ci is scriptless and writes only node_modules plus the
+                // fenced cache, so reset plus ordinary untracked cleanup is the
+                // bounded cleanup required here.
+                `git clean -ffd -e node_modules ${controlCleanExcludes}`,
+                `rm -rf -- ${shellQuote(cachePath)}`,
+              ].join(" && "),
+              cwd: this.workspaceRoot, timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs, maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
+            });
+            if (installed.exitCode !== 0) throw new CloudWorkspaceError(this.name, "provider_unavailable", "deterministic dependency hydration failed", "deferred");
+          }
         }
       } finally {
         await this.transitionNetworkPolicy(workspace, "deny-all");

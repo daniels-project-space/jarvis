@@ -2631,6 +2631,7 @@ describe("real Convex multi-agent workspace and integration races", () => {
     const planner: any = await t.run(async (ctx) => (await ctx.db.query("jobs")
       .withIndex("by_mission", (q) => q.eq("missionId", String(missionId))).collect())
       .find((job) => job.goalStage === "planning"));
+    expect(planner.toolScope).toEqual(["repository_read_file", "repository_list_files"]);
     await t.run(async (ctx) => {
       await ctx.db.patch(planner._id, { status: "done", result: "quiet planner result", completedAt: Date.now() });
       const runtime = await ctx.db.query("jobRuntime").withIndex("by_job", (q) => q.eq("jobId", planner._id)).first();

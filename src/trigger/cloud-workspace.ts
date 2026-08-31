@@ -138,7 +138,7 @@ export interface CloudWorkspaceProvider {
    * package registry implement this after source upload and before Codex is
    * allowed to run. It is deliberately not a general command escape hatch.
    */
-  hydrateDependencies?(workspace: CloudWorkspace): Promise<void>;
+  hydrateDependencies?(workspace: CloudWorkspace, options?: { installDependencies: boolean }): Promise<void>;
   exec(workspace: CloudWorkspace, request: ExecRequest): Promise<ExecResult>;
   readFile(workspace: CloudWorkspace, path: string, maxBytes: number): Promise<Uint8Array>;
   writeFile(workspace: CloudWorkspace, path: string, data: Uint8Array, maxBytes: number): Promise<void>;
