@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   canonicalAuthJson,
   parseChatgptSubscriptionAuthText,
@@ -26,9 +26,19 @@ export const PINNED_CODEX_VERSION = "codex-cli 0.144.5";
 export const CHATGPT_LOGIN_STATUS_RECEIPT = "Logged in using ChatGPT";
 
 const nodeRequire = createRequire(import.meta.url);
-const DEFAULT_CONSUMER_ROOT = "/home/node/.jarvis-codex-consumers";
-const DEFAULT_ISOLATION_ROOT = "/home/node/.jarvis-codex-isolations";
 const ownedSubscriptionHomes = new Map<string, string>();
+
+function runtimeAuthorityRoot(name: ".jarvis-codex-consumers" | ".jarvis-codex-isolations"): string {
+  // Trigger runs as `node` with HOME=/home/node, while the free hardened
+  // controller runs as its own unprivileged service user with a writable
+  // HOME=/var/lib/jarvis-agent-fleet. Both are trusted host configuration;
+  // neither authority directory may fall back into a model-visible checkout.
+  const configuredHome = String(process.env.HOME ?? "").trim();
+  const runtimeHome = configuredHome && isAbsolute(configuredHome)
+    ? resolve(configuredHome)
+    : "/home/node";
+  return join(runtimeHome, name);
+}
 
 function directChild(root: string, path: string): boolean {
   return dirname(path) === root && path.startsWith(`${root}${sep}`);
@@ -197,7 +207,7 @@ export async function prepareSubscriptionEnv(
   }
 
   try {
-    const root = resolve(options.root ?? DEFAULT_CONSUMER_ROOT);
+    const root = resolve(options.root ?? runtimeAuthorityRoot(".jarvis-codex-consumers"));
     if (unsafeConsumerRoot(root)) throw new Error("unsafe consumer root");
     mkdirSync(root, { recursive: true, mode: 0o700 });
     chmodSync(root, 0o700);
@@ -237,7 +247,7 @@ export function isolateSubscriptionEnv(
   const safeScope = scope.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120) || "agent";
   // Each worker uses a non-temporary authority root outside every repository
   // sandbox. No consumer home is derived from a model-visible checkout path.
-  const isolationRoot = resolve(root ?? DEFAULT_ISOLATION_ROOT);
+  const isolationRoot = resolve(root ?? runtimeAuthorityRoot(".jarvis-codex-isolations"));
   mkdirSync(isolationRoot, { recursive: true, mode: 0o700 });
   chmodSync(isolationRoot, 0o700);
   const canonicalIsolationRoot = realpathSync(isolationRoot);

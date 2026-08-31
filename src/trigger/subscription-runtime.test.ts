@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   cleanupSubscriptionHome,
@@ -174,6 +174,30 @@ describe("subscription subprocess capability scope", () => {
       expect(() => readFileSync(join(String(env.CODEX_HOME), "AGENTS.md"), "utf8")).toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("places default authority homes under the current hardened service home", async () => {
+    const serviceHome = mkdtempSync(join(tmpdir(), "jarvis-service-home-"));
+    vi.stubEnv("HOME", serviceHome);
+    try {
+      const source = await prepareSubscriptionEnv("codex", {
+        controller,
+        scope: "service-default",
+      });
+      expect(source.error).toBeUndefined();
+      expect(dirname(String(source.env.CODEX_HOME))).toBe(
+        join(serviceHome, ".jarvis-codex-consumers"),
+      );
+
+      const isolated = isolateCloudSubscriptionEnv(source.env, "service-isolation");
+      expect(dirname(String(isolated.CODEX_HOME))).toBe(
+        join(serviceHome, ".jarvis-codex-isolations"),
+      );
+      expect(cleanupSubscriptionHome(isolated)).toBe(true);
+      expect(cleanupSubscriptionHome(source.env)).toBe(true);
+    } finally {
+      rmSync(serviceHome, { recursive: true, force: true });
     }
   });
 
