@@ -195,6 +195,49 @@ describe("Goal Mode contracts", () => {
     expect(value.workstreams.every((stream) => stream.agentId === "paul")).toBe(true);
   });
 
+  it("rejects plans that make a specialist self-certify controller-only lifecycle rows", () => {
+    expect(() => parseGoalPlan(`${GOAL_PLAN_MARKER}${JSON.stringify({
+      summary: "Audit the durable worker path",
+      route: "existing_project",
+      primaryRepo: "daniels-project-space/jarvis",
+      outcome,
+      crew,
+      workstreams: [workstream({
+        id: "self-audit",
+        label: "Self audit",
+        task: "Inspect the admitted source and then verify the completed Atlas workEvent and workAttempt records.",
+        agentId: "atlas",
+        repo: "daniels-project-space/jarvis",
+        readonly: true,
+        dependsOn: [],
+        acceptanceCriteria: ["The durable post-dispatch workEvent checkpoint is recorded."],
+      })],
+      validation: { criteria: ["Controller verifies the final receipt"], tests: [], liveChecks: [] },
+    })}`)).toThrow(/controller-only lifecycle evidence/);
+  });
+
+  it("allows specialists to inspect the source implementation of controller lifecycle tables", () => {
+    const value = parseGoalPlan(`${GOAL_PLAN_MARKER}${JSON.stringify({
+      summary: "Document the controller lifecycle implementation",
+      route: "existing_project",
+      primaryRepo: "daniels-project-space/jarvis",
+      outcome,
+      crew,
+      workstreams: [workstream({
+        id: "source-audit",
+        label: "Source audit",
+        task: "Inspect the current workEvents schema and explain how controller lifecycle code is implemented.",
+        agentId: "atlas",
+        repo: "daniels-project-space/jarvis",
+        readonly: true,
+        dependsOn: [],
+        acceptanceCriteria: ["Cite the relevant source files and symbols."],
+      })],
+      validation: { criteria: ["The source explanation is traceable"], tests: [], liveChecks: [] },
+    })}`);
+    expect(value.workstreams[0]?.id).toBe("source-audit");
+  });
+
   it("gives complex plans a useful durable response envelope", () => {
     const prompt = plannerTask(
       "Make a mature commerce application launch-ready end to end",
@@ -210,6 +253,8 @@ describe("Goal Mode contracts", () => {
     expect(prompt).toContain("never turn a baseline observation into an exact target");
     expect(prompt).toContain('never invent "no provider workspace was opened" as a stop condition');
     expect(prompt).toContain("Do not require a specialist to prove its own post-exit provider-workspace termination");
+    expect(prompt).toContain("it cannot query arbitrary live mission/job, workEvent, workAttempt");
+    expect(prompt).toContain("Reserve them for the server-captured final validation audit");
   });
 
   it("rejects cyclic plans", () => {

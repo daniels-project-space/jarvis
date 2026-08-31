@@ -29,6 +29,8 @@ describe("supervisor verification boundaries", () => {
     expect(SUPERVISOR_MEASUREMENT_RULES).toContain("inequality");
     expect(SUPERVISOR_MEASUREMENT_RULES).toContain("sandbox Git HEAD is a synthetic transport commit");
     expect(SUPERVISOR_MEASUREMENT_RULES).toContain("post-exit provider termination");
+    expect(SUPERVISOR_MEASUREMENT_RULES).toContain("never a Daniel decision");
+    expect(SUPERVISOR_MEASUREMENT_RULES).toContain("workEvent");
   });
 
   it("carries completed checkpoint evidence into repair-pass supervision", () => {
