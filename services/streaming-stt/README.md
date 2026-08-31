@@ -34,3 +34,8 @@ an explicit feature gate: existing deployments make no stream-ticket requests.
 
 The browser feature fails closed when either setting is absent. It does not add a
 paid transcription provider or provision a GPU.
+
+After every service update, validate the end-of-utterance protocol as well as
+`/healthz`: an authenticated stream must emit `ready`, accept PCM16 audio, emit a
+`final` message after `{ "type": "end" }`, and close with code 1000. Health alone
+does not prove that the recognizer can flush its final encoder chunk.

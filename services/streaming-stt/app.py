@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -31,6 +32,7 @@ _decode_lock = asyncio.Lock()
 _used_tickets: dict[str, int] = {}
 _active_connections = 0
 _active_lock = asyncio.Lock()
+logger = logging.getLogger("jarvis.streaming_stt")
 
 
 def _model_path(name: str) -> str:
@@ -108,17 +110,32 @@ async def _claim_ticket(ticket: str, origin: str | None) -> bool:
 def _decode(stream: sherpa_onnx.OnlineStream, done: bool = False) -> str:
     model = recognizer()
     if done:
+        # Zipformer needs a short tail to flush the final encoder chunk. The
+        # upstream sherpa-onnx streaming server feeds this padding before
+        # input_finished(); without it the native decoder can abort the socket
+        # at end-of-utterance instead of returning a final transcript.
+        tail_padding = np.zeros(int(SAMPLE_RATE * 0.3), dtype=np.float32)
+        stream.accept_waveform(SAMPLE_RATE, tail_padding)
         stream.input_finished()
     while model.is_ready(stream):
         model.decode_stream(stream)
     return str(model.get_result(stream)).strip()
 
 
+def _verify_recognizer_lifecycle() -> None:
+    """Fail startup unless the recognizer can accept and finalize a stream."""
+    model = recognizer()
+    stream = model.create_stream()
+    stream.accept_waveform(SAMPLE_RATE, np.zeros(SAMPLE_RATE // 10, dtype=np.float32))
+    _decode(stream, done=True)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Refuse readiness until ONNX files are mapped. This removes the otherwise
-    # noticeable first-utterance model load while keeping the container CPU-only.
-    recognizer()
+    # Refuse readiness until ONNX files are mapped and a stream can be finalized.
+    # This removes the first-utterance model load and prevents a shallow health
+    # check from advertising a service that crashes at end-of-utterance.
+    await asyncio.to_thread(_verify_recognizer_lifecycle)
     yield
 
 
@@ -168,6 +185,7 @@ async def stream(websocket: WebSocket) -> None:
                     async with _decode_lock:
                         result = await asyncio.to_thread(_decode, voice, True)
                     await websocket.send_json({"type": "final", "text": result})
+                    await websocket.close(code=1000)
                     return
                 await websocket.close(code=1003)
                 return
@@ -186,6 +204,12 @@ async def stream(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "partial", "text": result})
     except (WebSocketDisconnect, asyncio.TimeoutError):
         return
+    except Exception:
+        logger.exception("streaming STT session failed")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
     finally:
         async with _active_lock:
             _active_connections = max(0, _active_connections - 1)
