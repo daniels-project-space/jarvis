@@ -285,6 +285,52 @@ describe("real Convex specialist/controller race matrix", () => {
     })).reservations).toEqual([]);
   });
 
+  it("cancels an input-held worker after confirming its exact closed dispatch", async () => {
+    const f = await specialistFixture("read_only");
+    expect(await f.t.mutation(api.jobs.requestInput, {
+      jobId: f.jobId,
+      expectedAttempt: 1,
+      authorityDigest: f.authorityDigest,
+      workerRunId: "specialist-run",
+      question: "Production evidence is still required.",
+      checkpoint: "The worker has already stopped and released its provider workspace.",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    const closedDispatch = (await rows(f.t)).dispatches[0];
+    await f.t.run(async (ctx) => ctx.db.patch(closedDispatch._id, {
+      payloadDigest: "0".repeat(64),
+    }));
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(false);
+    await f.t.run(async (ctx) => ctx.db.patch(closedDispatch._id, {
+      payloadDigest: closedDispatch.payloadDigest,
+    }));
+
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+
+    const state = await rows(f.t);
+    expect(state.jobs[0]).toMatchObject({
+      status: "cancelled",
+      progress: "cancelled by Daniel",
+    });
+    expect(state.jobs[0]).not.toHaveProperty("dispatchId");
+    expect(state.jobs[0]).not.toHaveProperty("workerRunId");
+    expect(state.dispatches).toEqual([
+      expect.objectContaining({ status: "closed" }),
+    ]);
+    expect(state.attempts).toEqual([
+      expect.objectContaining({ status: "needs_input" }),
+    ]);
+  });
+
   it("retries an accepted-response-lost launch byte-equivalently and accepts one delayed run", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-23T01:00:00Z"));

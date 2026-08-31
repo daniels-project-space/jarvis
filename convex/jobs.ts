@@ -203,6 +203,37 @@ async function closeClaimedDispatchReceipt(
   return true;
 }
 
+async function closeOrConfirmDispatchReceiptForControl(
+  ctx: any,
+  row: any,
+  workerRunId: unknown,
+  closeReason: string,
+  now = Date.now(),
+) {
+  if (await closeClaimedDispatchReceipt(
+    ctx,
+    row,
+    workerRunId,
+    closeReason,
+    now,
+  )) return true;
+  if (typeof workerRunId !== "string" || !row.dispatchReceiptId) return false;
+  const receipt: any = await ctx.db.get(row.dispatchReceiptId);
+  return Boolean(
+    receipt
+    && receipt.status === "closed"
+    && typeof receipt.closedAt === "number"
+    && receipt.jobId === row._id
+    && receipt.attempt === row.attempt
+    && receipt.workerRunId === workerRunId
+    && receipt.dispatchId === row.dispatchId
+    && receipt.generation === row.dispatchGeneration
+    && receipt.phase === row.dispatchPhase
+    && receipt.receiptDigest === row.dispatchReceiptDigest
+    && receipt.payloadDigest === row.dispatchPayloadDigest,
+  );
+}
+
 function dispatchReceiptMatchesRequest(receipt: any, row: any, a: any) {
   return Boolean(receipt
     && receipt.jobId === row._id
@@ -6128,7 +6159,7 @@ export const control = mutation({
         || exact.receipt.resultDigest !== await sha256Hex(result)
         || exact.receipt.evidenceDigest !== await sha256Hex(evidence)
       ) return false;
-      if (row.dispatchId && !await closeClaimedDispatchReceipt(
+      if (row.dispatchId && !await closeOrConfirmDispatchReceiptForControl(
         ctx,
         row,
         row.deliveryRunId ?? row.workerRunId,
@@ -6353,7 +6384,7 @@ export const control = mutation({
           evidence: cancellationEvidence,
         }, now);
       }
-      if (row.dispatchId && !await closeClaimedDispatchReceipt(
+      if (row.dispatchId && !await closeOrConfirmDispatchReceiptForControl(
         ctx,
         row,
         row.deliveryRunId ?? row.workerRunId,
