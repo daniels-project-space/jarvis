@@ -10,6 +10,7 @@ import {
   FOREGROUND_HISTORY_OMISSION_MARKER,
   FOREGROUND_HISTORY_TEXT_LIMIT,
   FOREGROUND_HISTORY_TEXT_PER_MESSAGE_LIMIT,
+  isRetiredAutomaticChatNotification,
   MAX_CHAT_RECOVERY_WAKES,
   MAX_CHAT_TURN_ATTEMPTS,
 } from "./chatQueue";
@@ -763,6 +764,64 @@ describe("durable foreground chat recovery", () => {
     expect(rows.find((row) => row._id === staleId)?.status).toBe("error");
     expect(rows.some((row) => row.parentMessageId === staleId && /expired/i.test(row.text))).toBe(true);
     expect(rows.find((row) => row._id === freshId)?.status).toBe("done");
+  });
+});
+
+describe("background notification separation", () => {
+  const obsolete =
+    `Sir, I've had two goes at fixing "TypeError: Failed to fetch" and it's still misbehaving — this one needs your eyes.`;
+
+  it("recognizes only the obsolete incident-to-chat template", () => {
+    expect(isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+      text: obsolete,
+    })).toBe(true);
+    expect(isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+      text: "Mission complete — the verified report is ready.",
+    })).toBe(false);
+    expect(isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+      text: "☀️ Morning, sir.\nAll 7 deploys are green.\n7/7 deploys healthy.",
+    })).toBe(true);
+    expect(isRetiredAutomaticChatNotification({
+      role: "assistant",
+      status: "done",
+      delivery: "notification",
+      text: "Heads up, sir — Jarvis just failed to deploy. I'm sending an engineer in to trace it and fix it now.",
+    })).toBe(true);
+  });
+
+  it("hides and physically retires stale repair errors without deleting useful reports", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.chatQueue.postAssistant, {
+      threadId: "main",
+      text: obsolete,
+      workerToken: WORKER,
+    });
+    await t.mutation(api.chatQueue.postAssistant, {
+      threadId: "main",
+      text: "Mission complete — the verified report is ready.",
+      workerToken: WORKER,
+    });
+
+    expect(await t.query(api.chatQueue.listMessages, {
+      threadId: "main",
+      workerToken: WORKER,
+    })).toHaveLength(1);
+    expect(await t.run(async (ctx) => await ctx.db.query("chatMessages").collect())).toHaveLength(2);
+    await expect(t.mutation(api.chatQueue.retireLegacyAutomaticNotifications, {
+      workerToken: WORKER,
+    })).resolves.toEqual({ retired: 1 });
+    expect(await t.run(async (ctx) => await ctx.db.query("chatMessages").collect())).toEqual([
+      expect.objectContaining({ text: "Mission complete — the verified report is ready." }),
+    ]);
   });
 });
 

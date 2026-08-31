@@ -1,5 +1,4 @@
 import { schedules } from "@trigger.dev/sdk/v3";
-import { sendPush } from "./push-send";
 import { vaultService } from "../lib/vault-client";
 import { PROJECT_BY_SLUG } from "../lib/project-registry";
 
@@ -42,15 +41,6 @@ async function convexQuery(path: string, args: unknown) {
     ).value;
   } catch {
     return null;
-  }
-}
-
-async function chatThread(): Promise<string> {
-  try {
-    const t = await convexQuery("ui:getActiveThread", {});
-    return typeof t === "string" && t ? t : "main";
-  } catch {
-    return "main";
   }
 }
 
@@ -116,7 +106,8 @@ export const stackPoller = schedules.task({
     }));
     const sync = await convexMutation<{ changed: string[]; total: number }>("projectState:sync", { projects: rows });
     // Self-healing: a newly-broken deploy files an incident (the healer
-    // dispatches a root-cause repair agent within ~2 min) and tells Daniel.
+    // dispatches a root-cause repair agent within ~2 min). Project health is
+    // visible in work/attention surfaces and must not become generic chat/push.
     if (newlyBroken.length) {
       for (const app of newlyBroken)
         await convexMutation("incidents:report", {
@@ -125,11 +116,6 @@ export const stackPoller = schedules.task({
           signature: `deploy-failed:${app}`,
           message: `Vercel production deploy for ${app} is in ERROR state.`,
         });
-      await convexMutation("chatQueue:postAssistant", {
-        threadId: await chatThread(),
-        text: `Heads up, sir — ${newlyBroken.join(" and ")} just failed to deploy. I'm sending an engineer in to trace it and fix it now.`,
-      });
-      await sendPush("⚠️ Deploy failed", `${newlyBroken.join(", ")} — repair agent dispatched.`, "/");
     }
     return { polled: rows.length, changed: sync?.changed ?? [], newlyBroken };
   },

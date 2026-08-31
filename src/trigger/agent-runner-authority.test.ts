@@ -813,6 +813,44 @@ describe("production Trigger worker authority harness", () => {
     expect(requests.map((request) => request.path)).not.toContain("jobs:enqueue");
   });
 
+  it("keeps escalated infrastructure failures out of normal chat", async () => {
+    const requests: MutationTrace[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as MutationTrace;
+      requests.push(body);
+      const value = (() => {
+        switch (body.path) {
+          case "jobs:migrateControlPlane":
+            return { steps: 0, complete: true, phase: null };
+          case "jobs:reapStale":
+            return { requeued: [], releasedDispatches: [], abandoned: [], expiredCloudWorkspaceHolds: [], quarantinedDispatches: [] };
+          case "controllerSession:status":
+            return { state: "clear" };
+          case "incidents:claimForRepair":
+            return { claims: [], escalations: [{ id: "incident-1", message: "TypeError: Failed to fetch" }] };
+          case "jobs:cloudWorkspaceOrphans":
+          case "reminders:due":
+            return [];
+          default:
+            return null;
+        }
+      })();
+      return new Response(JSON.stringify({ status: "success", value }), { status: 200 });
+    }));
+
+    await runAgentMaintenance();
+
+    expect(requests.map((request) => request.path)).toContain("chatQueue:retireLegacyAutomaticNotifications");
+    expect(requests.filter((request) => request.path === "chatQueue:postAssistant")).toEqual([]);
+    expect(notifications.sendPush).toHaveBeenCalledWith(
+      "Jarvis needs your input",
+      "A self-repair needs a decision. Tap to review the concise summary.",
+      "/",
+      { category: "work" },
+    );
+    expect(JSON.stringify(notifications.sendPush.mock.calls)).not.toContain("Failed to fetch");
+  });
+
   it("keeps a stale reclaimed reminder silent when its fenced delivery loses", async () => {
     const requests: MutationTrace[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {

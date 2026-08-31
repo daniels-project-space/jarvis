@@ -69,6 +69,30 @@ const GUEST_CHAT_BUCKET_CAPACITY = 3;
 const GUEST_CHAT_REFILL_MS = 2 * 60_000;
 const GUEST_CHAT_DAILY_LIMIT = 24;
 const GUEST_CHAT_MAX_IN_FLIGHT = 2;
+const RETIRED_AUTOMATIC_NOTIFICATION_SCAN_LIMIT = 128;
+
+// Older fleet maintenance copied raw repair failures into Daniel's main
+// conversation even though the same incident already had a dedicated
+// attention item. Keep user-requested reminders and completed-work reports,
+// but retire only exact obsolete automatic templates from reads and storage.
+export function isRetiredAutomaticChatNotification(message: {
+  role?: string;
+  text?: string;
+  status?: string;
+  delivery?: string;
+}): boolean {
+  if (
+    message.role !== "assistant"
+    || message.status !== "done"
+    || message.delivery !== "notification"
+  ) return false;
+  const text = message.text ?? "";
+  return /^Sir, I've had two goes at fixing "[\s\S]{0,120}" and it's still misbehaving — this one needs your eyes\.$/.test(text)
+    || /^I have to be honest, sir — the background job "[\s\S]{1,500}" kept dying on me and I've stopped retrying it\.$/.test(text)
+    || /^I've stopped the background job "[\s\S]{1,500}" because its worker reservation could not be verified\. It is waiting for review; I have not started a replacement\.$/.test(text)
+    || /^Heads up, sir — [\s\S]{1,500} just failed to deploy\. I'm sending an engineer in to trace it and fix it now\.$/.test(text)
+    || /^☀️ Morning, sir\.\n[\s\S]{1,1000}\n\d+\/\d+ deploys healthy/.test(text);
+}
 
 export const FOREGROUND_HISTORY_OMISSION_MARKER = "\n… [earlier history omitted] …\n";
 
@@ -436,13 +460,16 @@ export const listMessages = query({
   handler: async (ctx, a) => {
     const identity = await conversationViewerIdentity(ctx, a);
     const threadId = scopedConversationThread(identity, a.threadId);
-    const rows = await ctx.db
+    const rows = (await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
       .order("desc")
       // The always-mounted foreground surface needs only the newest visible
-      // turns. A streamed token therefore re-reads at most twenty rows.
-      .take(20);
+      // turns. Read a small bounded cushion while obsolete incident copies are
+      // being physically retired so the visible window still contains twenty.
+      .take(28))
+      .filter((row) => !isRetiredAutomaticChatNotification(row))
+      .slice(0, 20);
     return await attachFileBadgesToMessages(ctx, threadId, rows.reverse());
   },
 });
@@ -479,7 +506,11 @@ export const paginatedMessages = query({
       });
     return {
       ...result,
-      page: await attachFileBadgesToMessages(ctx, threadId, result.page),
+      page: await attachFileBadgesToMessages(
+        ctx,
+        threadId,
+        result.page.filter((row) => !isRetiredAutomaticChatNotification(row)),
+      ),
     };
   },
 });
@@ -492,11 +523,13 @@ export const listRecentMessages = query({
   handler: async (ctx, a) => {
     const identity = await conversationViewerIdentity(ctx, a);
     const threadId = scopedConversationThread(identity, a.threadId);
-    const rows = await ctx.db
+    const rows = (await ctx.db
       .query("chatMessages")
       .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
       .order("desc")
-      .take(8);
+      .take(12))
+      .filter((row) => !isRetiredAutomaticChatNotification(row))
+      .slice(0, 8);
     return await attachFileBadgesToMessages(ctx, threadId, rows.reverse());
   },
 });
@@ -1617,6 +1650,21 @@ export const postAssistant = mutation({
       delivery: "notification",
       createdAt: Date.now(),
     });
+  },
+});
+
+export const retireLegacyAutomaticNotifications = mutation({
+  args: { workerToken: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    requireWorker(a.workerToken);
+    const rows = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_thread", (q: any) => q.eq("threadId", "main"))
+      .order("desc")
+      .take(RETIRED_AUTOMATIC_NOTIFICATION_SCAN_LIMIT);
+    const stale = rows.filter(isRetiredAutomaticChatNotification);
+    for (const row of stale) await ctx.db.delete(row._id);
+    return { retired: stale.length };
   },
 });
 

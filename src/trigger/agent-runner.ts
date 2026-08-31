@@ -1062,21 +1062,12 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
   }
   try {
     await convexMutation("chatQueue:reapStuck", {}).catch(() => {});
+    await convexMutation("chatQueue:retireLegacyAutomaticNotifications", {}).catch(() => {});
     const reaped: any = await convexMutation("jobs:reapStale", {});
     recovered = Number(reaped?.requeued?.length ?? 0) + Number(reaped?.releasedDispatches?.length ?? 0);
     abandoned = Number(reaped?.abandoned?.length ?? 0);
     expiredCloudWorkspaceHolds = Number(reaped?.expiredCloudWorkspaceHolds?.length ?? 0);
     quarantinedDispatches = Number(reaped?.quarantinedDispatches?.length ?? 0);
-    for (const title of reaped?.abandoned ?? [])
-      await convexMutation("chatQueue:postAssistant", {
-        threadId: await chatThread(),
-        text: `I have to be honest, sir — the background job "${title}" kept dying on me and I've stopped retrying it.`,
-      }).catch(() => {});
-    for (const title of reaped?.quarantinedDispatches ?? [])
-      await convexMutation("chatQueue:postAssistant", {
-        threadId: await chatThread(),
-        text: `I've stopped the background job "${title}" because its worker reservation could not be verified. It is waiting for review; I have not started a replacement.`,
-      }).catch(() => {});
     controllerSession = controllerSessionAutonomousWorkStatus(
       await convexQuery("controllerSession:status", {}),
     );
@@ -1135,12 +1126,16 @@ export async function runAgentMaintenance(runtimeAttestation?: CloudProviderRunt
           await convexMutation("incidents:linkJob", { id: inc.id, jobId: String(repairJobId) }).catch(() => {});
         }
       }
-      for (const esc of healer?.escalations ?? []) {
-        await convexMutation("chatQueue:postAssistant", {
-          threadId: await chatThread(),
-          text: `Sir, I've had two goes at fixing "${String(esc.message).slice(0, 120)}" and it's still misbehaving — this one needs your eyes.`,
-        });
-        await sendPush("JARVIS needs you", String(esc.message).slice(0, 120), "/", { category: "work" });
+      if (Array.isArray(healer?.escalations) && healer.escalations.length > 0) {
+        // Incidents already own a concise, actionable attention item. Do not
+        // duplicate raw infrastructure errors into normal conversation, and
+        // coalesce one maintenance pass into at most one decision alert.
+        await sendPush(
+          "Jarvis needs your input",
+          "A self-repair needs a decision. Tap to review the concise summary.",
+          "/",
+          { category: "work" },
+        );
       }
     }
   } catch {

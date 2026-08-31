@@ -1,22 +1,11 @@
 import { schedules } from "@trigger.dev/sdk/v3";
-import { sendPush } from "./push-send";
 
-// Slice F — proactive morning briefing. Composes a rundown from the cloud-stack
-// snapshot + recent background jobs and posts it into the chat unprompted.
+// Daily low-cost summary calculation. Routine health status stays available to
+// Jarvis and the work surfaces, but never interrupts Daniel through chat/push.
 
 const CONVEX_URL =
   process.env.CONVEX_URL ?? process.env.NEXT_PUBLIC_CONVEX_URL ?? "https://tangible-goose-318.convex.cloud";
 
-async function convexMutation(path: string, args: unknown) {
-  const workerToken = process.env.JARVIS_WORKER_TOKEN;
-  if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
-  const protectedArgs = { ...((args ?? {}) as Record<string, unknown>), workerToken };
-  await fetch(`${CONVEX_URL}/api/mutation`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, args: protectedArgs, format: "json" }),
-  }).catch(() => {});
-}
 async function convexQuery(path: string, args: unknown) {
   const workerToken = process.env.JARVIS_WORKER_TOKEN;
   if (!workerToken) throw new Error("JARVIS_WORKER_TOKEN is not configured");
@@ -46,15 +35,6 @@ export const morningBriefing = schedules.task({
     const jobs: any[] = (await convexQuery("jobs:list", { limit: 8 })) ?? [];
     const doneJobs = jobs.filter((j) => j.status === "done").length;
 
-    const lines = [
-      "☀️ Morning, sir.",
-      broken.length
-        ? `⚠️ ${broken.length} app${broken.length > 1 ? "s" : ""} need attention: ${broken.join(", ")}.`
-        : `All ${live} deploys are green.`,
-      `${live}/${stack.length} deploys healthy${doneJobs ? ` · ${doneJobs} background job${doneJobs > 1 ? "s" : ""} completed` : ""}.`,
-    ];
-    await convexMutation("chatQueue:postAssistant", { threadId: "main", text: lines.join("\n") });
-    await sendPush("☀️ Morning briefing", lines.slice(1).join(" "), "/", { category: "reminder" });
-    return { posted: true, broken };
+    return { posted: false, broken, live, total: stack.length, doneJobs };
   },
 });
