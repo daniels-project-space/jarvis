@@ -1,6 +1,9 @@
+import { PROJECT_REGISTRY } from "./project-registry";
+
 export type FastAgentDispatch = {
   task: string;
   agentId?: "paul" | "atlas" | "iris" | "maya" | "chloe" | "sentry";
+  repo?: string;
 };
 
 export type FastGoalCrewDispatch = {
@@ -13,6 +16,19 @@ const namedAgents = new Set(["paul", "atlas", "iris", "maya", "chloe", "sentry"]
 const vagueTask = /^(?:it|that|this|the task|the issue|something|what we discussed)(?:\s+please)?[.!?]*$/i;
 const projectFeatureTask = /(?:\b(?:add(?:ed)?|build|implement(?:ed)?|create(?:d)?|make|fix(?:ed)?|improve(?:d)?|redesign(?:ed)?|change(?:d)?|update(?:d)?)\b.*\b(?:feature|button|control|page|screen|view|workflow|flow|form|filter|search|setting|tab|dashboard|ui|ux|integration|functionality|bug)\b|\b(?:feature|button|control|page|screen|view|workflow|flow|form|filter|search|setting|tab|dashboard|ui|ux|integration|functionality|bug)\b.*\b(?:add(?:ed)?|build|implement(?:ed)?|create(?:d)?|make|fix(?:ed)?|improve(?:d)?|redesign(?:ed)?|change(?:d)?|update(?:d)?)\b)/i;
 const exploratoryHostRequest = /^(?:what|which|why|how|when|where|should|can\s+we|could\s+we)\b/i;
+
+function explicitProjectRepository(task: string): string | null | undefined {
+  const normalized = task.toLowerCase();
+  const matches = PROJECT_REGISTRY.filter((project) => {
+    const aliases = [project.name, project.slug, project.slug.replaceAll("-", " "), project.repo];
+    return aliases.some((alias) => {
+      const escaped = alias.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:$|[^a-z0-9])`, "i").test(normalized);
+    });
+  });
+  if (matches.length > 1) return null;
+  return matches[0]?.repo;
+}
 
 /**
  * Only explicit, singular delegation commands belong on the deterministic
@@ -32,9 +48,15 @@ export function parseFastAgentDispatch(input: string): FastAgentDispatch | null 
   const actor = String(match[1]).toLowerCase();
   const task = String(match[2]).trim().replace(/\s+(?:please|thanks?)\s*[.!?]*$/i, "").trim();
   if (task.length < 10 || vagueTask.test(task)) return null;
+  const repo = explicitProjectRepository(task);
+  // A singular fast handoff must not guess ownership when the task explicitly
+  // spans multiple portfolio projects. Let the conversational/Goal lane plan
+  // that boundary instead of creating a contextless worker.
+  if (repo === null) return null;
   return {
     task,
     agentId: namedAgents.has(actor) ? actor as FastAgentDispatch["agentId"] : undefined,
+    ...(repo ? { repo } : {}),
   };
 }
 

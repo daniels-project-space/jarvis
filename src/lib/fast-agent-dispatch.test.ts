@@ -30,6 +30,20 @@ describe("parseFastAgentDispatch", () => {
       .toEqual({ task: "research the current UK rental market?", agentId: undefined });
   });
 
+  it("attaches the canonical Jarvis repository to an explicit Jarvis task", () => {
+    expect(parseFastAgentDispatch("Launch an agent to audit the current Jarvis work map for stale tasks"))
+      .toEqual({
+        task: "audit the current Jarvis work map for stale tasks",
+        agentId: undefined,
+        repo: "daniels-project-space/jarvis",
+      });
+  });
+
+  it("keeps an explicitly cross-project handoff out of the singular fast lane", () => {
+    expect(parseFastAgentDispatch("Launch Paul to repair the connection between Jarvis and Project Hub"))
+      .toBeNull();
+  });
+
   it.each([
     "Should we launch an agent?",
     "Launch an agent to fix it",

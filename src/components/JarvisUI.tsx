@@ -3992,6 +3992,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           args: {
             task: intent.task,
             agent_id: intent.agentId,
+            ...(intent.repo ? { repo: intent.repo } : {}),
             ...(hostProject ? { host_context: hostProject.context } : {}),
           },
         }),
@@ -4005,7 +4006,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       const awaitingApproval = /consequential|Needs you|will not execute/i.test(result);
       const reply = awaitingApproval
         ? `${assigned} has the plan ready, but it needs your approval in the work card before anything consequential happens.`
-        : `${assigned} is on it. The work is live.`;
+        : `${assigned} has the work queued securely. The card changes to Running when a worker claims it.`;
       if (!background) updateConversationMood(reply);
       showCaption({ who: "jarvis", text: reply, phase: "ready" });
       void logTurn({ threadId: threadRef.current, role: "user", text: requestedText });
