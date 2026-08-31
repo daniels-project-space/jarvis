@@ -2022,6 +2022,31 @@ export const recordValidation = mutation({
         ? new Set(validation.stopConditionsSatisfied.map((value) => String(value).trim()))
         : new Set<string>();
       const observed = validation.observedOutcome;
+      const contractIssues: string[] = [];
+      if (validation.outcomeAchieved !== true) contractIssues.push("outcomeAchieved must be true");
+      if (!Array.isArray(validation.outcomeEvidence) || validation.outcomeEvidence.length < 2) {
+        contractIssues.push("outcomeEvidence must contain at least two authoritative observations");
+      }
+      const missingObservedFields = (["metric", "baseline", "observed", "target", "measurementWindow"] as const)
+        .filter((field) => !observed?.[field]);
+      if (missingObservedFields.length) {
+        contractIssues.push(`observedOutcome is missing ${missingObservedFields.join(", ")}`);
+      }
+      const mismatchedOutcomeFields = plan?.outcome && observed
+        ? (["metric", "target", "measurementWindow"] as const)
+          .filter((field) => observed[field].trim() !== plan.outcome[field].trim())
+        : [];
+      if (mismatchedOutcomeFields.length) {
+        contractIssues.push(`observedOutcome must copy accepted ${mismatchedOutcomeFields.join(", ")} verbatim`);
+      }
+      const missingStops = requiredStops.filter((condition) => !satisfiedStops.has(condition.trim()));
+      if (requiredStops.length < 1) contractIssues.push("the accepted plan has no stop condition");
+      else if (missingStops.length) {
+        contractIssues.push(
+          `stopConditionsSatisfied must include verbatim: ${missingStops.slice(0, 3)
+            .map((condition) => JSON.stringify(condition.slice(0, 180))).join(", ")}`,
+        );
+      }
       const matchesAcceptedOutcome = Boolean(
         plan?.outcome
         && observed
@@ -2042,7 +2067,11 @@ export const recordValidation = mutation({
         return {
           advanced: false,
           rejected: true,
-          error: "Goal completion requires the accepted measurable outcome and every stop condition to be evidenced",
+          error: [
+            "Goal completion requires the accepted measurable outcome and every stop condition to be evidenced",
+            contractIssues.join("; "),
+            "If the evidence cannot prove the accepted contract, return refine or blocked instead of pass",
+          ].filter(Boolean).join(": ").slice(0, 800),
         };
       }
     }

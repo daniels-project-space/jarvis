@@ -208,6 +208,7 @@ describe("Goal Mode contracts", () => {
     expect(prompt).toContain("a rejection-only gate does not satisfy the outcome");
     expect(prompt).toContain("never copy an incidental elapsed runtime");
     expect(prompt).toContain("never turn a baseline observation into an exact target");
+    expect(prompt).toContain('never invent "no provider workspace was opened" as a stop condition');
     expect(prompt).toContain("Do not require a specialist to prove its own post-exit provider-workspace termination");
   });
 
@@ -288,6 +289,7 @@ describe("Goal Mode contracts", () => {
     expect(task).toContain("persisted lineage");
     expect(task).toContain(GOAL_VALIDATION_MARKER);
     expect(task).toContain('"verdict":"pass|refine|blocked"');
+    expect(task).toContain("copy metric, target, measurementWindow, and every satisfied stop-condition sentence verbatim");
   });
 
   it("creates only the necessary crew and makes profit goals impossible to pass on sales proxies", () => {
