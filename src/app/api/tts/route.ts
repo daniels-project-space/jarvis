@@ -15,12 +15,47 @@ export const maxDuration = 15;
 
 const CONFIG_CACHE_MS = 5 * 60_000;
 const SELF_HOSTED_CONNECT_TIMEOUT_MS = 5_000;
+const EDGE_CLIENT_POOL_MAX = 2;
 
 type TtsConfig =
   | { kind: "edge"; engine: typeof EDGE_TTS_ENGINE; voice: typeof EDGE_TTS_VOICE }
   | { kind: "self-hosted"; engine: typeof SELF_HOSTED_TTS_ENGINE; voice: typeof SELF_HOSTED_TTS_VOICE; url: string; apiKey: string };
 
 let cachedSelfHostedConfig: { value: Extract<TtsConfig, { kind: "self-hosted" }> | null; expiresAt: number } | null = null;
+const idleEdgeClients: MsEdgeTTS[] = [];
+let edgeWarmPromise: Promise<void> | null = null;
+
+async function acquireEdgeClient(): Promise<MsEdgeTTS> {
+  const client = idleEdgeClients.pop() ?? new MsEdgeTTS();
+  try {
+    // setMetadata is also the package's connection health check: it is a
+    // no-op on a live socket and reconnects a frozen/stale serverless socket.
+    await client.setMetadata(EDGE_TTS_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    return client;
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+}
+
+function releaseEdgeClient(client: MsEdgeTTS, reusable: boolean) {
+  if (!reusable || idleEdgeClients.length >= EDGE_CLIENT_POOL_MAX) {
+    client.close();
+    return;
+  }
+  idleEdgeClients.push(client);
+}
+
+async function warmEdgeClient(): Promise<void> {
+  if (idleEdgeClients.length > 0) return;
+  if (!edgeWarmPromise) {
+    edgeWarmPromise = (async () => {
+      const client = await acquireEdgeClient();
+      releaseEdgeClient(client, true);
+    })().finally(() => { edgeWarmPromise = null; });
+  }
+  await edgeWarmPromise;
+}
 
 function escapeSpeechXml(value: string): string {
   return value
@@ -138,6 +173,10 @@ export async function GET(req: NextRequest) {
   if (!(await authorized(req))) return Response.json({ error: "unauthorized" }, { status: 401 });
   const config = await ttsConfig();
   if (!config) return Response.json({ error: "self-hosted speech is unavailable" }, { status: 503 });
+  // The browser calls this while voice is armed and again as a turn starts.
+  // Reuse that gesture-time request to open the free Edge speech socket before
+  // model text arrives; POST then sends SSML over the already-live connection.
+  if (config.kind === "edge") await warmEdgeClient().catch(() => undefined);
   return new Response(null, {
     status: 204,
     headers: {
@@ -170,10 +209,18 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const tts = new MsEdgeTTS();
+  let tts: MsEdgeTTS | null = null;
+  let releaseTts: ((reusable: boolean) => void) | null = null;
   try {
-    await tts.setMetadata(config.voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    const { audioStream } = tts.toStream(escapeSpeechXml(text), {
+    tts = await acquireEdgeClient();
+    const client = tts;
+    let released = false;
+    releaseTts = (reusable) => {
+      if (released) return;
+      released = true;
+      releaseEdgeClient(client, reusable);
+    };
+    const { audioStream } = client.toStream(escapeSpeechXml(text), {
       rate: speechRate(payload?.speed),
       pitch: speechPitch(payload?.pitchHz),
       volume: 100,
@@ -184,13 +231,13 @@ export async function POST(req: NextRequest) {
         const finish = () => {
           if (closed) return;
           closed = true;
-          tts.close();
+          releaseTts?.(true);
           controller.close();
         };
         const fail = (error: Error) => {
           if (closed) return;
           closed = true;
-          tts.close();
+          releaseTts?.(false);
           controller.error(error);
         };
         audioStream.on("data", (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
@@ -198,18 +245,22 @@ export async function POST(req: NextRequest) {
         audioStream.once("error", fail);
         req.signal.addEventListener("abort", () => {
           audioStream.destroy();
-          finish();
+          if (closed) return;
+          closed = true;
+          releaseTts?.(false);
+          try { controller.close(); } catch { /* cancelled response */ }
         }, { once: true });
       },
       cancel() {
+        if (closed) return;
         closed = true;
         audioStream.destroy();
-        tts.close();
+        releaseTts?.(false);
       },
     });
     return new Response(stream, { headers: speechHeaders(config) });
   } catch (error) {
-    tts.close();
+    releaseTts?.(false);
     return Response.json(
       { error: String(error).replace(/\s+/g, " ").slice(0, 180) },
       { status: 502, headers: { "cache-control": "private, no-store" } },

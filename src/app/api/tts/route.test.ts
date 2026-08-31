@@ -67,18 +67,21 @@ describe("Ryan Neural route", () => {
   });
 
   it("advertises one fixed engine and voice", async () => {
+    const before = mock.instances.length;
     const response = await GET(new Request("https://jarvis.test/api/tts") as any);
     expect(response.status).toBe(204);
     expect(response.headers.get("x-jarvis-tts-engine")).toBe(EDGE_TTS_ENGINE);
     expect(response.headers.get("x-jarvis-tts-voice")).toBe(EDGE_TTS_VOICE);
+    expect(mock.instances).toHaveLength(before + 1);
+    expect(mock.instances.at(-1)?.setMetadata).toHaveBeenCalledWith(EDGE_TTS_VOICE, "mp3");
   });
 
-  it("constructs one Ryan upstream stream for one request", async () => {
+  it("reuses the gesture-warmed Ryan connection for the next speech request", async () => {
     const before = mock.instances.length;
     const response = await POST(request() as any);
     const tts = mock.instances.at(-1);
-    expect(mock.instances).toHaveLength(before + 1);
-    expect(tts.setMetadata).toHaveBeenCalledWith(EDGE_TTS_VOICE, "mp3");
+    expect(mock.instances).toHaveLength(before);
+    expect(tts.setMetadata).toHaveBeenCalledTimes(2);
     expect(tts.toStream).toHaveBeenCalledWith("A &lt;safe&gt; phrase", {
       rate: "+10%", pitch: "+4Hz", volume: 100,
     });
@@ -87,18 +90,30 @@ describe("Ryan Neural route", () => {
     mock.streams.at(-1)!.emit("data", Buffer.from([1, 2, 3]));
     mock.streams.at(-1)!.emit("end");
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
-    expect(tts.close).toHaveBeenCalledTimes(1);
+    expect(tts.close).not.toHaveBeenCalled();
   });
 
-  it("cancels the single upstream stream without starting another request", async () => {
+  it("retires a cancelled pooled stream without starting another request", async () => {
     const before = mock.instances.length;
     const response = await POST(request("Cancel this") as any);
     const stream = mock.streams.at(-1)!;
     const tts = mock.instances.at(-1);
     await response.body!.cancel();
-    expect(mock.instances).toHaveLength(before + 1);
+    expect(mock.instances).toHaveLength(before);
     expect(stream.destroy).toHaveBeenCalledTimes(1);
     expect(tts.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a fresh speech connection after the pooled socket was cancelled", async () => {
+    const before = mock.instances.length;
+    const response = await POST(request("Fresh connection") as any);
+    const tts = mock.instances.at(-1);
+    expect(mock.instances).toHaveLength(before + 1);
+    expect(tts.setMetadata).toHaveBeenCalledWith(EDGE_TTS_VOICE, "mp3");
+    mock.streams.at(-1)!.emit("data", Buffer.from([4, 5, 6]));
+    mock.streams.at(-1)!.emit("end");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([4, 5, 6]));
+    expect(tts.close).not.toHaveBeenCalled();
   });
 
   it("uses only the authenticated self-hosted Kokoro stream when opted in", async () => {
