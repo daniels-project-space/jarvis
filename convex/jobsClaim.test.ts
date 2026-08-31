@@ -329,6 +329,17 @@ describe("real Convex specialist/controller race matrix", () => {
     expect(state.attempts).toEqual([
       expect.objectContaining({ status: "needs_input" }),
     ]);
+    expect(state.attention).toEqual([
+      expect.objectContaining({ status: "resolved" }),
+    ]);
+    expect(await f.t.mutation(api.jobs.control, {
+      jobId: f.jobId,
+      action: "cancel",
+      workerToken: WORKER,
+    })).toBe(true);
+    expect((await rows(f.t)).attention).toEqual([
+      expect.objectContaining({ status: "resolved" }),
+    ]);
   });
 
   it("retries an accepted-response-lost launch byte-equivalently and accepts one delayed run", async () => {

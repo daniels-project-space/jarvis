@@ -234,6 +234,22 @@ async function closeOrConfirmDispatchReceiptForControl(
   );
 }
 
+async function resolveOpenJobAttention(
+  ctx: any,
+  jobId: Id<"jobs">,
+  now = Date.now(),
+) {
+  const attention = await ctx.db
+    .query("attentionItems")
+    .withIndex("by_jobId", (q: any) => q.eq("jobId", String(jobId)))
+    .take(50);
+  for (const item of attention) {
+    if (item.status === "open") {
+      await ctx.db.patch(item._id, { status: "resolved", updatedAt: now });
+    }
+  }
+}
+
 function dispatchReceiptMatchesRequest(receipt: any, row: any, a: any) {
   return Boolean(receipt
     && receipt.jobId === row._id
@@ -6120,7 +6136,10 @@ export const control = mutation({
       && row.status === "cancelled"
       && !isSupervisorOwnedJob(row)
     ) {
-      if (!row.dispatchId) return true;
+      if (!row.dispatchId) {
+        await resolveOpenJobAttention(ctx, a.jobId);
+        return true;
+      }
       const attempt = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
       if (!attempt?.completedAt
         || (attempt.providerWorkspaceId && !attempt.providerTerminatedAt)
@@ -6136,6 +6155,7 @@ export const control = mutation({
         workerRunId: undefined,
         deliveryRunId: undefined,
       });
+      await resolveOpenJobAttention(ctx, a.jobId);
       return true;
     }
     if (
@@ -6175,6 +6195,7 @@ export const control = mutation({
           deliveryRunId: undefined,
         });
       }
+      await resolveOpenJobAttention(ctx, a.jobId);
       return true;
     }
     const wouldResurrectSupervisorTerminal =
@@ -6417,6 +6438,7 @@ export const control = mutation({
       for (const approval of approvals) {
         if (approval.status === "pending") await ctx.db.patch(approval._id, { status: "cancelled", resolvedAt: now });
       }
+      await resolveOpenJobAttention(ctx, a.jobId, now);
     } else if (a.action === "retry" && ["error", "cancelled"].includes(row.status)) {
       const previous = await attemptFor(ctx, a.jobId, row.attempt ?? 1);
       if (previous && !previous.completedAt) return false;
