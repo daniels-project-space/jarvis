@@ -106,15 +106,21 @@ function object(value: unknown): Record<string, unknown> {
 
 const VALIDATION_TEST_PATH = /^(?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_@.-]+\.(?:test|spec)\.[cm]?[jt]sx?$/;
 
-function validationCommand(args: Record<string, unknown>): string {
+type ValidationCommand = {
+  command: string;
+  kind: "tests" | "typecheck" | "build";
+  paths: string[];
+};
+
+function validationCommand(args: Record<string, unknown>): ValidationCommand {
   const kind = String(args.kind ?? "");
   if (kind === "typecheck") {
     if (args.paths !== undefined) throw new Error("typecheck does not accept paths");
-    return "npx tsc --noEmit --pretty false";
+    return { command: "npx tsc --noEmit --pretty false", kind, paths: [] };
   }
   if (kind === "build") {
     if (args.paths !== undefined) throw new Error("build does not accept paths");
-    return "npm run build";
+    return { command: "npm run build", kind, paths: [] };
   }
   if (kind !== "tests" || !Array.isArray(args.paths) || args.paths.length < 1 || args.paths.length > 24) {
     throw new Error("tests require one to twenty-four bounded test paths");
@@ -128,7 +134,121 @@ function validationCommand(args: Record<string, unknown>): string {
   // Paths use a deliberately shell-inert grammar, so the resulting command
   // cannot smuggle flags, substitutions, separators, or traversal into the
   // fixed local Vitest invocation.
-  return `npx vitest run --reporter=verbose -- ${paths.join(" ")}`;
+  // Vitest treats arguments after a bare `--` as runner passthrough rather
+  // than file filters. The prior command therefore ran the entire repository
+  // while claiming to run only the admitted files. This grammar already
+  // rejects flags and shell metacharacters, so pass the exact filters directly.
+  // JSON is parsed below into an aggregate-only receipt; raw test output never
+  // crosses into the model response.
+  return {
+    command: `npx vitest run --reporter=json ${paths.join(" ")}`,
+    kind: "tests",
+    paths,
+  };
+}
+
+function boundedCount(value: unknown): number | null {
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 && count <= 1_000_000 ? count : null;
+}
+
+function validationTestReceipt(
+  stdout: string,
+  exitCode: number,
+  durationMs: number,
+  requestedPaths: string[],
+): { text: string; success: boolean } {
+  try {
+    const report = object(JSON.parse(stdout));
+    const rawResults = Array.isArray(report.testResults) ? report.testResults : [];
+    const files = requestedPaths.map((path) => {
+      const matches = rawResults.filter((entry) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+        const name = String((entry as Record<string, unknown>).name ?? "").replace(/\\/g, "/");
+        return name === path || name.endsWith(`/${path}`);
+      });
+      const assertions = matches.flatMap((entry) => {
+        const value = (entry as Record<string, unknown>).assertionResults;
+        return Array.isArray(value) ? value : [];
+      });
+      const statuses = assertions.map((entry) =>
+        entry && typeof entry === "object" && !Array.isArray(entry)
+          ? String((entry as Record<string, unknown>).status ?? "unknown")
+          : "unknown",
+      );
+      return {
+        path,
+        reported: matches.length === 1,
+        tests: statuses.length,
+        passed: statuses.filter((status) => status === "passed").length,
+        failed: statuses.filter((status) => status === "failed").length,
+        pending: statuses.filter((status) => status === "pending" || status === "skipped" || status === "todo").length,
+        unknown: statuses.filter((status) => !["passed", "failed", "pending", "skipped", "todo"].includes(status)).length,
+      };
+    });
+    const expectedNames = new Set(requestedPaths);
+    const unexpectedFiles = rawResults.filter((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return true;
+      const name = String((entry as Record<string, unknown>).name ?? "").replace(/\\/g, "/");
+      return ![...expectedNames].some((path) => name === path || name.endsWith(`/${path}`));
+    }).length;
+    const totals = {
+      suites: boundedCount(report.numTotalTestSuites),
+      passedSuites: boundedCount(report.numPassedTestSuites),
+      failedSuites: boundedCount(report.numFailedTestSuites),
+      tests: boundedCount(report.numTotalTests),
+      passed: boundedCount(report.numPassedTests),
+      failed: boundedCount(report.numFailedTests),
+      pending: boundedCount(report.numPendingTests),
+    };
+    const observedTotals = files.reduce(
+      (sum, file) => ({
+        tests: sum.tests + file.tests,
+        passed: sum.passed + file.passed,
+        failed: sum.failed + file.failed,
+        pending: sum.pending + file.pending,
+      }),
+      { tests: 0, passed: 0, failed: 0, pending: 0 },
+    );
+    const reportAccepted = rawResults.length <= requestedPaths.length
+      && unexpectedFiles === 0
+      && files.every((file) => file.reported && file.unknown === 0)
+      && Object.values(totals).every((value) => value !== null)
+      && totals.tests === observedTotals.tests
+      && totals.passed === observedTotals.passed
+      && totals.failed === observedTotals.failed
+      && totals.pending === observedTotals.pending;
+    const success = exitCode === 0
+      && report.success === true
+      && reportAccepted
+      && totals.failed === 0
+      && totals.failedSuites === 0;
+    return {
+      text: JSON.stringify({
+        kind: "tests",
+        success,
+        exitCode,
+        durationMs,
+        reportAccepted,
+        unexpectedFiles,
+        totals,
+        files,
+      }),
+      success,
+    };
+  } catch {
+    return {
+      text: JSON.stringify({
+        kind: "tests",
+        success: false,
+        exitCode,
+        durationMs,
+        reportAccepted: false,
+        error: "validation report was not valid bounded Vitest JSON",
+      }),
+      success: false,
+    };
+  }
 }
 
 export class CloudWorkspaceToolBridge {
@@ -159,12 +279,22 @@ export class CloudWorkspaceToolBridge {
         return result(JSON.stringify({ exitCode: execution.exitCode, stdout, stderr, durationMs: execution.durationMs }), true);
       }
       if (call.tool === "repository_validate") {
+        const validation = validationCommand(args);
         const execution = await this.provider.exec(this.workspace, {
-          command: validationCommand(args),
+          command: validation.command,
           timeoutMs: DEFAULT_WORKSPACE_LIMITS.commandTimeoutMs,
           maxOutputBytes: DEFAULT_WORKSPACE_LIMITS.maxOutputBytes,
           signal: this.options.signal,
         });
+        if (validation.kind === "tests") {
+          const receipt = validationTestReceipt(
+            execution.stdout,
+            execution.exitCode,
+            execution.durationMs,
+            validation.paths,
+          );
+          return result(receipt.text, receipt.success);
+        }
         const stdout = validateSandboxOutput(execution.stdout, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
         const stderr = validateSandboxOutput(execution.stderr, DEFAULT_WORKSPACE_LIMITS.maxOutputBytes, this.provider.name);
         return result(

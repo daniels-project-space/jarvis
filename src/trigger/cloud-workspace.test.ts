@@ -36,6 +36,12 @@ const BASE = "a".repeat(40);
 const JOB = "job-checkpoint-replay";
 const LOCK = "b".repeat(64);
 
+function toolText(outcome: Awaited<ReturnType<CloudWorkspaceToolBridge["invoke"]>>): string {
+  const item = outcome.contentItems[0];
+  if (!item || item.type !== "inputText") throw new Error("expected a text tool result");
+  return item.text;
+}
+
 function tar(entries: Array<{ name: string; type?: string; data?: Uint8Array; size?: number }>): Uint8Array {
   const blocks: Uint8Array[] = [];
   const encoder = new TextEncoder();
@@ -302,8 +308,19 @@ describe("fail-closed cloud workspace boundary", () => {
       arguments: { kind: "tests", paths: ["src/lib/agent-fleet-dispatch.test.ts", "convex/jobsClaim.test.ts"] },
     });
     expect(valid.success).toBe(true);
+    expect(JSON.parse(toolText(valid))).toMatchObject({
+      kind: "tests",
+      success: true,
+      reportAccepted: true,
+      unexpectedFiles: 0,
+      totals: { tests: 2, passed: 2, failed: 0 },
+      files: [
+        { path: "src/lib/agent-fleet-dispatch.test.ts", reported: true, tests: 1, passed: 1 },
+        { path: "convex/jobsClaim.test.ts", reported: true, tests: 1, passed: 1 },
+      ],
+    });
     expect(provider.observedExecCommands).toEqual([
-      "npx vitest run --reporter=verbose -- src/lib/agent-fleet-dispatch.test.ts convex/jobsClaim.test.ts",
+      "npx vitest run --reporter=json src/lib/agent-fleet-dispatch.test.ts convex/jobsClaim.test.ts",
     ]);
 
     const typecheck = await bridge.invoke({
@@ -326,6 +343,53 @@ describe("fail-closed cloud workspace boundary", () => {
     expect(injected.success).toBe(false);
     expect(traversed.success).toBe(false);
     expect(provider.observedExecCommands).toHaveLength(2);
+  });
+
+  it("returns aggregate test evidence without exposing secret-like reporter content", async () => {
+    const provider = new FakeCloudWorkspaceProvider();
+    const workspace = await provider.createWorkspace({
+      attemptKey: "readonly-validation-redaction:1", template: "node", runtime: "node-22",
+      lockfileDigest: "e".repeat(64), limits: DEFAULT_WORKSPACE_LIMITS,
+    });
+    vi.spyOn(provider, "exec").mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        success: true,
+        numTotalTestSuites: 1,
+        numPassedTestSuites: 1,
+        numFailedTestSuites: 0,
+        numTotalTests: 2,
+        numPassedTests: 2,
+        numFailedTests: 0,
+        numPendingTests: 0,
+        testResults: [{
+          name: `${workspace.root}/src/lib/safe.test.ts`,
+          status: "passed",
+          message: "access_token=abcdefghijklmnopqrstuvwxyz123456",
+          assertionResults: [
+            { title: "fixture access_token=abcdefghijklmnopqrstuvwxyz123456", status: "passed" },
+            { title: "another safe assertion", status: "passed" },
+          ],
+        }],
+      }),
+      stderr: "access_token=abcdefghijklmnopqrstuvwxyz123456",
+      providerSessionId: workspace.providerSessionId,
+      durationMs: 12,
+    });
+    const bridge = new CloudWorkspaceToolBridge(provider, workspace, {
+      allowedToolScope: ["repository_validate"],
+    });
+    const outcome = await bridge.invoke({
+      threadId: "t", turnId: "r", callId: "validate-redaction", namespace: null,
+      tool: "repository_validate", arguments: { kind: "tests", paths: ["src/lib/safe.test.ts"] },
+    });
+    expect(outcome.success).toBe(true);
+    expect(toolText(outcome)).not.toContain("abcdefghijklmnopqrstuvwxyz123456");
+    expect(JSON.parse(toolText(outcome))).toMatchObject({
+      success: true,
+      totals: { tests: 2, passed: 2, failed: 0 },
+      files: [{ path: "src/lib/safe.test.ts", tests: 2, passed: 2, failed: 0 }],
+    });
   });
 
   it.each([

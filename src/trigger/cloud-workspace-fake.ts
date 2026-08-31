@@ -95,7 +95,27 @@ export class FakeCloudWorkspaceProvider implements CloudWorkspaceProvider {
         }, { once: true });
       });
     }
-    const stdout = request.command.startsWith("printf ") ? request.command.slice(7) : "";
+    const validationPrefix = "npx vitest run --reporter=json ";
+    const validationPaths = request.command.startsWith(validationPrefix)
+      ? request.command.slice(validationPrefix.length).split(" ").filter(Boolean)
+      : [];
+    const stdout = validationPaths.length
+      ? JSON.stringify({
+          success: true,
+          numTotalTestSuites: validationPaths.length,
+          numPassedTestSuites: validationPaths.length,
+          numFailedTestSuites: 0,
+          numTotalTests: validationPaths.length,
+          numPassedTests: validationPaths.length,
+          numFailedTests: 0,
+          numPendingTests: 0,
+          testResults: validationPaths.map((path) => ({
+            name: `${workspace.root}/${path}`,
+            status: "passed",
+            assertionResults: [{ status: "passed" }],
+          })),
+        })
+      : request.command.startsWith("printf ") ? request.command.slice(7) : "";
     if (Buffer.byteLength(stdout) > request.maxOutputBytes) {
       throw new CloudWorkspaceError(this.name, "resource_limit", "command output exceeded limit", "rejected");
     }
