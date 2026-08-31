@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
-  CODEX_REVIEW_WORKING_DIRECTORY,
   codexReviewExecPrefix,
+  resolveCodexReviewWorkingDirectory,
 } from "./model-policy";
 
 type ReviewSpawnOptions = {
@@ -52,7 +52,7 @@ export function reviewPrompt(
 
     try {
       child = spawnReview(bin, args, {
-        cwd: CODEX_REVIEW_WORKING_DIRECTORY,
+        cwd: resolveCodexReviewWorkingDirectory(),
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });

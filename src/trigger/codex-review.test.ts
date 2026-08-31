@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { reviewPrompt, type CodexReviewSpawn } from "./codex-review";
+import { resolveCodexReviewWorkingDirectory } from "./model-policy";
 
 type FakeChild = ChildProcessWithoutNullStreams & {
   stdin: PassThrough;
@@ -110,13 +111,18 @@ describe("controller Codex review transport", () => {
         "-",
       ],
       options: {
-        cwd: "/app",
+        cwd: resolveCodexReviewWorkingDirectory(),
         env,
         stdio: ["pipe", "pipe", "pipe"],
       },
     });
     expect(invocation!.args.join("\0")).not.toContain("signed-review-receipt");
     expect(readdirSync(tempRoot)).toEqual([]);
+  });
+
+  it("uses a neutral existing directory when the Trigger-only /app path is absent", () => {
+    expect(resolveCodexReviewWorkingDirectory(() => false)).toBe(tmpdir());
+    expect(resolveCodexReviewWorkingDirectory((path) => path === "/app")).toBe("/app");
   });
 
   it("settles an asynchronous spawn error exactly once without hanging", async () => {

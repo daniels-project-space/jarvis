@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { normalizeWorkModelTier, type WorkModelTier } from "../lib/work-models";
 import { visibleTurnText } from "../lib/host-context";
 import { isConversationalReflex } from "../lib/conversation-intent";
@@ -41,6 +43,19 @@ export function codexExecPrefix(tier: string, effort?: unknown): string[] {
 }
 
 export const CODEX_REVIEW_WORKING_DIRECTORY = "/app";
+
+// Trigger images run from /app, while the free systemd fleet has an immutable
+// checkout under /opt and deliberately does not create a synthetic /app.
+// The receipt-only reviewer has no shell/tools and ignores repository rules,
+// so a neutral existing directory is sufficient. Resolve this at spawn time
+// rather than letting an ENOENT look like an inconclusive model verdict.
+export function resolveCodexReviewWorkingDirectory(
+  pathExists: (path: string) => boolean = existsSync,
+): string {
+  return pathExists(CODEX_REVIEW_WORKING_DIRECTORY)
+    ? CODEX_REVIEW_WORKING_DIRECTORY
+    : tmpdir();
+}
 
 // Supervisor review consumes a controller-signed receipt, not a writable
 // specialist checkout. It needs model reasoning only: no shell, web, apps,
