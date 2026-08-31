@@ -177,7 +177,7 @@ import { ChatFilePicker } from "./chat-files/ChatFilePicker";
 import { GuestChatFileAccess } from "./chat-files/GuestChatFileAccess";
 import { ChatFilePendingMonitor, type ChatFileNotice } from "./chat-files/ChatFilePendingMonitor";
 import { useChatFileDropZone } from "./chat-files/useChatFileDropZone";
-import { SPOKEN_CAPTION_TEXT_CLASS, spokenCaptionStageClassName } from "@/lib/spoken-caption-layout";
+import { SPOKEN_CAPTION_TEXT_CLASS, spokenCaptionSurfaceClassName } from "@/lib/spoken-caption-layout";
 import type { ChatFileManifest } from "@/lib/chat-files";
 import { buildSpeculativeResearchQuery } from "@/lib/speculative-research";
 import {
@@ -6300,12 +6300,17 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               <LiveResearchIndicator state={liveResearch} />
             </div>
           )}
-          {/* THE ONE caption — one persistent node throughout token streaming,
-              finalization and narration. Compact overlays keep it beside their
-              visible orb; only a truly full-screen workspace owns the surface. */}
-          {caption && !fullBleed && (
-            <div className={`pointer-events-none absolute ${spokenCaptionStageClassName({ compactAside, commandExpanded, overlayUp })} z-30 flex justify-center px-6`}>
-              <SpokenCaption caption={caption} />
+          {/* THE ONE caption — tool panels must never make a successful answer
+              look silent. On a full-bleed panel it becomes a compact bottom
+              transcript; otherwise it stays beneath the visible orb. */}
+          {caption && !panelFull && (
+            <div
+              data-jarvis-caption-surface={fullBleed ? "overlay" : "stage"}
+              className={`pointer-events-none ${spokenCaptionSurfaceClassName({ fullBleed, compactAside, commandExpanded, overlayUp })} z-40 flex justify-center`}
+            >
+              <div className={fullBleed ? "flex w-[min(92vw,760px)] justify-center rounded-2xl border border-white/10 bg-black/75 px-4 py-2 shadow-2xl backdrop-blur-xl" : "contents"}>
+                <SpokenCaption caption={caption} />
+              </div>
             </div>
           )}
         </div>
@@ -6758,7 +6763,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             >
               <span aria-hidden="true" className={voiceAction.tone === "connecting" || voiceAction.tone === "listening" ? "animate-pulse" : ""}>{voiceAction.glyph}</span>
             </button>
-            {live === "live" && caption ? (
+            {caption ? (
               <span className={`glass min-w-0 flex-1 truncate rounded-xl px-4 py-2.5 text-sm ${caption.who === "you" ? "text-amber" : "text-cyan"}`}>
                 {caption.text}
               </span>

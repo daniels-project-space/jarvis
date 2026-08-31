@@ -118,7 +118,7 @@ describe("orb side-mode layout contracts", () => {
     expect(center + diameter / 2).toBeLessThan(viewportWidth);
     // Keep captions beneath the right-side orb's visual core rather than
     // competing with it; this is deliberately lower than the prior 70%.
-    expect(jarvisSource).toContain("spokenCaptionStageClassName({ compactAside, commandExpanded, overlayUp })");
+    expect(jarvisSource).toContain("spokenCaptionSurfaceClassName({ fullBleed, compactAside, commandExpanded, overlayUp })");
     expect(spokenCaptionStageClassName({ compactAside: true, commandExpanded: false, overlayUp: false }))
       .toBe("top-[74%] hidden md:flex md:left-[62%] md:right-0");
   });

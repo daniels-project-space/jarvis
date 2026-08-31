@@ -13,3 +13,19 @@ export function spokenCaptionStageClassName({
     ? "top-[74%] hidden md:flex md:left-[62%] md:right-0"
     : "top-[63%] inset-x-0";
 }
+
+export function spokenCaptionSurfaceClassName({
+  fullBleed,
+  compactAside,
+  commandExpanded,
+  overlayUp,
+}: {
+  fullBleed: boolean;
+  compactAside: boolean;
+  commandExpanded: boolean;
+  overlayUp: boolean;
+}): string {
+  return fullBleed
+    ? "fixed bottom-[4.75rem] inset-x-0 px-4"
+    : `absolute ${spokenCaptionStageClassName({ compactAside, commandExpanded, overlayUp })} px-6`;
+}

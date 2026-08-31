@@ -184,7 +184,7 @@ describe("live voice bootstrap policy", () => {
   it("keeps the single spoken transcript slightly smaller and lower than the orb", () => {
     const source = readFileSync(new URL("../components/JarvisUI.tsx", import.meta.url), "utf8");
     expect(source).toContain("SPOKEN_CAPTION_TEXT_CLASS");
-    expect(source).toContain("spokenCaptionStageClassName({ compactAside, commandExpanded, overlayUp })");
+    expect(source).toContain("spokenCaptionSurfaceClassName({ fullBleed, compactAside, commandExpanded, overlayUp })");
     expect(SPOKEN_CAPTION_TEXT_CLASS).toBe(
       "text-[0.95rem] font-semibold leading-snug tracking-tight md:text-[1.3rem] lg:text-[1.5rem]",
     );
