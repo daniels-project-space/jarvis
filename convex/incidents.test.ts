@@ -49,6 +49,28 @@ describe("incident observation fencing", () => {
     });
   });
 
+  it.each(["dispatched", "needs-daniel"] as const)(
+    "retires a pre-threshold one-off browser fetch incident left %s",
+    async (status) => {
+      const t = convexTest(schema, modules);
+      const id = await report(t, `client:legacy-${status}`);
+      await t.mutation(api.incidents.setStatus, {
+        id,
+        status,
+        workerToken: WORKER,
+      });
+
+      await expect(t.mutation(api.incidents.claimForRepair, {
+        workerToken: WORKER,
+      })).resolves.toEqual({ claims: [], escalations: [] });
+      await expect(t.run(async (ctx) => await ctx.db.get(id))).resolves.toMatchObject({
+        status: "resolved",
+        attempts: 0,
+        observedCountAtLastAttempt: 1,
+      });
+    },
+  );
+
   it("admits a repair only after the transient network failure really recurs", async () => {
     const t = convexTest(schema, modules);
     const id = await report(t);

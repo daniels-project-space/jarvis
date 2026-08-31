@@ -129,6 +129,30 @@ export const claimForRepair = mutation({
   args: { limit: v.optional(v.number()), maxAttempts: v.optional(v.number()), workerToken: v.optional(v.string()) },
   handler: async (ctx, a) => {
     requireWorker(a.workerToken);
+    // Migrate one-off browser network incidents that an older healer already
+    // dispatched or escalated before the recurrence threshold existed. A
+    // stale status must not keep a phantom "repair running" notification alive
+    // when the product never observed the failure again.
+    for (const status of ["dispatched", "needs-daniel"] as const) {
+      const legacyTransient = await ctx.db
+        .query("incidents")
+        .withIndex("by_status", (q: any) => q.eq("status", status))
+        .order("asc")
+        .take(24);
+      for (const incident of legacyTransient) {
+        if (
+          !isTransientBrowserNetworkIncident(incident)
+          || incident.count >= TRANSIENT_NETWORK_REPORT_THRESHOLD
+        ) continue;
+        await ctx.db.patch(incident._id, {
+          status: "resolved",
+          attempts: 0,
+          observedCountAtLastAttempt: incident.count,
+          updatedAt: Date.now(),
+        });
+        await syncIncidentAttention(ctx, { ...incident, status: "resolved" });
+      }
+    }
     const open = await ctx.db
       .query("incidents")
       .withIndex("by_status", (q: any) => q.eq("status", "open"))
