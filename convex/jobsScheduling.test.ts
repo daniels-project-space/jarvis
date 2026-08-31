@@ -101,6 +101,51 @@ describe("project-group fair reservation authority", () => {
     });
   });
 
+  it("does not let a new retry receipt smuggle a historical job across the activation cutoff", async () => {
+    const t = convexTest(schema, modules);
+    const oldJobId = await enqueue(t, {
+      missionId: "activation-receipt-cutoff",
+      label: "Historic paid-wake work",
+    });
+    vi.setSystemTime(new Date("2026-07-22T12:05:00Z"));
+    const createdAtFloor = Date.now() - 1;
+    const newJobId = await enqueue(t, {
+      missionId: "activation-receipt-cutoff",
+      label: "New self-hosted work",
+    });
+    const paidWake = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "paid-trigger-wake",
+      workerToken: WORKER,
+    });
+    expect(paidWake.reservations.map((reservation) => reservation.jobId))
+      .toEqual([String(oldJobId)]);
+
+    vi.setSystemTime(new Date("2026-07-22T12:08:00Z"));
+    const selfHosted = await t.mutation(api.jobs.reserveDispatchBatch, {
+      limit: 1,
+      reason: "selfhost-reconciliation",
+      createdAtFloor,
+      workerToken: WORKER,
+    });
+
+    expect(selfHosted.reservations.map((reservation) => reservation.jobId))
+      .toEqual([String(newJobId)]);
+    expect(await t.run(async (ctx) => ctx.db.get(oldJobId))).toMatchObject({
+      status: "pending",
+      progress: "held outside the self-hosted activation window",
+    });
+    expect(await t.run(async (ctx) => ctx.db.get(oldJobId)))
+      .not.toHaveProperty("dispatchId");
+    const receipt = await t.run(async (ctx) => ctx.db.query("dispatchReceipts")
+      .filter((q) => q.eq(q.field("jobId"), oldJobId))
+      .first());
+    expect(receipt).toMatchObject({
+      status: "superseded",
+      closeReason: "canonical job predates self-hosted activation",
+    });
+  });
+
   it("binds admitted dynamic machines, holds old workers, and records only Trigger OOM escalation", async () => {
     const t = convexTest(schema, modules);
     const readId = await enqueue(t, { missionId: "mission-bounded-read" });

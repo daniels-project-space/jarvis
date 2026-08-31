@@ -1661,12 +1661,16 @@ export const reserveDispatchBatch = mutation({
     )) throw new Error("createdAtFloor is invalid");
     const reservations: any[] = [];
     const retryableReceipts = async (status: "reserved" | "reconciling") => {
-      let query = ctx.db.query("dispatchReceipts")
+      const query = ctx.db.query("dispatchReceipts")
         .withIndex("by_status_lease", (q: any) => q.eq("status", status).lte("leaseUntil", now));
-      if (a.createdAtFloor !== undefined) {
-        query = query.filter((q: any) => q.gte(q.field("createdAt"), a.createdAtFloor));
-      }
-      return await query.take(limit);
+      // A receipt can be newer than its canonical job (for example after a
+      // paid-wake response is lost and maintenance reissues dispatch). When a
+      // self-hosted activation floor is present, inspect a bounded due window
+      // and fence against the job's creation time below. Receipt time is not
+      // work-admission authority.
+      return await query.take(a.createdAtFloor === undefined
+        ? limit
+        : DISPATCH_CANDIDATE_WINDOW_MAX);
     };
     const retryable = [
       ...await retryableReceipts("reconciling"),
@@ -1683,6 +1687,28 @@ export const reserveDispatchBatch = mutation({
         && row.dispatchPayloadDigest === receipt.payloadDigest
         && Number(row.dispatchGeneration) === Number(receipt.generation)
         && row.dispatchPhase === receipt.phase;
+      if (exact && a.createdAtFloor !== undefined
+        && Number(row.createdAt) < a.createdAtFloor) {
+        await ctx.db.patch(receipt._id, {
+          status: "superseded",
+          closeReason: "canonical job predates self-hosted activation",
+          leaseUntil: undefined,
+          closedAt: now,
+          updatedAt: now,
+        });
+        await patchJobWithRuntime(ctx, row, {
+          ...invalidateDeliveryLease(row),
+          status: "pending",
+          stage: "queued",
+          progress: "held outside the self-hosted activation window",
+          nextRunAt: Math.max(now, Number(row.nextRunAt ?? now)),
+          dispatchId: undefined,
+          dispatchLeaseUntil: undefined,
+          workerRunId: undefined,
+          heartbeatAt: now,
+        });
+        continue;
+      }
       if (!exact) {
         await ctx.db.patch(receipt._id, {
           status: "superseded",
