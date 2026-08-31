@@ -24,8 +24,21 @@ describe("WorkMapBubble", () => {
   it("stays as a tiny bubble until Daniel opens it", () => {
     const markup = renderToStaticMarkup(<WorkMapBubble snapshot={snapshot} owner documentCount={3} {...actions} />);
     expect(markup).toContain("data-work-map-trigger");
-    expect(markup).toContain("1 active worker task");
+    expect(markup).toContain("1 open task, 1 running");
     expect(markup).not.toContain("data-work-map=\"true\"");
+  });
+
+  it("does not describe paused or input work as active workers", () => {
+    const paused = { ...node, state: "paused" as const, status: "paused", jobId: "paused" };
+    const needsInput = { ...node, state: "needs_input" as const, status: "needs_input", jobId: "input" };
+    const pausedSnapshot: CompactWorkSnapshot = {
+      ...snapshot,
+      fleet: snapshot.fleet ? { ...snapshot.fleet, nodes: [paused, needsInput] } : null,
+      hierarchy: [{ ...snapshot.hierarchy[0], projects: [{ ...snapshot.hierarchy[0].projects[0], jobs: [paused, needsInput] }] }],
+    };
+    const markup = renderToStaticMarkup(<WorkMapBubble snapshot={pausedSnapshot} owner documentCount={3} {...actions} />);
+    expect(markup).toContain("2 open tasks, none running, 1 needs input");
+    expect(markup).not.toContain("active worker");
   });
 
   it("renders a real constrained SVG/DOM topology with category controls, working leaf affordances, and no canvas", () => {

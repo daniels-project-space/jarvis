@@ -75,7 +75,7 @@ const CATEGORY_DETAILS: Record<Exclude<WorkMapCategoryId, "general" | "projects"
   marketing: "Campaigns, content, and brand work",
   business: "Commercial and operational work",
   research: "Research, audits, and analysis",
-  operations: "Active Jarvis operations",
+  operations: "Jarvis operations and background work",
 };
 
 function plural(count: number, singular: string, pluralWord = `${singular}s`) {
@@ -147,8 +147,14 @@ function relevantNodes(snapshot: CompactWorkSnapshot) {
 }
 
 /** A worker may intentionally appear in both its project and domain branches. */
-export function workMapActiveJobCount(snapshot: CompactWorkSnapshot) {
-  return new Set(relevantNodes(snapshot).map((node) => node.jobId)).size;
+export function workMapJobSummary(snapshot: CompactWorkSnapshot) {
+  const nodes = relevantNodes(snapshot);
+  return {
+    open: new Set(nodes.map((node) => node.jobId)).size,
+    running: new Set(nodes.filter(isWorkMapNodeWorking).map((node) => node.jobId)).size,
+    needsInput: new Set(nodes.filter((node) => node.state === "needs_input").map((node) => node.jobId)).size,
+    paused: new Set(nodes.filter((node) => node.state === "paused").map((node) => node.jobId)).size,
+  };
 }
 
 function mapContextTerms(context: string) {
@@ -292,7 +298,7 @@ export function buildWorkMap(snapshot: CompactWorkSnapshot, input: WorkMapInput 
     categories.push({
       id: "projects",
       label: "Projects",
-      detail: `${plural(projects.length, "project")} with active workers`,
+      detail: `${plural(projects.length, "project")} with open work`,
       branches: projects.slice(0, WORK_MAP_MAX_LEAVES),
       workCount,
     });

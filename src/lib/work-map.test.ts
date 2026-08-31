@@ -5,7 +5,7 @@ import {
   isWorkMapNodeWorking,
   shouldHideWorkMap,
   selectContextualWorkMapCategories,
-  workMapActiveJobCount,
+  workMapJobSummary,
   workMapPosition,
   WORK_MAP_MAX_LEAVES,
 } from "./work-map";
@@ -82,13 +82,18 @@ describe("work map projection", () => {
     expect(isWorkMapNodeWorking(node({ state: "paused" }))).toBe(false);
   });
 
-  it("counts each durable job once even when it appears in project and domain branches", () => {
-    const durableSnapshot = snapshot([node({ jobId: "shared-job", id: "shared-job" })]);
+  it("counts open, running, paused, and input work without calling every durable row active", () => {
+    const durableSnapshot = snapshot([
+      node({ jobId: "running-job", id: "running-job" }),
+      node({ jobId: "paused-job", id: "paused-job", state: "paused" }),
+      node({ jobId: "input-job", id: "input-job", state: "needs_input" }),
+    ]);
     const map = buildWorkMap(durableSnapshot);
 
     expect(map.filter((category) => category.id === "projects" || category.id === "marketing")
-      .reduce((count, category) => count + category.workCount, 0)).toBe(2);
-    expect(workMapActiveJobCount(durableSnapshot)).toBe(1);
+      .reduce((count, category) => count + category.workCount, 0)).toBe(6);
+    expect(workMapJobSummary(durableSnapshot)).toEqual({ open: 3, running: 1, paused: 1, needsInput: 1 });
+    expect(map.find((category) => category.id === "projects")?.detail).toBe("1 project with open work");
   });
 
   it("yields the work map to chat, voice, research, caption, and stage surfaces", () => {

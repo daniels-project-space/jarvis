@@ -10,7 +10,7 @@ import {
   type WorkMapLeaf,
   type WorkMapTodoItem,
   type WorkMapTodoSummary,
-  workMapActiveJobCount,
+  workMapJobSummary,
   workMapPosition,
   selectContextualWorkMapCategories,
 } from "@/lib/work-map";
@@ -179,12 +179,17 @@ export function WorkMapBubble({
   if (!open) {
     // Project and domain branches intentionally show the same job in two useful
     // contexts, so the trigger must count durable jobs rather than map leaves.
-    const activeCount = workMapActiveJobCount(snapshot);
+    const work = workMapJobSummary(snapshot);
+    const workSummary = [
+      work.open ? `${work.open} open ${work.open === 1 ? "task" : "tasks"}` : "",
+      work.running ? `${work.running} running` : "none running",
+      work.needsInput ? `${work.needsInput} ${work.needsInput === 1 ? "needs" : "need"} input` : "",
+    ].filter(Boolean).join(", ");
     return <section data-work-map-context aria-label="Contextual Jarvis work map" className="pointer-events-none absolute left-1/2 top-1/2 z-30 h-[min(370px,62vh)] w-[min(600px,96vw)] -translate-x-1/2 -translate-y-1/2">
       <svg aria-hidden="true" viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 h-full w-full opacity-45">
         {orbitCategories.map((category, index) => { const point = workMapPosition(index, orbitCategories.length); return <line key={category.id} className={categoryWorking(category) ? "work-map-live-line" : "work-map-line"} x1="50" y1="50" x2={point.x} y2={point.y} />; })}
       </svg>
-      <button ref={triggerRef} type="button" data-work-map-trigger aria-expanded="false" aria-label={`Open Jarvis work map and reveal all${activeCount ? `, ${activeCount} active worker ${activeCount === 1 ? "task" : "tasks"}` : ""}`} onClick={() => openMap(true)} className="pointer-events-auto absolute left-1/2 top-1/2 h-28 w-28 -translate-x-1/2 -translate-y-1/2 rounded-full bg-transparent outline-none ring-cyan/30 focus-visible:ring-1"><span className="sr-only">Reveal all work</span></button>
+      <button ref={triggerRef} type="button" data-work-map-trigger aria-expanded="false" aria-label={`Open Jarvis work map${workSummary ? `, ${workSummary}` : ""}`} onClick={() => openMap(true)} className="pointer-events-auto absolute left-1/2 top-1/2 h-28 w-28 -translate-x-1/2 -translate-y-1/2 rounded-full bg-transparent outline-none ring-cyan/30 focus-visible:ring-1"><span className="sr-only">Reveal all work</span></button>
       {orbitCategories.map((category, index) => {
         const point = workMapPosition(index, orbitCategories.length);
         const active = categoryWorking(category);
