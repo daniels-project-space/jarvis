@@ -33,6 +33,8 @@ export async function runSelfHostedAgentFleetController(
   let providerDueAt = dependencies.now() + PROVIDER_REVALIDATE_INTERVAL_MS;
   let maintenanceDueAt = 0;
   let supervisorDueAt = 0;
+  let maintenanceInFlight: Promise<void> | null = null;
+  let supervisorInFlight: Promise<void> | null = null;
   while (!signal.aborted) {
     const now = dependencies.now();
     if (now >= providerDueAt) {
@@ -41,12 +43,28 @@ export async function runSelfHostedAgentFleetController(
       providerDueAt = now + PROVIDER_REVALIDATE_INTERVAL_MS;
     }
     if (now >= maintenanceDueAt) {
-      await dependencies.runMaintenance();
       maintenanceDueAt = now + MAINTENANCE_INTERVAL_MS;
+      // Recovery/reminder work is useful but must never become a head-of-line
+      // block for a newly queued specialist. Keep one bounded logical flight;
+      // a slow provider call may finish later, while reservations keep moving.
+      if (!maintenanceInFlight) {
+        maintenanceInFlight = Promise.resolve()
+          .then(() => dependencies.runMaintenance())
+          .catch(() => undefined)
+          .finally(() => { maintenanceInFlight = null; });
+      }
     }
     if (now >= supervisorDueAt) {
-      await dependencies.runSupervisorSweep(signal);
       supervisorDueAt = now + SUPERVISOR_INTERVAL_MS;
+      // The supervisor sweep has its own durable leases. Run at most one in
+      // the background so an unavailable supervisor dependency cannot freeze
+      // the specialist reservation loop, as happened in production.
+      if (!supervisorInFlight) {
+        supervisorInFlight = Promise.resolve()
+          .then(() => dependencies.runSupervisorSweep(signal))
+          .catch(() => undefined)
+          .finally(() => { supervisorInFlight = null; });
+      }
     }
 
     const [reservation] = await dependencies.reserve("selfhost-daemon", 1);

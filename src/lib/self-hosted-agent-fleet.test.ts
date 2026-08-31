@@ -70,7 +70,7 @@ describe("self-hosted durable agent fleet controller", () => {
     expect(reserve).toHaveBeenNthCalledWith(1, "selfhost-daemon", 1);
     expect(reserve).toHaveBeenCalledTimes(2);
     expect(deps.wait).not.toHaveBeenCalled();
-    expect(deps.runSupervisorSweep).toHaveBeenCalledTimes(2);
+    expect(deps.runSupervisorSweep).toHaveBeenCalledTimes(1);
   });
 
   it("idles without inventing work and wakes from the abort signal", async () => {
@@ -86,5 +86,28 @@ describe("self-hosted durable agent fleet controller", () => {
     expect(deps.reserve).toHaveBeenCalledWith("selfhost-daemon", 1);
     expect(deps.runJob).not.toHaveBeenCalled();
     expect(wait).toHaveBeenCalledWith(750, abort.signal);
+  });
+
+  it("does not let a stuck maintenance or supervisor sweep block queued work", async () => {
+    const abort = new AbortController();
+    const reserve = vi.fn()
+      .mockResolvedValueOnce([reservation])
+      .mockImplementationOnce(async () => {
+        abort.abort();
+        return [];
+      });
+    const never = () => new Promise<void>(() => undefined);
+    const deps = dependencies({
+      reserve,
+      runMaintenance: vi.fn(never),
+      runSupervisorSweep: vi.fn(never),
+    });
+
+    await runSelfHostedAgentFleetController(1_000, abort.signal, deps);
+
+    expect(deps.runMaintenance).toHaveBeenCalledTimes(1);
+    expect(deps.runSupervisorSweep).toHaveBeenCalledTimes(1);
+    expect(deps.runJob).toHaveBeenCalledWith(reservation, abort.signal);
+    expect(reserve).toHaveBeenCalledTimes(2);
   });
 });
