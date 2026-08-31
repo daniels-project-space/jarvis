@@ -260,6 +260,20 @@ const strings = (value: unknown, maxItems: number, maxChars: number) =>
     .filter(Boolean)
     .slice(0, maxItems);
 
+function requiresControllerOnlyWorkerEvidence(value: string): boolean {
+  const controllerRecord = /\b(?:workevents?|workattempts?|jobruntime|missionruntime|providerterminatedat|controller[- ]owned (?:terminal )?lifecycle)\b/gi;
+  const proofVerb = /\b(?:verify|report|confirm|prove|audit|certify|attest)\b/i;
+  const lifecycleQualifier = /\b(?:live|durable|current|completed|post-dispatch|post-exit|terminal|own|this|its)\b/i;
+  const evidenceNoun = /\b(?:record|records|row|rows|receipt|receipts|checkpoint|checkpoints|status|termination)\b/i;
+  for (const match of value.matchAll(controllerRecord)) {
+    const start = Math.max(0, Number(match.index ?? 0) - 180);
+    const end = Math.min(value.length, Number(match.index ?? 0) + match[0].length + 180);
+    const context = value.slice(start, end);
+    if (lifecycleQualifier.test(context) && (proofVerb.test(context) || evidenceNoun.test(context))) return true;
+  }
+  return false;
+}
+
 function knownProject(text: string) {
   const normalized = text.toLowerCase();
   return PROJECT_REGISTRY.find((project) => {
@@ -493,10 +507,22 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
       ),
     };
     const guardrails = strings(row.guardrails, 8, 500);
+    const acceptanceCriteria = strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500).length
+      ? strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500)
+      : ["Deliver the scoped outcome with concrete verification evidence"];
     if (!deliverableInput || deliverable.description.length < 12 || !deliverable.requiredEvidence.length) {
       throw new Error(`Goal plan workstream ${id} requires a structured deliverable and evidence contract`);
     }
     if (!guardrails.length) throw new Error(`Goal plan workstream ${id} requires at least one explicit guardrail`);
+    if (requiresControllerOnlyWorkerEvidence([
+      task,
+      ...acceptanceCriteria,
+      ...deliverable.requiredEvidence,
+    ].join("\n"))) {
+      throw new Error(
+        `Goal plan workstream ${id} assigns controller-only lifecycle evidence to a specialist; reserve live job, event, attempt, and termination predicates for the final controller audit`,
+      );
+    }
     return {
       id,
       label: clampText(row.label, 80) || `Workstream ${index + 1}`,
@@ -511,9 +537,7 @@ export function parseGoalPlan(text: string, maxBuildSessions = 6): GoalPlan {
       })(),
       readonly: row.readonly === true,
       dependsOn: strings(row.dependsOn ?? row.depends_on, 8, 48).map((dependency) => slug(dependency, "")),
-      acceptanceCriteria: strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500).length
-        ? strings(row.acceptanceCriteria ?? row.acceptance_criteria, 8, 500)
-        : ["Deliver the scoped outcome with concrete verification evidence"],
+      acceptanceCriteria,
       deliverable,
       guardrails,
       mcp: strings(row.mcp, 2, 20).filter((name): name is "playwright" | "context7" => name === "playwright" || name === "context7"),
@@ -646,7 +670,7 @@ export function plannerTask(goal: string, route: GoalRoute, acceptanceCriteria: 
     `Reuse boundary: ${route.infrastructureContext}`,
     acceptanceCriteria.length ? `Daniel's acceptance criteria:\n${acceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
     `Act as the hierarchical crew manager. Inspect the current repository, AGENTS.md, callers, live manifests and relevant primary-source docs. Find existing skills, templates and infrastructure before proposing new code. First define one measurable outcome contract: current baseline, primary metric, target, measurement window, authoritative evidence sources, and exact stop conditions. The measurement window is the sample period or observation cohort; never copy an incidental elapsed runtime into it unless latency is explicitly the primary metric, and never turn a baseline observation into an exact target. A business goal about profit must measure net contribution after attributable costs, refunds, fees and acquisition expense; sales, traffic, code shipped, or a deployment are not profit.`,
-    `Create only the ${maxBuildSessions === 1 ? "single necessary" : `1-${maxBuildSessions} necessary`} workstream${maxBuildSessions === 1 ? "" : "s"}; never add a ceremonial specialist merely to make a larger crew. Assign Paul to engineering/integration, Atlas to evidence research, Iris to media/visual quality, Maya to travel/calendar work, Chloe to social/content operations, and Sentry to reliability/security review. Give each workstream one structured deliverable, required evidence and explicit guardrails. Repository work intentionally runs in an isolated provider workspace: never invent "no provider workspace was opened" as a stop condition. Do not require a specialist to prove its own post-exit provider-workspace termination; require the controller-owned terminal lifecycle receipt in the final validation audit instead. Express only real ordering requirements as dependsOn edges; verified upstream outputs become the dependent worker's context. Continue reversible independent work before escalating, and ask Daniel only for the smallest genuinely protected decision. Once every stop condition is proved, stop the crew and leave no polling worker running merely to look busy.`,
+    `Create only the ${maxBuildSessions === 1 ? "single necessary" : `1-${maxBuildSessions} necessary`} workstream${maxBuildSessions === 1 ? "" : "s"}; never add a ceremonial specialist merely to make a larger crew. Assign Paul to engineering/integration, Atlas to evidence research, Iris to media/visual quality, Maya to travel/calendar work, Chloe to social/content operations, and Sentry to reliability/security review. Give each workstream one structured deliverable, required evidence and explicit guardrails. Repository work intentionally runs in an isolated provider workspace: never invent "no provider workspace was opened" as a stop condition. A specialist receives its immutable task, controller-bound source identity, allowed tools, and verified upstream handoffs; it cannot query arbitrary live mission/job, workEvent, workAttempt, or post-exit lifecycle rows. Never put those controller-only predicates in a specialist task, deliverable, or definition of done. Reserve them for the server-captured final validation audit. Do not require a specialist to prove its own current progress record. Do not require a specialist to prove its own post-exit provider-workspace termination. Express only real ordering requirements as dependsOn edges; verified upstream outputs become the dependent worker's context. Continue reversible independent work before escalating, and ask Daniel only for the smallest genuinely protected decision. Once every stop condition is proved, stop the crew and leave no polling worker running merely to look busy.`,
     `When quality defects are found, fix their generation, render, configuration, or data root cause; detection filters are secondary regression guards and a rejection-only gate does not satisfy the outcome. Independent writable sessions may run concurrently because every work item receives its own immutable worker branch and sandbox; specialists never share or integrate branches. Agents do not merge or deploy directly: the fenced delivery controller serializes reviewed receipts into the mission integration branch. Actions with public, third-party communication, financial, credential, booking, or destructive consequences remain separately approval-gated.`,
     "End with exactly one compact JSON object after GOAL_PLAN_JSON:. It must use this shape:",
     '{"summary":"...","route":"app_factory|youtube_studio|existing_project|cloud_new|general","primaryRepo":"owner/repo or empty","assumptions":["..."],"outcome":{"objective":"...","metric":"one primary metric","baseline":"current measured state/source","target":"observable threshold","measurementWindow":"...","evidenceSources":["authoritative source"],"stopConditions":["condition that ends work"]},"crew":{"process":"hierarchical","manager":"jarvis","delegationRules":["only necessary specialists"],"humanEscalation":["protected decision only after independent work"],"reportingCadence":"event-driven checkpoints; no idle polling"},"workstreams":[{"id":"stable-id","label":"short label","task":"self-contained task","agentId":"paul|atlas|iris|maya|chloe|sentry","repo":"owner/repo or empty","readonly":false,"dependsOn":["earlier-id"],"acceptanceCriteria":["observable evidence"],"deliverable":{"kind":"code_change|research_brief|creative_artifact|operational_result|decision_brief","description":"exact output","requiredEvidence":["proof"]},"guardrails":["explicit boundary"],"mcp":["playwright|context7"]}],"validation":{"criteria":["goal-level truth"],"tests":["deep test"],"liveChecks":["deployed/provider check"]},"factory":{"name":"required only for app_factory","slug":"...","brief":"full build brief"}}',
