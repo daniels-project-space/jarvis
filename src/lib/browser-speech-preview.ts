@@ -1,4 +1,8 @@
 export const BROWSER_SPEECH_FINAL_MIN_CONFIDENCE = 0.88;
+// Chromium often emits its final Web Speech result just after MediaRecorder's
+// stop event. Waiting a tiny, bounded tail is much cheaper than immediately
+// paying the normal ~2s server-STT round trip.
+export const BROWSER_SPEECH_FINAL_SETTLE_MS = 180;
 
 export type BrowserSpeechPreview = {
   sessionId: string;
@@ -11,6 +15,36 @@ export type BrowserSpeechPreview = {
 export type LiveTranscriptSource =
   | { source: "browser-final"; text: string }
   | { source: "server" };
+
+export async function waitForBrowserSpeechFinal(args: {
+  enabled: boolean;
+  current: () => BrowserSpeechPreview | null;
+  subscribe: (notify: () => void) => () => void;
+  timeoutMs?: number;
+}): Promise<boolean> {
+  if (!args.enabled) return false;
+  if (args.current()?.isFinal === true) return true;
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let unsubscribe: () => void = () => undefined;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(value);
+    };
+    const timer = setTimeout(
+      () => finish(args.current()?.isFinal === true),
+      args.timeoutMs ?? BROWSER_SPEECH_FINAL_SETTLE_MS,
+    );
+    const cleanup = args.subscribe(() => finish(args.current()?.isFinal === true));
+    unsubscribe = cleanup;
+    if (settled) cleanup();
+    else if (args.current()?.isFinal === true) finish(true);
+  });
+}
 
 function normalized(text: string): string {
   return String(text ?? "").trim().replace(/\s+/g, " ");
@@ -72,11 +106,13 @@ export function recoverLiveTranscriptFromBrowser(args: {
   sessionId: string;
   currentVoiceAt: number;
   sessionActive: boolean;
+  allowBrowserRecovery?: boolean;
 }): string {
   const preview = args.preview;
   const text = normalized(preview?.text ?? "");
   if (
     !args.sessionActive
+    || args.allowBrowserRecovery !== true
     || !preview
     || preview.sessionId !== args.sessionId
     || preview.observedVoiceAt !== args.currentVoiceAt
@@ -90,8 +126,9 @@ export function recoverLiveTranscriptFromBrowser(args: {
 
 /**
  * Server STT is the default. A browser transcript can replace the one allowed
- * server request only when it is final, strongly confident, tied to this exact
- * live session, and no VAD-accepted speech occurred after that final result.
+ * server request only when it is final, strongly confident, explicitly
+ * admitted as read-only, tied to this exact live session, and no VAD-accepted
+ * speech occurred after that final result.
  */
 export function chooseLiveTranscriptSource(args: {
   previous?: BrowserSpeechPreview | null;
@@ -99,6 +136,7 @@ export function chooseLiveTranscriptSource(args: {
   sessionId: string;
   currentVoiceAt: number;
   sessionActive: boolean;
+  allowBrowserFinalTranscript?: boolean;
   allowStableFinalWithoutConfidence?: boolean;
 }): LiveTranscriptSource {
   const preview = args.preview;
@@ -116,6 +154,7 @@ export function chooseLiveTranscriptSource(args: {
   );
   if (
     !args.sessionActive
+    || args.allowBrowserFinalTranscript !== true
     || !preview
     || preview.sessionId !== args.sessionId
     || !preview.isFinal

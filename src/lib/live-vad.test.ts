@@ -10,6 +10,7 @@ import {
   LIVE_UNFINISHED_END_SILENCE_MS,
   advanceLiveVad,
   createLiveVadState,
+  isReadOnlyBrowserFinalTranscript,
   liveEndpointSilenceMs,
   shouldDeferLiveCapture,
   shouldCloseLiveUtterance,
@@ -257,5 +258,20 @@ describe("live research preview admission", () => {
       ...stable,
       authoritativePartialTranscript: "Research Sesame voice",
     })).toBe(false);
+  });
+
+  it("limits authoritative browser finals to read-only requests", () => {
+    for (const safe of [
+      "How does the Jarvis voice path work?",
+      "Explain why the response is slow",
+      "Tell me about the current project architecture",
+    ]) expect(isReadOnlyBrowserFinalTranscript(safe)).toBe(true);
+
+    for (const unsafe of [
+      "How can you delete that file?",
+      "Research this and then deploy it",
+      "Start a team to make the Shopify store profitable",
+      "Tell Maya to send the message",
+    ]) expect(isReadOnlyBrowserFinalTranscript(unsafe)).toBe(false);
   });
 });

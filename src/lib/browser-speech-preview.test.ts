@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   BROWSER_SPEECH_FINAL_MIN_CONFIDENCE,
@@ -6,6 +6,7 @@ import {
   isStableBrowserFinalRevision,
   isStableBrowserSpeechRevision,
   recoverLiveTranscriptFromBrowser,
+  waitForBrowserSpeechFinal,
   type BrowserSpeechPreview,
 } from "./browser-speech-preview";
 
@@ -51,6 +52,7 @@ describe("browser speech preview", () => {
       sessionId: final.sessionId,
       currentVoiceAt: final.observedVoiceAt,
       sessionActive: true,
+      allowBrowserFinalTranscript: true,
     })).toEqual({ source: "browser-final", text: final.text });
 
     for (const rejected of [
@@ -63,6 +65,7 @@ describe("browser speech preview", () => {
         sessionId: rejected.sessionId,
         currentVoiceAt: rejected.observedVoiceAt,
         sessionActive: true,
+        allowBrowserFinalTranscript: true,
       })).toEqual({ source: "server" });
     }
   });
@@ -82,6 +85,7 @@ describe("browser speech preview", () => {
       sessionId: final.sessionId,
       currentVoiceAt: final.observedVoiceAt,
       sessionActive: true,
+      allowBrowserFinalTranscript: true,
       allowStableFinalWithoutConfidence: true,
     })).toEqual({ source: "browser-final", text: final.text });
 
@@ -114,6 +118,7 @@ describe("browser speech preview", () => {
         sessionId: "voice-session-1",
         currentVoiceAt: 4_000,
         sessionActive: true,
+        allowBrowserFinalTranscript: true,
         allowStableFinalWithoutConfidence: true,
       })).toEqual({ source: "server" });
     }
@@ -123,6 +128,7 @@ describe("browser speech preview", () => {
       sessionId: "voice-session-1",
       currentVoiceAt: 4_090,
       sessionActive: true,
+      allowBrowserFinalTranscript: true,
       allowStableFinalWithoutConfidence: true,
     })).toEqual({ source: "server" });
   });
@@ -134,25 +140,67 @@ describe("browser speech preview", () => {
       sessionId: final.sessionId,
       currentVoiceAt: final.observedVoiceAt + 90,
       sessionActive: true,
+      allowBrowserFinalTranscript: true,
     })).toEqual({ source: "server" });
     expect(chooseLiveTranscriptSource({
       preview: final,
       sessionId: "new-session",
       currentVoiceAt: final.observedVoiceAt,
       sessionActive: true,
+      allowBrowserFinalTranscript: true,
     })).toEqual({ source: "server" });
     expect(chooseLiveTranscriptSource({
       preview: final,
       sessionId: final.sessionId,
       currentVoiceAt: final.observedVoiceAt,
       sessionActive: false,
+      allowBrowserFinalTranscript: true,
     })).toEqual({ source: "server" });
     expect(chooseLiveTranscriptSource({
       preview: null,
       sessionId: final.sessionId,
       currentVoiceAt: final.observedVoiceAt,
       sessionActive: true,
+      allowBrowserFinalTranscript: true,
     })).toEqual({ source: "server" });
+  });
+
+  it("waits briefly for the final event that Chromium emits after recorder stop", async () => {
+    vi.useFakeTimers();
+    let current = preview({ text: "How does this voice path work", isFinal: false });
+    let notify: () => void = () => undefined;
+    const settled = waitForBrowserSpeechFinal({
+      enabled: true,
+      current: () => current,
+      subscribe: (listener) => {
+        notify = listener;
+        return () => { notify = () => undefined; };
+      },
+    });
+
+    current = { ...current, isFinal: true, confidence: 0.93 };
+    notify();
+    await expect(settled).resolves.toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("adds no wait without a recognizer and remains bounded when no final arrives", async () => {
+    await expect(waitForBrowserSpeechFinal({
+      enabled: false,
+      current: () => null,
+      subscribe: () => () => undefined,
+    })).resolves.toBe(false);
+
+    vi.useFakeTimers();
+    const timedOut = waitForBrowserSpeechFinal({
+      enabled: true,
+      current: () => preview({ isFinal: false }),
+      subscribe: () => () => undefined,
+      timeoutMs: 25,
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await expect(timedOut).resolves.toBe(false);
+    vi.useRealTimers();
   });
 
   it("rescues a fenced recorded utterance only from a usable final or stable revision", () => {
@@ -164,6 +212,7 @@ describe("browser speech preview", () => {
       sessionId: stable.sessionId,
       currentVoiceAt: stable.observedVoiceAt,
       sessionActive: true,
+      allowBrowserRecovery: true,
     })).toBe(stable.text);
 
     const final = preview({ isFinal: true, confidence: 0.7 });
@@ -173,7 +222,16 @@ describe("browser speech preview", () => {
       sessionId: final.sessionId,
       currentVoiceAt: final.observedVoiceAt,
       sessionActive: true,
+      allowBrowserRecovery: true,
     })).toBe(final.text);
+
+    expect(recoverLiveTranscriptFromBrowser({
+      previous: null,
+      preview: final,
+      sessionId: final.sessionId,
+      currentVoiceAt: final.observedVoiceAt,
+      sessionActive: true,
+    })).toBe("");
 
     expect(recoverLiveTranscriptFromBrowser({
       previous,
@@ -181,6 +239,7 @@ describe("browser speech preview", () => {
       sessionId: "another-session",
       currentVoiceAt: stable.observedVoiceAt,
       sessionActive: true,
+      allowBrowserRecovery: true,
     })).toBe("");
     expect(recoverLiveTranscriptFromBrowser({
       previous: null,
@@ -188,6 +247,7 @@ describe("browser speech preview", () => {
       sessionId: "voice-session-1",
       currentVoiceAt: 4_000,
       sessionActive: true,
+      allowBrowserRecovery: true,
     })).toBe("");
   });
 
@@ -202,6 +262,8 @@ describe("browser speech preview", () => {
     expect(liveTurn).toContain("attempt < 2");
     expect(liveTurn).toContain('"x-jarvis-stt-attempt": String(attempt + 1)');
     expect(liveTurn).toContain("recoverLiveTranscriptFromBrowser");
+    expect(liveTurn).toContain("waitForBrowserSpeechFinal");
+    expect(liveTurn).toContain("isReadOnlyBrowserFinalTranscript");
     expect(liveTurn).not.toContain("requestData()");
   });
 });

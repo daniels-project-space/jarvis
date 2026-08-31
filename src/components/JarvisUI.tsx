@@ -58,6 +58,7 @@ import {
   LIVE_BARGE_SAMPLE_MS,
   advanceLiveVad,
   createLiveVadState,
+  isReadOnlyBrowserFinalTranscript,
   isTrustedBrowserFinalQuestionEndpoint,
   shouldCloseLiveUtterance,
   shouldDeferLiveCapture,
@@ -183,6 +184,7 @@ import {
   chooseLiveTranscriptSource,
   isStableBrowserSpeechRevision,
   recoverLiveTranscriptFromBrowser,
+  waitForBrowserSpeechFinal,
   type BrowserSpeechPreview,
 } from "@/lib/browser-speech-preview";
 import {
@@ -4955,6 +4957,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
     let previousBrowserPreview: BrowserSpeechPreview | null = null;
     let previewRecognizer: BrowserSpeechRecognizer | null = null;
     let browserPreviewCaptureOpen = false;
+    let browserFinalSettleSignal: (() => void) | null = null;
     const selfHostedStreaming = { current: null as SelfHostedStreamingSpeech | null };
     let selfHostedPartial = "";
     const researchState: {
@@ -5024,6 +5027,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
             sessionId: voiceRequestId,
             currentVoiceAt: evidence.lastVoice,
             sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+            allowBrowserRecovery: isReadOnlyBrowserFinalTranscript(browserPreview?.text),
           });
           if (browserRecovery) {
             voiceTrace.transcriptSource = "browser-final";
@@ -5173,12 +5177,14 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
               previousBrowserPreview = previous;
               browserPreview = candidate;
               document.documentElement.dataset.jarvisBrowserSpeechPreview = allFinal ? "final" : "interim";
+              if (candidate.isFinal) browserFinalSettleSignal?.();
               if (isStableBrowserSpeechRevision(previousBrowserPreview, candidate)) {
                 startLiveResearch(candidate.text, previousBrowserPreview?.text ?? "");
               }
             };
             recognizer.onerror = () => {
               document.documentElement.dataset.jarvisBrowserSpeechPreview = "unavailable";
+              browserFinalSettleSignal?.();
             };
             recognizer.start();
           } catch {
@@ -5247,6 +5253,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
           sessionId: voiceRequestId,
           currentVoiceAt: vad.lastVoice,
           sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+          allowBrowserFinalTranscript: isReadOnlyBrowserFinalTranscript(browserPreview?.text),
           allowStableFinalWithoutConfidence,
         }).source === "browser-final";
         const trustedBrowserFinalQuestion = isTrustedBrowserFinalQuestionEndpoint(
@@ -5274,8 +5281,20 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
       await new Promise<void>((resolve) => {
         rec.onstop = () => {
           browserPreviewCaptureOpen = false;
-          try { previewRecognizer?.stop(); } catch { /* browser preview already ended */ }
-          resolve();
+          const recognizer = previewRecognizer;
+          try { recognizer?.stop(); } catch { /* browser preview already ended */ }
+          void waitForBrowserSpeechFinal({
+            // Do not add even this small tail to commands or empty browser
+            // previews; those must go straight to authoritative server STT.
+            enabled: recognizer !== null && isReadOnlyBrowserFinalTranscript(browserPreview?.text),
+            current: () => browserPreview as BrowserSpeechPreview | null,
+            subscribe: (notify) => {
+              browserFinalSettleSignal = notify;
+              return () => {
+                if (browserFinalSettleSignal === notify) browserFinalSettleSignal = null;
+              };
+            },
+          }).then(() => resolve(), () => resolve());
         };
         rec.start(250);
       });
@@ -5312,6 +5331,7 @@ export default function JarvisUI({ embedded = false }: { embedded?: boolean }) {
         sessionId: voiceRequestId,
         currentVoiceAt: vad.lastVoice,
         sessionActive: freeLoop.current && sessionEpoch === liveSessionEpoch.current,
+        allowBrowserFinalTranscript: isReadOnlyBrowserFinalTranscript(finalBrowserPreview?.text),
         allowStableFinalWithoutConfidence: isTrustedBrowserFinalQuestionEndpoint(
           finalBrowserPreview?.text,
           true,

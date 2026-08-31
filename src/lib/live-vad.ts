@@ -157,7 +157,23 @@ export function isTrustedBrowserFinalQuestionEndpoint(
 }
 
 const READ_ONLY_RESEARCH_INTENT = /\b(?:research|look up|find out|investigate|compare|explain|tell me about|what|why|how|who|where|when|which)\b/i;
-const MUTATING_OR_SENSITIVE_INTENT = /\b(?:send|message|email|post|publish|upload|delete|remove|buy|sell|pay|transfer|book|cancel|deploy|push|commit|execute|run|edit|change|create|download)\b/i;
+const MUTATING_OR_SENSITIVE_INTENT = /\b(?:send|message|email|text|call|post|publish|upload|delete|remove|move|rename|share|invite|buy|purchase|order|sell|pay|transfer|book|cancel|deploy|push|commit|execute|run|edit|change|create|make|start|launch|schedule|remind|approve|sign|subscribe|unsubscribe|download)\b/i;
+
+/**
+ * Browser recognition may become authoritative only for a narrow read-only
+ * request. Any action-shaped or sensitive utterance still pays for server STT
+ * before Jarvis is allowed to route it to tools or workers.
+ */
+export function isReadOnlyBrowserFinalTranscript(transcript: string | undefined): boolean {
+  const normalized = normalizedTranscript(transcript);
+  return Boolean(
+    normalized
+    && READ_ONLY_RESEARCH_INTENT.test(normalized)
+    && !MUTATING_OR_SENSITIVE_INTENT.test(normalized)
+    && !isUnfinishedPartial(normalized)
+    && !TRAILING_SELF_CORRECTION.test(normalized),
+  );
+}
 
 function previewWords(transcript: string): string[] {
   return normalizedTranscript(transcript)
@@ -181,7 +197,7 @@ export function shouldStartLiveResearchPreview(args: {
   const current = normalizedTranscript(args.authoritativePartialTranscript);
   const previous = normalizedTranscript(args.previousAuthoritativePartialTranscript);
   if (!current || !previous || isUnfinishedPartial(current) || TRAILING_SELF_CORRECTION.test(current)) return false;
-  if (!READ_ONLY_RESEARCH_INTENT.test(current) || MUTATING_OR_SENSITIVE_INTENT.test(current)) return false;
+  if (!isReadOnlyBrowserFinalTranscript(current)) return false;
 
   const currentWords = previewWords(current);
   const previousWords = previewWords(previous);
