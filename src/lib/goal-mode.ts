@@ -7,7 +7,12 @@ import { validateWorkDag } from "./workspace-protocol";
 
 export const GOAL_PLAN_MARKER = "GOAL_PLAN_JSON:";
 export const GOAL_VALIDATION_MARKER = "GOAL_VALIDATION_JSON:";
-export const GOAL_PLAN_RESULT_MAX_CHARS = 8_000;
+// The planner is asked to stay below 7,500 characters, but the durable
+// boundary must not corrupt an otherwise valid contract when a model exceeds
+// that soft prompt budget by a small amount. The runner persists only the
+// parsed compact contract (never the surrounding prose) and rejects it before
+// completion if that contract itself exceeds this hard bound.
+export const GOAL_PLAN_RESULT_MAX_CHARS = 12_000;
 export const WORK_RESULT_MAX_CHARS = 4_000;
 export const GOAL_VALIDATOR_TASK_MAX_CHARS = 40_000;
 

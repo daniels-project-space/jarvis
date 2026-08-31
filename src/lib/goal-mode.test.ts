@@ -202,7 +202,7 @@ describe("Goal Mode contracts", () => {
       ["Verify every external pipeline", "Preserve all consequential approval gates"],
       8,
     );
-    expect(GOAL_PLAN_RESULT_MAX_CHARS).toBeGreaterThanOrEqual(8_000);
+    expect(GOAL_PLAN_RESULT_MAX_CHARS).toBeGreaterThanOrEqual(12_000);
     expect(prompt).toContain("7,500 characters");
     expect(prompt).toContain("fix their generation, render, configuration, or data root cause");
     expect(prompt).toContain("a rejection-only gate does not satisfy the outcome");
