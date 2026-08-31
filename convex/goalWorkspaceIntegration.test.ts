@@ -19,6 +19,7 @@ import { testProjectSourceAdmission } from "./testSourceAdmission";
 import { patchJobWithRuntime } from "./controlPlane";
 import { ensureGoalNodeHandoff, verifiedGoalHandoffsForJob } from "./goalHandoffs";
 import { triggerClaimAuthority } from "../src/lib/trigger-machine";
+import { sealProjectSourceAdmission } from "../src/lib/source-admission";
 
 declare global {
   interface ImportMeta { glob(pattern: string): Record<string, () => Promise<unknown>>; }
@@ -2635,6 +2636,13 @@ describe("real Convex multi-agent workspace and integration races", () => {
     ]);
     const first: any = left ?? right;
     expect(first).toMatchObject({ kind: "plan", advanceLeaseVersion: 1 });
+    expect(first.admittedProjectSources).toEqual([
+      expect.objectContaining({
+        repository: REPO,
+        sourceBranch: "main",
+        sourceHeadSha: BASE,
+      }),
+    ]);
     expect(["worker-a", "worker-b"]).toContain(first.advanceLeaseOwner);
     expect(left && right).toBeFalsy();
     const firstFence = {
@@ -2687,6 +2695,47 @@ describe("real Convex multi-agent workspace and integration races", () => {
       .withIndex("by_mission", (q) => q.eq("missionId", String(missionId))).collect())
       .filter((job) => job.goalStage === "building"));
     expect(builds).toHaveLength(2);
+  });
+
+  it("refreshes only the observation time for the exact immutable source before a long plan commits", async () => {
+    const { t, missionId } = await goalAwaitingPlan();
+    const mission: any = await t.run(async (ctx) => ctx.db.get(missionId));
+    const prior = mission.projectAdmissions[0];
+    const refreshed = await sealProjectSourceAdmission({
+      protocolVersion: prior.protocolVersion,
+      canonicalProjectId: prior.canonicalProjectId,
+      repository: prior.repository,
+      sourceProvider: prior.sourceProvider,
+      sourceBranch: prior.sourceBranch,
+      sourceRef: prior.sourceRef,
+      sourceHeadSha: prior.sourceHeadSha,
+      sourceObservedAt: prior.sourceObservedAt + 1,
+    });
+    expect(await t.mutation(api.goalMode.admitPlanProjectsV2, {
+      id: missionId,
+      expectedAdvanceAttempt: 1,
+      projectAdmissions: [refreshed],
+      workerToken: TOKEN,
+    })).toMatchObject({ admitted: true, stale: false, added: 0, refreshed: 1, total: 1 });
+    expect(await t.run(async (ctx) => (await ctx.db.get(missionId) as any).projectAdmissions[0]))
+      .toEqual(refreshed);
+
+    const advancedHead = await sealProjectSourceAdmission({
+      protocolVersion: refreshed.protocolVersion,
+      canonicalProjectId: refreshed.canonicalProjectId,
+      repository: refreshed.repository,
+      sourceProvider: refreshed.sourceProvider,
+      sourceBranch: refreshed.sourceBranch,
+      sourceRef: refreshed.sourceRef,
+      sourceHeadSha: "9".repeat(40),
+      sourceObservedAt: refreshed.sourceObservedAt + 1,
+    });
+    await expect(t.mutation(api.goalMode.admitPlanProjectsV2, {
+      id: missionId,
+      expectedAdvanceAttempt: 1,
+      projectAdmissions: [advancedHead],
+      workerToken: TOKEN,
+    })).rejects.toThrow(`Mission source admission for ${REPO} is immutable`);
   });
 
   it("recovers a needs-input leaf without pausing its independent sibling", async () => {

@@ -779,20 +779,36 @@ async function goalPlanProjectAdmissions(
   plan: GoalPlan,
   primaryRepo: string | undefined,
   token: string,
-  alreadyAdmitted: readonly string[] = [],
+  alreadyAdmitted: readonly ProjectSourceAdmission[] = [],
 ): Promise<ProjectSourceAdmission[]> {
-  const existing = new Set(alreadyAdmitted);
+  const existingByScope = new Map(
+    alreadyAdmitted.map((admission) => [admission.repository ?? "evidence", admission]),
+  );
   const repositories = new Set<string>();
-  let needsEvidence = false;
+  let needsEvidence = existingByScope.has("evidence");
+  for (const admission of alreadyAdmitted) {
+    if (admission.repository) repositories.add(admission.repository);
+  }
   for (const stream of plan.workstreams) {
     const requested = stream.repo || (!stream.readonly ? primaryRepo || plan.primaryRepo : undefined);
     if (requested) {
       const canonical = canonicalizeRepository(requested, { allowShortName: true });
-      if (canonical && !existing.has(canonical)) repositories.add(canonical);
-    } else if (!existing.has("evidence")) needsEvidence = true;
+      if (canonical) repositories.add(canonical);
+    } else needsEvidence = true;
   }
-  const admitted = await Promise.all([...repositories].map((repository) =>
-    observeGitHubProjectSource({ repository, token: token || undefined })));
+  // Plan generation can legitimately exceed the ten-minute source-observation
+  // freshness window. Re-observe every required immutable scope before plan
+  // commit, including scopes already admitted at mission creation. Convex will
+  // accept the refresh only when repository, branch, ref, and exact head SHA
+  // are unchanged; a branch that advanced while planning remains a hard stop.
+  const admitted = await Promise.all([...repositories].map((repository) => {
+    const prior = existingByScope.get(repository);
+    return observeGitHubProjectSource({
+      repository,
+      requestedBranch: prior?.sourceBranch,
+      token: token || undefined,
+    });
+  }));
   if (needsEvidence) admitted.push(await evidenceProjectSourceAdmission());
   return admitted;
 }
@@ -1492,7 +1508,9 @@ export async function runAgentHarness(options: AgentHarnessOptions) {
                 plan,
                 claim.primaryRepo,
                 token,
-                Array.isArray(claim.admittedProjectScopes) ? claim.admittedProjectScopes.map(String) : [],
+                Array.isArray(claim.admittedProjectSources)
+                  ? claim.admittedProjectSources as ProjectSourceAdmission[]
+                  : [],
               );
               if (projectAdmissions.length) {
                 const admission: any = await convexMutation("goalMode:admitPlanProjectsV2", {

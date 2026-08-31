@@ -1123,6 +1123,10 @@ export const claimAdvance = mutation({
           admissionProtocolVersion: mission.admissionProtocolVersion,
           admittedProjectScopes: (mission.projectAdmissions ?? []).map((admission: ProjectSourceAdmission) =>
             admission.repository ?? "evidence"),
+          // Non-secret exact source bindings let a long-running planner renew
+          // freshness for the same branch/head before committing its plan.
+          // The worker re-observes GitHub; it cannot manufacture a new source.
+          admittedProjectSources: mission.projectAdmissions ?? [],
         };
       }
       if (activity.phase === "building" || activity.phase === "refining") {
@@ -1272,12 +1276,24 @@ export const admitPlanProjectsV2 = mutation({
     if (!await validProjectAdmissions(existing)) throw new Error("Mission source admission ledger is invalid");
     const byScope = new Map(existing.map((admission) => [admission.repository ?? "evidence", admission]));
     let added = 0;
+    let refreshed = 0;
     for (const admission of args.projectAdmissions) {
       const scope = admission.repository ?? "evidence";
       const prior = byScope.get(scope);
       if (prior) {
-        if (prior.sourceAdmissionDigest !== admission.sourceAdmissionDigest) {
+        const sameImmutableSource = prior.protocolVersion === admission.protocolVersion
+          && prior.canonicalProjectId === admission.canonicalProjectId
+          && prior.repository === admission.repository
+          && prior.sourceProvider === admission.sourceProvider
+          && prior.sourceBranch === admission.sourceBranch
+          && prior.sourceRef === admission.sourceRef
+          && prior.sourceHeadSha === admission.sourceHeadSha;
+        if (!sameImmutableSource) {
           throw new Error(`Mission source admission for ${scope} is immutable`);
+        }
+        if (admission.sourceObservedAt > prior.sourceObservedAt) {
+          byScope.set(scope, admission);
+          refreshed += 1;
         }
         continue;
       }
@@ -1286,8 +1302,8 @@ export const admitPlanProjectsV2 = mutation({
     }
     const projectAdmissions = [...byScope.values()];
     if (!await validProjectAdmissions(projectAdmissions)) throw new Error("Extended mission source admission ledger is invalid");
-    if (added) await patchMissionWithRuntime(ctx, mission, { projectAdmissions, updatedAt: Date.now() });
-    return { admitted: true, stale: false, added, total: projectAdmissions.length };
+    if (added || refreshed) await patchMissionWithRuntime(ctx, mission, { projectAdmissions, updatedAt: Date.now() });
+    return { admitted: true, stale: false, added, refreshed, total: projectAdmissions.length };
   },
 });
 
