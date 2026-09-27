@@ -21,10 +21,10 @@ starts.
 cd services/local-stt
 export LOCAL_STT_SHARED_SECRET='a-long-random-value'
 docker compose up --build -d
-curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8083/healthz
 ```
 
-For a self-hosted Jarvis app, set `LOCAL_STT_URL=http://127.0.0.1:8080`. For
+For a self-hosted Jarvis app, set `LOCAL_STT_URL=http://127.0.0.1:8083`. For
 the Vercel app, expose this worker over a private authenticated network and set
 `LOCAL_STT_URL` to that private/reachable base URL. Store both
 `LOCAL_STT_URL` and `LOCAL_STT_SHARED_SECRET` under the `local-stt` vault
@@ -44,6 +44,11 @@ container and to the Jarvis server environment; the public HTTPS endpoint is
 therefore transport-reachable but never anonymously usable. The streaming
 Zipformer remains a low-latency partial recognizer. Final commands are
 authoritatively transcribed by this Faster-Whisper worker.
+
+The VPS publishes container port 8080 only on host loopback port 8083. Its
+`speech.87.106.233.113.nip.io` Nginx transcription proxy must target
+`127.0.0.1:8083`; the container health check still targets port 8080 inside
+the container. Host port 8080 is reserved for the HyperAI OAuth callback.
 
 The endpoint accepts standard multipart `file`, `model`, `language`, and
 `prompt` fields and returns verbose JSON with segment confidence data. It never
