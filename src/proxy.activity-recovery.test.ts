@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
+vi.mock("server-only", () => ({}));
 vi.mock("@/lib/control-session", () => ({ adminSessionHash: vi.fn(), validateAdminSession: vi.fn() }));
 vi.mock("@/lib/viewer-jwt", () => ({ verifyViewerToken: vi.fn() }));
 vi.mock("@/lib/canonical-origin", () => ({ canonicalJarvisRedirect: () => null }));
