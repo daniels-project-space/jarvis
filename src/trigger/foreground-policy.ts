@@ -38,7 +38,6 @@ export const FOREGROUND_RUNNER_LEASE_MS = 25_000;
 // bounded explicit recovery, so a one-minute cloud poll paid for thousands of
 // empty runs without making a healthy reply faster. Five minutes preserves a
 // durable dead-man switch while normal turns remain event-driven.
-export const FOREGROUND_DURABLE_RECOVERY_CRON = "*/5 * * * *";
 // Keep the authenticated process warm only across an active conversation.
 // Event-driven wakes start the next session; an idle four-hour worker was
 // effectively permanent Trigger compute with no user-visible benefit.

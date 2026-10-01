@@ -1,3 +1,4 @@
+import { activityMutation } from "./activityRecovery";
 import { mutation, query, type MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { v } from "convex/values";
@@ -1805,7 +1806,7 @@ async function recordSupervisorControl(
   return supervisorControlResult(receipt, false);
 }
 
-export const startV1 = mutation({
+export const startV1 = activityMutation({
   args: {
     requestKey: v.string(),
     goal: v.string(),
@@ -1995,7 +1996,7 @@ export const startV1 = mutation({
   },
 });
 
-export const controlV1 = mutation({
+export const controlV1 = activityMutation({
   args: {
     missionId: v.id("missions"),
     requestKey: v.string(),

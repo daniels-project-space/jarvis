@@ -1,3 +1,4 @@
+import { armActivityRecovery } from "./activityRecovery";
 // Atomic compact projections for the live agent control plane. The helpers in
 // this file are intentionally database-only so every durable writer can use
 // them in the same Convex transaction without calling another function.
@@ -806,6 +807,7 @@ export async function insertJobWithRuntime(ctx: any, value: any) {
   const runtime = projectJobRuntime(admitted);
   await ctx.db.insert("jobRuntime", runtime);
   await refreshWorkGroupQueueProjection(ctx, runtime.schedulingGroupKey);
+  await armActivityRecovery(ctx);
   return jobId;
 }
 
@@ -856,6 +858,9 @@ async function patchJobWithRuntimeInternal(
   const queueRefreshRequired = Object.keys(patch).some((field) =>
     queueFields.has(field)
   );
+  if (patch.status === "pending" || (job.status === "pending" && "nextRunAt" in patch)) {
+    await armActivityRecovery(ctx);
+  }
   if (refreshQueue && queueRefreshRequired) {
     await refreshWorkGroupQueueProjection(ctx, projected.schedulingGroupKey);
   }
@@ -1110,6 +1115,7 @@ export async function promoteCompletedJobDependents(ctx: any, source: any, now =
 export async function insertMissionWithRuntime(ctx: any, value: any) {
   const missionId = await ctx.db.insert("missions", value);
   await upsertMissionRuntime(ctx, { ...value, _id: missionId });
+  await armActivityRecovery(ctx);
   return missionId;
 }
 

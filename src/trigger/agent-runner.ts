@@ -1,4 +1,4 @@
-import { metadata, schedules, task } from "@trigger.dev/sdk/v3";
+import { metadata, task } from "@trigger.dev/sdk/v3";
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
@@ -3915,12 +3915,9 @@ export const agentWorker = task({
 // The fleet controller is intentionally cheap and always available. It never
 // runs Codex itself; it repairs leases, performs bounded housekeeping and fans
 // runnable jobs into independent workers.
-export const agentFleetSupervisor = schedules.task({
+export const agentFleetSupervisor = task({
   id: "jarvis-agent-fleet-supervisor",
-  // Dispatch reservations expire after two minutes and missing worker
-  // heartbeats after five. Event-driven wakes handle normal work; this bounded
-  // sweep is recovery-only and never runs a model or workspace.
-  cron: AGENT_FLEET_SUPERVISOR_CRON,
+  // Durable Convex recovery is armed only by live work and due deadlines.
   machine: "micro",
   queue: { concurrencyLimit: 1 },
   maxDuration: 120,

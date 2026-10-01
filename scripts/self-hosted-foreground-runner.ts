@@ -1,4 +1,8 @@
 import { pathToFileURL } from "node:url";
+import { ConvexClient } from "convex/browser";
+import { api } from "../convex/_generated/api";
+import { waitForWork } from "../src/lib/wait-for-work";
+import { FOREGROUND_IDLE_TIMEOUT_MS } from "../src/trigger/foreground-policy";
 import {
   captureForegroundMemory,
   processChatQueue,
@@ -7,7 +11,7 @@ import {
 import { readSelfHostedForegroundConfig } from "../src/lib/self-hosted-foreground-config";
 
 const RESTART_DELAY_MS = 1_500;
-const SELF_HOSTED_IDLE_TIMEOUT_MS = 55 * 60 * 1_000;
+const SELF_HOSTED_IDLE_TIMEOUT_MS = FOREGROUND_IDLE_TIMEOUT_MS;
 
 function waitForRestart(signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -22,6 +26,7 @@ function waitForRestart(signal: AbortSignal): Promise<void> {
 
 export async function runSelfHostedForeground(): Promise<void> {
   const config = readSelfHostedForegroundConfig();
+  const activityClient = new ConvexClient(config.convexUrl);
   const shutdown = new AbortController();
   const stop = () => shutdown.abort();
   process.once("SIGINT", stop);
@@ -45,6 +50,15 @@ export async function runSelfHostedForeground(): Promise<void> {
   try {
     while (!shutdown.signal.aborted) {
       try {
+        // Keep rapid conversation follow-ups warm, then release the runner
+        // lease and sleep on the durable queue instead of heartbeating forever.
+        await waitForWork((observe, fail) => activityClient.onUpdate(
+          api.chatQueue.pendingSignal,
+          { workerToken: process.env.JARVIS_WORKER_TOKEN },
+          pending => observe({ ready: Boolean(pending) }),
+          fail,
+        ), shutdown.signal);
+        if (shutdown.signal.aborted) break;
         await processChatQueue({ source: "selfhost-daemon" }, "primary", runtime);
       } catch {
         // Never print bearer material or provider responses. The durable queue
@@ -54,6 +68,7 @@ export async function runSelfHostedForeground(): Promise<void> {
       if (!shutdown.signal.aborted) await waitForRestart(shutdown.signal);
     }
   } finally {
+    await activityClient.close();
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
   }

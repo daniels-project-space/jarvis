@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as activityRecovery from "../activityRecovery.js";
 import type * as agents from "../agents.js";
 import type * as appleMapsOfflinePreflights from "../appleMapsOfflinePreflights.js";
 import type * as approvals from "../approvals.js";
@@ -22,6 +23,7 @@ import type * as controlPlane from "../controlPlane.js";
 import type * as controllerSession from "../controllerSession.js";
 import type * as creationFiling from "../creationFiling.js";
 import type * as creations from "../creations.js";
+import type * as crons from "../crons.js";
 import type * as currentState from "../currentState.js";
 import type * as fileHelpers from "../fileHelpers.js";
 import type * as files from "../files.js";
@@ -70,6 +72,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  activityRecovery: typeof activityRecovery;
   agents: typeof agents;
   appleMapsOfflinePreflights: typeof appleMapsOfflinePreflights;
   approvals: typeof approvals;
@@ -84,6 +87,7 @@ declare const fullApi: ApiFromModules<{
   controllerSession: typeof controllerSession;
   creationFiling: typeof creationFiling;
   creations: typeof creations;
+  crons: typeof crons;
   currentState: typeof currentState;
   fileHelpers: typeof fileHelpers;
   files: typeof files;

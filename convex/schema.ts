@@ -151,6 +151,12 @@ const supervisorFleetManifestMemberValidator = v.object({
 // Convex holds the reactive index for search/recall. Multi-stage consolidation
 // (daily -> weekly -> long-term) is driven by Trigger.dev tasks.
 export default defineSchema({
+  activityRecoveryTimers: defineTable({
+    key: v.string(),
+    at: v.number(),
+    scheduledId: v.optional(v.id("_scheduled_functions")),
+  }).index("by_key", ["key"]),
+
   memory: defineTable({
     kind: v.string(), // "daily" | "knowledge" | "weekly" | "fact" | "project"
     title: v.string(),

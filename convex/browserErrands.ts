@@ -1,3 +1,4 @@
+import { activityMutation } from "./activityRecovery";
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireActor, requireAdmin, requireViewer, viewerAuthArgs } from "./controlAuth";
@@ -361,7 +362,7 @@ export const decide = mutation({
  * foreground owner receipt recorded by chatQueue; this makes the receipt and
  * the owner-visible approval both necessary for every browser run.
  */
-export const claim = mutation({
+export const claim = activityMutation({
   args: {
     errandId: v.id("browserErrands"),
     leaseToken: v.string(),

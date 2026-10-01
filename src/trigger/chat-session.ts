@@ -1,4 +1,4 @@
-import { metadata, schedules, task, tasks } from "@trigger.dev/sdk/v3";
+import { metadata, task, tasks } from "@trigger.dev/sdk/v3";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ConvexClient } from "convex/browser";
@@ -43,7 +43,6 @@ import {
   FOREGROUND_CONCURRENCY,
   FOREGROUND_ADMISSION_RESERVE_MS,
   canClaimForegroundTurn,
-  FOREGROUND_DURABLE_RECOVERY_CRON,
   FOREGROUND_HANDOFF_OVERLAP_MS,
   FOREGROUND_IDLE_TIMEOUT_MS,
   FOREGROUND_LANE_MAX_DURATION_SECONDS,
@@ -1089,13 +1088,9 @@ export const chatHandoff = task({
 
 // Recovery lane only: if an immediate trigger is lost between Vercel and
 // Trigger, the next schedule drains the durable Convex queue.
-export const chatDispatcher = schedules.task({
+export const chatDispatcher = task({
   id: "jarvis-chat-dispatcher",
-  // A lost Trigger response remains ambiguous, so recover it durably rather
-  // than terminally failing the turn. Normal turns and the browser watchdog
-  // remain event-driven; this lower-frequency schedule is only the final
-  // unattended dead-man switch.
-  cron: FOREGROUND_DURABLE_RECOVERY_CRON,
+  // Durable Convex recovery is armed only by live work and due deadlines.
   queue: { name: "jarvis-foreground-recovery", concurrencyLimit: 1 },
   maxDuration: 60,
   run: async () => {
