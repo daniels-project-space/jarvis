@@ -98,7 +98,7 @@ async function recoveryDemand(ctx: QueryCtx | MutationCtx, includeChat = true): 
   // Daniel. That label alone is not runnable work. Preserve automatic phase
   // advancement and synthesis when terminal children actually make it ready.
   for (const row of mission) {
-    if (row.externalRunId) continue; // the goal coordinator owns external polls
+    if (row.mode === "goal" || row.externalRunId) continue; // goal coordinator owns phase/external reconciliation
     const active = await ctx.db.query("jobRuntime").withIndex("by_mission_active_priority", q => q
       .eq("missionId", String(row.missionId)).eq("active", true)).first();
     if (active) continue;
