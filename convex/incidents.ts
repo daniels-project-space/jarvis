@@ -1,3 +1,4 @@
+import { activityMutation } from "./activityRecovery";
 import { mutation, query } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
 import type { Doc } from "./_generated/dataModel";
@@ -106,7 +107,7 @@ export const reconcileLegacyTransientAttention = mutation({
   },
 });
 
-export const report = mutation({
+export const report = activityMutation({
   args: {
     source: v.string(),
     signature: v.string(),

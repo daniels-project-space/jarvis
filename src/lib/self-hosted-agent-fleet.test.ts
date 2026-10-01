@@ -40,6 +40,16 @@ function dependencies(overrides: Partial<SelfHostedAgentFleetDependencies> = {})
 }
 
 describe("self-hosted durable agent fleet controller", () => {
+  it("keeps an idle daemon free of provider probes, maintenance and reservations", async () => {
+    const abort = new AbortController();
+    const deps = dependencies({ awaitActivity: vi.fn(async () => { abort.abort(); }) });
+    await runSelfHostedAgentFleetController(1_000, abort.signal, deps);
+    expect(deps.validateProvider).not.toHaveBeenCalled();
+    expect(deps.activateProtocol).not.toHaveBeenCalled();
+    expect(deps.runMaintenance).not.toHaveBeenCalled();
+    expect(deps.runSupervisorSweep).not.toHaveBeenCalled();
+    expect(deps.reserve).not.toHaveBeenCalled();
+  });
   it("fails before job admission when provider proof is unavailable", async () => {
     const abort = new AbortController();
     const deps = dependencies({

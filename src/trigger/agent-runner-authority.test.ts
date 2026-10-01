@@ -654,7 +654,7 @@ describe("production Trigger worker authority harness", () => {
     expect(AGENT_WORKER_CHECKPOINT_MARGIN_MS).toBe(2 * 60_000);
     expect(AGENT_WORKER_SOFT_DEADLINE_MS).toBe(28 * 60_000);
     expect(trigger.definitions.get("jarvis-agent-worker").maxDuration).toBe(AGENT_WORKER_MAX_DURATION_SECONDS);
-    expect(trigger.definitions.get("jarvis-agent-fleet-supervisor").cron).toBe("*/5 * * * *");
+    expect(trigger.definitions.get("jarvis-agent-fleet-supervisor").cron).toBeUndefined();
   });
 
   it("reaps only expired browser leases during maintenance without launching browser or worker work", async () => {

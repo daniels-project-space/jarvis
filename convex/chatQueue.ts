@@ -1,3 +1,4 @@
+import { activityMutation } from "./activityRecovery";
 import { mutation, query } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -439,12 +440,12 @@ async function admitMessage(
   return id;
 }
 
-export const sendMessage = mutation({
+export const sendMessage = activityMutation({
   args: sendMessageArgs,
   handler: admitMessage,
 });
 
-export const sendMessageWithRunnerLease = mutation({
+export const sendMessageWithRunnerLease = activityMutation({
   args: sendMessageArgs,
   handler: async (ctx, a) => {
     const messageId = await admitMessage(ctx, a);

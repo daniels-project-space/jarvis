@@ -1,3 +1,4 @@
+import { activityMutation } from "./activityRecovery";
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireAdmin, requireWorker } from "./controlAuth";
@@ -258,7 +259,7 @@ function calendarApprovalState(creation: any): { sourceKey?: string; revision?: 
 }
 
 /** Owner action: create or replace the one registry row for one saved TripDoc. */
-export const upsert = mutation({
+export const upsert = activityMutation({
   args: {
     creationId: v.id("creations"),
     sourceKey: v.string(),
@@ -770,7 +771,7 @@ export const due = query({
 });
 
 /** Atomically records a successful Gmail refresh and mirrors it into the exact saved TripDoc. */
-export const completeRefresh = mutation({
+export const completeRefresh = activityMutation({
   args: {
     id: v.id("appleMapsOfflinePreflights"),
     expectedUpdatedAt: v.number(),
@@ -841,7 +842,7 @@ export const completeRefresh = mutation({
 });
 
 /** Fail closed while retaining the existing reminder and the owner-visible saved-trip status. */
-export const markPending = mutation({
+export const markPending = activityMutation({
   args: {
     id: v.id("appleMapsOfflinePreflights"),
     expectedUpdatedAt: v.number(),

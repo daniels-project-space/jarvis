@@ -1,3 +1,4 @@
+import { activityMutation } from "./activityRecovery";
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, requireWorker, viewerAuthArgs } from "./controlAuth";
@@ -12,7 +13,7 @@ const priceOf = (kind: string, observation: any): number | undefined => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 };
 
-export const createProduct = mutation({
+export const createProduct = activityMutation({
   args: {
     query: v.string(),
     targetPence: v.optional(v.number()),
@@ -111,7 +112,7 @@ export const expireLapsed = mutation({
   },
 });
 
-export const createAsset = mutation({
+export const createAsset = activityMutation({
   args: {
     symbol: v.string(),
     provider: v.string(),
@@ -404,7 +405,7 @@ export const dismissEvent = mutation({
   },
 });
 
-export const cancel = mutation({
+export const cancel = activityMutation({
   args: { match: v.string(), ...actorAuthArgs },
   handler: async (ctx, a) => {
     await requireActor(ctx, a);

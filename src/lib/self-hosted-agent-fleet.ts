@@ -10,6 +10,7 @@ export type SelfHostedAgentFleetCycleResult = {
 };
 
 export type SelfHostedAgentFleetDependencies = {
+  awaitActivity?(signal: AbortSignal): Promise<void>;
   activateProtocol(): Promise<void>;
   validateProvider(): Promise<void>;
   resumeProviderHolds(): Promise<void>;
@@ -26,6 +27,8 @@ export async function runSelfHostedAgentFleetController(
   signal: AbortSignal,
   dependencies: SelfHostedAgentFleetDependencies,
 ): Promise<void> {
+  await dependencies.awaitActivity?.(signal);
+  if (signal.aborted) return;
   await dependencies.validateProvider();
   await dependencies.activateProtocol();
   await dependencies.resumeProviderHolds();
@@ -36,6 +39,8 @@ export async function runSelfHostedAgentFleetController(
   let maintenanceInFlight: Promise<void> | null = null;
   let supervisorInFlight: Promise<void> | null = null;
   while (!signal.aborted) {
+    await dependencies.awaitActivity?.(signal);
+    if (signal.aborted) break;
     const now = dependencies.now();
     if (now >= providerDueAt) {
       await dependencies.validateProvider();

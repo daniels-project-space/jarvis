@@ -1,3 +1,4 @@
+import { activityMutation } from "./activityRecovery";
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { actorAuthArgs, requireActor, requireViewer, viewerAuthArgs } from "./controlAuth";
@@ -8,7 +9,7 @@ const DELIVERY_LEASE_MS = 5 * 60_000;
 
 // Timed reminders: "remind me at 7pm to call mum" → push + spoken weave when
 // due. The agent-runner cron (*/2) sweeps `due` and delivers.
-export const add = mutation({
+export const add = activityMutation({
   args: {
     text: v.string(),
     at: v.number(),

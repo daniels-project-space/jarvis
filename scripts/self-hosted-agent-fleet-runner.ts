@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { ConvexClient } from "convex/browser";
+import { api } from "../convex/_generated/api";
+import { waitForWork } from "../src/lib/wait-for-work";
 
 import { issueLiveCloudProviderProbe } from "./probe-cloud-workspace-provider";
 import { reserveAgentFleetBatch, type AgentFleetReservation } from "../src/lib/agent-fleet-dispatch";
@@ -84,9 +87,16 @@ export async function runSelfHostedAgentFleet(): Promise<void> {
     triggerDeploymentVersion: config.controllerDeploymentId,
   } as const;
   const supervisorConvex = createSupervisorConvexClient({ url: config.convexUrl });
+  const activityClient = new ConvexClient(config.convexUrl);
 
   try {
     await runSelfHostedAgentFleetController(config.pollMs, shutdown.signal, {
+      awaitActivity: signal => waitForWork((observe, fail) => activityClient.onUpdate(
+        api.activityRecovery.fleetDemand,
+        { workerToken: process.env.JARVIS_WORKER_TOKEN },
+        demand => observe({ ready: demand.fleet, nextAt: demand.nextAt }),
+        fail,
+      ), signal),
       activateProtocol: async () => {
         await workerMutation(config.convexUrl, "jobs:activateHeartbeatProtocolV2", {
           triggerDeploymentVersion: config.controllerDeploymentId,
@@ -179,6 +189,7 @@ export async function runSelfHostedAgentFleet(): Promise<void> {
       now: Date.now,
     });
   } finally {
+    await activityClient.close();
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
   }
